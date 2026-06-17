@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 17.4: Expert Parallelism: Sharding Experts Across Nodes. Why a sparse MoE layer makes a new parallelism axis both possible and necessary, how it composes with data, tensor, and pipeline parallelism, and the cross-device traffic it creates." name="description"/>
+<title>Section 17.4: Expert Parallelism: Sharding Experts Across Nodes | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 17: Expert Parallelism and Sparse Distributed Models</a></div>
+<h1>Expert Parallelism: Sharding Experts Across Nodes</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They split the model and called the pieces experts, then put each of us in a different building. Now every token I see has travelled, and so will my answer."</p>
+<cite>An Expert That Lives Two Nodes Away</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A mixture-of-experts layer holds many experts but uses only a few per token, so its parameters can be scattered across devices that a dense layer could never afford, and a token's chosen expert may live on a different machine than the one that selected it.</strong> Expert parallelism is the distribution strategy this sparsity makes possible and necessary: place different experts on different devices, store only $E/D$ experts per device, and accept that routing now means sending tokens across the fabric to wherever their expert lives. This is a genuinely new parallelism axis, sitting alongside data, tensor, and pipeline parallelism rather than replacing any of them. This section shows what the axis buys (more experts than fit on one device), what it costs (cross-device token traffic), and how it stacks with the other three into the full parallel layout of a frontier MoE model. The traffic it creates is the all-to-all of <a href="section-17.5.html">Section 17.5</a>; here we measure how much of it there is.</p>
+</div>
+<p>The previous section built the router: a small gate that reads each token and names the one or two experts that should process it, out of $E$ experts in the layer. As long as every expert lives on the same device as the gate, that choice costs nothing to act on; the device simply calls the chosen expert's weights and moves on. The moment the experts no longer fit on one device, that comfortable assumption breaks. A modern MoE layer may carry sixty-four, one hundred twenty-eight, or more experts, each a full feed-forward block of tens of millions of parameters; stacked across many layers, the expert weights alone run to hundreds of billions of parameters, far past the memory of any single accelerator. The experts must be split across devices, and once they are, the gate's verdict can point at a device on the other side of the network.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of an expert-parallel MoE layer: four devices each hold two of eight experts and run the gate locally; tokens whose chosen expert lives on another device are dispatched across the fabric, while tokens whose expert is local stay put.">
+<defs>
+<marker id="arr174" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr174r" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b8431f"/></marker>
+</defs>
+<style>
+.b174 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.e174 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.4; }
+.t174 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s174 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.ll174 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr174); }
+.rl174 { fill:none; stroke:#b8431f; stroke-width:1.8; stroke-dasharray:5 3; marker-end:url(#arr174r); }
+</style>
+<text class="t174" x="430" y="22">One MoE layer, 8 experts sharded across 4 devices (E/D = 2 each)</text>
+<!-- four device columns -->
+<g>
+<rect class="b174" x="40" y="50" width="170" height="250" rx="10"/>
+<text class="t174" x="125" y="72">Device 0</text>
+<rect class="e174" x="60" y="118" width="60" height="38" rx="6"/><text class="s174" x="90" y="142">E0</text>
+<rect class="e174" x="130" y="118" width="60" height="38" rx="6"/><text class="s174" x="160" y="142">E1</text>
+<text class="s174" x="125" y="100">gate (local)</text>
+</g>
+<g>
+<rect class="b174" x="240" y="50" width="170" height="250" rx="10"/>
+<text class="t174" x="325" y="72">Device 1</text>
+<rect class="e174" x="260" y="118" width="60" height="38" rx="6"/><text class="s174" x="290" y="142">E2</text>
+<rect class="e174" x="330" y="118" width="60" height="38" rx="6"/><text class="s174" x="360" y="142">E3</text>
+<text class="s174" x="325" y="100">gate (local)</text>
+</g>
+<g>
+<rect class="b174" x="440" y="50" width="170" height="250" rx="10"/>
+<text class="t174" x="525" y="72">Device 2</text>
+<rect class="e174" x="460" y="118" width="60" height="38" rx="6"/><text class="s174" x="490" y="142">E4</text>
+<rect class="e174" x="530" y="118" width="60" height="38" rx="6"/><text class="s174" x="560" y="142">E5</text>
+<text class="s174" x="525" y="100">gate (local)</text>
+</g>
+<g>
+<rect class="b174" x="640" y="50" width="180" height="250" rx="10"/>
+<text class="t174" x="730" y="72">Device 3</text>
+<rect class="e174" x="660" y="118" width="60" height="38" rx="6"/><text class="s174" x="690" y="142">E6</text>
+<rect class="e174" x="730" y="118" width="60" height="38" rx="6"/><text class="s174" x="760" y="142">E7</text>
+<text class="s174" x="730" y="100">gate (local)</text>
+</g>
+<!-- token rows at bottom of each device -->
+<text class="s174" x="125" y="225">tokens arrive here</text>
+<text class="s174" x="325" y="225">tokens arrive here</text>
+<text class="s174" x="525" y="225">tokens arrive here</text>
+<text class="s174" x="730" y="225">tokens arrive here</text>
+<!-- local dispatch on device 0 -->
+<path class="ll174" d="M 95 215 L 92 160"/>
+<text class="s174" x="125" y="252">local: expert is here</text>
+<!-- remote dispatch device 1 -> device 2 (E5) -->
+<path class="rl174" d="M 325 218 C 400 340 520 340 558 160"/>
+<text class="s174" x="525" y="252" fill="#b8431f">remote: token sent to D2</text>
+<!-- remote dispatch device 3 -> device 0 (E1) -->
+<path class="rl174" d="M 730 218 C 470 350 200 350 162 160"/>
+<text class="s174" x="730" y="252" fill="#b8431f">remote: token sent to D0</text>
+<text class="s174" x="430" y="328">solid = local dispatch (stays on device)   dashed = remote dispatch (crosses the fabric)</text>
+</svg>
+<figcaption><strong>Figure 17.4.1:</strong> Expert parallelism for one MoE layer. Eight experts are sharded across four devices, $E/D = 2$ per device, and every device runs the gate locally for its own tokens. When the gate selects an expert that lives on the same device (solid arrow), the token is processed in place; when it selects an expert on another device (dashed arrows), the token must be dispatched across the fabric, processed there, and its result returned. Those dashed arrows, summed over all device pairs, are the all-to-all traffic of <a href="section-17.5.html">Section 17.5</a>, and the demo below counts them.</figcaption>
+</figure>
+
+<h2>1. A New Axis: Place Experts on Different Devices <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The idea is direct. A layer has $E$ experts and you have $D$ devices; assign experts to devices so each device stores a disjoint block of them. With contiguous sharding, device $d$ holds experts $d \cdot (E/D)$ through $(d+1)\cdot(E/D) - 1$, so every device carries exactly</p>
+$$\frac{E}{D} \text{ experts}, \qquad \text{memory per device} = \frac{E}{D} \cdot P_{\text{expert}} \text{ parameters},$$
+<p>where $P_{\text{expert}}$ is the parameter count of one expert. Doubling the device count halves the experts per device and halves the per-device expert memory, which is exactly the lever that lets a layer hold more experts than any single accelerator could store. A layer with $E = 256$ experts that would never fit on one device fits comfortably when spread over $D = 64$ devices at four experts each. This is the memory win, and it is the whole reason expert parallelism exists.</p>
+<p>What makes this a distinct parallelism axis, rather than a variant of the ones in <a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>, is what gets split and how the split is resolved at run time. Tensor parallelism splits a single weight matrix and every token touches every shard; pipeline parallelism splits the layer stack and every token flows through every stage in order; data parallelism replicates the whole model and splits the batch. Expert parallelism splits along the expert dimension, and crucially each token visits only the one or two shards its gate selected, not all of them. The split is data-dependent: the router decides, per token, which device's experts to engage. That data-dependence is what forces the token movement, and it is why the collective underneath is an all-to-all rather than the all-reduce of data parallelism.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Sparsity Is What Makes the Axis Both Possible and Affordable</div>
+<p>You can shard experts across devices precisely because a token uses only a few of them. If every token had to visit every expert, sharding would force each token across the entire fabric on every layer, and the communication would dwarf any memory saving. Top-$k$ routing with small $k$ means each token contacts only $k$ of the $D$ device groups, so the per-token traffic stays bounded even as $E$ and $D$ grow. Expert parallelism is the rare case where distributing the model <em>reduces</em> the compute each device does (a device runs only its own experts on only the tokens routed to them), while adding a new, well-bounded communication cost in its place.</p>
+</div>
+
+<h2>2. The Gate Is Local, the Expert May Not Be <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Every device runs the gate on the tokens it currently holds. The gate is tiny, a single projection from the token width to $E$ logits, so replicating it on every device costs almost nothing and avoids any communication to compute the routing decision. The result of that local computation, however, is a set of expert indices that point all over the cluster. A token sitting on device $0$ whose gate selects expert $5$ must be sent to whichever device stores expert $5$; on Figure 17.4.1 that is device $2$. The token's vector travels there, the expert processes it, and the output travels back to device $0$ to continue through the rest of the layer. Three movements hide inside one routing decision: dispatch out, compute remote, combine back.</p>
+<p>How much of this traffic is there? Under roughly uniform routing, a token's chosen expert lands on the token's own device only $1/D$ of the time, so the fraction of tokens that must be dispatched remotely is $1 - 1/D$. With $D = 8$ that is already $87.5\%$, and it climbs toward $100\%$ as the expert-parallel group widens. This is not a defect to be engineered away; it is the structural cost of putting experts on separate machines, and it is why the next section is devoted entirely to making that all-to-all exchange fast. The demo below makes the fraction concrete by running a real gate over a batch and counting, device by device, how many tokens stay home and how many cross the fabric.</p>
+<pre><code class="language-python">import numpy as np
+
+# An MoE layer with E experts, sharded across D devices.
+# Each device holds E/D experts and runs the gate locally for the tokens it
+# owns. A token's top-1 expert may live on another device, so it must be
+# DISPATCHED there. We count local vs remote dispatches: the cross-device
+# traffic that expert parallelism creates.
+
+rng = np.random.default_rng(7)
+E, D = 64, 8                 # experts, devices
+experts_per_device = E // D  # = 8 experts on each device
+T_per_device = 2048          # tokens each device processes this batch
+H = 16                       # token feature width for the gate
+
+# Map each expert id -> the device that stores it (contiguous block sharding).
+expert_to_device = np.repeat(np.arange(D), experts_per_device)
+
+# A simple learned gate: project tokens to E logits, pick the argmax expert.
+gate_W = rng.standard_normal((H, E))
+
+local = 0
+remote = 0
+for src in range(D):                       # each device runs its own gate
+    tokens = rng.standard_normal((T_per_device, H))
+    logits = tokens @ gate_W
+    chosen_expert = logits.argmax(axis=1)  # top-1 routing
+    dst = expert_to_device[chosen_expert]  # device that holds that expert
+    is_local = (dst == src)
+    local += int(is_local.sum())
+    remote += int((~is_local).sum())
+
+total = local + remote
+print(f"experts E                 : {E}")
+print(f"devices D                 : {D}")
+print(f"experts per device E/D    : {experts_per_device}")
+print(f"tokens routed total       : {total}")
+print(f"local  dispatches         : {local:6d}  ({100*local/total:5.1f}%)")
+print(f"remote dispatches         : {remote:6d}  ({100*remote/total:5.1f}%)")
+print(f"expected remote fraction  : {100*(1 - 1/D):5.1f}%  (= 1 - 1/D under uniform routing)")
+print(f"bytes crossing the fabric : {remote * H * 4 / 1e6:.2f} MB  (4-byte floats, width {H})")
+</code></pre>
+<div class="code-caption"><strong>Code 17.4.1:</strong> Expert parallelism from first principles. Each of the $D$ devices runs the gate locally over its own tokens, then the chosen expert id is mapped to the device that stores it; tokens whose expert lives elsewhere are counted as remote dispatches, which is the cross-fabric traffic expert parallelism creates.</div>
+<pre><code class="language-text">experts E                 : 64
+devices D                 : 8
+experts per device E/D    : 8
+tokens routed total       : 16384
+local  dispatches         :   1974  ( 12.0%)
+remote dispatches         :  14410  ( 88.0%)
+expected remote fraction  :  87.5%  (= 1 - 1/D under uniform routing)
+bytes crossing the fabric : 0.92 MB  (4-byte floats, width 16)
+</code></pre>
+<div class="code-caption"><strong>Output 17.4.1:</strong> Of $16{,}384$ tokens, only $12\%$ found their expert on the same device; the other $88\%$ had to be dispatched across the fabric, matching the $1 - 1/D = 87.5\%$ prediction for uniform top-1 routing over eight devices. Sharding experts saved memory and bought, in exchange, a layer where almost every token travels.</div>
+<p>The takeaway from Output 17.4.1 is that remote dispatch is the common case, not the exception. The $0.92$ MB of token vectors crossing the fabric here is small only because the toy feature width is sixteen; at a real hidden size of several thousand, with a full batch and many MoE layers, the per-step traffic is large enough that the all-to-all becomes the dominant communication cost of the entire training step. That is precisely why expert-parallel groups are placed with such care, the subject of the next part.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: DeepSpeed-MoE, Megatron, and Tutel Do the Sharding and Dispatch</div>
+<p>Code 17.4.1 only counts the dispatches; a production system must actually shard the experts, run the all-to-all, compute, and all-to-all back, all overlapped with the rest of the layer. You do not write that. DeepSpeed-MoE, Megatron-LM, and Microsoft's Tutel each expose an expert-parallel MoE layer where you declare the expert count and the expert-parallel group size, and the framework places experts, builds the dispatch and combine all-to-all, and handles capacity and load balancing:</p>
+<pre><code class="language-python"># DeepSpeed-MoE: one wrapper turns a dense FFN into a sharded expert-parallel layer.
+import deepspeed.moe.layer as moe
+
+expert_ffn = build_feedforward(hidden_size)          # one expert's weights
+moe_layer = moe.MoE(
+    hidden_size=hidden_size,
+    expert=expert_ffn,
+    num_experts=64,                                  # E experts in the layer
+    ep_size=8,                                        # D devices in the expert-parallel group
+    k=1,                                             # top-1 routing
+)
+# moe_layer now shards the 64 experts over 8 devices (8 each), runs the gate,
+# and performs the dispatch/combine all-to-all internally on every forward pass.
+out, aux_loss, _ = moe_layer(tokens)                 # aux_loss is the load-balancing term of 17.6
+</code></pre>
+<div class="code-caption"><strong>Code 17.4.2:</strong> The sharding, dispatch, and combine that Code 17.4.1 only measured, collapsed to one <code>MoE</code> layer with an <code>ep_size</code> argument. DeepSpeed-MoE, Megatron-LM, and Tutel each place the experts across the expert-parallel group, build the two all-to-all exchanges, and return the load-balancing auxiliary loss; the dozens of lines of manual dispatch bookkeeping become a single constructor.</div>
+</div>
+
+<h2>3. Composing With Data, Tensor, and Pipeline Parallelism <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Expert parallelism rarely travels alone. A frontier MoE model stacks it with the three axes of <a href="../module-16-model-pipeline-sharded-parallelism/section-16.9.html">Section 16.9</a> into a single device layout, and the placement of each axis follows the same rule that governed the dense case: put the most frequent, most bandwidth-hungry collective on the fastest links. The dense MoE blocks (attention, the shared parameters) use data and tensor parallelism as usual; the expert blocks add the expert axis on top. Table 17.4.1 lays out who splits what and which collective each axis rides, so the full stack reads as one grid rather than four separate tricks.</p>
+<div class="table-caption"><strong>Table 17.4.1:</strong> The four parallelism axes of a frontier MoE model, what each splits, and the collective it relies on. Expert parallelism is the row that sparsity adds; the other three are carried over from <a href="../module-16-model-pipeline-sharded-parallelism/section-16.9.html">Section 16.9</a>.</div>
+<table>
+<thead>
+<tr><th scope="col">Axis</th><th scope="col">What it splits</th><th scope="col">Per token</th><th scope="col">Collective</th></tr>
+</thead>
+<tbody>
+<tr><td>Data</td><td>The batch (model replicated)</td><td>sees its own model copy</td><td>all-reduce (gradients)</td></tr>
+<tr><td>Tensor</td><td>One weight matrix across devices</td><td>touches every shard</td><td>all-reduce / all-gather</td></tr>
+<tr><td>Pipeline</td><td>The layer stack into stages</td><td>flows through every stage</td><td>point-to-point (activations)</td></tr>
+<tr><td>Expert</td><td>The experts of an MoE layer</td><td>visits only its chosen experts</td><td>all-to-all (dispatch / combine)</td></tr>
+</tbody>
+</table>
+<p>The interesting design choice is how the expert axis interleaves with the data axis. In the common arrangement, the expert-parallel group and the data-parallel group partition the same set of devices: with $G$ devices total, an expert-parallel size of $D$ means there are $G/D$ data-parallel replicas, each holding a full set of $E$ experts sharded $D$ ways. The gate's all-to-all runs inside each expert-parallel group; the gradient all-reduce runs across the data-parallel replicas. The two collectives touch disjoint device sets, so they can overlap, and the expert and data degrees multiply to consume the device budget exactly, the same product constraint formalized for the dense axes in <a href="../module-16-model-pipeline-sharded-parallelism/section-16.9.html">Section 16.9</a>.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Data Parallelism Returns as a Sparse Cousin</div>
+<p>The exact-gradient identity that opened the book in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a> said that an average over examples decomposes across workers, which made data parallelism exact and all-reduce its engine. Expert parallelism is the sparse descendant of that same idea: instead of every worker holding the whole model and splitting the data, every device holds a slice of the experts and the <em>tokens</em> are routed to the slice that owns them. The collective changes from all-reduce to all-to-all because the routing is now data-dependent and sparse rather than uniform and dense, but the move is recognizably the same: split the work across machines, send only what must be sent, and recombine. When you meet a new parallel method, ask which collective it rides; for expert parallelism the answer, developed next, is all-to-all.</p>
+</div>
+
+<h2>4. Why the Expert-Parallel Group Is a Node or Crosses Nodes <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The all-to-all dispatch is the most bandwidth-hungry collective in the MoE forward pass, and Output 17.4.1 showed why: nearly every token crosses the group. The placement rule therefore wants the expert-parallel group on the fastest interconnect available. Inside a single node, accelerators are linked by high-bandwidth fabric (NVLink-class) an order of magnitude faster than the network between nodes, so the cheapest expert-parallel group is one that fits within a node, eight experts-per-device sharded across the eight devices of that node. When a layer has more experts than one node can hold, the group is forced to span nodes, and the all-to-all then rides the slower cross-node network, which is exactly when the communication cost models of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a> and the collective-cost analysis of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> start to bite.</p>
+<p>This is the tension that shapes real deployments. A larger expert-parallel group stores more experts and saves more memory per device, but it widens the all-to-all and pushes it onto slower links; a group confined to one node keeps the all-to-all fast but caps the expert count at what the node can hold. The resolution mirrors the dense case: keep the expert-parallel group within the fastest domain that holds enough experts, and only cross nodes when the model genuinely demands it. The frontier open-weight MoE models that span thousands of accelerators do cross nodes, and a substantial share of their engineering is in making that cross-node all-to-all overlap with computation so the experts are never idle waiting for tokens.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The MoE Layer That Outgrew a Single Node</div>
+<p><strong>Who:</strong> A distributed-training engineer bringing up a $128$-expert MoE language model on a cluster of eight-accelerator nodes.</p>
+<p><strong>Situation:</strong> Each expert was a $90$-million-parameter feed-forward block; one MoE layer's experts alone needed far more memory than a single node's eight accelerators could hold.</p>
+<p><strong>Problem:</strong> Sharding all $128$ experts across one node's eight devices ($16$ experts each) overflowed device memory once optimizer state and activations were added.</p>
+<p><strong>Dilemma:</strong> Keep the expert-parallel group inside one node and shrink the model to fit, fast all-to-all but fewer experts, or widen the group across two nodes, full expert count but an all-to-all that now rides the slower cross-node network.</p>
+<p><strong>Decision:</strong> They set the expert-parallel size to $16$, spanning two nodes, so each device held eight experts, and invested in overlapping the dispatch all-to-all with the attention computation of the same layer.</p>
+<p><strong>How:</strong> Using a framework expert-parallel layer (the kind in Code 17.4.2), they pinned the expert-parallel group to the two nodes on the same rack switch and tuned the capacity factor (Section 17.7) so the all-to-all payload stayed predictable.</p>
+<p><strong>Result:</strong> The full $128$-expert layer trained with per-device memory under budget, and because the cross-node all-to-all overlapped with computation, the step time rose only modestly versus the infeasible single-node ideal.</p>
+<p><strong>Lesson:</strong> The expert-parallel group should sit in the fastest domain that still holds the experts; when the model forces you across nodes, the engineering shifts from avoiding the all-to-all to hiding it behind compute.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Everyone Commutes</div>
+<p>In a dense data-parallel job, the tokens stay home and only the gradients commute at the end of the step. In an expert-parallel MoE layer, the gradients still commute, and now the tokens commute too, twice per layer, out to their expert and back. Output 17.4.1's $88\%$ remote rate means the average token in that toy layer is a daily long-distance commuter that never works at its home office. The all-to-all of Section 17.5 is, in effect, the cluster's rush-hour traffic-control system.</p>
+</div>
+
+<h2>5. The Memory Win and the Communication Bill <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>It is worth stating the trade plainly, because expert parallelism is unusual among the four axes in what it gives and what it charges. The win is memory: a layer can hold $E$ experts using only $E/D$ experts' worth of memory on each device, which lets MoE models carry an order of magnitude more parameters than a dense model trained on the same hardware, while keeping the per-token compute low because only $k$ experts fire. The bill is communication: two all-to-all exchanges per MoE layer, each moving most of the batch's tokens across the expert-parallel group, on top of the gradient all-reduce that data parallelism already owed. Expert parallelism does not reduce the total work; it relocates the bottleneck from device memory to network bandwidth, and the rest of this chapter is about keeping that relocated bottleneck under control through routing balance (Section 17.6), capacity limits (Section 17.7), and serving-time placement (Section 17.8).</p>
+<p>The cleanest way to see the bill is to compare it to the alternative. To hold the same total parameters densely, you would need tensor or pipeline parallelism deep enough to fit the giant dense layer, and every token would touch every shard on every layer. The MoE route trades that guaranteed dense traffic for sparse, routed traffic that only the selected experts incur. Whether the trade pays off depends on the routing balance and the interconnect, which is exactly why the next sections measure and shape the routed traffic rather than assuming it is free. The dense baseline for that comparison is the $3$D layout of <a href="../module-16-model-pipeline-sharded-parallelism/section-16.9.html">Section 16.9</a>; the sparse alternative is the layout this section added.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Cheaper Expert Routing and Placement (2024 to 2026)</div>
+<p>Because the all-to-all is the cost expert parallelism creates, recent work attacks it from several directions at once. The open-weight frontier MoE models of this period (the Mixtral-style sparse mixtures, DeepSeek-V3 and its fine-grained shared-plus-routed expert design, and Qwen's MoE variants) push the expert count high while keeping the active-parameter fraction low, and report training stacks that overlap the dispatch all-to-all with computation so aggressively that the expert axis adds little wall-clock. A parallel line rethinks placement: expert-choice routing inverts the assignment so experts pick tokens and load stays balanced by construction, and dropless and grouped-GEMM kernels remove the token-dropping that capacity limits used to force. Systems such as Tutel and the MegaBlocks lineage contribute adaptive expert-parallel layouts and block-sparse expert kernels that keep devices busy under skewed routing. The common thread is that the memory win of expert parallelism is taken as settled, and the research is on shrinking and hiding the communication bill it incurs, the same bill Output 17.4.1 made visible.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.4.1: Read the Remote Fraction <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Output 17.4.1 reported an $88\%$ remote-dispatch rate for $D = 8$ devices under top-1 routing. (a) Using the $1 - 1/D$ rule, state the remote fraction for $D = 4$, $D = 16$, and $D = 64$, and explain in one sentence why it approaches $100\%$ as the expert-parallel group widens. (b) Argue why this means a wider expert-parallel group is not automatically better, even though it stores more experts per layer. (c) Connect your answer to the placement rule of Section 4: which property of the interconnect makes a node-sized group attractive despite its high remote fraction?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.4.2: Top-k and the Traffic <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 17.4.1 to use top-$2$ routing instead of top-$1$ (each token now selects its two highest-logit experts). Count a remote dispatch for every chosen expert that lives off the token's device, so a single token can contribute zero, one, or two remote dispatches. Report the total dispatch count and the remote fraction, and compare the bytes crossing the fabric to the top-$1$ run. Explain why top-$2$ routing roughly doubles the all-to-all payload, and what that implies for the choice of $k$ in a bandwidth-limited cluster.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.4.3: Memory Versus Bandwidth <span class="exercise-type analysis">Analysis</span></div>
+<p>Consider an MoE layer with $E = 256$ experts, each $P_{\text{expert}} = 50$ million parameters at $2$ bytes per parameter. (a) Compute the per-device expert memory for $D = 8$, $D = 32$, and $D = 64$, using the $\tfrac{E}{D}\,P_{\text{expert}}$ formula from Section 1. (b) Suppose a batch presents $T = 2^{20}$ tokens with hidden size $4096$ at $2$ bytes each, top-1 routing, and the $1 - 1/D$ remote fraction; estimate the bytes moved by one dispatch all-to-all for each $D$. (c) As $D$ grows, the memory per device falls but the dispatch payload barely changes; argue from your two columns of numbers when widening the expert-parallel group stops paying off, and tie this to the cross-node penalty named in Section 4 and quantified in <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-17.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 17.3</span><span class="nav-title">Routing and Gating</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 17</span><span class="nav-num">Contents</span><span class="nav-title">Expert Parallelism and Sparse Distributed Models</span></a>
+<a class="next" href="section-17.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 17.5</span><span class="nav-title">All-to-All Communication for Token Routing</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

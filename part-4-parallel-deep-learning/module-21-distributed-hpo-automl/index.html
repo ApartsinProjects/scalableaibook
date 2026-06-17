@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 21: Distributed Hyperparameter Search and AutoML. Why search is embarrassingly parallel yet bottlenecked on allocation, grid and random and Bayesian optimization, multi-fidelity optimization, successive halving and Hyperband, population-based training, distributed trial scheduling and early stopping, Ray Tune and the AutoML ecosystem, and cost-aware distributed experimentation." name="description"/>
+<title>Chapter 21: Distributed Hyperparameter Search and AutoML | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: Distributed Hyperparameter Search and AutoML</a></div>
+<h1>Distributed Hyperparameter Search and AutoML</h1>
+<p class="chapter-subtitle">Every chapter of this part has scaled a single training run across many machines, holding the configuration fixed: a chosen learning rate, a chosen batch size, a chosen architecture, all decided before the cluster started. This chapter asks the question that production teams actually face once one run works, which is how to find the configuration in the first place. Hyperparameter search looks, at first glance, like the easiest distributed workload in the entire book, because the trials are independent and nothing needs to talk to anything else: launch a hundred configurations on a hundred workers and wait. That first glance is a trap. The trials are independent, but a finite compute budget is not, and the moment you have more configurations to try than accelerators to try them on, the real problem stops being parallelism and becomes allocation: which trials deserve more compute, which should be stopped early, and how a scheduler decides under uncertainty while runs are still in flight. This chapter develops that allocation problem from first principles, from the naive grid through random and Bayesian search, the multi-fidelity idea that you can judge a configuration before it finishes, the successive-halving and Hyperband schedulers that act on that idea, population-based training that mutates configurations mid-flight, the distributed scheduling and early-stopping machinery that makes it all run on a cluster, the Ray Tune and AutoML ecosystem that ships it, and the cost-aware experimentation that decides when the search itself is worth the spend. It closes Part IV by turning every single training run the part built into one point in a search the cluster runs over all of them.</p>
+</header>
+<main class="content" id="main-content">
+<figure class="chapter-hero">
+<img src="images/hero.png" alt="Conceptual illustration for Chapter 21: Distributed Hyperparameter Search and AutoML" loading="lazy">
+</figure>
+<blockquote class="epigraph">
+<p>"I am one of two hundred trials, all of us convinced our learning rate is the special one. The scheduler does not share our optimism. Half of us will be quietly killed at epoch three, and the cruelest part is that it will probably be right."</p>
+<cite>A Trial That Plateaued Early</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Distributed hyperparameter search is embarrassingly parallel in its trials and genuinely hard in its allocation: the configurations are independent and need no communication, so launching them on a cluster is trivial, but a finite compute budget is shared, so the binding problem is not parallelism but deciding which trials deserve more compute, which to stop early, and how a scheduler makes those calls under uncertainty while runs are still in flight.</strong> This is the chapter where "just run more configurations" stops being an answer and becomes a budget. Independence makes the easy part easy: there is no all-reduce here, no parameter server, no gradient to synchronize, just a queue of trials and a pool of workers, and the data-parallel and elastic machinery of the earlier chapters runs inside each trial without the trials ever needing to coordinate. What independence does not buy you is efficiency. With ten thousand configurations and a thousand worker-hours, the question is never "can I run them in parallel" but "which ones should I bother finishing," and that question has no answer until you accept the central idea of the chapter: you can estimate a configuration's final quality from a partial, cheap evaluation, and reallocate compute away from the ones that look bad before they finish. That single idea, multi-fidelity evaluation, is what separates a search that wastes ninety percent of its budget on doomed trials from one that concentrates compute on the promising few. Successive halving and Hyperband turn it into a schedule; population-based training turns it into an evolutionary loop that mutates live configurations instead of discarding them; the distributed scheduler turns it into early-stopping decisions made across a cluster of asynchronous workers reporting partial results at different rates. Underneath all of it sits the same scale-out thesis the book has been building: the hard part of running many experiments is not making them parallel, it is coordinating a shared, finite resource across independent actors that each think they deserve it. The cluster scheduling of <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/index.html">Chapter 33</a> is the general version of this allocation problem; this chapter is its specialization to the case where the jobs being scheduled are themselves trial runs of the model, and where stopping one early is not a failure but the whole point.</p>
+</div>
+
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+This is the final chapter of Part IV, and it steps back from any single training run to ask how the configuration that run uses gets chosen at all. Chapters 15 through 19 scaled one model across many machines and the previous chapter built the distributed infrastructure that trains a policy by reinforcement; in every case the hyperparameters arrived fixed, decided by someone before the cluster spun up. This chapter is about that someone's job, mechanized and distributed. The workload it studies is unlike any other in the book in one specific way: the units of work are independent, so the parallelism is free, and that freedom is exactly what makes the chapter's real subject visible. When parallelism costs nothing, the only thing left to engineer is allocation, and the chapter is a sustained study of how to spend a fixed compute budget across many candidate configurations when you cannot afford to finish them all.
+</p>
+<p>
+The eight sections fall into three movements. The first establishes the problem and the classical toolkit: Section 21.1 shows why search is embarrassingly parallel and why that is precisely not enough, and Section 21.2 develops grid, random, and Bayesian optimization as three answers to where in the configuration space to look. The second movement introduces the idea that reorganizes everything: Section 21.3 develops multi-fidelity optimization, the claim that a cheap partial evaluation predicts a configuration's final quality; Section 21.4 turns that claim into the successive-halving and Hyperband schedules; and Section 21.5 turns it into population-based training, which mutates live configurations rather than discarding the losers. The third movement makes it run on a cluster and pays for it: Section 21.6 builds the distributed trial scheduler and the early-stopping decisions it makes across asynchronous workers, Section 21.7 maps the whole construction onto Ray Tune and the surrounding AutoML ecosystem, and Section 21.8 closes with cost-aware experimentation, the discipline of deciding when the search is worth its own spend.
+</p>
+<p>
+Read in order, the eight sections take you from "the trials are independent, so the easy part is easy and the hard part is allocation" to "you can place configurations with Bayesian search, evaluate them at low fidelity, schedule compute with Hyperband or population-based training, run the whole thing across a cluster with early stopping, drive it from Ray Tune, and reason about whether the search pays for itself." The argument is cumulative: independence frees the parallelism, multi-fidelity evaluation makes early decisions possible, the schedulers act on those decisions, the distributed machinery runs them at scale, and the cost analysis tells you when to stop searching and start training.
+</p>
+</div>
+
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>This chapter assumes the cluster and reliability machinery the earlier chapters built. From <a href="../module-18-elastic-fault-tolerant-training/index.html">Chapter 18: Elastic and Fault-Tolerant Distributed Training</a> you carry checkpointing and the ability to pause, resume, and migrate a run, because multi-fidelity scheduling depends on being able to stop a trial at a checkpoint and either resume it later or discard it cleanly. The chapter also leans forward on the cluster scheduling and resource-allocation ideas developed in <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/index.html">Chapter 33: Cluster Infrastructure and Scheduling</a>, since a trial scheduler is a domain-specific scheduler placing jobs on a shared, finite pool of accelerators; you can read this chapter first and Chapter 33 will generalize what you build here. Beyond that the chapter assumes comfortable Python, the basic machine-learning vocabulary of training, validation, learning curves, and overfitting, and a working sense of what a hyperparameter is and why its value matters, but no prior experience with an automated search system. Section 21.1 builds the allocation framing from the ground up before any specific algorithm appears.</p>
+</div>
+
+<div class="objectives">
+<h3>Learning Objectives</h3>
+<ul>
+<li>Explain why distributed hyperparameter search is embarrassingly parallel in its trials yet bottlenecked on allocation, framing the real problem as spending a finite compute budget rather than achieving parallelism.</li>
+<li>Compare grid search, random search, and Bayesian optimization as strategies for choosing where in the configuration space to evaluate, and reason about when each is appropriate.</li>
+<li>Articulate the multi-fidelity idea that a cheap, partial evaluation predicts a configuration's final quality, and identify the budget dimensions (epochs, data, resolution) it can exploit.</li>
+<li>Trace how successive halving allocates compute by repeatedly evaluating and pruning, and how Hyperband hedges across the trade-off between many cheap trials and few expensive ones.</li>
+<li>Describe population-based training as an evolutionary loop that exploits and explores a live population of configurations rather than discarding the losers.</li>
+<li>Design a distributed trial scheduler that makes early-stopping decisions across asynchronous workers reporting partial results at different rates, as in the ASHA algorithm.</li>
+<li>Map the chapter's abstractions onto Ray Tune and the surrounding AutoML ecosystem, recognizing what the library handles internally.</li>
+<li>Reason about cost-aware distributed experimentation, deciding when an additional search is worth its compute spend and how to bound the budget.</li>
+</ul>
+</div>
+
+<div class="callout key-takeaway">
+<div class="callout-title">Remember the Chapter as One Sentence</div>
+<p>If you keep one thing from this chapter, keep this: <strong>hyperparameter search is the rare distributed workload whose parallelism is free, because the trials are independent, which means the entire engineering problem is allocation, deciding under uncertainty which trials deserve more of a finite compute budget and which to stop early, and every method in the chapter, from Bayesian placement through multi-fidelity evaluation, Hyperband, population-based training, and distributed early-stopping schedulers, exists to spend that budget well</strong>. Read forward, the sections build the system in the order it is actually assembled: first the framing that names allocation as the real problem, then the classical placement strategies, then the multi-fidelity idea that makes early decisions possible, then the schedulers that act on it, then the distributed machinery that runs them at scale, and finally the cost analysis that decides when to search at all. Read as a question, the chapter asks of any search at scale: where should I evaluate, how cheaply can I tell a good configuration from a bad one, how do I reallocate compute away from the losers while runs are still in flight, and how do I know the search is worth more than just training the best guess I already have. The roadmap below walks the eight sections that answer it.</p>
+</div>
+
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num">21.1</span>
+<a class="section-title" href="section-21.1.html">Why Search Is Embarrassingly Parallel, and Why That Is Not Enough</a>
+<span class="section-desc">Establishes that independent trials make the parallelism free, which is exactly why the real and binding problem is allocation: spending a finite compute budget across more configurations than the cluster can finish.</span>
+</li>
+<li>
+<span class="section-num">21.2</span>
+<a class="section-title" href="section-21.2.html">Grid, Random, and Bayesian Optimization</a>
+<span class="section-desc">Develops three strategies for choosing where in the configuration space to evaluate, from exhaustive grids through the surprising strength of random search to the surrogate-model placement of Bayesian optimization.</span>
+</li>
+<li>
+<span class="section-num">21.3</span>
+<a class="section-title" href="section-21.3.html">Multi-Fidelity Optimization</a>
+<span class="section-desc">Introduces the idea that reorganizes the rest of the chapter: a cheap, partial evaluation predicts a configuration's final quality, so compute can be reallocated away from doomed trials before they finish.</span>
+</li>
+<li>
+<span class="section-num">21.4</span>
+<a class="section-title" href="section-21.4.html">Successive Halving and Hyperband</a>
+<span class="section-desc">Turns the multi-fidelity idea into a schedule, repeatedly evaluating and pruning with successive halving, then hedging across the cheap-many versus expensive-few trade-off with Hyperband.</span>
+</li>
+<li>
+<span class="section-num">21.5</span>
+<a class="section-title" href="section-21.5.html">Population-Based Training</a>
+<span class="section-desc">Reframes search as an evolutionary loop over a live population, exploiting good configurations and exploring perturbations of them mid-flight rather than discarding the losers outright.</span>
+</li>
+<li>
+<span class="section-num">21.6</span>
+<a class="section-title" href="section-21.6.html">Distributed Trial Scheduling and Early Stopping</a>
+<span class="section-desc">Builds the scheduler that makes early-stopping decisions across asynchronous workers reporting partial results at different rates, the asynchronous successive-halving machinery that runs the search on a real cluster.</span>
+</li>
+<li>
+<span class="section-num">21.7</span>
+<a class="section-title" href="section-21.7.html">Ray Tune and the AutoML Ecosystem</a>
+<span class="section-desc">Maps the chapter's hand-built abstractions onto Ray Tune and the surrounding AutoML tools, showing how a few lines stand in for the schedulers, search algorithms, and distributed execution built by hand.</span>
+</li>
+<li>
+<span class="section-num">21.8</span>
+<a class="section-title" href="section-21.8.html">Cost-Aware Distributed Experimentation</a>
+<span class="section-desc">Closes the chapter and the part by treating compute as a budget to be justified, reasoning about when an additional search is worth its spend and how to bound the cost of finding a configuration.</span>
+</li>
+</ul>
+
+<p>Read the eight sections in order and you will hold a working blueprint for a search that spends its budget well: <a href="section-21.1.html">Section 21.1</a> names allocation as the real problem behind the easy parallelism, <a href="section-21.2.html">Section 21.2</a> places configurations with grid, random, and Bayesian search, <a href="section-21.3.html">Section 21.3</a> introduces the multi-fidelity idea that makes early decisions possible, <a href="section-21.4.html">Sections 21.4</a> and <a href="section-21.5.html">21.5</a> turn that idea into the Hyperband and population-based schedules, <a href="section-21.6.html">Section 21.6</a> runs them across a cluster with asynchronous early stopping, <a href="section-21.7.html">Section 21.7</a> maps the whole construction onto Ray Tune, and <a href="section-21.8.html">Section 21.8</a> decides when the search is worth its cost. The thread to watch is the earlier part reappearing inside each trial: the <a href="../module-18-elastic-fault-tolerant-training/index.html">Chapter 18</a> checkpointing that lets a scheduler pause and resume a run, the data-parallel step running unchanged inside every configuration, and the cluster allocation of <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/index.html">Chapter 33</a> as the general form of the trial scheduler you build here.</p>
+
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>This chapter closes Part IV. Across seven chapters the part took a single model and scaled its training across many machines, through data, model, sharded, and expert parallelism, elastic and fault-tolerant execution, frontier pre-training, distributed reinforcement learning, and finally the search over the configurations themselves; the recurring lesson was that the binding constraint is never one accelerator in isolation but the coordination that keeps a cluster of them productive. With that, the book pivots from building models to serving them. <a href="../../part-5-distributed-inference/module-22-per-node-inference-efficiency/index.html">Chapter 22: Per-Node Inference Efficiency: A Prerequisite</a> opens Part V, and it opens it deliberately on one machine. Before any fleet of replicas can be reasoned about, the unit economics of a single node, its quantization, its KV cache, its attention kernels, have to be understood, because distributed serving multiplies per-node behavior across the fleet and a fleet built on an inefficient node is an expensive mistake repeated many times. Read it next, and watch the scale-out story turn around: where Part IV asked how to spread one training run across many machines, Part V starts by asking what one machine actually costs to serve, then multiplies that answer across a distributed inference system.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+<h3 class="bib-category">Search Strategies and Bayesian Optimization</h3>
+<div class="bib-entry-card">
+<p class="bib-ref">Bergstra, J., Bengio, Y. "Random Search for Hyper-Parameter Optimization." Journal of Machine Learning Research 13, 2012. <a href="https://www.jmlr.org/papers/v13/bergstra12a.html" target="_blank" rel="noopener">jmlr.org/papers/v13/bergstra12a.html</a></p>
+<p class="bib-annotation">The paper that showed random search beats grid search when only a few hyperparameters matter, the surprising baseline that frames the placement question of Section 21.2.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Snoek, J., Larochelle, H., Adams, R. P. "Practical Bayesian Optimization of Machine Learning Algorithms." arXiv:1206.2944, NeurIPS 2012. <a href="https://arxiv.org/abs/1206.2944" target="_blank" rel="noopener">arxiv.org/abs/1206.2944</a></p>
+<p class="bib-annotation">The work that made Gaussian-process Bayesian optimization a practical tool for tuning models, the surrogate-model placement strategy developed in Section 21.2.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<h3 class="bib-category">Multi-Fidelity Scheduling</h3>
+<div class="bib-entry-card">
+<p class="bib-ref">Jamieson, K., Talwalkar, A. "Non-stochastic Best Arm Identification and Hyperparameter Optimization (Successive Halving)." arXiv:1502.07943, AISTATS 2016. <a href="https://arxiv.org/abs/1502.07943" target="_blank" rel="noopener">arxiv.org/abs/1502.07943</a></p>
+<p class="bib-annotation">The paper that cast hyperparameter tuning as a best-arm problem and introduced successive halving, the pruning schedule at the core of Section 21.4.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Li, L., Jamieson, K., DeSalvo, G., Rostamizadeh, A., Talwalkar, A. "Hyperband: A Novel Bandit-Based Approach to Hyperparameter Optimization." arXiv:1603.06560, JMLR 2018. <a href="https://arxiv.org/abs/1603.06560" target="_blank" rel="noopener">arxiv.org/abs/1603.06560</a></p>
+<p class="bib-annotation">The algorithm that hedges successive halving across the cheap-many versus expensive-few trade-off, the central scheduler studied in Section 21.4.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Falkner, S., Klein, A., Hutter, F. "BOHB: Robust and Efficient Hyperparameter Optimization at Scale." arXiv:1807.01774, ICML 2018. <a href="https://arxiv.org/abs/1807.01774" target="_blank" rel="noopener">arxiv.org/abs/1807.01774</a></p>
+<p class="bib-annotation">The method that combines Bayesian optimization with Hyperband, marrying the placement of Section 21.2 to the multi-fidelity scheduling of Section 21.4.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<h3 class="bib-category">Distributed Scheduling and Population Methods</h3>
+<div class="bib-entry-card">
+<p class="bib-ref">Li, L., Jamieson, K., Rostamizadeh, A., Gonina, E., Hardt, M., Recht, B., Talwalkar, A. "A System for Massively Parallel Hyperparameter Tuning (ASHA)." arXiv:1810.05934, MLSys 2020. <a href="https://arxiv.org/abs/1810.05934" target="_blank" rel="noopener">arxiv.org/abs/1810.05934</a></p>
+<p class="bib-annotation">The asynchronous successive-halving algorithm that makes early-stopping decisions across a cluster of workers reporting at different rates, the direct reference for Section 21.6.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Jaderberg, M., Dalibard, V., Osindero, S., Czarnecki, W. M., Donahue, J., Razavi, A., Vinyals, O., Green, T., Dunning, I., Simonyan, K., Fernando, C., Kavukcuoglu, K. "Population Based Training of Neural Networks." arXiv:1711.09846, 2017. <a href="https://arxiv.org/abs/1711.09846" target="_blank" rel="noopener">arxiv.org/abs/1711.09846</a></p>
+<p class="bib-annotation">The work that introduced population-based training, the evolutionary exploit-and-explore loop over live configurations developed in Section 21.5.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<h3 class="bib-category">Frameworks and AutoML Systems</h3>
+<div class="bib-entry-card">
+<p class="bib-ref">Liaw, R., Liang, E., Nishihara, R., Moritz, P., Gonzalez, J. E., Stoica, I. "Tune: A Research Platform for Distributed Model Selection and Training." arXiv:1807.05118, 2018. <a href="https://arxiv.org/abs/1807.05118" target="_blank" rel="noopener">arxiv.org/abs/1807.05118</a></p>
+<p class="bib-annotation">The platform that packages distributed search, schedulers, and early stopping behind a small API, the primary framework mapped onto the chapter in Section 21.7.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Akiba, T., Sano, S., Yanase, T., Ohta, T., Koyama, M. "Optuna: A Next-generation Hyperparameter Optimization Framework." arXiv:1907.10902, KDD 2019. <a href="https://arxiv.org/abs/1907.10902" target="_blank" rel="noopener">arxiv.org/abs/1907.10902</a></p>
+<p class="bib-annotation">The define-by-run optimization framework with built-in pruning that complements Ray Tune in the ecosystem surveyed in Section 21.7.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<h3 class="bib-category">Scaling Hyperparameters to Large Models</h3>
+<div class="bib-entry-card">
+<p class="bib-ref">Yang, G., Hu, E. J., Babuschkin, I., Sidor, S., Liu, X., Farhi, D., Ryder, N., Pachocki, J., Chen, W., Gao, J. "Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter Transfer (muP)." arXiv:2203.03466, NeurIPS 2021. <a href="https://arxiv.org/abs/2203.03466" target="_blank" rel="noopener">arxiv.org/abs/2203.03466</a></p>
+<p class="bib-annotation">The result that tunes a small model and transfers the hyperparameters to a much larger one, a cost-aware alternative to searching at full scale that informs Section 21.8.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="../index.html"><span class="nav-label">Previous</span><span class="nav-num">Part IV</span><span class="nav-title">Parallel Deep Learning and Large Models</span></a>
+<a class="up" href="../index.html"><span class="nav-label">Part IV</span><span class="nav-num">Contents</span><span class="nav-title">Parallel Deep Learning and Large Models</span></a>
+<a class="next" href="section-21.1.html"><span class="nav-label">Next</span><span class="nav-num">Section 21.1</span><span class="nav-title">Why Search Is Embarrassingly Parallel, and Why That Is Not Enough</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

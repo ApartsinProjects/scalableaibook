@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 21.2: Grid, Random, and Bayesian Optimization. The three search strategies, why random beats grid in high dimensions, and the throughput-versus-information tension that makes Bayesian optimization sample-efficient but sequential." name="description"/>
+<title>Section 21.2: Grid, Random, and Bayesian Optimization | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: Distributed Hyperparameter Search and AutoML</a></div>
+<h1>Grid, Random, and Bayesian Optimization</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I proposed the next configuration with great confidence. Then I learned the other nineteen workers had already proposed it too, and none of us had finished the first one."</p>
+<cite>A Surrogate Model With Too Many Suitors</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The three classic ways to search a hyperparameter space (grid, random, and Bayesian optimization) sit at different points on a single trade-off: how much you let past results inform the next configuration, and how much parallelism you keep when you do.</strong> Grid and random search decide every configuration in advance, so a thousand workers can run a thousand trials with zero coordination, but they learn nothing from the trials already finished. Bayesian optimization fits a model of the objective and chooses each configuration to be maximally informative, spending far fewer trials to reach a good answer, but each suggestion depends on prior results, which makes it sequential by nature. Scaling Bayesian optimization across a cluster therefore means deliberately giving back some of its sample efficiency to recover parallelism. This section makes that tension concrete and measures it.</p>
+</div>
+<p><a href="section-21.1.html">Section 21.1</a> established that hyperparameter search is embarrassingly parallel at the level of trials: each configuration trains an independent model, and independent work spreads across machines without communication. That section also warned that embarrassing parallelism is necessary but not sufficient, because a search that proposes bad configurations wastes the cluster no matter how perfectly it parallelizes. This section is about the proposal step itself, the algorithm that decides which configurations to try. The choice of search strategy determines both how few trials you need and how cleanly those trials fan out across workers, and those two goals pull in opposite directions.</p>
+<p>We treat the search as minimizing an objective $f(\boldsymbol{\lambda})$, the validation loss obtained by training with hyperparameters $\boldsymbol{\lambda}$ drawn from a search space $\Lambda$. Every evaluation of $f$ is one full (or partial) training run, so evaluations are expensive and few, often dozens to low hundreds, not millions. That scarcity is what separates hyperparameter optimization from ordinary continuous optimization and is exactly why a model of $f$ can pay for itself.</p>
+
+<h2>1. Grid Search: Exhaustive and Exponential <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Grid search discretizes each hyperparameter into a small set of candidate values and evaluates every combination. With $D$ hyperparameters and $v$ values per axis, the grid has $v^{D}$ points. Its appeal is total simplicity and perfect parallelism: the full list of configurations is known before any worker starts, so you scatter $v^{D}$ independent trials across the cluster and gather the best, with no proposal logic and no coordination. For two or three axes with a handful of values each, grid search is a perfectly sensible default and is easy to reason about.</p>
+<p>The trouble is the exponent. Adding one more hyperparameter multiplies the cost by $v$; going from four axes to eight at five values each takes the grid from $625$ to roughly $390{,}000$ points. No cluster makes that affordable when each point is a training run. Worse, the grid spends its budget uniformly even though hyperparameters are almost never equally important. If the learning rate dominates the final loss and the weight-decay value barely matters, a grid still evaluates every weight-decay setting at every learning rate, burning most of its trials distinguishing configurations that differ only along an axis nobody cares about. The grid is blind to which axes deserve resolution.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Parallelism Is Easy; Spending Trials Wisely Is Hard</div>
+<p>Grid and random search achieve perfect parallelism precisely because they refuse to learn from finished trials: with nothing to wait for, everything runs at once. That same refusal is their weakness. The expensive resource in hyperparameter search is not worker time in aggregate but the number of training runs you can afford, and a strategy that ignores results wastes that budget on uninformative configurations. The rest of this chapter is a sustained attempt to buy back trial efficiency without paying too much parallelism for it.</p>
+</div>
+
+<h2>2. Random Search: Better Coverage in High Dimensions <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Random search draws each configuration independently and uniformly from the search space. It keeps every advantage of grid search (the whole batch is decided up front, so it is fully parallel) while discarding the rigid lattice. Bergstra and Bengio (2012) showed that this small change is a large improvement in high dimensions, and the reason is geometric rather than statistical. On a grid, the projection of the trials onto any single axis takes only $v$ distinct values, no matter how many total points you spend; every trial that shares a learning rate is wasted resolution on that axis. Random search, by contrast, gives every trial a distinct value on every axis, so its projection onto the few axes that actually matter is as fine as the total trial count allows.</p>
+<p>Put differently: if only a handful of the $D$ hyperparameters meaningfully affect the loss, random search effectively concentrates its full budget on those important axes for free, because it never repeats a coordinate. Figure 21.2.1 shows the effect for a two-dimensional space where only the horizontal axis matters. The grid tries just three distinct horizontal values across nine trials; random search tries nine. This is why random search, not grid search, is the right baseline against which every smarter method in this chapter is measured, and why an honest comparison of a new optimizer always reports its budget against random search of the same size.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three panels. Left: a 3 by 3 grid of trial points whose horizontal projection collapses onto three values. Middle: nine random points whose horizontal projection spreads across nine distinct values. Right: a Bayesian-optimization surrogate curve with sampled points and an arrow marking the next, most promising point to evaluate.">
+<defs>
+<marker id="arr212" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.bx212 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.4; }
+.pt212 { fill:#b86b1f; }
+.tk212 { fill:#b86b1f; }
+.t212 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s212 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.cv212 { fill:none; stroke:#14385c; stroke-width:2; }
+.ac212 { fill:none; stroke:#b86b1f; stroke-width:1.8; marker-end:url(#arr212); }
+.ax212 { stroke:#9aa3ad; stroke-width:1; }
+</style>
+<!-- Panel 1: grid -->
+<text class="t212" x="130" y="24">Grid: 9 trials, 3 distinct x-values</text>
+<rect class="bx212" x="55" y="40" width="150" height="150"/>
+<!-- grid points 3x3 -->
+<g>
+<circle class="pt212" cx="92.5" cy="77.5" r="5"/><circle class="pt212" cx="130" cy="77.5" r="5"/><circle class="pt212" cx="167.5" cy="77.5" r="5"/>
+<circle class="pt212" cx="92.5" cy="115" r="5"/><circle class="pt212" cx="130" cy="115" r="5"/><circle class="pt212" cx="167.5" cy="115" r="5"/>
+<circle class="pt212" cx="92.5" cy="152.5" r="5"/><circle class="pt212" cx="130" cy="152.5" r="5"/><circle class="pt212" cx="167.5" cy="152.5" r="5"/>
+</g>
+<!-- x projection ticks -->
+<line class="ax212" x1="55" y1="205" x2="205" y2="205"/>
+<rect class="tk212" x="90" y="201" width="5" height="9"/><rect class="tk212" x="127.5" y="201" width="5" height="9"/><rect class="tk212" x="165" y="201" width="5" height="9"/>
+<text class="s212" x="130" y="228">x-projection: only 3 values</text>
+<!-- Panel 2: random -->
+<text class="t212" x="430" y="24">Random: 9 trials, 9 distinct x-values</text>
+<rect class="bx212" x="355" y="40" width="150" height="150"/>
+<g>
+<circle class="pt212" cx="372" cy="60" r="5"/><circle class="pt212" cx="488" cy="72" r="5"/><circle class="pt212" cx="430" cy="95" r="5"/>
+<circle class="pt212" cx="401" cy="120" r="5"/><circle class="pt212" cx="466" cy="110" r="5"/><circle class="pt212" cx="380" cy="150" r="5"/>
+<circle class="pt212" cx="447" cy="160" r="5"/><circle class="pt212" cx="415" cy="178" r="5"/><circle class="pt212" cx="495" cy="145" r="5"/>
+</g>
+<line class="ax212" x1="355" y1="205" x2="505" y2="205"/>
+<rect class="tk212" x="369.5" y="201" width="4" height="9"/><rect class="tk212" x="398.5" y="201" width="4" height="9"/><rect class="tk212" x="412.5" y="201" width="4" height="9"/><rect class="tk212" x="427.5" y="201" width="4" height="9"/><rect class="tk212" x="444.5" y="201" width="4" height="9"/><rect class="tk212" x="463.5" y="201" width="4" height="9"/><rect class="tk212" x="485.5" y="201" width="4" height="9"/><rect class="tk212" x="492.5" y="201" width="4" height="9"/><rect class="tk212" x="377.5" y="201" width="4" height="9"/>
+<text class="s212" x="430" y="228">x-projection: 9 distinct values</text>
+<!-- Panel 3: BO surrogate -->
+<text class="t212" x="720" y="24">Bayesian: model picks the next point</text>
+<rect class="bx212" x="605" y="40" width="220" height="150"/>
+<!-- surrogate curve -->
+<path class="cv212" d="M 615 70 Q 660 150 700 120 T 770 160 Q 800 165 815 100"/>
+<!-- sampled points on curve -->
+<circle class="pt212" cx="640" cy="118" r="5"/><circle class="pt212" cx="700" cy="120" r="5"/><circle class="pt212" cx="765" cy="158" r="5"/>
+<!-- acquisition arrow toward minimum near x=770 -->
+<path class="ac212" d="M 745 95 L 768 145"/>
+<text class="s212" x="775" y="88">next</text>
+<text class="s212" x="715" y="183">surrogate of validation loss</text>
+</svg>
+<figcaption><strong>Figure 21.2.1:</strong> Three search strategies on the same space. Left: a $3\times3$ grid of nine trials collapses to only three distinct values when projected onto the horizontal axis, wasting resolution if that axis is the important one. Middle: nine random trials give nine distinct horizontal values, so they explore the important axis far more finely at the same budget. Right: Bayesian optimization fits a surrogate of the validation loss to the points seen so far and uses an acquisition function to pick the single next point (the arrow), trading the free parallelism of the other two for sample efficiency.</figcaption>
+</figure>
+
+<h2>3. Bayesian Optimization: Sample-Efficient but Sequential <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Grid and random search never look at a finished trial before launching the next. Bayesian optimization does the opposite: it builds a probabilistic <em>surrogate</em> model of the objective from all evaluations so far, then uses that model to decide where to evaluate next. The surrogate is a cheap stand-in for the expensive $f$, predicting both a mean $\mu(\boldsymbol{\lambda})$ (where the loss is likely to be low) and an uncertainty $\sigma(\boldsymbol{\lambda})$ (where the model has not yet looked). A Gaussian process is the textbook surrogate; the Tree-structured Parzen Estimator (TPE) used by Optuna and Hyperopt is a popular alternative that scales better to mixed and conditional spaces.</p>
+<p>The model chooses the next configuration by maximizing an <em>acquisition function</em> that balances exploitation (sampling where the predicted loss is low) against exploration (sampling where the model is uncertain, in case a better basin hides there). A simple and widely used choice is the lower confidence bound, which for a minimization problem is</p>
+$$\boldsymbol{\lambda}_{\text{next}} = \arg\min_{\boldsymbol{\lambda} \in \Lambda} \; \big[\, \mu(\boldsymbol{\lambda}) - \kappa \, \sigma(\boldsymbol{\lambda}) \,\big],$$
+<p>where the constant $\kappa \ge 0$ tunes the exploration-exploitation balance: $\kappa = 0$ chases the current best prediction greedily, while large $\kappa$ rewards uncertain, unexplored regions. Each cycle evaluates the chosen $\boldsymbol{\lambda}_{\text{next}}$, adds the result to the data, refits the surrogate, and repeats. Because $\boldsymbol{\lambda}_{\text{next}}$ depends on every prior result through $\mu$ and $\sigma$, the loop is inherently <strong>sequential</strong>: the $(t{+}1)$-th proposal cannot be computed until the $t$-th evaluation reports back. This is the exact opposite of the all-at-once parallelism of grid and random search, and it is the central friction of this section.</p>
+<p>The payoff for that friction is sample efficiency. The code below pits random search against a small Bayesian-style optimizer on the same four-dimensional objective at the same trial budget, using a distance-weighted neighbor surrogate as a lightweight stand-in for a Gaussian process and the lower confidence bound acquisition above. Both are given equal trials; the question is who reaches a low loss with fewer of them.</p>
+<pre><code class="language-python">import numpy as np
+
+# 4-D validation-loss-like objective to MINIMIZE. One narrow good basin plus
+# rugged sinusoidal ripples, so most random points land in poor regions.
+def objective(x):
+    center = np.array([0.30, 0.65, 0.45, 0.55])
+    basin  = np.sum((x - center) ** 2)
+    ripple = 0.04 * np.sum(np.sin(5.0 * x) ** 2)
+    return basin + ripple
+
+DIM, BUDGET = 4, 30
+LO, HI = np.zeros(DIM), np.ones(DIM)
+
+def random_search(seed):                              # fully parallel: all configs up front
+    rng = np.random.default_rng(seed)
+    y = np.array([objective(x) for x in rng.uniform(LO, HI, size=(BUDGET, DIM))])
+    return np.minimum.accumulate(y)                   # best-so-far curve
+
+# Surrogate: distance-weighted neighbor mean (cheap GP stand-in) plus an
+# uncertainty proxy that grows with distance from the nearest sampled point.
+def surrogate(cand, X, y, k=5):
+    d = np.linalg.norm(X - cand, axis=1)
+    idx = np.argsort(d)[:k]
+    w = 1.0 / (d[idx] ** 2 + 1e-9)
+    return np.sum(w * y[idx]) / np.sum(w), d[idx].min()   # (mu, sigma)
+
+def bayes_search(seed, n_init=6, n_cand=600, kappa=0.6):  # SEQUENTIAL: each pick uses all prior y
+    rng = np.random.default_rng(seed)
+    X = rng.uniform(LO, HI, size=(n_init, DIM))
+    y = np.array([objective(x) for x in X])
+    curve = list(np.minimum.accumulate(y))
+    for _ in range(BUDGET - n_init):
+        cands = rng.uniform(LO, HI, size=(n_cand, DIM))
+        # Lower confidence bound acquisition: minimize mu - kappa*sigma.
+        scores = np.array([(lambda m, s: m - kappa * s)(*surrogate(c, X, y)) for c in cands])
+        nxt = cands[np.argmin(scores)]                # depends on EVERY prior result
+        X = np.vstack([X, nxt]); y = np.append(y, objective(nxt))
+        curve.append(min(curve[-1], y[-1]))
+    return np.array(curve)
+
+trials_at = [6, 12, 20, 30]
+rs = np.array([[random_search(s)[t - 1] for t in trials_at] for s in range(50)])
+bo = np.array([[bayes_search(s)[t - 1]  for t in trials_at] for s in range(50)])
+
+print("best-so-far validation loss, mean over 50 runs (lower is better)")
+print(f"{'trials':>8} | {'random':>10} | {'bayesian':>10}")
+for j, t in enumerate(trials_at):
+    print(f"{t:>8} | {rs[:, j].mean():>10.4f} | {bo[:, j].mean():>10.4f}")
+print()
+print(f"bayesian reaches {bo[:, 2].mean():.4f} by trial 20")
+print(f"random needs all 30 trials to reach {rs[:, 3].mean():.4f}, still worse")
+</code></pre>
+<div class="code-caption"><strong>Code 21.2.1:</strong> Random search versus a from-scratch Bayesian-style optimizer on one four-dimensional objective, equal trial budget. The surrogate plus acquisition function let <code>bayes_search</code> steer toward the good basin, while <code>random_search</code> samples blindly; the inner <code>for</code> loop is what forbids running its trials all at once.</div>
+<pre><code class="language-text">best-so-far validation loss, mean over 50 runs (lower is better)
+  trials |     random |   bayesian
+       6 |     0.2546 |     0.2546
+      12 |     0.1893 |     0.2061
+      20 |     0.1601 |     0.1060
+      30 |     0.1446 |     0.0876
+
+bayesian reaches 0.1060 by trial 20
+random needs all 30 trials to reach 0.1446, still worse</code></pre>
+<div class="code-caption"><strong>Output 21.2.1:</strong> After a shared random warm-up (identical at 6 trials), Bayesian optimization pulls ahead once its surrogate has data: by trial 20 it reaches a loss random search never matches even with all 30 trials. The early tie at 12 trials shows the model needs a few evaluations before its guidance beats luck.</div>
+<p>The numbers tell the whole story of the trade-off. Bayesian optimization spends its first six trials no better than random, because the surrogate has too little data to be trustworthy, then sharply overtakes once the model has something to fit: at twenty trials it has reached a loss that random search does not match at thirty. In wall-clock terms on a single worker, Bayesian optimization is the clear winner, fewer expensive training runs for a better answer. The catch is hidden in the code: <code>random_search</code> could have launched all thirty trials simultaneously across thirty workers, whereas <code>bayes_search</code> must finish trial $t$ before it can even propose trial $t{+}1$. On a thirty-worker cluster, naive Bayesian optimization would leave twenty-nine workers idle.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Optimizer That Was Too Smart for the Cluster</div>
+<p>There is a recurring rite of passage in which an engineer, thrilled that Bayesian optimization needs five times fewer trials, deploys it on a freshly provisioned hundred-GPU cluster and watches utilization sit at one percent. The optimizer is busy being clever, proposing one configuration at a time, while ninety-nine GPUs hum quietly at idle and the bill arrives at full price. Sample efficiency and machine efficiency are not the same number, and the cluster only charges you for the second one.</p>
+</div>
+
+<h2>4. Parallelizing Bayesian Optimization <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>To use a cluster, Bayesian optimization must propose more than one configuration at a time, and every way of doing so trades a little of its sample efficiency back for parallelism. Two families dominate. <strong>Batch (synchronous) Bayesian optimization</strong> proposes a batch of $q$ points from the current surrogate, evaluates them in parallel on $q$ workers, then refits once all $q$ report. The difficulty is that the obvious choice (take the $q$ best acquisition points) returns $q$ nearly identical configurations clustered on the same predicted optimum, which wastes the batch. Practical batch methods enforce diversity, for example by penalizing candidates near already-selected ones or by using the model to <em>hallucinate</em> a plausible outcome for each pending point so the next selection accounts for it.</p>
+<p><strong>Asynchronous Bayesian optimization</strong> keeps all workers busy at all times: whenever any worker finishes, the surrogate is refit with the new result and a single fresh configuration is proposed for that worker, while the others keep running. No worker ever waits for the slowest, which matters greatly when training times vary across configurations, a near-certainty since larger models and higher epoch counts run longer. The cost is that each proposal is made against a surrogate missing the results of all the still-running trials, so the model is always working with slightly stale information. This is the same throughput-versus-information tension that runs through the whole book: synchronous methods preserve the most information per decision but stall on the slowest worker, while asynchronous methods maximize throughput at the price of acting on partial knowledge, exactly the choice between synchronous and asynchronous SGD in <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a> and between synchronous and asynchronous actor-learner architectures in <a href="../module-20-distributed-rl-infrastructure/index.html">Chapter 20</a>.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Same Trade-Off, One Level Up</div>
+<p>Hyperparameter search adds a layer of distribution on top of the training it controls: each trial may itself be a data-parallel job from <a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a>, and the search loop coordinates many such jobs. Yet the governing trade-off is unchanged. Just as data-parallel SGD chooses how often workers synchronize their gradients, distributed Bayesian optimization chooses how often the search synchronizes its surrogate, and both pay for staleness in the currency of efficiency. Recognizing that the throughput-versus-information dilemma reappears at the search level, not just the gradient level, is what lets you reason about a full AutoML system instead of memorizing one more algorithm.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Filling a Sixty-GPU Cluster With a Sequential Optimizer</div>
+<p><strong>Who:</strong> An applied scientist tuning a vision model on a shared sixty-GPU research cluster.</p>
+<p><strong>Situation:</strong> Each trial trained for about three hours, and a fixed budget of 240 trials had to finish over a weekend before a Monday review.</p>
+<p><strong>Problem:</strong> A textbook Gaussian-process Bayesian optimizer reached good configurations in far fewer trials than random search, but it proposed one configuration at a time, so it could use only one GPU and would need a month.</p>
+<p><strong>Dilemma:</strong> Fall back to random search, which fills all sixty GPUs instantly but needs many more trials to match the quality, or keep the sample-efficient optimizer and leave fifty-nine GPUs idle.</p>
+<p><strong>Decision:</strong> They switched to asynchronous Bayesian optimization, refitting the surrogate each time any worker finished and immediately proposing one new configuration for that freed worker.</p>
+<p><strong>How:</strong> An Optuna study with a TPE sampler and sixty parallel workers sharing one storage backend let each worker pull its own freshly proposed trial without blocking on the others.</p>
+<p><strong>Result:</strong> Cluster utilization stayed above ninety percent, the 240-trial budget finished in roughly fourteen hours, and the asynchronous staleness cost only a handful of extra trials versus the idealized sequential run, a trade they would take every time.</p>
+<p><strong>Lesson:</strong> On a real cluster the right Bayesian optimizer is rarely the most sample-efficient one; it is the one that keeps the workers full while staying smarter than random.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Optuna Runs the Whole Loop for You</div>
+<p>Code 21.2.1 hand-built a surrogate, an acquisition function, and the proposal loop, roughly forty lines that still lacked parallelism. Optuna replaces all of it: you define an objective, pick a sampler (TPE here, the same model-based family), and ask for $n$ trials. Pointing many workers at one shared storage URL turns the identical script into asynchronous distributed Bayesian optimization, with the library handling proposal, surrogate fitting, result storage, and the coordination that keeps every worker busy.</p>
+<pre><code class="language-python"># Each of N machines runs this same script; they share one storage backend.
+import optuna
+
+def objective(trial):
+    lr  = trial.suggest_float("lr", 1e-5, 1e-1, log=True)
+    wd  = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
+    return train_and_validate(lr, wd)        # returns the validation loss to MINIMIZE
+
+study = optuna.create_study(
+    direction="minimize",
+    sampler=optuna.samplers.TPESampler(),    # model-based, like Bayesian optimization
+    study_name="vision-tune",
+    storage="postgresql://host/optuna",      # shared store = async distributed search
+    load_if_exists=True,
+)
+study.optimize(objective, n_trials=240)      # workers pull trials concurrently
+print(study.best_params, study.best_value)
+</code></pre>
+<div class="code-caption"><strong>Code 21.2.2:</strong> The same model-based search as Code 21.2.1, now distributed and asynchronous in a dozen lines. The shared <code>storage</code> backend is the entire trick: each worker proposes against the latest surrogate and writes its result back, so the cluster stays full without any explicit batching code. scikit-optimize (<code>skopt</code>) and BoTorch offer the same ideas with Gaussian-process surrogates when you want batch (synchronous) proposals instead.</div>
+</div>
+
+<h2>5. Choosing a Strategy <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The three strategies are not a ladder where each strictly dominates the last; they occupy a trade-off, summarized in Table 21.2.1. Grid search is defensible only for two or three axes you genuinely want exhaustively covered. Random search is the right default for high-dimensional spaces, for very large worker counts where coordination is unwelcome, and as the honest baseline every other method must beat. Bayesian optimization earns its complexity when evaluations are expensive enough that cutting their number matters more than keeping every worker perfectly busy, which is to say almost always for deep learning, provided you parallelize it asynchronously rather than running it one trial at a time.</p>
+<div class="table-caption"><strong>Table 21.2.1:</strong> The three search strategies on the two axes that matter for a cluster: how many expensive trials they need, and how cleanly those trials parallelize.</div>
+<table>
+<thead>
+<tr><th scope="col">Strategy</th><th scope="col">Uses past results?</th><th scope="col">Trial efficiency</th><th scope="col">Parallelism</th><th scope="col">Best when</th></tr>
+</thead>
+<tbody>
+<tr><td>Grid</td><td>No</td><td>Poor (exponential in $D$)</td><td>Perfect, all up front</td><td>2 to 3 axes, exhaustive coverage</td></tr>
+<tr><td>Random</td><td>No</td><td>Good in high $D$</td><td>Perfect, all up front</td><td>Many axes, huge clusters, baseline</td></tr>
+<tr><td>Bayesian</td><td>Yes</td><td>Best per trial</td><td>Sequential; recovered via batch / async</td><td>Expensive evaluations, modest clusters</td></tr>
+</tbody>
+</table>
+<p>One caveat keeps this section honest: every strategy here decides which configurations to run, but none decides how long to run each one. A search that runs each trial to full convergence still wastes its budget finishing trials that were clearly losing after the first epoch. The largest gains in distributed hyperparameter search come from coupling a good proposal strategy with early stopping of unpromising trials, which is the subject of <a href="section-21.3.html">Section 21.3</a> on multi-fidelity optimization. The methods of this section choose <em>where</em> to look; multi-fidelity methods choose <em>how hard</em> to look before giving up.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Bayesian Optimization at Cluster Scale (2024 to 2026)</div>
+<p>Because every distributed Bayesian optimizer pays a staleness tax for asynchrony, recent work tries to shrink that tax. BoTorch (Balandat et al.) has continued to advance Monte-Carlo acquisition functions whose gradients make large batch proposals tractable, so a single synchronous step can fill dozens of workers with genuinely diverse configurations rather than near-duplicates. A second thread brings large language models into the proposal loop: methods in the lineage of OptFormer and LLM-guided search use a model trained on prior tuning studies to warm-start the surrogate or to suggest configurations directly, cutting the cold-start trials in which classical Bayesian optimization is no better than random. A third pushes cost-awareness into the acquisition function itself, valuing a configuration not only by its expected improvement but by its expected improvement <em>per GPU-hour</em>, so the search prefers cheap-to-evaluate regions when they are nearly as good. We make that cost accounting explicit in this chapter's own <a href="section-21.8.html">Section 21.8</a> on cost-aware experimentation and return to it when evaluating search systems in <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/index.html">Chapter 5</a>.</p>
+</div>
+<p>We now have the proposal half of distributed hyperparameter search: grid and random search trade learning for perfect parallelism, while Bayesian optimization trades parallelism for learning and recovers it through batch and asynchronous variants. The remaining inefficiency is that all three commit a full training run to every configuration they try. <a href="section-21.3.html">Section 21.3</a> attacks that waste directly, allocating a small budget to many configurations and more budget only to the survivors.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.2.1: When Does Random Beat Grid? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Consider a search space with $D = 6$ hyperparameters, of which only $2$ meaningfully affect the validation loss, and a budget of $64$ trials. Describe the distinct values each strategy explores along an important axis: a grid with $2$ values per axis ($2^6 = 64$ points), and random search with $64$ points. Explain in terms of axis projections (Figure 21.2.1) why random search resolves the important axes far better at the identical budget, and state what would have to be true about the search space for grid search to be the better choice.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.2.2: Tune the Exploration Constant <span class="exercise-type coding">Coding</span></div>
+<p>Take Code 21.2.1 and sweep the acquisition constant $\kappa$ over $\{0.0, 0.3, 0.6, 1.5, 3.0\}$, reporting the mean best-so-far loss at $30$ trials for each. Explain the shape of the resulting curve: why does $\kappa = 0$ (pure exploitation) underperform, and why does a very large $\kappa$ also underperform by drifting toward pure random search? Identify the $\kappa$ that best balances exploration and exploitation for this objective, and argue why the best value would change if the objective had several widely separated good basins.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.2.3: Cost the Idle Cluster <span class="exercise-type analysis">Analysis</span></div>
+<p>You have a budget of $200$ trials and a cluster of $50$ workers; each trial trains for $2$ hours. Estimate the wall-clock time and the worker-hours consumed under three regimes: (a) random search using all $50$ workers; (b) purely sequential Bayesian optimization using one worker; (c) asynchronous Bayesian optimization using all $50$ workers, assuming its staleness costs $10\%$ more trials than the sequential ideal to reach the same loss. Compute the GPU-hour cost of each at a notional \$2 per worker-hour, and argue from your numbers why asynchronous Bayesian optimization is usually the right default on a busy cluster. We formalize this cost accounting in <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-21.1.html"><span class="nav-label">Previous</span><span class="nav-num">Section 21.1</span><span class="nav-title">Why Search Is Embarrassingly Parallel</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 21</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Hyperparameter Search and AutoML</span></a>
+<a class="next" href="section-21.3.html"><span class="nav-label">Next</span><span class="nav-num">Section 21.3</span><span class="nav-title">Multi-Fidelity Optimization</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

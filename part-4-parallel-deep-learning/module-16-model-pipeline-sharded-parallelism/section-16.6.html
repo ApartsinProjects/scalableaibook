@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 16.6: DeepSpeed and Megatron-LM. The two production frameworks that combine tensor, pipeline, and sharded data parallelism, what each owns, how they compose, and why choosing the parallel degrees is the hard part." name="description"/>
+<title>Section 16.6: DeepSpeed and Megatron-LM | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 16: Model, Pipeline, and Sharded Parallelism</a></div>
+<h1>DeepSpeed and Megatron-LM</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I have been sharded by ZeRO, sliced by tensor parallelism, and staged by the pipeline. Ask me who I am and I will hand you a config file."</p>
+<cite>A Shard That Believes It Is the Whole Model</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The parallelism techniques of this chapter are rarely written by hand; they reach production through two frameworks, DeepSpeed and Megatron-LM, that each own a different slice of the problem and are most often used together.</strong> Megatron-LM contributes the high-throughput tensor and pipeline parallelism that splits one transformer across the fast links inside and between a few nodes. DeepSpeed contributes ZeRO, which shards the optimizer state, gradients, and parameters across the data-parallel replicas, plus offload paths that push state down the memory hierarchy to CPU and NVMe when even sharding is not enough. Neither framework is the whole answer. The skill this section builds is reading a model and a cluster, deciding how much of each kind of parallelism to apply, and understanding that this choice, not the code, is the hard and consequential part. That choice is where the next several sections, culminating in 3D parallelism, all converge.</p>
+</div>
+<p>The previous five sections built the components separately. Tensor parallelism (<a href="section-16.2.html">Section 16.2</a>) split each layer's matrices across devices. Pipeline parallelism (<a href="section-16.3.html">Section 16.3</a>) split the stack of layers into stages. ZeRO (<a href="section-16.4.html">Section 16.4</a>) sharded the training state across data-parallel workers, and PyTorch FSDP (<a href="section-16.5.html">Section 16.5</a>) packaged the ZeRO idea natively. Each on its own addresses one ceiling. A real frontier-scale training run hits several ceilings at once, so it needs several of these techniques composed in one job. Assembling that composition correctly, with the right collectives on the right network links, is more than a weekend of plumbing, and it is exactly what the two dominant frameworks exist to provide.</p>
+<p>This section is about what those frameworks own, how they fit together, and why the configuration is the genuinely difficult artifact. We diagram the composed stack, run a demo that prices the memory and communication of two contrasting strategies, and show illustratively how the choice is expressed in a config. The deep treatment of stacking all the axes at once is <a href="section-16.9.html">Section 16.9</a> on 3D and 4D parallelism; here we set it up by naming the tools and the trade-off they manage.</p>
+
+<h2>1. Two Frameworks, Two Jobs <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>DeepSpeed, from Microsoft, and Megatron-LM, from NVIDIA, are often spoken of in the same breath, which obscures that they solve different problems and were designed around different parts of the memory-and-communication budget. Keeping their responsibilities distinct is the first step to using them well.</p>
+<p>Megatron-LM is a transformer training system whose signature contribution is efficient <strong>tensor parallelism</strong>: it lays out the attention and feed-forward matrices so that the per-layer all-reduce lands on the fast intra-node interconnect, and it pairs this with a carefully scheduled <strong>pipeline parallelism</strong> across nodes. Its reason to exist is throughput; it is the reference implementation for getting high hardware utilization out of a transformer that has been cut into pieces. Megatron does not, by itself, shard the optimizer state across data-parallel replicas; within a model-parallel group each replica still holds a full optimizer for its slice.</p>
+<p>DeepSpeed is a training-optimization library whose signature contribution is <strong>ZeRO</strong>, the sharding of optimizer state, gradients, and parameters across the data-parallel workers so that no single device holds the full training state (<a href="section-16.4.html">Section 16.4</a>). On top of ZeRO it adds <strong>offload</strong> paths that move state off the GPU entirely, and it integrates pipeline and tensor parallelism so that ZeRO data parallelism can wrap around a model-parallel core. DeepSpeed's reason to exist is memory: it lets a given cluster train a model larger than the naive arithmetic says should fit.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Frameworks Partition the Problem, Not Just the Model</div>
+<p>Megatron owns the <em>within-model</em> split (tensor and pipeline parallelism on fast links), and DeepSpeed owns the <em>across-replica</em> split (ZeRO sharding and offload of training state). They compose because they act on orthogonal axes: Megatron decides how one copy of the model is cut across a handful of tightly coupled devices, and DeepSpeed decides how the many copies share their optimizer state and, when needed, spill it down the memory hierarchy. Choosing how much of each to apply is the configuration problem this section is really about.</p>
+</div>
+
+<h2>2. Offload and Infinity: Renting the Memory Hierarchy <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>ZeRO shards the training state across GPUs, but the total still has to live somewhere in aggregate GPU memory. DeepSpeed's ZeRO-Offload and ZeRO-Infinity break that constraint by treating the whole memory hierarchy, not just HBM, as the place where state can live. ZeRO-Offload moves the fp32 optimizer state and the optimizer step itself to CPU memory, so the GPU holds only what it needs for the forward and backward pass. ZeRO-Infinity goes further and streams parameters and optimizer state to and from NVMe solid-state storage, letting a single node, or a small cluster, train a model whose state would never fit in its GPUs.</p>
+<p>This is the memory hierarchy from <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.8.html">Chapter 2</a> used as a deliberate design lever rather than an accident of hardware. Each step down the hierarchy, HBM to CPU DRAM to NVMe, multiplies capacity and divides bandwidth, so offload buys you the ability to fit a model at the cost of slower per-step data movement. It is the right tool when the alternative is not training the model at all, and the wrong tool when you have enough GPUs that staying in HBM keeps the accelerators busy. The reliability machinery that makes long offloaded runs survivable, checkpointing and elastic restart, is the subject of <a href="../module-18-elastic-fault-tolerant-training/index.html">Chapter 18</a>.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The GPU That Sent Its Homework to the Hard Drive</div>
+<p>ZeRO-Infinity lets a lone GPU train a model whose optimizer state lives mostly on an NVMe drive, fetched layer by layer just in time. It works, in the sense that the model trains, the way a student with a tiny desk works by keeping all but the current page in a filing cabinet across the room. Every page arrives when needed; you just would not call the throughput inspiring. Offload is a capability switch, not a speed switch.</p>
+</div>
+
+<h2>3. The Composed Stack <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The canonical large-model recipe stacks the two frameworks along orthogonal axes: Megatron supplies tensor parallelism within a node and pipeline parallelism across a few nodes, forming one complete model replica, and DeepSpeed wraps ZeRO data parallelism around that replica so many replicas share their sharded optimizer state. This is the arrangement that trained a long line of well-known large models, and it is the concrete realization of the "a primitive returns, scaled out" thread: the all-reduce of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> appears here three times over, once inside tensor parallelism, once as the pipeline's point-to-point exchange, and once as ZeRO's reduce-scatter and all-gather. Figure 16.6.1 shows the composition.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of the composed training stack: Megatron tensor parallelism inside a node, pipeline parallelism across nodes forming one model replica, and DeepSpeed ZeRO data parallelism across replicas, with arrows showing which network link carries each collective.">
+<defs>
+<marker id="arr166" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.box166 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.tp166 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.zr166 { fill:#eef6ee; stroke:#2f7d32; stroke-width:1.6; }
+.t166 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.tb166 { font:600 13px sans-serif; fill:#b86b1f; text-anchor:middle; }
+.tg166 { font:600 13px sans-serif; fill:#2f7d32; text-anchor:middle; }
+.s166 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l166 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr166); }
+.dl166 { fill:none; stroke:#2f7d32; stroke-width:1.6; stroke-dasharray:5 3; marker-end:url(#arr166); }
+</style>
+<text class="t166" x="430" y="24">One model replica = Megatron tensor x pipeline parallelism</text>
+
+<!-- Replica A: pipeline stages, each stage tensor-parallel -->
+<rect class="box166" x="40" y="44" width="360" height="150" rx="10"/>
+<text class="s166" x="220" y="62">Replica A (Megatron)</text>
+<rect class="tp166" x="60" y="74" width="150" height="48" rx="7"/>
+<text class="tb166" x="135" y="94">Stage 1 (layers 1..L/2)</text>
+<text class="s166" x="135" y="111">GPU0 | GPU1  tensor-split</text>
+<rect class="tp166" x="230" y="74" width="150" height="48" rx="7"/>
+<text class="tb166" x="305" y="94">Stage 2 (layers L/2..L)</text>
+<text class="s166" x="305" y="111">GPU2 | GPU3  tensor-split</text>
+<line x1="210" y1="98" x2="228" y2="98" class="l166"/>
+<text class="s166" x="220" y="150">tensor all-reduce: fast NVLink (inside a stage)</text>
+<text class="s166" x="220" y="168">pipeline send/recv: across nodes (between stages)</text>
+
+<!-- Replica B mirror -->
+<rect class="box166" x="460" y="44" width="360" height="150" rx="10"/>
+<text class="s166" x="640" y="62">Replica B (Megatron, identical layout)</text>
+<rect class="tp166" x="480" y="74" width="150" height="48" rx="7"/>
+<text class="tb166" x="555" y="94">Stage 1 (layers 1..L/2)</text>
+<text class="s166" x="555" y="111">GPU4 | GPU5  tensor-split</text>
+<rect class="tp166" x="650" y="74" width="150" height="48" rx="7"/>
+<text class="tb166" x="725" y="94">Stage 2 (layers L/2..L)</text>
+<text class="s166" x="725" y="111">GPU6 | GPU7  tensor-split</text>
+<line x1="630" y1="98" x2="648" y2="98" class="l166"/>
+<text class="s166" x="640" y="150">tensor all-reduce: fast NVLink (inside a stage)</text>
+<text class="s166" x="640" y="168">pipeline send/recv: across nodes (between stages)</text>
+
+<!-- DeepSpeed ZeRO data parallel across replicas -->
+<rect class="zr166" x="200" y="260" width="460" height="92" rx="10"/>
+<text class="tg166" x="430" y="286">DeepSpeed ZeRO data parallelism (across replicas)</text>
+<text class="s166" x="430" y="308">reduce-scatter gradients + all-gather params over the global fabric</text>
+<text class="s166" x="430" y="326">each replica holds 1/(data-parallel degree) of the optimizer state</text>
+<text class="s166" x="430" y="344">ZeRO-Offload / Infinity spills that shard to CPU DRAM or NVMe</text>
+
+<path class="dl166" d="M 220 194 L 220 230 L 300 230 L 300 258"/>
+<path class="dl166" d="M 640 194 L 640 230 L 560 230 L 560 258"/>
+<text class="s166" x="430" y="226">corresponding shards across replicas synchronize</text>
+
+<text class="s166" x="430" y="378">orange = Megatron (within-model, fast links)   green = DeepSpeed ZeRO (across replicas, global fabric)</text>
+<text class="s166" x="430" y="400">the configuration chooses the three degrees: tensor x pipeline x data</text>
+</svg>
+<figcaption><strong>Figure 16.6.1:</strong> The composed training stack. Each Megatron replica (left and right) is one model cut by tensor parallelism inside a stage (fast intra-node all-reduce, orange) and pipeline parallelism between stages (point-to-point across nodes). DeepSpeed ZeRO (green, dashed) wraps the replicas, synchronizing corresponding shards with reduce-scatter and all-gather over the global fabric and optionally offloading each shard down the memory hierarchy. The configuration's job is to pick the three parallel degrees that keep the heaviest traffic on the fastest links.</figcaption>
+</figure>
+<p>Reading Figure 16.6.1 from the inside out gives the design rule the whole stack obeys: put the highest-volume, most-frequent communication on the fastest link. Tensor parallelism all-reduces activations on every layer, so it goes on NVLink inside a node. Pipeline parallelism exchanges only stage-boundary activations, far less traffic, so it can cross slower node-to-node links. ZeRO's parameter and gradient traffic, large but once per step, spreads over the global fabric. Get that ordering wrong, for example by spreading tensor parallelism across slow inter-node links, and the accelerators starve waiting on communication.</p>
+
+<h2>4. Pricing Two Strategies: A Runnable Demo <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The reason configuration is hard is that memory and communication pull in opposite directions, and the only way to see the tension is to put numbers on it. The program below takes one model and one cluster and prices two strategies: pure ZeRO-3, which shards everything across all sixty-four GPUs, and a 3D-parallel layout that combines tensor, pipeline, and a small data-parallel degree. For each it reports the per-device memory broken into training state and activations, whether it fits, and the dominant communication volume per step. The arithmetic is deliberately simplified to expose the trade-off, not to replace a profiler.</p>
+<pre><code class="language-python"># Compare per-device memory and dominant communication for parallelism strategies.
+# Model: a transformer of P parameters trained in mixed precision with Adam.
+# Cluster: G GPUs, each with M_gpu bytes of usable HBM.
+
+P = 70e9          # parameters (70B model)
+G = 64            # total GPUs
+M_gpu = 80e9      # 80 GB per GPU (bytes)
+H = 8192          # hidden size
+L = 80            # transformer layers
+B = 2             # micro-batch sequences per device
+S = 4096          # sequence length
+
+# Per-parameter training-state bytes (mixed precision + Adam):
+#  fp16 weight 2 + fp16 grad 2 + fp32 master 4 + fp32 m 4 + fp32 v 4 = 16 bytes.
+state_per_param = 16
+
+def gb(x):
+    return x / 1e9
+
+print(f"Model: {P/1e9:.0f}B params | Cluster: {G} GPUs x {gb(M_gpu):.0f} GB")
+print(f"Full training state if undivided: {gb(P*state_per_param):.0f} GB "
+      f"(needs &gt;= {P*state_per_param/M_gpu:.0f} GPUs just to hold state)\n")
+
+# Activation memory per device (rough): bytes for stored activations of local layers.
+act_const = 12
+def act_mem(layers_on_device):
+    return act_const * 2 * B * S * H * layers_on_device
+
+# --- Config A: pure ZeRO-3 (sharded data parallel across all G GPUs) ---
+zero3_state = P * state_per_param / G        # training state sharded 1/G
+zero3_act = act_mem(L)                        # full stack of layers present locally
+zero3_total = zero3_state + zero3_act
+zero3_comm = 3 * 2 * P / G    # all-gather x2 + reduce-scatter, bytes/device/step (global fabric)
+
+# --- Config B: tensor(T) x pipeline(Pp) x data(D) = 3D parallelism ---
+T, Pp, D = 8, 4, 2                            # 8*4*2 = 64 = G
+assert T * Pp * D == G
+params_per_dev = P / (T * Pp)                 # tensor + pipeline both shrink the local params
+tp_pp_state = params_per_dev * state_per_param
+tp_pp_act = act_mem(L / Pp) / T               # fewer layers (pipeline), tensor-split width
+tp_pp_total = tp_pp_state + tp_pp_act
+tp_comm = 4 * (L / Pp) * 2 * B * S * H        # per-layer TP all-reduce, mostly intra-node
+
+print("Config A  pure ZeRO-3 (sharded data parallel, degree 64)")
+print(f"  per-device state : {gb(zero3_state):6.1f} GB")
+print(f"  per-device activ : {gb(zero3_act):6.1f} GB")
+print(f"  per-device TOTAL : {gb(zero3_total):6.1f} GB   fits={'YES' if zero3_total&lt;M_gpu else 'NO'}")
+print(f"  dominant comm    : {gb(zero3_comm):6.2f} GB/device/step over the GLOBAL group (slow links)\n")
+
+print(f"Config B  3D parallel  T={T} x P={Pp} x D={D}")
+print(f"  per-device state : {gb(tp_pp_state):6.1f} GB")
+print(f"  per-device activ : {gb(tp_pp_act):6.1f} GB")
+print(f"  per-device TOTAL : {gb(tp_pp_total):6.1f} GB   fits={'YES' if tp_pp_total&lt;M_gpu else 'NO'}")
+print(f"  dominant comm    : {gb(tp_comm):6.2f} GB/device/step, mostly INTRA-node (fast NVLink)\n")
+
+print("Trade-off summary")
+print(f"  ZeRO-3 frees memory by sharding state {G}x but pays {gb(zero3_comm):.2f} GB/step on the global fabric.")
+print(f"  3D parallel keeps the heavy traffic on fast links, at the cost of a more complex config and")
+print(f"  larger per-device state ({gb(tp_pp_state):.0f} vs {gb(zero3_state):.1f} GB).")
+</code></pre>
+<div class="code-caption"><strong>Code 16.6.1:</strong> A back-of-the-envelope pricer that contrasts pure ZeRO-3 against a tensor x pipeline x data layout on the same 70B model and 64-GPU cluster, reporting per-device memory (split into state and activations) and the dominant per-step communication for each.</div>
+<pre><code class="language-text">Model: 70B params | Cluster: 64 GPUs x 80 GB
+Full training state if undivided: 1120 GB (needs &gt;= 14 GPUs just to hold state)
+
+Config A  pure ZeRO-3 (sharded data parallel, degree 64)
+  per-device state :   17.5 GB
+  per-device activ :  128.8 GB
+  per-device TOTAL :  146.3 GB   fits=NO
+  dominant comm    :   6.56 GB/device/step over the GLOBAL group (slow links)
+
+Config B  3D parallel  T=8 x P=4 x D=2
+  per-device state :   35.0 GB
+  per-device activ :    4.0 GB
+  per-device TOTAL :   39.0 GB   fits=YES
+  dominant comm    :  10.74 GB/device/step, mostly INTRA-node (fast NVLink)
+
+Trade-off summary
+  ZeRO-3 frees memory by sharding state 64x but pays 6.56 GB/step on the global fabric.
+  3D parallel keeps the heavy traffic on fast links, at the cost of a more complex config and
+  larger per-device state (35 vs 17.5 GB).</code></pre>
+<div class="code-caption"><strong>Output 16.6.1:</strong> Pure ZeRO-3 shards the optimizer state beautifully (17.5 GB per device) yet still does not fit, because every device holds the activations of the full 80-layer stack (128.8 GB); sharding state does not shard activations. The 3D layout fits in 39 GB by cutting both layers (pipeline) and layer width (tensor), and it keeps its heavier communication on the fast intra-node links.</div>
+<p>The lesson in Output 16.6.1 is the one that surprises newcomers: ZeRO-3 alone is not enough at this scale, and the reason is activations, not optimizer state. Sharding the state across sixty-four GPUs drives it down to a comfortable 17.5 GB, but each GPU still runs the entire forward pass, so it stores the activations of all eighty layers, and those dominate. The 3D layout wins not by sharding state harder but by splitting the layers themselves across pipeline stages and tensor shards, which cuts the activation footprint along with it. This is precisely why activation checkpointing (<a href="section-16.8.html">Section 16.8</a>) and tensor or pipeline parallelism are not optional luxuries on top of ZeRO; they attack the term ZeRO cannot reach.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Collective Decides the Layout</div>
+<p>Every strategy in Output 16.6.1 is ultimately a decision about which collective runs on which link. Pure ZeRO-3 routes all of its all-gather and reduce-scatter traffic over the global fabric; the 3D layout pushes the high-frequency tensor all-reduce onto NVLink and reserves the global fabric for the once-per-step ZeRO synchronization. The frameworks are, at heart, machinery for binding the collectives of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> to a physical network so the fast links carry the heavy traffic. When you later meet 3D parallelism in <a href="section-16.9.html">Section 16.9</a> and expert parallelism's all-to-all in <a href="../module-17-expert-parallelism-moe/index.html">Chapter 17</a>, ask the same question first: which collective, on which link, how often?</p>
+</div>
+
+<h2>5. The Configuration Is the Hard Part <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Once the frameworks are in place, the engineering does not become typing; it becomes choosing. The number of parameters, the cluster topology, the sequence length, and the batch size jointly determine a feasible region of (tensor, pipeline, data, ZeRO-stage, offload) settings, and within that region throughput can vary by large factors. The config file looks innocuous and is the most consequential artifact in the run. Below is an illustrative DeepSpeed configuration paired with the launch flags that select Megatron's model-parallel degrees; the point is not the exact keys but that a handful of integers encode the entire layout.</p>
+<pre><code class="language-json">// ds_config.json (illustrative): DeepSpeed owns ZeRO sharding and offload
+{
+  "train_micro_batch_size_per_gpu": 2,
+  "gradient_accumulation_steps": 8,
+  "bf16": { "enabled": true },
+  "zero_optimization": {
+    "stage": 1,                      // ZeRO-1: shard optimizer state only,
+                                     //   because Megatron already shards the model
+    "offload_optimizer": {           // spill the optimizer shard to CPU if needed
+      "device": "cpu",
+      "pin_memory": true
+    },
+    "overlap_comm": true,            // hide reduce-scatter behind the backward pass
+    "reduce_bucket_size": 5e8
+  }
+}
+</code></pre>
+<div class="code-caption"><strong>Code 16.6.2:</strong> An illustrative DeepSpeed ZeRO config for a job whose model is already tensor- and pipeline-parallel under Megatron. Because Megatron shards the model, ZeRO-1 (optimizer state only) is often the right stage; pushing to ZeRO-3 would all-gather parameters that Megatron already split, duplicating work.</div>
+<pre><code class="language-bash"># Megatron launch flags (illustrative): these pick the model-parallel degrees.
+# Total GPUs = tensor x pipeline x data must equal the world size.
+torchrun --nproc_per_node=8 --nnodes=8 pretrain_gpt.py \
+    --tensor-model-parallel-size 8 \    # within a node, on NVLink
+    --pipeline-model-parallel-size 4 \  # across nodes, stage to stage
+    --sequence-parallel \               # split activations along the sequence too (16.7)
+    --deepspeed --deepspeed_config ds_config.json
+# data-parallel degree is implied: 64 GPUs / (8 * 4) = 2
+</code></pre>
+<div class="code-caption"><strong>Code 16.6.3:</strong> The Megatron side of the same job. Three integers, the tensor, pipeline, and implied data degrees, fix the layout that Figure 16.6.1 draws; <code>--sequence-parallel</code> previews the long-context techniques of <a href="section-16.7.html">Section 16.7</a>.</div>
+<p>Two integers in Code 16.6.3 that multiply wrong, or a ZeRO stage in Code 16.6.2 that fights the model parallelism instead of complementing it, can halve throughput or break the run. Choosing them well requires the communication-cost reasoning of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a> applied to the specific topology, plus a few profiling runs. The systematic method for navigating this space is the subject of <a href="section-16.10.html">Section 16.10</a>; what matters here is the recognition that the frameworks have moved the difficulty from implementation to decision.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: DeepSpeed and Megatron Replace Thousands of Lines</div>
+<p>Writing tensor parallelism, pipeline scheduling, and ZeRO sharding by hand is thousands of lines of collective plumbing, memory bookkeeping, and overlap scheduling, and getting the overlap right alone is a research project. DeepSpeed reduces the ZeRO and offload side to one <code>deepspeed.initialize</code> call plus the JSON of Code 16.6.2; Megatron-LM reduces the model-parallel side to the launch flags of Code 16.6.3 over its transformer implementation. The combined frameworks handle process-group construction, collective scheduling, gradient bucketing, parameter all-gather, optimizer-state offload, and the placement of each collective on the correct network link. Your job shrinks to choosing a few integers and providing the data, which is why every section after this one is about choosing those integers well rather than implementing what they trigger.</p>
+<pre><code class="language-python">import deepspeed
+
+# model already wrapped with Megatron tensor + pipeline parallelism upstream
+model_engine, optimizer, _, _ = deepspeed.initialize(
+    model=model, model_parameters=model.parameters(),
+    config="ds_config.json")        # the JSON of Code 16.6.2 drives ZeRO + offload
+
+for batch in data_loader:
+    loss = model_engine(batch)      # forward across pipeline stages
+    model_engine.backward(loss)     # reduce-scatter gradients (ZeRO), overlapped
+    model_engine.step()             # optimizer step on the (possibly offloaded) shard
+</code></pre>
+<div class="code-caption"><strong>Code 16.6.4:</strong> The entire DeepSpeed training loop for a model that Megatron has already cut along tensor and pipeline axes. The three calls hide ZeRO's reduce-scatter, the parameter all-gather, and the offloaded optimizer step; the layout itself lives in the config and launch flags, not the loop.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The 40B Model That Would Not Fit, Then Did</div>
+<p><strong>Who:</strong> An ML platform engineer at a startup standing up a 64-GPU cluster (eight nodes, eight 80 GB GPUs each, NVLink inside a node, slower Ethernet between).</p>
+<p><strong>Situation:</strong> The research team wanted to pretrain a 40-billion-parameter transformer and had started with the simplest thing that could work, pure ZeRO-3 across all sixty-four GPUs.</p>
+<p><strong>Problem:</strong> The job ran out of memory on the first step despite ZeRO-3 sharding the optimizer state thirty-two-fold; the profiler showed activations, not state, filling the GPU, exactly the pattern in Output 16.6.1.</p>
+<p><strong>Dilemma:</strong> Add aggressive activation checkpointing to make ZeRO-3 fit but pay recomputation cost and still route all traffic over slow Ethernet, or introduce Megatron tensor and pipeline parallelism to shrink the activation footprint at the cost of a more intricate config.</p>
+<p><strong>Decision:</strong> They moved to a composed stack: Megatron tensor parallelism of degree eight inside each node, pipeline degree four across nodes, ZeRO-1 with optimizer offload wrapping a data-parallel degree of two.</p>
+<p><strong>How:</strong> Tensor parallelism stayed on intra-node NVLink, pipeline stage boundaries crossed the slower links where their light traffic could tolerate it, and ZeRO-1 sharded only the optimizer state because Megatron already sharded the model, the reasoning behind Code 16.6.2.</p>
+<p><strong>Result:</strong> Per-device memory dropped under the 80 GB ceiling with room to spare, the heavy tensor all-reduce never touched Ethernet, and step time fell by more than half compared to the checkpointed ZeRO-3 attempt.</p>
+<p><strong>Lesson:</strong> When activations dominate, sharding state harder cannot save you; split the model so the activations shrink, and place each collective on the link that can afford it.</p>
+</div>
+
+<h2>6. What Composes, and Where It Goes Next <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The two frameworks compose because they act on orthogonal axes, and that orthogonality is what the next sections exploit and extend. Megatron's tensor and pipeline parallelism cut a single model copy; DeepSpeed's ZeRO and offload manage the many copies and the memory hierarchy beneath them. Stack them and you have three parallel degrees to choose, the setup for the full 3D parallelism treatment in <a href="section-16.9.html">Section 16.9</a>. Add the sequence and context parallelism of <a href="section-16.7.html">Section 16.7</a> and a fourth axis appears, the 4D layout. Add expert parallelism's all-to-all (<a href="../module-17-expert-parallelism-moe/index.html">Chapter 17</a>) and a fifth. Each new axis is another integer in the config and another collective to place on the network.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Automating the Parallelism Choice (2024 to 2026)</div>
+<p>Because the configuration is the hard part, a research line is trying to remove the human from it. Auto-parallelization systems in the lineage of Alpa search the space of tensor, pipeline, and data degrees to fit a model on a cluster automatically, and the idea has matured into the planners shipping inside production stacks. NVIDIA's Megatron-Core and the NeMo framework, together with the maturing of FSDP2 and PyTorch's <code>DTensor</code> and the <code>torch.distributed</code> tensor-parallel API, are converging the once-separate DeepSpeed and Megatron capabilities into composable building blocks with cost-model-driven defaults. Recent work also pushes offload further with NVMe-aware schedulers that overlap solid-state-storage traffic with compute so ZeRO-Infinity-style training keeps the accelerators busier. The throughline is that choosing the parallel degrees, the skill this section names as the hard one, is itself becoming an optimization problem the frameworks solve, with the human supplying constraints rather than integers. We return to the cost models that make such search tractable in <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>.</p>
+</div>
+<p>We now have the production frameworks and a clear division of labor: Megatron within the model, DeepSpeed across the replicas and down the memory hierarchy, and a configuration that ties them to the physical network. The remaining ceiling this chapter has not addressed is the sequence dimension, the activations that grow with context length and that even tensor and pipeline parallelism leave on each device. Splitting the sequence itself across machines is the subject of <a href="section-16.7.html">Section 16.7</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.6.1: Who Owns Which Axis? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each responsibility, state whether it belongs to Megatron-LM, to DeepSpeed, or to both acting together, and justify it in one sentence: (a) splitting a single attention layer's weight matrix across four GPUs; (b) sharding the fp32 optimizer state across data-parallel replicas; (c) streaming optimizer state to NVMe when GPU and CPU memory are exhausted; (d) scheduling pipeline micro-batches to keep stage idle time low; (e) placing the per-layer activation all-reduce on the fast intra-node link. Then explain why a job can use both frameworks at once without the axes conflicting.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.6.2: Re-Price the Cluster <span class="exercise-type coding">Coding</span></div>
+<p>Starting from Code 16.6.1, add a third configuration that applies activation checkpointing to the pure ZeRO-3 case by reducing the stored activation term (for example, dividing <code>act_const</code> by a checkpointing factor of eight to approximate storing only layer boundaries). Recompute whether ZeRO-3-plus-checkpointing now fits in 80 GB, and compare its per-step communication and its recomputation cost (one extra forward pass) against the 3D layout. Then sweep the tensor and pipeline degrees of Config B over the factorizations of 64 and print, for each, the per-device total memory; identify which layouts fit and which keep tensor parallelism within a single eight-GPU node.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.6.3: The Stage That Fights the Sharding <span class="exercise-type analysis">Analysis</span></div>
+<p>Code 16.6.2 chooses ZeRO-1 rather than ZeRO-3 for a model that Megatron already shards. Explain, in terms of the collectives each stage runs (<a href="section-16.4.html">Section 16.4</a>), why combining ZeRO-3's parameter all-gather with Megatron's tensor parallelism can duplicate communication and memory work, and under what cluster conditions ZeRO-3 over a model-parallel core would nonetheless be the right call. Quantify your argument using the per-step communication terms from Output 16.6.1, and state what you would measure on a real cluster to settle the choice.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-16.5.html"><span class="nav-label">Previous</span><span class="nav-num">Section 16.5</span><span class="nav-title">PyTorch FSDP</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 16</span><span class="nav-num">Contents</span><span class="nav-title">Model, Pipeline, and Sharded Parallelism</span></a>
+<a class="next" href="section-16.7.html"><span class="nav-label">Next</span><span class="nav-num">Section 16.7</span><span class="nav-title">Sequence and Context Parallelism</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

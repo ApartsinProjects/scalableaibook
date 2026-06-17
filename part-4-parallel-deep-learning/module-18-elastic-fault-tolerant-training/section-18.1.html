@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 18.1: Failure Is the Norm at Thousand-GPU Scale. Why a months-long training job on thousands of GPUs is interrupted many times, why synchronous parallelism makes one failure fatal, and why restart-from-scratch is ruinously wasteful." name="description"/>
+<title>Section 18.1: Failure Is the Norm at Thousand-GPU Scale | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 18: Elastic and Fault-Tolerant Distributed Training</a></div>
+<h1>Failure Is the Norm at Thousand-GPU Scale</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They asked me to run for two months without stopping. I lasted ninety minutes, twice an hour, on a good day."</p>
+<cite>A Spot Instance, Moments Before Preemption</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>At the scale where frontier models are trained, the binding constraint is not how fast the GPUs compute but how often they break, because a job spread across thousands of accelerators is, at any given hour, a system in which something is probably about to fail.</strong> Chapters 15 through 17 built the parallelism that lets one model train across thousands of devices, and every one of those schemes is synchronous: the workers march in lockstep through an all-reduce on every step, so a single dead GPU stalls all of them. A months-long run on that many devices will be interrupted not once but many times, and if each interruption throws away all progress, the wasted compute dwarfs the useful work. This section establishes the arithmetic of unreliability that forces the rest of the chapter into existence: checkpointing to save progress, elasticity to keep going through membership changes, and straggler and preemption handling to survive a world where machines come and go without asking.</p>
+</div>
+<p>The previous three chapters treated a training job as a fixed set of workers that start together, run together, and finish together. That picture is correct for an afternoon on eight GPUs. It quietly stops being correct as the GPU count and the wall-clock both grow, and the reason is not subtle. Each accelerator, each network link, each power supply, and each cooling loop has some small probability of failing on any given day. One machine, observed for a day, almost never fails. Thousands of machines, observed for two months, fail constantly. The job does not get to choose whether failures happen; it only gets to choose whether a failure ends the run or merely dents it. The discipline of making that choice the second way, keeping a long job alive through a steady drizzle of hardware faults, is elastic and fault-tolerant training, and it begins by taking the failure rate seriously as a number rather than a nuisance.</p>
+<p>We built the conceptual vocabulary for this in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.4.html">Section 2.4</a>, where failure detection, recovery, and the distinction between a crashed process and a slow one were introduced as general distributed-systems concerns. Here we specialize those ideas to the one workload that stresses them hardest: a single tightly coupled computation, running for months, that cannot make progress unless almost every participant is healthy at almost every step.</p>
+
+<h2>1. The Arithmetic of Unreliability <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Start with one number you can defend and follow it to a conclusion you cannot escape. Suppose a single GPU, together with the host, network, and power that keep it useful, has a probability $p$ of suffering a job-ending fault on any given day. A reasonable operational figure is a fraction of a percent; we will use $p = 0.005$, half a percent per GPU per day. For one GPU this is reassuring: across a two-month run it will almost certainly survive. The danger appears only when the GPUs are many and they are coupled, because a synchronous job fails when <em>any</em> of its members fails.</p>
+<p>Model each GPU's faults as a Poisson process, the standard assumption for independent rare events. A per-day fault probability $p$ corresponds to a fault rate of $\lambda_{\text{gpu}} = -\ln(1 - p)$ faults per GPU per day. Independent rates add, so a job of $G$ GPUs fails at rate $\lambda_{\text{job}} = G\,\lambda_{\text{gpu}}$. The mean time between job failures, the job-level MTBF, is the reciprocal of that combined rate,</p>
+$$\text{MTBF}_{\text{job}} = \frac{1}{G \cdot \big(-\ln(1 - p)\big)}, \qquad \mathbb{E}[\text{failures over } D \text{ days}] = G \cdot \big(-\ln(1 - p)\big) \cdot D.$$
+<p>The shape of these two expressions is the whole story. The MTBF shrinks like $1/G$: double the GPUs and you halve the time between interruptions. The expected number of failures over a fixed run grows like $G$: every GPU you add is one more thing that can take down the entire job. There is no regime in which adding workers makes a synchronous job more reliable; it can only make the wall-clock shorter, and it does so while making interruptions more frequent. The code below evaluates both formulas across a realistic range of cluster sizes so the trend is concrete rather than asymptotic.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram showing per-GPU failure events from many accelerators compounding onto a single job timeline, turning rare individual faults into frequent job-wide interruptions across a long run.">
+<defs>
+<marker id="arr181" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.t181 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s181 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.sl181 { font:11.5px sans-serif; fill:#5a626c; text-anchor:start; }
+.ax181 { fill:none; stroke:#14385c; stroke-width:1.6; }
+.gpu181 { stroke:#b86b1f; stroke-width:1.4; }
+.fault181 { fill:#b86b1f; }
+.jobline181 { fill:none; stroke:#14385c; stroke-width:2.2; }
+.kill181 { fill:#c0392b; }
+.drop181 { fill:none; stroke:#c0392b; stroke-width:1.4; stroke-dasharray:3 3; marker-end:url(#arr181); }
+</style>
+<text class="t181" x="430" y="24">Rare per-GPU faults compound into frequent job interruptions</text>
+<!-- per-GPU lanes -->
+<text class="sl181" x="20" y="58">GPU 1</text>
+<line class="gpu181" x1="80" y1="54" x2="800" y2="54"/>
+<circle class="fault181" cx="430" cy="54" r="4"/>
+<text class="sl181" x="20" y="84">GPU 2</text>
+<line class="gpu181" x1="80" y1="80" x2="800" y2="80"/>
+<circle class="fault181" cx="250" cy="80" r="4"/>
+<circle class="fault181" cx="650" cy="80" r="4"/>
+<text class="sl181" x="20" y="110">GPU 3</text>
+<line class="gpu181" x1="80" y1="106" x2="800" y2="106"/>
+<circle class="fault181" cx="540" cy="106" r="4"/>
+<text class="sl181" x="20" y="136">...</text>
+<line class="gpu181" x1="80" y1="132" x2="800" y2="132"/>
+<text class="sl181" x="20" y="162">GPU G</text>
+<line class="gpu181" x1="80" y1="158" x2="800" y2="158"/>
+<circle class="fault181" cx="160" cy="158" r="4"/>
+<circle class="fault181" cx="360" cy="158" r="4"/>
+<circle class="fault181" cx="730" cy="158" r="4"/>
+<text class="s181" x="430" y="186">each lane: one GPU, a fault is rare (orange dot)</text>
+<!-- drop arrows onto job line -->
+<path class="drop181" d="M 160 162 L 160 248"/>
+<path class="drop181" d="M 250 84 L 250 248"/>
+<path class="drop181" d="M 360 162 L 360 248"/>
+<path class="drop181" d="M 430 58 L 430 248"/>
+<path class="drop181" d="M 540 110 L 540 248"/>
+<path class="drop181" d="M 650 84 L 650 248"/>
+<path class="drop181" d="M 730 162 L 730 248"/>
+<!-- job timeline -->
+<text class="sl181" x="20" y="256">Job</text>
+<line class="jobline181" x1="80" y1="252" x2="800" y2="252"/>
+<circle class="kill181" cx="160" cy="252" r="5"/>
+<circle class="kill181" cx="250" cy="252" r="5"/>
+<circle class="kill181" cx="360" cy="252" r="5"/>
+<circle class="kill181" cx="430" cy="252" r="5"/>
+<circle class="kill181" cx="540" cy="252" r="5"/>
+<circle class="kill181" cx="650" cy="252" r="5"/>
+<circle class="kill181" cx="730" cy="252" r="5"/>
+<text class="s181" x="430" y="284">the job line collects EVERY lane's faults: interruptions become frequent (red)</text>
+<line class="ax181" x1="80" y1="320" x2="800" y2="320"/>
+<path class="ax181" d="M 800 320 l -8 -4 m 8 4 l -8 4" fill="none" stroke="#14385c" stroke-width="1.6"/>
+<text class="s181" x="80" y="338">run start</text>
+<text class="s181" x="800" y="338">two months later</text>
+</svg>
+<figcaption><strong>Figure 18.1.1:</strong> Why scale turns rare faults into constant interruptions. Each upper lane is a single GPU on which a job-ending fault (orange) is genuinely uncommon. The synchronous job, drawn as the bottom timeline, inherits the union of every lane's faults: because one dead member stalls the all-reduce for all members, each orange dot drops down to a red job interruption. With $G$ lanes the red events arrive about $G$ times as often as on any one lane, which is exactly the $1/G$ shrink of the MTBF formula above.</figcaption>
+</figure>
+<pre><code class="language-python">import math
+
+# Each GPU (with its host, network, and power) has a small per-day fault probability.
+p_fail_per_gpu_day = 0.005          # 0.5% chance one GPU faults on a given day
+run_days = 60.0                     # a two-month training run
+hours_per_day = 24.0
+
+def job_mtbf_hours(num_gpus, p_day):
+    rate_per_gpu_day = -math.log(1.0 - p_day)        # Poisson rate from per-day prob
+    rate_job_hour = num_gpus * rate_per_gpu_day / hours_per_day   # rates add across GPUs
+    return 1.0 / rate_job_hour                       # mean time between job failures
+
+def expected_failures(num_gpus, p_day, days):
+    return num_gpus * (-math.log(1.0 - p_day)) * days
+
+print(f"{'GPUs':&gt;8} {'job MTBF (h)':&gt;14} {'exp. failures':&gt;16}")
+for n in [1, 8, 64, 512, 4096, 16384]:
+    print(f"{n:&gt;8} {job_mtbf_hours(n, p_fail_per_gpu_day):&gt;14.1f}"
+          f" {expected_failures(n, p_fail_per_gpu_day, run_days):&gt;16.1f}")
+</code></pre>
+<div class="code-caption"><strong>Code 18.1.1:</strong> The two unreliability formulas evaluated directly. <code>job_mtbf_hours</code> returns the mean hours between interruptions for a synchronous job of a given size; <code>expected_failures</code> returns how many interruptions a fixed-length run should expect.</div>
+<pre><code class="language-text">    GPUs   job MTBF (h)    exp. failures
+       1         4788.0              0.3
+       8          598.5              2.4
+      64           74.8             19.2
+     512            9.4            154.0
+    4096            1.2           1231.9
+   16384            0.3           4927.5
+</code></pre>
+<div class="code-caption"><strong>Output 18.1.1:</strong> One GPU expects 0.3 faults over two months and a comfortable MTBF of two hundred days. At 4096 GPUs the same per-device assumption yields an interruption roughly every 1.2 hours and more than 1200 of them across the run. The reliability of the individual part did not change; only the count did.</div>
+<p>Read Output 18.1.1 next to Figure 18.1.1 and the lesson lands. The single-GPU column is the comforting world the previous chapters assumed: a fault is a once-in-a-blue-moon event you can ignore. By the time the job spans four thousand accelerators, the MTBF has fallen below a working lunch and the run will be interrupted more than a thousand times. Nothing about the hardware degraded; the arithmetic of many independent parts simply caught up with the wall-clock. A training system designed as if failures were rare is, at this scale, a system designed to fail.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: At Scale, Reliability Is a Property of the Job, Not the GPU</div>
+<p>The per-device failure rate barely matters once you commit to thousands of devices for months; what matters is $G \cdot D$, the product of fleet size and run length, because the expected number of interruptions grows linearly in both. You cannot buy your way out with more reliable GPUs, since each one you add to a synchronous job is one more single point of failure for the whole job. The only durable response is to change what a failure <em>costs</em>: make an interruption lose minutes of progress instead of weeks. Everything in this chapter is a way of lowering that cost.</p>
+</div>
+
+<h2>2. Why Synchronous Parallelism Makes One Failure Fatal <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The data parallelism of <a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a>, the sharded parallelism of <a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>, and the expert parallelism of <a href="../module-17-expert-parallelism-moe/index.html">Chapter 17</a> share a structural feature that is the source of their fragility. Every training step ends in a collective: an all-reduce of gradients, a reduce-scatter and all-gather of sharded parameters, an all-to-all of expert activations. A collective is a barrier. It cannot complete until every participant has arrived with its contribution, because the result each worker receives is a function of all the inputs. If one worker is gone, the collective never returns; the surviving workers block on it forever, holding their GPUs idle while they wait for a peer that will never speak again.</p>
+<p>This is why a single failure is not a local event but a global one. There is no notion of the job limping along at reduced capacity, the way a web service drops one replica and serves the rest. A synchronous training step is all-or-nothing: either all workers reach the collective and the step succeeds, or one does not and the step, and every step after it, hangs. Without intervention, the practical outcome is that the whole job is declared dead, every worker is torn down, and the run restarts. The very property that made distributed training <em>exact</em>, the collective that combines all contributions into one coherent update, is also what makes it brittle. We are not trying to abandon synchronous training; its convergence behavior is too good. We are trying to wrap it in machinery that detects the missing participant, removes it, and lets the survivors continue, which is precisely the elastic-membership problem of <a href="section-18.4.html">Section 18.4</a>.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Loneliest All-Reduce</div>
+<p>A surviving worker blocked on a collective is not crashed, not erroring, not even slow. It is patiently, correctly, waiting for a teammate, exactly as designed, forever. Thousands of expensive accelerators can sit at full power draw and zero useful work, each one a model of good behavior, all of them stuck because one peer three racks over lost a power supply. The healthiest possible workers produce the most wasteful possible outcome. This is why detecting the absence quickly matters as much as the parallelism itself.</p>
+</div>
+
+<h2>3. The Ruinous Cost of Restart-From-Scratch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Suppose the job has no fault tolerance beyond "if anything dies, relaunch the whole thing from the beginning." Each interruption then discards every GPU-hour spent since the run started. Combine that with Output 18.1.1, where a 4096-GPU run expects more than a thousand interruptions, and the waste compounds catastrophically: the run can spend the overwhelming majority of its compute repeatedly re-doing work it had already done, never accumulating enough uninterrupted progress to finish. The alternative is to write the training state to durable storage periodically, a <em>checkpoint</em>, so that a failure rewinds the job only to the last checkpoint rather than to day zero. The code below contrasts the two policies in GPU-hours, the currency that turns into dollars on the cloud bill.</p>
+<pre><code class="language-python">import math
+
+p, run_days, hpd = 0.005, 60.0, 24.0
+G = 4096
+ef = G * (-math.log(1.0 - p)) * run_days        # expected interruptions over the run
+ckpt_interval_h = 1.0                            # checkpoint every hour
+
+# Restart-from-scratch: each failure discards everything since the run began.
+# Bound the expected lost wall-clock per failure by the mean elapsed time, run/2.
+naive_lost_gpu_h = ef * (run_days * hpd / 2.0) * G
+
+# Checkpointing: a failure rewinds only to the last checkpoint, losing on
+# average half a checkpoint interval of wall-clock.
+ckpt_lost_gpu_h  = ef * (ckpt_interval_h / 2.0) * G
+
+print(f"expected interruptions   : {ef:.1f}")
+print(f"restart-from-scratch lost: {naive_lost_gpu_h:,.0f} GPU-hours")
+print(f"checkpoint-every-1h lost : {ckpt_lost_gpu_h:,.0f} GPU-hours")
+print(f"reduction factor         : {naive_lost_gpu_h / ckpt_lost_gpu_h:,.0f}x")
+</code></pre>
+<div class="code-caption"><strong>Code 18.1.2:</strong> Wasted compute under the two recovery policies on the same 4096-GPU, two-month run. The restart-from-scratch figure bounds each failure's loss by the mean elapsed time; checkpointing loses half a checkpoint interval per failure.</div>
+<pre><code class="language-text">expected interruptions   : 1231.9
+restart-from-scratch lost: 3,632,968,665 GPU-hours
+checkpoint-every-1h lost : 2,522,895 GPU-hours
+reduction factor         : 1,440x
+</code></pre>
+<div class="code-caption"><strong>Output 18.1.2:</strong> The same interruptions cost billions of GPU-hours under naive restart but a few million under hourly checkpointing, a roughly 1440-fold reduction. The restart figure exceeds any real budget, which is the point: an uncheckpointed run of this size does not merely cost more, it cannot finish.</div>
+<p>The restart-from-scratch number in Output 18.1.2 is deliberately absurd; it is larger than the total compute any organization would ever spend, and that is exactly why no frontier run is operated that way. The comparison makes the abstract argument financial. At a representative cloud price of a few dollars per GPU-hour, the gap between the two policies is the difference between a feasible project and an impossible one. Checkpointing does not eliminate the cost of failure, since each interruption still loses some work and some recovery time, but it converts an unbounded loss into a small, predictable tax. The next two sections turn that tax down further by making the checkpoints themselves fast and cheap to write.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Pretraining Run That Budgeted for Breakage</div>
+<p><strong>Who:</strong> A platform reliability engineer responsible for a multi-week foundation-model pretraining job on a 2048-GPU cluster.</p>
+<p><strong>Situation:</strong> An early test run of the same job had been launched with checkpointing disabled "to save the write overhead," and it crashed near the four-day mark from a single node's memory error.</p>
+<p><strong>Problem:</strong> The crash erased all four days of progress, and a back-of-the-envelope MTBF estimate said the next attempt would likely die again before finishing, in an endless loop of near-misses.</p>
+<p><strong>Dilemma:</strong> Keep checkpointing off and gamble on a lucky uninterrupted run, which the arithmetic of Output 18.1.1 said was vanishingly unlikely, or pay the per-checkpoint write cost and accept slightly slower steady-state throughput.</p>
+<p><strong>Decision:</strong> They enabled checkpointing on a fixed interval and provisioned spare nodes so a failed worker could be replaced without a full relaunch, treating interruptions as expected rather than exceptional.</p>
+<p><strong>How:</strong> They measured the job's MTBF empirically over the first day, then set the checkpoint interval and spare-node count so that expected lost work stayed under a small percentage of total compute, the optimization made rigorous in <a href="section-18.2.html">Section 18.2</a>.</p>
+<p><strong>Result:</strong> The full run completed despite dozens of mid-run node faults; each one cost minutes of rewind instead of days, and the run never restarted from scratch again.</p>
+<p><strong>Lesson:</strong> Checkpointing is not overhead you add if you have spare time; at this scale it is the difference between a job that finishes and a job that loops forever on its own failures.</p>
+</div>
+
+<h2>4. What the Frontier Reports <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The arithmetic above is not a worst-case fantasy; it matches what operators of the largest published runs describe. Public training reports for frontier models read, in their reliability sections, like field notes on a constant stream of hardware faults, and the engineering they describe is overwhelmingly about surviving those faults rather than computing faster. The pattern is consistent across organizations and model families: at the thousand-to-tens-of-thousands GPU scale, interruptions are measured in events per day, and the systems are built to absorb them.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Reliability Reports From Frontier Runs (2024 to 2026)</div>
+<p>The Llama 3 herd-of-models report (Grattafiori et al., Meta, 2024) is the most-cited recent example: training the 405B model on a cluster of 16,384 H100 GPUs, the team logged 466 job interruptions across a 54-day pretraining window, about 78% of them traced to confirmed or suspected hardware issues such as GPU and HBM failures, and they document the checkpointing and automated-recovery tooling built specifically to keep the run alive. Earlier, Meta's OPT-175B logbook (Zhang et al., 2022) recorded dozens of manual restarts and loss-spike recoveries over its run and is studied as an honest account of how messy large-scale training actually is. The reliability theme continues into 2024 to 2026 work on automated failure detection and fast, sharded, asynchronous checkpointing (the lineage of Google's Gemini infrastructure and PyTorch's distributed-checkpoint and TorchElastic stacks), all aimed at the same target: drive the cost of an inevitable interruption toward zero. We unpack the checkpointing half of that response in <a href="section-18.2.html">Section 18.2</a> and the elasticity half in <a href="section-18.4.html">Section 18.4</a>.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: TorchElastic Turns a Fatal Failure Into a Membership Change</div>
+<p>Writing fault tolerance by hand means a watchdog to detect the dead worker, logic to tear down and re-form the process group, and a barrier so survivors reload a consistent checkpoint before resuming, easily hundreds of lines of brittle coordination code. PyTorch's <code>torchrun</code> (the TorchElastic launcher) provides this as a runtime. You launch the job through it and a single failed worker triggers an automatic restart of the process group on the healthy nodes instead of killing the run:</p>
+<pre><code class="language-bash"># Elastic launch: run with anywhere from 4 to 8 healthy nodes, 8 GPUs each.
+# A node failure shrinks the group and restarts from the last checkpoint,
+# instead of hanging the whole job on a dead all-reduce.
+torchrun \
+  --nnodes=4:8 \
+  --nproc_per_node=8 \
+  --max_restarts=50 \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint="$HEAD_NODE:29500" \
+  train.py
+</code></pre>
+<div class="code-caption"><strong>Code 18.1.3:</strong> The <code>--nnodes=4:8</code> range and rendezvous backend let the job tolerate node loss as a membership change rather than a crash. The launcher handles detection, process-group re-formation, and restart that <a href="section-18.4.html">Section 18.4</a> dissects; your script only needs to load from the latest checkpoint on start.</div>
+</div>
+
+<h2>5. The Shape of the Chapter <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The two formulas of Section 1 define every problem this chapter solves, because each piece of machinery is an attack on one term in the cost of an interruption. The cost of a single interruption is, roughly, the work lost since the last save plus the time to detect the failure plus the time to recover and resume. Lowering the first term is checkpointing, made fast and non-blocking in <a href="section-18.2.html">Section 18.2</a> and made correct on resume, with deterministic replay, in <a href="section-18.3.html">Section 18.3</a>. Keeping the job alive across the membership change, rather than tearing it down, is elasticity in <a href="section-18.4.html">Section 18.4</a>. Two failure modes that are not outright crashes get their own treatment: the worker that is alive but slow, handled by straggler detection in <a href="section-18.5.html">Section 18.5</a>, and the worker that is healthy but reclaimed by the cloud, handled by preemption and spot-instance training in <a href="section-18.6.html">Section 18.6</a>. <a href="section-18.7.html">Section 18.7</a> adds memory offload across the hierarchy so that a job survives not only lost workers but exhausted device memory, and <a href="section-18.8.html">Section 18.8</a> closes the loop with the observability needed to see all of this happening in time to react.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Fault Tolerance Scales Out, Too</div>
+<p>The book's spine is that essential activities are distributed across many machines; this chapter shows that <em>reliability itself</em> must be distributed alongside them. The fault-tolerance ideas first met as MapReduce task re-execution in <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a> and as parameter-server recovery in <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a> return here transformed by the hardest constraint yet: a single tightly synchronized computation that cannot tolerate even one missing participant per step. The same primitives, checkpointing and re-execution, reappear in <a href="../../part-7-infrastructure/module-35-reliable-secure-distributed-ai/index.html">Chapter 35</a> as Byzantine-robust aggregation, where the failed worker is not merely absent but adversarial. Reliability, like computation, is something you learn to spread across the cluster.</p>
+</div>
+<p>With the arithmetic of unreliability established, the per-failure cost named term by term, and the chapter mapped onto those terms, the natural first move is to attack the largest and most controllable term: the work lost since the last save. That means writing checkpoints, and writing them fast enough that the saving does not itself become the bottleneck. <a href="section-18.2.html">Section 18.2</a> takes up distributed, sharded, asynchronous checkpointing.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.1.1: Where the MTBF Crosses Your Patience <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the MTBF formula from Section 1 with $p = 0.005$ per GPU per day, reason qualitatively (no code needed) about the smallest GPU count $G$ at which the job-level MTBF drops below one hour. Then explain in words why a run at that scale is unworkable without checkpointing even though each individual GPU is, by the same assumption, expected to run for roughly two hundred days between faults. Connect your answer to the all-or-nothing nature of the synchronous collective described in Section 2.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.1.2: The Optimal Checkpoint Interval <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 18.1.2 into a function of the checkpoint interval $T$ (in hours). Model the expected wasted work per unit of useful time as the sum of two terms: the rewind cost, which grows with $T$ (you lose on average $T/2$ of work per failure, and failures arrive at the job's fault rate), and the write overhead, which shrinks with $T$ (a fixed write time $c$ is paid once per interval). Sweep $T$ over a sensible range for the 4096-GPU job, plot or print total waste against $T$, and report the $T$ that minimizes it. Comment on how the optimum moves as the fault rate or the write cost $c$ changes. This is the calculation <a href="section-18.2.html">Section 18.2</a> formalizes.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.1.3: Budgeting a Real Run <span class="exercise-type analysis">Analysis</span></div>
+<p>You are given 30 days of wall-clock on 8000 GPUs at \$2.50 per GPU-hour. Using the expected-failures formula with $p = 0.005$, estimate the number of interruptions over the run. Assuming checkpointing limits each interruption to 15 minutes of lost-and-recovered wall-clock across all GPUs, estimate the total GPU-hours and dollars spent on recovery, and express it as a fraction of the run's total compute budget. Then redo the estimate for the naive restart-from-scratch policy and state plainly whether that policy could complete the run within the 30-day window at all. Use this to argue, with numbers, why the reliability engineering of this chapter is a budget item and not a luxury.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html"><span class="nav-label">Chapter Overview</span><span class="nav-num">Chapter 18</span><span class="nav-title">Elastic and Fault-Tolerant Distributed Training</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 18</span><span class="nav-num">Contents</span><span class="nav-title">Elastic and Fault-Tolerant Distributed Training</span></a>
+<a class="next" href="section-18.2.html"><span class="nav-label">Next</span><span class="nav-num">Section 18.2</span><span class="nav-title">Distributed Checkpointing</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

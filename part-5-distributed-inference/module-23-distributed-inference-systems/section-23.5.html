@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 23.5: Multi-Model and Multi-Tenant GPU Serving. Packing many models and tenants onto a shared GPU fleet to raise utilization, with co-location, MIG, time-slicing, model multiplexing, and multi-LoRA serving." name="description"/>
+<title>Section 23.5: Multi-Model and Multi-Tenant GPU Serving | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 23: Distributed Inference Systems</a></div>
+<h1>Multi-Model and Multi-Tenant GPU Serving</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They gave me a whole GPU to myself. I answered four requests a second and spent the rest of my life watching the fan spin."</p>
+<cite>A Model Alone on Forty Gigabytes</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A serving platform almost never runs one model that fills one GPU; it runs hundreds of models and tenants, most of them too small or too quiet to justify a GPU each, so the platform's central job is to pack many of them onto shared hardware without letting them trample one another.</strong> The previous sections sized a fleet for a single busy model: replicas, batch-aware routing, and autoscaling on queue depth. Real platforms invert that picture. The typical model is a fine-tuned variant serving a single team at a few requests per second, and giving each one a dedicated accelerator leaves that accelerator idle ninety-eight percent of the time. This section is about reclaiming that idle silicon: co-locating models on one GPU, partitioning a GPU into smaller slices, multiplexing models in and out of memory by traffic, and the technique that makes multi-tenant serving cheap for fine-tuned models, serving many low-rank adapters over one shared base. Every one of these trades isolation for utilization, and the engineering is in choosing where on that trade-off to sit.</p>
+</div>
+<p>Chapters 22 and the first half of this chapter took the model as a given and asked how to serve it fast and at scale. That framing assumes the model is worth a GPU. For the busy frontier model it is, but it is the exception. A mature machine learning platform at a company of any size accumulates models the way a codebase accumulates services: a ranking model here, a fraud scorer there, a dozen fine-tuned language models for as many internal teams, a long tail of experiments that someone forgot to turn off. The arithmetic that follows is unforgiving. A modern accelerator can answer hundreds or thousands of requests per second, and the median model in that catalog sees a handful. Dedicating one GPU per model is the natural first design and the most expensive mistake a platform can make. The whole subject of this section is how to stop making it.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Top: many small models each pinned to its own nearly idle GPU. Bottom left: the same models co-located onto a few shared GPUs. Bottom right: one base model in GPU memory with many small LoRA adapters stacked on top of it.">
+<defs>
+<marker id="arr235" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.g235 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.m235 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.4; }
+.a235 { fill:#e9f6ee; stroke:#1f8a4c; stroke-width:1.3; }
+.base235 { fill:#eaf0fb; stroke:#3a5fa8; stroke-width:1.6; }
+.t235 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s235 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.h235 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.l235 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr235); }
+</style>
+<text class="h235" x="230" y="22">Dedicated: one GPU per model (idle)</text>
+<g>
+<rect class="g235" x="40" y="36" width="80" height="58" rx="7"/>
+<rect class="m235" x="52" y="46" width="56" height="16" rx="3"/>
+<text class="s235" x="80" y="84">~2% used</text>
+<rect class="g235" x="140" y="36" width="80" height="58" rx="7"/>
+<rect class="m235" x="152" y="46" width="56" height="16" rx="3"/>
+<text class="s235" x="180" y="84">~2% used</text>
+<rect class="g235" x="240" y="36" width="80" height="58" rx="7"/>
+<rect class="m235" x="252" y="46" width="56" height="16" rx="3"/>
+<text class="s235" x="280" y="84">~2% used</text>
+<rect class="g235" x="340" y="36" width="80" height="58" rx="7"/>
+<rect class="m235" x="352" y="46" width="56" height="16" rx="3"/>
+<text class="s235" x="380" y="84">~2% used</text>
+</g>
+<text class="s235" x="230" y="110">N quiet models burn N whole GPUs</text>
+<line x1="230" y1="120" x2="230" y2="150" class="l235"/>
+<text class="h235" x="230" y="172">Co-located: pack models onto one GPU</text>
+<rect class="g235" x="70" y="184" width="320" height="120" rx="9"/>
+<text class="s235" x="230" y="202">shared GPU (compute + memory)</text>
+<rect class="m235" x="90" y="214" width="84" height="30" rx="4"/><text class="s235" x="132" y="233">model A</text>
+<rect class="m235" x="184" y="214" width="84" height="30" rx="4"/><text class="s235" x="226" y="233">model B</text>
+<rect class="m235" x="278" y="214" width="92" height="30" rx="4"/><text class="s235" x="324" y="233">model C</text>
+<rect class="m235" x="90" y="252" width="120" height="30" rx="4"/><text class="s235" x="150" y="271">model D</text>
+<rect class="m235" x="220" y="252" width="150" height="30" rx="4"/><text class="s235" x="295" y="271">model E (busier)</text>
+<text class="s235" x="230" y="298">utilization climbs; isolation weakens</text>
+<text class="h235" x="680" y="172">Multi-LoRA: many tenants, one base</text>
+<rect class="base235" x="540" y="200" width="280" height="46" rx="8"/>
+<text class="t235" x="680" y="222">shared base model weights</text>
+<text class="s235" x="680" y="238">loaded once (e.g. 14 GB)</text>
+<rect class="a235" x="540" y="256" width="40" height="22" rx="3"/><text class="s235" x="560" y="271">a1</text>
+<rect class="a235" x="586" y="256" width="40" height="22" rx="3"/><text class="s235" x="606" y="271">a2</text>
+<rect class="a235" x="632" y="256" width="40" height="22" rx="3"/><text class="s235" x="652" y="271">a3</text>
+<rect class="a235" x="678" y="256" width="40" height="22" rx="3"/><text class="s235" x="698" y="271">a4</text>
+<rect class="a235" x="724" y="256" width="40" height="22" rx="3"/><text class="s235" x="744" y="271">a5</text>
+<rect class="a235" x="770" y="256" width="40" height="22" rx="3"/><text class="s235" x="790" y="271">aN</text>
+<text class="s235" x="680" y="296">each adapter ~0.06% of the base</text>
+<line x1="430" y1="244" x2="528" y2="244" class="l235"/>
+<text class="s235" x="478" y="236">tenants</text>
+</svg>
+<figcaption><strong>Figure 23.5.1:</strong> Three ways to place models on GPUs. Top: the naive design gives each quiet model its own accelerator, which then sits nearly idle. Bottom left: co-location packs several models onto one shared GPU until its compute or memory fills, raising utilization at the cost of weaker isolation. Bottom right: multi-LoRA serving keeps one base model resident and stacks many small per-tenant adapters on top, so each additional tenant costs almost no memory. The runnable demo later in this section quantifies both the co-location packing and the adapter saving.</figcaption>
+</figure>
+
+<h2>1. Why a GPU per Model Is the Expensive Default <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Start with the resource that drives the cost. A GPU has a fixed serving capacity, call it $C$ requests per second at full load, and a fixed memory budget $M$. A single model resident on its own GPU consumes the memory of its weights and serves at its own offered rate $\lambda$. Its utilization is $\lambda / C$, and for the median model in a real catalog that ratio is a small fraction of one percent. If a platform hosts $N$ such models, the dedicated design buys $N$ GPUs and runs the whole fleet at an average utilization of</p>
+$$U_{\text{dedicated}} = \frac{\sum_{i=1}^{N} \lambda_i}{N \cdot C},$$
+<p>which, when every $\lambda_i$ is tiny relative to $C$, is a tiny number. The money spent on those GPUs is almost entirely spent on idle silicon. The platform is paying for capacity it provisioned but cannot fill, because the unit of provisioning (a whole GPU) is far coarser than the unit of demand (one quiet model).</p>
+<p>The fix is to make the unit of provisioning finer, so that the capacity a model receives is closer to the capacity it needs. There are three broad ways to do this, and they are not mutually exclusive. The first is co-location: run several whole models in one GPU's memory at once and let them share its compute. The second is partitioning: carve one physical GPU into smaller logical GPUs, each with a slice of the compute and memory, and hand a slice to a model. The third is multiplexing: keep only the models that are currently receiving traffic resident in GPU memory, and swap others in on demand, paying a load cost when a cold model is called. Sections 2 through 4 take these in turn, and the demo in Section 5 measures what they recover.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Unit of Provisioning Must Match the Unit of Demand</div>
+<p>A whole GPU is a coarse unit; a quiet model is a fine demand. Dedicating one to the other guarantees waste proportional to the mismatch. Every technique in this section is a way to shrink the provisioning unit (a memory slice, a time slice, a residency slot, a low-rank adapter) until it fits the demand, so that utilization rises from a fraction of a percent toward something a finance team will tolerate. The recurring tax for shrinking the unit is weaker isolation: the finer you slice, the more tenants share a fate.</p>
+</div>
+
+<h2>2. Co-location, Partitioning, and Time-Slicing <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The simplest form of sharing is co-location: load several models into one GPU's memory and let the serving runtime interleave their kernels. This works when the models are small enough to coexist in memory and quiet enough that their combined offered rate stays under $C$. The runtime time-shares the streaming multiprocessors across whichever model has work to do. Co-location costs almost nothing to adopt, because it is just running more processes against the same device, but it provides the weakest isolation: a sudden burst to one model contends for the same compute as every co-resident neighbor, and a model that leaks memory can evict its roommates.</p>
+<p>Hardware offers a stronger form of sharing through partitioning. NVIDIA's Multi-Instance GPU (MIG) splits one physical accelerator into up to seven isolated instances, each with a dedicated, fenced slice of compute units, memory, and memory bandwidth. A model placed in a MIG slice gets hardware-enforced isolation: a neighbor's burst cannot steal its compute, because the partition is physical. The cost is rigidity, since the slices come in fixed sizes and a model that needs slightly more than one slice must take a whole larger one. Between bare co-location and hard MIG partitions sits the Multi-Process Service (MPS), which lets several processes submit work to the GPU concurrently with lighter-weight, software-level resource limits, trading some of MIG's isolation for finer, reconfigurable sharing. These are the same GPU-sharing mechanisms a cluster scheduler exposes to every workload, and the scheduling layer that decides which models land on which slice is the subject of <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/index.html">Chapter 33</a>; here we are concerned only with how a serving platform uses them to pack models.</p>
+<div class="table-caption"><strong>Table 23.5.1:</strong> Three GPU-sharing mechanisms a serving platform composes, ordered from softest to hardest isolation. Co-location and MPS raise utilization most aggressively; MIG trades some packing density for fenced, predictable performance.</div>
+<table>
+<thead>
+<tr><th scope="col">Mechanism</th><th scope="col">What it shares</th><th scope="col">Isolation</th><th scope="col">Best when</th></tr>
+</thead>
+<tbody>
+<tr><td>Co-location (time-share)</td><td>Whole GPU compute and memory, interleaved per process</td><td>Weak (software, best-effort)</td><td>Many quiet models, latency tolerant</td></tr>
+<tr><td>MPS (concurrent processes)</td><td>Compute with soft per-process limits, shared memory</td><td>Medium (software-enforced limits)</td><td>Bursty models needing some concurrency</td></tr>
+<tr><td>MIG (hardware partition)</td><td>Fenced compute, memory, and bandwidth slices</td><td>Strong (hardware-enforced)</td><td>Tenants with strict QoS or noisy-neighbor risk</td></tr>
+</tbody>
+</table>
+<p>Table 23.5.1 is a spectrum, not a menu of one choice. A real platform might run its noisy or premium tenants on MIG slices for guaranteed performance and pack its long tail of quiet internal models onto co-located shared GPUs, accepting best-effort latency there in exchange for the highest possible packing density. The decision for each model is a function of how much isolation its tenant is willing to pay for, which is exactly the utilization-versus-isolation trade-off we make explicit in Section 6.</p>
+
+<h2>3. Model Multiplexing with Load-on-Demand <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Co-location and partitioning both assume every model is resident in GPU memory all the time. For a catalog of hundreds of models that assumption breaks: their weights together do not fit. Multiplexing relaxes it. Treat GPU memory as a cache of resident models, keep the ones currently receiving traffic loaded, and when a request arrives for a model that is not resident, load it (evicting a cold one if memory is full) before serving. This is the classic cache-and-miss pattern applied to model weights, and it lets a small fleet host a catalog far larger than its aggregate memory, because at any instant only the active subset needs to be present.</p>
+<p>The price is the load cost. Swapping a multi-gigabyte model into GPU memory takes time, anywhere from a fraction of a second to several seconds depending on weight size and where the weights live, and a request that triggers a miss waits for that load before it is served. If $p$ is the fraction of requests that miss and each miss costs $T_{\text{load}}$ seconds of GPU time amortized over a burst of $B$ requests, the serving capacity lost to loading is</p>
+$$\text{capacity lost} = \frac{\lambda \, p \, T_{\text{load}}}{B},$$
+<p>a quantity the platform must keep small by holding the right models resident and by making loads fast. Multiplexing therefore lives or dies on cold-start economics: the cheaper and rarer the load, the more aggressively a platform can multiplex. Making that load cheap (through warm pools, faster weight streaming, and snapshotting) is important enough that the next section, <a href="section-23.6.html">Section 23.6</a>, is devoted to it. For now we treat $T_{\text{load}}$ as a fixed penalty and measure its drag on utilization.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Model That Was Always Asleep When You Called</div>
+<p>An on-demand platform once hosted a demo model that a sales engineer pulled up only during customer calls. It was almost never resident, so every demo opened with an awkward four-second pause while its weights streamed in, right as the prospect was watching. The fix was not a bigger GPU; it was a tiny scheduled job that sent the model one synthetic request a minute before each meeting on the sales calendar, keeping it warm exactly when a human was about to need it. Multiplexing rewards knowing your traffic better than your traffic knows itself.</p>
+</div>
+
+<h2>4. Multi-LoRA: Many Tenants on One Base Model <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The techniques so far treat every model as an opaque blob of weights to be packed, sliced, or swapped. Fine-tuned language models break that assumption in a way the platform can exploit. When a base model is adapted with Low-Rank Adaptation (LoRA), introduced for training in <a href="../../part-4-parallel-deep-learning/module-19-training-foundation-models/section-19.7.html">Section 19.7</a>, the fine-tune does not produce a new full set of weights. It produces a small low-rank update: for a weight matrix $W \in \mathbb{R}^{d \times d}$, the adapter is a pair $A \in \mathbb{R}^{d \times r}$ and $B \in \mathbb{R}^{r \times d}$ with rank $r \ll d$, and the adapted weight is $W + BA$. The adapter's parameter count is $2dr$ against the base layer's $d^2$, a ratio of $2r/d$ that for typical values ($r = 16$, $d = 4096$) is well under one percent.</p>
+<p>This changes multi-tenant serving completely. Instead of holding one full model per tenant, the platform holds <em>one</em> copy of the shared base model in GPU memory and a small adapter per tenant. Serving a request for tenant $t$ means running the base forward pass and applying tenant $t$'s adapter, so $N$ tenants each get their own custom model while the memory cost is one base plus $N$ tiny adapters rather than $N$ full models. A platform can then keep hundreds of customized models hot on a single GPU, switching adapters per request at almost no memory cost. The systems work that makes this efficient at high request rates, batching requests that use <em>different</em> adapters together so the base computation is shared across the batch, is the engine behind the multi-LoRA fleets of <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a>; here we establish the memory arithmetic that motivates it.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: High-Throughput Multi-LoRA and Model Multiplexing (2024 to 2026)</div>
+<p>Serving thousands of LoRA adapters concurrently from one base model became a distinct systems problem and then a solved one. Punica (Chen et al., 2024) introduced a custom batched kernel (Segmented Gather Matrix-Vector multiplication, SGMV) that runs many distinct adapters in a single batch with the base weights fetched once, so adapter count barely affects throughput. S-LoRA (Sheng et al., 2024) pushed this to thousands of adapters per GPU by paging adapter weights in and out of a unified memory pool, much as a paged KV cache manages attention state, and reported serving orders of magnitude more adapters than dedicated copies allow. On the multiplexing side, work in the lineage of AlpaServe (Li et al., 2023) showed that deliberately co-locating models and exploiting statistical multiplexing of bursty traffic can cut the GPUs needed for a latency target severalfold, and production stacks (vLLM, TensorRT-LLM, Ray Serve) now ship multi-LoRA and model-multiplexing support as first-class features. The frontier is dynamic adapter scheduling under tight latency budgets and fair sharing of the shared base across competing tenants.</p>
+</div>
+
+<h2>5. A Demo: Dedicated vs Shared, and Multi-LoRA Memory <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The two ideas at the heart of this section, packing many quiet models onto shared GPUs and stacking many adapters on one base, are both arithmetic, so we can simulate them in pure Python and read the payoff directly. The program below builds a catalog of sixty low-traffic models, sizes a dedicated fleet (one GPU each) and a shared fleet (greedy packing under a compute cap and a memory budget), and charges the shared fleet a load-cost penalty for swapping cold models. It then computes the memory of serving fifty fine-tuned tenants as full copies versus as one base plus fifty LoRA adapters.</p>
+<pre><code class="language-python">import random
+random.seed(7)
+
+CAP = 1000.0          # requests/sec a single GPU can sustain at full load
+LOAD_S = 4.0          # seconds to load one model's weights into GPU memory
+GPU_MEM = 40.0        # GB of GPU memory per device
+N_MODELS = 60
+
+# Each model: a steady request rate (req/s) and a weight size (GB).
+models = []
+for i in range(N_MODELS):
+    rate = random.choice([2, 5, 8, 15, 30, 60])      # most models are low-traffic
+    size = random.choice([3.0, 3.0, 6.0, 12.0])      # weights in GB
+    models.append({"id": i, "rate": rate, "size": size})
+total_rate = sum(m["rate"] for m in models)
+
+# Dedicated: one GPU per model.
+dedicated_gpus = N_MODELS
+dedicated_util = total_rate / (dedicated_gpus * CAP)
+
+# Shared multiplexing: greedily pack models onto GPUs under compute + memory caps.
+gpus = []
+for m in sorted(models, key=lambda x: -x["rate"]):
+    placed = False
+    for g in gpus:
+        if g["load"] + m["rate"] <= CAP and g["mem"] + m["size"] <= GPU_MEM:
+            g["load"] += m["rate"]; g["mem"] += m["size"]; g["models"].append(m["id"])
+            placed = True; break
+    if not placed:
+        gpus.append({"load": m["rate"], "mem": m["size"], "models": [m["id"]]})
+shared_gpus = len(gpus)
+shared_util = total_rate / (shared_gpus * CAP)
+
+# Load-cost penalty: cold misses steal serving capacity (GPU-time spent loading).
+miss_rate, burst = 0.02, 200.0
+swaps_per_sec = total_rate * miss_rate / burst
+load_overhead_gpu_s = swaps_per_sec * LOAD_S
+load_penalty_frac = load_overhead_gpu_s / float(shared_gpus)
+effective_util = total_rate / ((shared_gpus * CAP) * (1 - load_penalty_frac))
+
+print("=== Dedicated vs shared multiplexed serving ===")
+print(f"models                        : {N_MODELS}")
+print(f"total traffic (req/s)         : {total_rate}")
+print(f"dedicated GPUs (1 per model)  : {dedicated_gpus}")
+print(f"dedicated utilization         : {dedicated_util*100:.1f}%")
+print(f"shared GPUs (multiplexed)     : {shared_gpus}")
+print(f"shared utilization            : {shared_util*100:.1f}%")
+print(f"GPU reduction                 : {dedicated_gpus/shared_gpus:.1f}x")
+print(f"load-cost penalty (GPU-time)  : {load_penalty_frac*100:.1f}% lost to swapping")
+print(f"effective shared utilization  : {effective_util*100:.1f}%")
+
+# Multi-LoRA: N tenant adapters share ONE base model in memory.
+base_gb, n_layers, d, r = 14.0, 32, 4096, 16
+n_adapters, bytes_per_param = 50, 2          # fp16
+adapter_params = n_layers * 2 * (d * r)      # A (d x r) and B (r x d) per layer
+adapter_gb = adapter_params * bytes_per_param / 1e9
+dedicated_copies_gb = n_adapters * base_gb
+multilora_gb = base_gb + n_adapters * adapter_gb
+
+print()
+print("=== Multi-LoRA: N adapters on one base model ===")
+print(f"size per adapter (GB)         : {adapter_gb:.3f}")
+print(f"tenants (adapters)            : {n_adapters}")
+print(f"dedicated full copies (GB)    : {dedicated_copies_gb:.1f}")
+print(f"one base + {n_adapters} adapters (GB)   : {multilora_gb:.1f}")
+print(f"memory saving                 : {dedicated_copies_gb/multilora_gb:.1f}x")
+print(f"adapter cost vs base (each)   : {adapter_gb/base_gb*100:.2f}% of base")
+</code></pre>
+<div class="code-caption"><strong>Code 23.5.1:</strong> A from-scratch simulation of model packing and multi-LoRA memory. The first half greedily co-locates sixty quiet models onto shared GPUs and charges a swap penalty; the second half compares fifty full model copies against one base plus fifty low-rank adapters. No GPU or deep-learning library is used; the point is the arithmetic, not the kernels.</div>
+<pre><code class="language-text">=== Dedicated vs shared multiplexed serving ===
+models                        : 60
+total traffic (req/s)         : 977
+dedicated GPUs (1 per model)  : 60
+dedicated utilization         : 1.6%
+shared GPUs (multiplexed)     : 10
+shared utilization            : 9.8%
+GPU reduction                 : 6.0x
+load-cost penalty (GPU-time)  : 3.9% lost to swapping
+effective shared utilization  : 10.2%
+
+=== Multi-LoRA: N adapters on one base model ===
+size per adapter (GB)         : 0.008
+tenants (adapters)            : 50
+dedicated full copies (GB)    : 700.0
+one base + 50 adapters (GB)   : 14.4
+memory saving                 : 48.5x
+adapter cost vs base (each)   : 0.06% of base
+</code></pre>
+<div class="code-caption"><strong>Output 23.5.1:</strong> Sixty quiet models on dedicated GPUs run at 1.6% utilization; packed onto a shared fleet they collapse to ten GPUs at roughly ten percent utilization, a sixfold reduction in hardware, while swapping costs under four percent of fleet GPU-time. Multi-LoRA replaces 700 GB of full copies with 14.4 GB (one base plus fifty adapters), a 48.5-fold memory saving, because each adapter is six hundredths of one percent of the base.</div>
+<p>The two halves of Output 23.5.1 are the section in numbers. Co-location turns a fleet that was almost entirely idle into one that is six times smaller and still mostly idle, which tells you both that sharing pays and that even a packed fleet has room for more tenants before compute, rather than memory, becomes the binding constraint. The multi-LoRA result is the more dramatic: serving fifty customized models for fifty tenants costs essentially the memory of one model, which is why multi-tenant fine-tuned serving is economically possible at all. A platform that did not exploit the low-rank structure would need 700 GB and a rack of GPUs for what fits comfortably on one.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Fine-Tuning Product That Could Not Afford a GPU per Customer</div>
+<p><strong>Who:</strong> A platform team at a startup selling per-customer fine-tuned language assistants.</p>
+<p><strong>Situation:</strong> Each of three hundred customers had a LoRA fine-tune of the same 13-billion-parameter base, and most customers sent only a few requests per minute.</p>
+<p><strong>Problem:</strong> The first design loaded each customer's merged full model on its own GPU instance, which meant three hundred GPUs running at well under one percent utilization and a cloud bill that erased the product's margin.</p>
+<p><strong>Dilemma:</strong> Keep dedicated instances for clean isolation and predictable latency but lose money on every customer, or share aggressively to survive financially and risk one customer's traffic spike degrading another's latency.</p>
+<p><strong>Decision:</strong> They kept the adapters separate from the base and served them with a multi-LoRA runtime, holding one base model resident per GPU and paging hundreds of adapters over it, while reserving dedicated MIG slices only for the handful of enterprise customers who paid for a latency guarantee.</p>
+<p><strong>How:</strong> They stopped merging adapters into full checkpoints, stored each customer's adapter as a small file, and adopted a serving engine that batches requests across different adapters so the base forward pass is shared, exactly the Punica and S-LoRA approach from the research frontier above.</p>
+<p><strong>Result:</strong> Three hundred customers fit on a small fleet instead of three hundred GPUs, utilization rose from a fraction of a percent into a healthy range, and per-customer serving cost fell by more than an order of magnitude, matching the memory arithmetic of Output 23.5.1. The enterprise tenants on MIG slices kept their isolation.</p>
+<p><strong>Lesson:</strong> When tenants share a base model, do not serve them as independent blobs. Exploit the low-rank structure to share the expensive part and isolate only the tenants who pay for isolation.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: vLLM Serves Many LoRA Adapters Over One Base</div>
+<p>The memory arithmetic in Code 23.5.1 motivates multi-LoRA serving; a production engine implements it, including the batched cross-adapter kernel, the adapter paging, and per-request adapter selection. With vLLM you enable LoRA on a base model and pass a different adapter per request, and the engine keeps the base resident while swapping adapters in and out of a managed pool:</p>
+<pre><code class="language-python"># pip install vllm
+from vllm import LLM, SamplingParams
+from vllm.lora.request import LoRARequest
+
+llm = LLM(model="meta-llama/Llama-2-13b-hf", enable_lora=True)   # base loaded ONCE
+sp = SamplingParams(max_tokens=128)
+
+# Two tenants, two adapters, one resident base. Requests can batch together.
+out_a = llm.generate("Summarize the ticket.", sp,
+                     lora_request=LoRARequest("tenant_a", 1, "/adapters/tenant_a"))
+out_b = llm.generate("Draft a reply.", sp,
+                     lora_request=LoRARequest("tenant_b", 2, "/adapters/tenant_b"))
+</code></pre>
+<div class="code-caption"><strong>Code 23.5.2:</strong> Two tenants served from one resident base model with per-request adapters. The dozens of lines of packing and adapter bookkeeping that Code 23.5.1 only sketches collapse to an <code>enable_lora</code> flag plus a <code>LoRARequest</code> per call; vLLM handles the resident base, the adapter pool, the cross-adapter batching kernel, and eviction internally.</div>
+</div>
+
+<h2>6. The Utilization-versus-Isolation Trade-off <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Every technique in this section moves the same single slider. Push it toward utilization and you pack more tenants per GPU, raise the fraction of silicon doing useful work, and lower cost per model; push it toward isolation and you fence tenants off from one another so that no tenant's behavior can hurt another's latency or correctness. The two ends are in genuine tension, because the very thing that raises utilization, sharing a resource, is the thing that lets one tenant's load spill onto another. The central failure mode of shared serving is the noisy neighbor: a tenant whose traffic spike, oversized batch, or memory leak degrades the service every co-resident tenant receives, through no fault of theirs.</p>
+<p>A platform manages this tension with fairness and quality-of-service controls rather than by retreating to dedicated GPUs. Per-tenant rate limits and quotas cap how much of a shared GPU any one tenant can consume, so a spike is shed at the door instead of starving neighbors. QoS classes let the platform promise tight latency to premium tenants (placed on fenced MIG slices or given priority in the request scheduler) while the long tail of internal models shares co-located capacity on a best-effort basis. The art is to sit as far toward utilization as each tenant's contract allows: hard isolation only where it is paid for, aggressive sharing everywhere else. This is the same statistical-multiplexing bet that underlies all shared infrastructure, that not every tenant peaks at once, made safe by quotas that bound the damage when the bet occasionally loses.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Per-Node Economics, Multiplied Across the Fleet</div>
+<p>Chapter 22 established the per-node serving numbers, how much a single GPU costs and how many requests it can answer, as a labeled scale-up prerequisite. This section is where those numbers become a distributed-systems problem. Utilization, the noisy-neighbor effect, multi-LoRA packing, and QoS classes are all properties of the <em>fleet</em>, not of one node, and they exist precisely because the platform refuses to let any one model own a node it cannot fill. The same per-node KV-cache and memory economics return, multiplied across many tenants and many machines, as the core of distributed LLM serving in <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a>. Scale-out here is not about making one model bigger; it is about making one fleet serve far more models than it has GPUs.</p>
+</div>
+<p>We have now turned the idle-GPU problem into a packing problem and shown three answers (share the device, slice the device, swap models through the device) plus the adapter trick that makes multi-tenant fine-tuned serving nearly free in memory. The one cost we deferred throughout is the load cost: every multiplexing scheme pays it on a miss, and a platform that multiplexes aggressively pays it often. Making that cold start fast, through warm pools, weight streaming, and snapshotting, is what stands between a clever packing plan and a usable one. That is the subject of <a href="section-23.6.html">Section 23.6</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.5.1: Pick the Sharing Mechanism <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each tenant, choose co-location, MPS, or a MIG slice from Table 23.5.1, and justify the choice in terms of the utilization-versus-isolation trade-off: (a) a paying enterprise customer with a contractual 50-millisecond p99 latency on a steady, moderate request rate; (b) forty internal experiment models, each receiving a handful of requests per hour, with no latency commitment; (c) a marketing model that is quiet most of the week but bursts to thousands of requests per second during scheduled campaigns. Explain what goes wrong if you place tenant (a) on co-located shared GPUs with tenant (c).</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.5.2: Vary the Load Cost <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 23.5.1 to sweep the miss rate $p$ from 0 to 0.3 and the per-load time $T_{\text{load}}$ from 0.5 to 8 seconds, and plot (or tabulate) the effective shared utilization for each combination. Identify the region where the load-cost penalty consumes more than a quarter of the fleet's GPU-time, making multiplexing a net loss. Then add a simple residency policy: keep the busiest $k$ models always resident so they never miss, and show how increasing $k$ shifts the break-even boundary. Relate your findings to why the warm-pool techniques of Section 23.6 matter.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.5.3: When Does Multi-LoRA Stop Saving? <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the multi-LoRA arithmetic in Code 23.5.1, derive the adapter rank $r$ at which serving $N$ tenants as one base plus $N$ adapters costs the same GPU memory as serving them as $N$ full copies, as a function of $N$, the base size, the hidden dimension $d$, and the number of adapted layers. For a 14 GB base with $d = 4096$ and 32 adapted layers, at what rank does the memory saving fall below 2x for $N = 50$ tenants? Discuss why, in practice, the compute cost of applying many distinct adapters in one batch (not the memory) is the constraint that eventually binds, and which research-frontier system from Section 4 addresses it.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-23.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 23.4</span><span class="nav-title">Autoscaling on GPU Utilization and Queue Depth</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 23</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Inference Systems</span></a>
+<a class="next" href="section-23.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 23.6</span><span class="nav-title">Large-Model Loading, Cold Starts, and Warm Pools</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

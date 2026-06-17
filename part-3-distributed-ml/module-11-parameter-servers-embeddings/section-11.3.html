@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 11.3: Centralized and Sharded Parameter Servers. Why one central server is a bandwidth and memory bottleneck, how key-sharding turns it into aggregate bandwidth that scales with server count, and why a hot key still unbalances one shard." name="description"/>
+<title>Section 11.3: Centralized and Sharded Parameter Servers | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Distributed Machine Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 11: Parameter Servers and Distributed Embeddings</a></div>
+<h1>Centralized and Sharded Parameter Servers</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They promised me I would hold the whole model. They did not mention that ten thousand workers would all want their slice of me at once, every millisecond, forever."</p>
+<cite>A Parameter Server Under Mild Staleness</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A parameter server stops being a server the moment its single machine runs out of memory to hold the parameters or bandwidth to serve them; the fix is to split the parameters across many server nodes by key, so that the workers' traffic fans out and the system's capacity grows with the number of servers instead of being capped by one.</strong> In the previous section we built the push-pull contract between workers and one logical server. Now we make that server real at scale. One box cannot hold a terabyte of embeddings, and even if it could, every worker pulling and pushing through one network card would queue behind every other worker. Sharding the key space across $S$ servers turns a central bottleneck into aggregate bandwidth, the same partitioning idea introduced in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.3.html">Section 2.3</a>. The catch, which this section makes concrete with a runnable measurement, is that sharding only balances the load when the keys are accessed evenly; one popular item embedding can pin an entire shard.</p>
+</div>
+<p>The push-pull architecture of <a href="section-11.2.html">Section 11.2</a> treated the server as a single logical store of parameters: workers pull the current weights, compute gradients, and push them back. That logical picture is correct and we keep it. What we did not say is how many physical machines sit behind that logical store. The simplest answer, one machine, is where every parameter-server story begins and where it almost immediately ends, because a single server hits two ceilings at once. It can hold only as many parameters as fit in its memory, and it can serve only as many bytes per second as its network interface delivers. A recommendation model with billions of embedding rows blows past the first ceiling; a training job with thousands of workers all pulling each step blows past the second. This section is about removing both ceilings by the same move the rest of the book keeps making: partition the work across more machines.</p>
+
+<h2>1. Why One Central Server Cannot Hold <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Consider what a single parameter server must do each training step. Every one of $W$ workers pulls a copy of the parameters it needs and later pushes a gradient of the same shape. If the model has $P$ parameters of 4 bytes each, and for simplicity every worker touches the whole model, the server must move on the order of $2 \cdot W \cdot P \cdot 4$ bytes per step, out for the pull and back in for the push. The two quantities that determine whether this is survivable are the server's memory, which must hold $4P$ bytes of parameters plus optimizer state, and the server's network bandwidth $B$, which sets a floor of $2 W P \cdot 4 / B$ seconds on every step no matter how fast the workers compute.</p>
+<p>Both terms grow in directions you do not control. Memory grows with the model: modern recommendation systems carry embedding tables far larger than any single machine's RAM, a problem we confront directly in <a href="section-11.6.html">Section 11.6</a>. Bandwidth pressure grows with the worker count: doubling the workers to train faster also doubles the bytes the one server must shovel, so past a point adding workers makes each step slower, not faster. A single central server is therefore not a small version of a distributed parameter server; it is a different thing that stops working at exactly the scale where you needed it.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Central Server Has a Fixed Capacity, the Workload Does Not</div>
+<p>One server offers a fixed memory budget and a fixed bandwidth $B$, but the load on it grows with both the model size $P$ and the worker count $W$. The per-step service time $2 W P \cdot 4 / B$ rises without bound while $B$ stays put, so a central server is a bottleneck by construction, not by misconfiguration. Sharding is the structural fix: spread the parameters over $S$ servers and the aggregate bandwidth becomes $S \cdot B$, a ceiling that you raise by buying more machines rather than a faster card.</p>
+</div>
+
+<h2>2. Sharding the Key Space Across Servers <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The parameters of a model are addressable by key: weight matrix $W_3$ row $4{,}812$, or embedding row for item $98{,}214$, or simply a flat index into a parameter vector. Because parameters are keyed, we can partition them exactly the way <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.3.html">Section 2.3</a> partitions any keyed dataset: assign each key to one of $S$ servers by a deterministic function of the key. The cleanest such function hashes the key and takes the result modulo $S$, so that server $s$ owns the keys with $\text{hash}(k) \bmod S = s$. Each server holds roughly $1/S$ of the parameters and answers only for its own keys.</p>
+<p>A worker that needs keys spread across the model no longer talks to one machine. It groups the keys it wants by their owning shard, sends one pull request to each relevant server, and waits for the parts to come back; a push fans out the same way, routing each gradient to the server that owns its key. The logical push-pull contract is unchanged, but underneath it the traffic is now spread over $S$ network cards instead of funneled through one. If $W$ workers each touch the whole model uniformly, every server sees about $1/S$ of the total bytes, and the per-step service floor falls from $2 W P \cdot 4 / B$ to $2 W P \cdot 4 / (S B)$. That is the whole payoff: the central bottleneck becomes aggregate bandwidth that scales with the server count.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of two workers routing keyed pull and push requests through a hash-modulo router to four server shards; one shard holding a hot key is drawn larger and shaded to show it is overloaded.">
+<defs>
+<marker id="arr113" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b113 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w113 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.hot113 { fill:#f7d9d4; stroke:#b0322a; stroke-width:2; }
+.t113 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.th113 { font:600 14px sans-serif; fill:#b0322a; text-anchor:middle; }
+.s113 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l113 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr113); }
+</style>
+<text class="t113" x="100" y="40">Workers</text>
+<rect class="w113" x="40" y="56" width="120" height="48" rx="8"/>
+<text class="t113" x="100" y="85">Worker 1</text>
+<rect class="w113" x="40" y="120" width="120" height="48" rx="8"/>
+<text class="t113" x="100" y="149">Worker 2</text>
+<rect class="b113" x="250" y="78" width="150" height="68" rx="10"/>
+<text class="t113" x="325" y="105">Router</text>
+<text class="s113" x="325" y="125">shard = hash(key)</text>
+<text class="s113" x="325" y="139">mod S</text>
+<line x1="160" y1="80" x2="246" y2="100" class="l113"/>
+<line x1="160" y1="144" x2="246" y2="124" class="l113"/>
+<text class="t113" x="640" y="28">Server shards (key space partitioned)</text>
+<rect class="b113" x="470" y="48" width="150" height="46" rx="8"/>
+<text class="t113" x="545" y="70">Shard 0</text>
+<text class="s113" x="545" y="86">keys hash to 0</text>
+<rect class="b113" x="470" y="104" width="150" height="46" rx="8"/>
+<text class="t113" x="545" y="126">Shard 1</text>
+<text class="s113" x="545" y="142">keys hash to 1</text>
+<rect class="hot113" x="455" y="162" width="180" height="74" rx="8"/>
+<text class="th113" x="545" y="188">Shard 2 (HOT)</text>
+<text class="s113" x="545" y="206">holds popular key 42</text>
+<text class="s113" x="545" y="222">65% of all traffic</text>
+<rect class="b113" x="470" y="246" width="150" height="46" rx="8"/>
+<text class="t113" x="545" y="268">Shard 3</text>
+<text class="s113" x="545" y="284">keys hash to 3</text>
+<path class="l113" d="M 400 100 L 466 71"/>
+<path class="l113" d="M 400 110 L 466 127"/>
+<path class="l113" d="M 400 124 L 451 192"/>
+<path class="l113" d="M 400 134 L 466 269"/>
+<text class="s113" x="710" y="200">one shard saturates</text>
+<text class="s113" x="710" y="216">while the rest idle</text>
+</svg>
+<figcaption><strong>Figure 11.3.1:</strong> A sharded parameter server. Workers route each keyed pull or push through a hash-modulo rule to the server that owns the key, so traffic fans out across $S$ shards instead of one central machine. When access is even, every shard carries about $1/S$ of the load; when one key is hot (here key 42 on shard 2), that shard absorbs a disproportionate share and saturates while the others sit nearly idle, the skew problem this section measures.</figcaption>
+</figure>
+<p>The hash-modulo rule of Figure 11.3.1 is the simplest placement, and it has one well-known weakness: if you change $S$ (add or remove a server), almost every key's $\text{hash}(k) \bmod S$ changes, so the whole table reshuffles. Production systems avoid that with consistent hashing, which maps keys and servers onto the same ring so that adding a server moves only about $1/S$ of the keys instead of nearly all of them. We use plain modulo in this section's demo because the load-balancing behavior we want to expose is identical and the code stays readable; the consistent-hashing refinement is a placement detail layered on top of the same idea, covered as a partitioning technique in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.3.html">Section 2.3</a>.</p>
+
+<h2>3. The Hot Key: Skew Comes Back <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Sharding balances the load only under an assumption that real workloads violate: that keys are accessed uniformly. They are not. In a recommendation model the embedding for a blockbuster movie or a viral product is pulled and updated far more often than the embedding for an obscure one. Whichever shard happens to own that hot key inherits a flood of traffic that the hash function spread nowhere, because all those requests carry the same key and the same key maps to one shard. This is precisely the data-skew problem that haunted the Spark shuffle in <a href="../../part-2-distributed-data/module-07-spark-dataframes/section-7.7.html">Section 7.7</a>: a uniform partitioning function gives a uniform load only on a uniform key distribution, and a skewed distribution concentrates the work on whichever partition holds the heavy keys.</p>
+<p>The next program makes the effect measurable. It shards a key space of 100,000 keys across $S = 8$ servers with the same hash-modulo rule, then issues two million access operations under two distributions: uniform, where every key is equally likely, and skewed, where 60 percent of accesses hit a single hot key and the remaining 40 percent spread evenly. It counts how many accesses land on each shard. Nothing about the sharding changes between the two runs; only the access pattern does.</p>
+<pre><code class="language-python">import hashlib, random
+
+S = 8                      # number of server shards
+KEYS = 100_000             # distinct parameter keys (e.g. embedding rows)
+ACCESSES = 2_000_000       # total push/pull operations issued by the workers
+
+def shard_of(key):
+    # consistent placement: hash the key, take it modulo the shard count
+    h = hashlib.blake2b(str(key).encode(), digest_size=8).digest()
+    return int.from_bytes(h, "big") % S
+
+random.seed(0)
+
+# ---- Uniform access: each pull/push touches a key drawn evenly ----
+uniform = [0] * S
+for _ in range(ACCESSES):
+    k = random.randrange(KEYS)              # every key equally likely
+    uniform[shard_of(k)] += 1
+
+# ---- Skewed access: one hot key (a popular item embedding) dominates ----
+# 60% of accesses hit a single hot key; the rest spread uniformly.
+HOT_KEY = 42
+skewed = [0] * S
+for _ in range(ACCESSES):
+    k = HOT_KEY if random.random() &lt; 0.60 else random.randrange(KEYS)
+    skewed[shard_of(k)] += 1
+
+def report(name, load):
+    total = sum(load)
+    mean = total / S
+    hi = max(load)
+    bars = " ".join(f"{c/total:5.1%}" for c in load)
+    print(name)
+    print(f"  per-shard share     : {bars}")
+    print(f"  busiest shard       : {hi:,} accesses ({hi/total:.1%} of all)")
+    print(f"  imbalance (max/mean): {hi/mean:.2f}x")
+    print()
+
+print(f"servers S = {S}, keys = {KEYS:,}, accesses = {ACCESSES:,}")
+print(f"hot key {HOT_KEY} lives on shard {shard_of(HOT_KEY)}")
+print()
+report("UNIFORM access", uniform)
+report("SKEWED access (60% on one hot key)", skewed)
+</code></pre>
+<div class="code-caption"><strong>Code 11.3.1:</strong> Routing a keyed workload across $S$ server shards and counting per-shard load under uniform versus skewed access. The placement rule is identical in both runs; only the key distribution differs, isolating skew as the sole cause of any imbalance.</div>
+<pre><code class="language-text">servers S = 8, keys = 100,000, accesses = 2,000,000
+hot key 42 lives on shard 2
+
+UNIFORM access
+  per-shard share     : 12.5% 12.6% 12.5% 12.4% 12.4% 12.5% 12.5% 12.5%
+  busiest shard       : 252,527 accesses (12.6% of all)
+  imbalance (max/mean): 1.01x
+
+SKEWED access (60% on one hot key)
+  per-shard share     :  5.0%  5.0% 65.0%  5.0%  5.0%  5.0%  5.0%  5.0%
+  busiest shard       : 1,299,769 accesses (65.0% of all)
+  imbalance (max/mean): 5.20x
+</code></pre>
+<div class="code-caption"><strong>Output 11.3.1:</strong> Under uniform access the eight shards each carry about 12.5 percent of the load, an imbalance of 1.01x, almost perfect. The single hot key pushes shard 2 to 65 percent of all traffic, a 5.20x imbalance, so one shard does the work of five while the other seven idle. Sharding raised the ceiling but did not flatten the load.</div>
+<p>The uniform run confirms the promise of Section 2: eight shards, eight near-equal slices, an imbalance of 1.01x that would let the system serve roughly eight times the traffic of one central server. The skewed run confirms the threat: shard 2, which happens to own key 42, carries 65 percent of all accesses and runs 5.20 times hotter than the average shard. The aggregate bandwidth $S B$ is real, but a single worker's step is gated by the slowest shard it must wait for, and that shard is the hot one. The fix is not more shards (the hot key would still land on exactly one of them); it is to break the hot key itself, by replicating its parameter across several servers for reads or splitting its updates, which is the subject of the next two callouts and of replication below.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Shard That Met a Celebrity</div>
+<p>Add a wildly popular new item to a recommendation catalog and you can watch one parameter shard light up like a switchboard during a telethon. Engineers have a name for the keys that do this, "celebrity keys" or "hot keys", and a folklore remedy that sounds like a contradiction: store the celebrity in several places at once so no single shard has to take all its calls. The hot key does not care how cleverly you hashed it; fame routes to a single address unless you deliberately give it more.</p>
+</div>
+
+<h2>4. Replication: Availability and Read Throughput <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Sharding solves capacity but introduces a fragility: each parameter now lives on exactly one server, so if that server crashes, the slice of the model it held is gone and training stalls. It also means a hot key's reads all hit one machine. Replication addresses both. Keep $r$ copies of each shard on $r$ different servers; a write must update the copies (or a designated primary that propagates the change), but a read can be served by any replica. For availability this means losing one server costs you nothing, because a replica still holds the shard, the fault-tolerance property we develop fully in <a href="section-11.8.html">Section 11.8</a>. For read throughput it means a hot key's pull traffic can be spread across $r$ replicas instead of crushing one, turning the 5.20x imbalance of Output 11.3.1 into something closer to $5.20 / r$ for reads.</p>
+<p>Replication is not free, and the tension is the familiar one from <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.3.html">Section 2.3</a>: more replicas give more read throughput and more resilience but cost more memory ($r$ copies of the parameters) and make writes more expensive, because a gradient push must reach every replica to keep them consistent, or accept that replicas drift slightly between syncs. Parameter servers exploit a property that ordinary databases cannot: machine learning training already tolerates a little staleness, so replicas need not be perfectly synchronized after every push. That tolerance is what makes aggressive replication and asynchronous updates practical here, and it is the bridge to <a href="section-11.4.html">Section 11.4</a>, which asks how synchronized the updates across servers and workers really need to be.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Embedding Table That Outgrew Its Server</div>
+<p><strong>Who:</strong> A machine learning platform engineer at a video-streaming service running the recommendation model.</p>
+<p><strong>Situation:</strong> The item-embedding table reached 400 GB and no longer fit on the single parameter-server box that had served it since launch.</p>
+<p><strong>Problem:</strong> Training workers stalled waiting on that one server, and a planned catalog expansion would push the table past 700 GB, well beyond any single machine.</p>
+<p><strong>Dilemma:</strong> Rent one enormous high-memory instance, simple but capped and costly, or shard the embedding table across many ordinary servers, cheaper and scalable but requiring keyed routing, replication, and a hot-key story.</p>
+<p><strong>Decision:</strong> They sharded the table across sixteen servers by hashing the item id, because memory was the binding ceiling and only sharding raises it by adding machines rather than buying a bigger one.</p>
+<p><strong>How:</strong> Workers grouped each batch's item ids by shard and issued one pull per relevant shard; the three hottest items were replicated across four servers each so their read traffic spread, exactly the remedy Output 11.3.1 motivates.</p>
+<p><strong>Result:</strong> The table now fits with headroom, per-step wait time fell because traffic fanned out across sixteen network cards, and the previously saturated shards dropped to roughly even load once the celebrity items were replicated.</p>
+<p><strong>Lesson:</strong> Shard for capacity, then replicate the few hot keys for balance and availability. Sharding alone raises the ceiling; only attacking the hot key flattens the load beneath it.</p>
+</div>
+
+<h2>5. The Li et al. Design and Aggregate Bandwidth <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The architecture this section describes is the one Mu Li and colleagues formalized in their 2014 parameter-server design, the reference point for nearly every keyed parameter store since. Their system splits parameters across a group of server nodes, each owning a range of the key space, with a server manager that tracks which node holds which keys and replicates ranges for fault tolerance. Workers hold a shard of the training data and a routing layer that turns a set of keys into per-server requests, exactly the fan-out of Figure 11.3.1. Two design choices make it scale: parameters and gradients are communicated as sparse key-value pairs, so a worker moves only the keys it actually touched rather than the whole model, and updates are aggregated on the server side, so a server applies the combined effect of many workers' pushes to its slice.</p>
+<p>The reason the design scales is the arithmetic of Section 2 read in reverse. A central server offers bandwidth $B$; the sharded server offers $S B$, because $S$ independent machines each serve their slice in parallel over their own network card. As long as the access pattern is reasonably uniform, throughput rises almost linearly with $S$, which is why these systems were demonstrated on hundreds of server nodes serving models with billions of parameters. The qualifier "reasonably uniform" is the entire content of Section 3: the aggregate bandwidth is a ceiling the workload reaches only when no single shard is hot. This same sharded-store-with-aggregation pattern returns, transformed, when we shard a single model's weights and optimizer state across devices in <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>; the parameter server shards a key-value store across machines, ZeRO and FSDP shard one contiguous weight tensor across accelerators, but the move (split by key or index, fan out the traffic, aggregate the result) is the same.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Partitioning Returns as Sharded Parameters</div>
+<p>The partitioning of a keyed dataset across machines, introduced abstractly in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.3.html">Section 2.3</a>, is here applied to the parameters themselves: the model becomes a partitioned key-value store. The same idea, with the same skew caveat, will return as sharded model state in <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a> and as sharded vector indexes in <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a>. Each time you meet a system that "scales to billions" of something, look for the key it shards on and ask what happens when one key gets hot; the answer is almost always the lesson of Output 11.3.1.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Hot-Key Handling in Trillion-Parameter Embedding Stores (2024 to 2026)</div>
+<p>The hot-key problem of Output 11.3.1 is an active engineering frontier precisely because recommendation embedding tables keep growing into the trillions of parameters. Recent industrial systems attack skew with hardware-software co-design: NVIDIA's HugeCTR and its HierarchicalKV backend (2024) cache the hottest embedding rows in GPU high-bandwidth memory while the cold tail lives in host memory or on remote shards, so a celebrity key is served from the fastest tier rather than crushing one cold shard. Meta's work on terabyte-scale embeddings reports frequency-aware sharding that places hot rows on dedicated, replicated shards and even quantizes or dimension-reduces the long cold tail to fit the memory budget. Parallel lines on "in-network aggregation" push gradient combining into programmable switches to relieve the busiest server's inbound bandwidth. The common thread for 2024 to 2026 is that uniform hash sharding is treated as a baseline to be corrected with access-frequency information, never as the final word; we apply the same frequency-aware thinking to embedding tables directly in <a href="section-11.6.html">Section 11.6</a> and to distributed recommendation in <a href="../../part-8-case-studies/module-38-case-distributed-recommendation/index.html">Chapter 38</a>.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Ray Puts the Shard on a Server With One Decorator</div>
+<p>Code 11.3.1 routed keys to shards by hand to expose the load, but you do not implement a sharded parameter server from scratch in production. A Ray actor is a stateful process pinned to a node; declaring $S$ of them gives you $S$ server shards, and the routing collapses to choosing an actor by the key's hash:</p>
+<pre><code class="language-python"># pip install ray
+import ray
+ray.init()
+
+@ray.remote
+class ParamShard:                              # one actor == one server shard
+    def __init__(self): self.params = {}
+    def pull(self, keys):  return {k: self.params.get(k, 0.0) for k in keys}
+    def push(self, grads):                     # server-side aggregation
+        for k, g in grads.items(): self.params[k] = self.params.get(k, 0.0) - 0.05 * g
+
+S = 8
+shards = [ParamShard.remote() for _ in range(S)]          # S processes, S nodes
+def shard_for(key): return shards[hash(key) % S]          # route by key
+ray.get(shard_for(42).push.remote({42: 1.3}))             # push lands on one shard
+</code></pre>
+<div class="code-caption"><strong>Code 11.3.2:</strong> The sharded parameter server of Code 11.3.1 as eight Ray actors. The roughly forty lines of manual routing, process management, and per-shard state collapse to one decorator and a hash; Ray handles process placement, the network transport of <code>pull</code> and <code>push</code>, and restart of a failed actor, leaving only the key-to-shard rule for you to choose.</div>
+</div>
+
+<h2>6. What Sharding Bought, and What It Did Not <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Sharding the parameter server converts a fixed-capacity central machine into a system whose memory and bandwidth grow with the server count $S$. That is a real and necessary win: it is the only way a 400 GB or 7 TB embedding table runs at all, and it is the only way thousands of workers pull each step without queuing behind one network card. Replication layers availability and read scaling on top, at the cost of memory and write coordination, with machine learning's tolerance for staleness softening the coordination cost in a way ordinary storage systems cannot enjoy.</p>
+<p>What sharding did not buy is freedom from skew. The aggregate bandwidth $S B$ is a ceiling reached only when the load spreads evenly, and real keyed workloads, recommendation embeddings most of all, are sharply skewed. The hot key is the same adversary that unbalanced the MapReduce and Spark shuffles, met again at the parameter layer, and it is handled by the same family of remedies: replicate the heavy key, split its updates, or route its traffic specially. With the physical layout of the server settled (how many machines, partitioned by key, replicated for safety), the next question is one of timing: when many workers and many server shards all push and pull at once, how tightly must their updates be synchronized? That is where <a href="section-11.4.html">Section 11.4</a> begins.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.3.1: Why More Shards Will Not Cool a Hot Key <span class="exercise-type conceptual">Conceptual</span></div>
+<p>In Output 11.3.1, shard 2 carries 65 percent of the traffic because it owns the single hot key. Suppose you double the server count from 8 to 16 to relieve it. Explain precisely why the hot shard's <em>share</em> of traffic does not fall in proportion, and what the imbalance (max/mean) would do instead. Then name two mechanisms from Section 4 that <em>do</em> reduce the hot shard's load, and state which one helps reads, which helps writes, and which helps availability.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.3.2: Replicate the Hot Key <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 11.3.1. Detect the hottest key (the one with the most accesses) and replicate it across $r = 4$ shards, routing each <em>read</em> of that key to one of its $r$ replicas chosen at random while keeping all other keys on their single shard. Re-run the skewed workload and report the new per-shard load and imbalance. By how much did replicating one key reduce the busiest shard's share, and what is the residual imbalance once the hot key is spread? Discuss why this helps reads but would complicate writes.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.3.3: Bandwidth Ceiling of Central vs Sharded <span class="exercise-type analysis">Analysis</span></div>
+<p>A model has $P = 2 \times 10^9$ parameters of 4 bytes each, $W = 500$ workers each pulling and pushing the full model every step, and each server has network bandwidth $B = 12.5$ gigabytes per second. Using the per-step service floor $2 W P \cdot 4 / (S B)$, compute the minimum seconds per step for a single central server ($S = 1$) and for a sharded server with $S = 50$, assuming uniform access. Then argue, from Output 11.3.1, how a single hot key carrying 65 percent of traffic changes the effective per-step floor for the sharded case, and why that brings you back to the remedies of Section 4. We make this bandwidth accounting rigorous in <a href="../module-10-distributed-optimization/index.html">Chapter 10</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-11.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 11.2</span><span class="nav-title">Push-Pull Architecture</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 11</span><span class="nav-num">Contents</span><span class="nav-title">Parameter Servers and Distributed Embeddings</span></a>
+<a class="next" href="section-11.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 11.4</span><span class="nav-title">Synchronous and Asynchronous Updates</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

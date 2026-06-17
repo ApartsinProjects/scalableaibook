@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 19.6: Orchestrating Distributed Pretraining. How data, tensor, pipeline, and expert parallelism compose into one foundation-model pretraining run, the training recipe at scale, and why Model FLOPs Utilization is the central performance goal." name="description"/>
+<title>Section 19.6: Orchestrating Distributed Pretraining | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 19: Training Foundation Models at Scale</a></div>
+<h1>Orchestrating Distributed Pretraining</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They spent four chapters teaching me to shard, to pipeline, to route, and to recover. Then one Tuesday they switched everything on at once and asked me to behave like a single calm machine for ninety days."</p>
+<cite>A Cluster Mid-Pretraining, Day Forty-One</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A foundation-model pretraining run is the moment every parallelism in Part IV stops being a separate technique and becomes one composed system: a data loader streaming tokenized shards into a model that is simultaneously data-parallel, tensor-parallel, pipeline-parallel, and possibly expert-parallel, all running under elastic checkpointing while a team watches loss curves and utilization dashboards for months.</strong> Nothing here is new machinery; the machinery was built in Chapters 15 through 18. What is new is the orchestration: choosing the parallel degrees that tile your cluster, wiring the training recipe (warmup, decay, clipping, large-batch scaling) so a 2048-GPU run stays numerically stable, and treating Model FLOPs Utilization as the single number that decides whether your millions of dollars of compute are doing arithmetic or waiting on the network. This section is where the chapters compose.</p>
+</div>
+<p>By this point in the book the individual parallelisms are familiar tools. Data parallelism replicates the model and synchronizes gradients with an all-reduce (<a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a>). Tensor and pipeline parallelism split one model that no single device can hold (<a href="../module-16-model-pipeline-sharded-parallelism/section-16.9.html">Chapter 16</a>). Expert parallelism routes tokens to experts scattered across machines (<a href="../module-17-expert-parallelism-moe/index.html">Chapter 17</a>). Elastic, fault-tolerant training keeps a thousand-GPU job alive through constant hardware failures (<a href="../module-18-elastic-fault-tolerant-training/index.html">Chapter 18</a>). A real pretraining run uses all of them at once, on the same step, for weeks. Orchestrating that composition, deciding how much of each parallelism to apply, how to feed it data, and how to keep it efficient and alive, is the subject of this section and the practical heart of the chapter.</p>
+
+<h2>1. Assembling the Parallelism: Mapping a Model onto a Cluster <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The first decision in any pretraining run is how to lay the model across the GPUs. You have a fixed cluster of $N$ accelerators and several orthogonal ways to split work, and the product of the chosen degrees must exactly equal the world size. For a dense transformer the three classic axes are tensor parallel (TP), pipeline parallel (PP), and data parallel (DP), giving the well-known 3D-parallel mapping. The constraint is a single identity,</p>
+$$N = d_{\text{TP}} \cdot d_{\text{PP}} \cdot d_{\text{DP}},$$
+<p>and when the model is a mixture of experts you add a fourth factor $d_{\text{EP}}$ for expert parallelism, making it 4D. The art is not in the arithmetic but in matching each axis to the hardware level whose bandwidth it can afford. Tensor parallelism exchanges activations on every layer, so it must stay inside one node where NVLink is fast; pushing it across nodes collapses utilization. Pipeline parallelism only passes a thin activation tensor between adjacent stages, so it tolerates the slower inter-node fabric and is the natural way to span nodes to fit a model that does not fit in one. Data parallelism communicates once per step (the gradient all-reduce) and soaks up whatever GPUs remain to raise throughput.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The pretraining stack: a streaming data loader feeds a 3D-parallel model laid across a GPU cluster, with checkpointing to durable storage and a monitoring loop watching loss and Model FLOPs Utilization.">
+<defs>
+<marker id="arr196" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b196 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w196 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g196 { fill:#eef6ee; stroke:#2f7d32; stroke-width:1.6; }
+.t196 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s196 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l196 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr196); }
+</style>
+<!-- data loader -->
+<rect class="w196" x="20" y="150" width="130" height="110" rx="10"/>
+<text class="t196" x="85" y="180">Data loader</text>
+<text class="s196" x="85" y="200">tokenized</text>
+<text class="s196" x="85" y="216">shards (Ch 8)</text>
+<text class="s196" x="85" y="236">stream &amp;</text>
+<text class="s196" x="85" y="252">prefetch</text>
+<path class="l196" d="M 150 205 L 195 205"/>
+<!-- 3D-parallel model on cluster -->
+<rect class="b196" x="200" y="70" width="420" height="280" rx="12"/>
+<text class="t196" x="410" y="94">3D-parallel model on the GPU cluster</text>
+<!-- DP replicas as columns -->
+<text class="s196" x="410" y="116">data-parallel replicas (gradient all-reduce, Ch 15)</text>
+<!-- replica 1 -->
+<rect class="g196" x="222" y="130" width="170" height="190" rx="8"/>
+<text class="s196" x="307" y="150">replica 1 (one node)</text>
+<rect class="w196" x="236" y="162" width="64" height="40" rx="5"/>
+<text class="s196" x="268" y="186">TP shard</text>
+<rect class="w196" x="314" y="162" width="64" height="40" rx="5"/>
+<text class="s196" x="346" y="186">TP shard</text>
+<rect class="b196" x="236" y="212" width="142" height="34" rx="5"/>
+<text class="s196" x="307" y="234">pipeline stage A</text>
+<rect class="b196" x="236" y="254" width="142" height="34" rx="5"/>
+<text class="s196" x="307" y="276">pipeline stage B</text>
+<text class="s196" x="307" y="306">TP intra-node, PP across stages</text>
+<!-- replica 2 -->
+<rect class="g196" x="426" y="130" width="170" height="190" rx="8"/>
+<text class="s196" x="511" y="150">replica 2 (one node)</text>
+<rect class="w196" x="440" y="162" width="64" height="40" rx="5"/>
+<text class="s196" x="472" y="186">TP shard</text>
+<rect class="w196" x="518" y="162" width="64" height="40" rx="5"/>
+<text class="s196" x="550" y="186">TP shard</text>
+<rect class="b196" x="440" y="212" width="142" height="34" rx="5"/>
+<text class="s196" x="511" y="234">pipeline stage A</text>
+<rect class="b196" x="440" y="254" width="142" height="34" rx="5"/>
+<text class="s196" x="511" y="276">pipeline stage B</text>
+<text class="s196" x="511" y="306">... DP times across the cluster</text>
+<!-- checkpoint store -->
+<rect class="b196" x="670" y="70" width="190" height="90" rx="10"/>
+<text class="t196" x="765" y="100">Checkpoint store</text>
+<text class="s196" x="765" y="120">durable, async</text>
+<text class="s196" x="765" y="138">restart point (Ch 18)</text>
+<path class="l196" d="M 620 130 L 668 120"/>
+<!-- monitoring -->
+<rect class="b196" x="670" y="250" width="190" height="100" rx="10"/>
+<text class="t196" x="765" y="280">Monitoring</text>
+<text class="s196" x="765" y="300">loss, grad-norm,</text>
+<text class="s196" x="765" y="318">MFU, throughput</text>
+<text class="s196" x="765" y="336">(Ch 5, Ch 18)</text>
+<path class="l196" d="M 620 280 L 668 290"/>
+</svg>
+<figcaption><strong>Figure 19.6.1:</strong> The pretraining stack this section orchestrates. A streaming data loader feeds tokenized shards into a model that is tensor-parallel inside each node, pipeline-parallel across its stages, and data-parallel across replicas. The same model writes durable checkpoints asynchronously and emits loss, gradient-norm, throughput, and Model FLOPs Utilization to a monitoring loop. Every box is a chapter of Part IV; this section wires them together.</figcaption>
+</figure>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Parallelism Degrees Are a Bandwidth-Matching Problem</div>
+<p>Choosing $d_{\text{TP}}, d_{\text{PP}}, d_{\text{DP}}$ (and $d_{\text{EP}}$) is not free choice; it is placement against a bandwidth hierarchy. Tensor parallelism is the hungriest communicator and belongs on the fastest link (intra-node NVLink), pipeline parallelism is the leanest and spans the slow inter-node fabric, and data parallelism fills the remainder. Get the mapping backwards, for example tensor-parallel across nodes, and Model FLOPs Utilization collapses even though every other line of code is correct. The cluster topology, not the model, dictates the first cut of the degrees.</p>
+</div>
+
+<h2>2. Wiring the Data Loader and Running Under Elasticity <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A model laid across the cluster is useless without tokens to feed it, and at pretraining scale the data path is itself a distributed system. The corpus has been tokenized and written as sharded files in the previous section and stored on the distributed file system of <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/index.html">Chapter 8</a>. Each data-parallel replica streams a disjoint set of shards, prefetching and decoding ahead of the GPU so the accelerators never stall waiting for input. The subtlety unique to pretraining is that the loader must be deterministic and resumable: when a failure throws the job back to a checkpoint, the data loader has to re-seek to the exact token offset it had reached, or the run will silently re-train on some tokens and skip others. This is why the loader's position is part of the checkpoint, not just the model weights and optimizer state.</p>
+<p>Running under elasticity ties the whole picture together. Over a run of weeks across thousands of GPUs, hardware failure is not an exception to handle but a steady-state condition to absorb, exactly the regime that <a href="../module-18-elastic-fault-tolerant-training/index.html">Chapter 18</a> built machinery for. The orchestration writes checkpoints on a fixed wall-clock cadence, detects a dead worker, reconstitutes the process group (possibly at a smaller world size), reloads the last checkpoint including the data-loader offset, and resumes. The cost of each restart is wasted compute since the last checkpoint plus a fixed reload overhead, and a well-run job budgets for it rather than being surprised by it. Our planner in Section 4 makes that budget a concrete number.</p>
+
+<h2>3. The Training Recipe at Scale <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Composing the parallelism gets the arithmetic onto the cluster; the training recipe decides whether that arithmetic converges to a good model instead of diverging into a wall of NaNs. Three ingredients dominate at scale. The first is the learning-rate schedule: a short linear warmup over the first few thousand steps lets the optimizer's running statistics settle before the full step size is applied, after which a cosine or linear decay brings the rate down toward zero over the token budget. A schedule with peak rate $\eta_{\max}$, warmup length $T_w$, and total length $T$ takes the shape</p>
+$$\eta(t) = \begin{cases} \eta_{\max}\,\dfrac{t}{T_w}, & t \le T_w, \\[6pt] \eta_{\max}\,\dfrac{1 + \cos\!\big(\pi\,\tfrac{t - T_w}{T - T_w}\big)}{2}, & t > T_w. \end{cases}$$
+<p>The second ingredient is large-batch scaling. A 2048-GPU data-parallel job has an enormous global batch (millions of tokens per step), and the relationship between batch size and the right learning rate is the subject of <a href="../../part-3-distributed-ml/module-10-distributed-optimization/section-10.8.html">Chapter 10</a>: too small a rate wastes the parallelism, too large a one destabilizes it, and the usable batch saturates past a critical size. The third is gradient clipping, the safety valve that rescales the global gradient whenever its norm exceeds a threshold, so a single bad batch cannot blow the weights apart. These three, warmup-decay, batch-matched learning rate, and clipping, are what keep a run on the rails for months.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Loss Spike at 3 a.m.</div>
+<p>Pretraining teams develop a folklore around the loss spike: the curve, flat and reassuring for days, suddenly jumps, and a pager goes off. Sometimes it self-heals as the optimizer recovers; sometimes it is the leading edge of a divergence that will ruin the run. The standard remedy entered the literature as a manual operation: roll back to a checkpoint before the spike, skip the offending data batches, and resume. An entire engineering practice exists around deciding, at 3 a.m., whether to wait and watch or to roll back and burn a day of compute.</p>
+</div>
+
+<h2>4. A Pretraining-Run Planner <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The decisions above, parallel degrees, throughput, wall-clock, cost, and expected failures, can be turned into a single back-of-the-envelope planner before a single GPU is reserved. The code below takes a model, a token budget, and a cluster, picks the 3D-parallel degrees so they tile the world size, and estimates the run. Its throughput estimate rests on the standard dense-transformer FLOP count of $C \approx 6PT$ for $P$ parameters and $T$ training tokens (forward plus backward), and on a target Model FLOPs Utilization, the fraction of the hardware's peak the run actually sustains. Everything else, GPU-hours, dollars, and the number of failures to expect from the cluster's mean time between failures, follows by arithmetic.</p>
+<pre><code class="language-python">import math
+
+# A pretraining-run planner: model + tokens + cluster -> a run plan.
+# Choose parallel degrees, then estimate MFU, wall-clock, GPU-hours,
+# dollar cost, and how many hardware failures to expect over the run.
+
+# --- Inputs: the model (a Llama-3-70B-class dense transformer). ---
+P = 70e9                      # parameters
+n_layers = 80
+d_model = 8192
+tokens = 15e12               # training token budget (15T)
+
+# --- Inputs: the cluster (H100 SXM nodes, 8 GPUs each). ---
+n_gpus = 2048
+gpu_per_node = 8
+peak_flops = 989e12          # H100 BF16 peak, FLOP/s per GPU (dense)
+dollars_per_gpu_hour = 2.50  # typical large-reservation rate
+mtbf_gpu_hours = 50000.0     # mean time between failures, per-GPU hours
+
+# --- Step 1: pick parallel degrees (tensor x pipeline x data = world size). ---
+# Tensor parallel stays inside one node (fast NVLink); pipeline spans nodes to
+# fit the model; data parallel soaks up the rest of the cluster for throughput.
+tp = gpu_per_node            # 8-way tensor parallel, NVLink-bound, intra-node
+pp = 8                       # 8 pipeline stages -> 10 layers per stage
+dp = n_gpus // (tp * pp)     # data-parallel replicas fill the remaining GPUs
+assert tp * pp * dp == n_gpus, "degrees must tile the cluster exactly"
+
+# --- Step 2: arithmetic of the run. 6*P*tokens is the standard dense FLOP
+#     estimate (fwd+bwd) from the Chinchilla/Kaplan accounting. ---
+total_flops = 6.0 * P * tokens
+mfu = 0.45                   # target Model FLOPs Utilization (H100 70B regime)
+sustained = n_gpus * peak_flops * mfu     # delivered FLOP/s across the cluster
+
+seconds = total_flops / sustained
+hours = seconds / 3600.0
+days = hours / 24.0
+gpu_hours = hours * n_gpus
+cost = gpu_hours * dollars_per_gpu_hour
+
+# --- Step 3: expected failures over the wall-clock, from per-GPU MTBF. ---
+expected_failures = gpu_hours / mtbf_gpu_hours
+# A restart wastes, on average, half a checkpoint interval plus a fixed
+# restart overhead. Budget that lost time.
+ckpt_interval_h = 1.0        # checkpoint every hour of wall-clock
+restart_overhead_h = 0.25    # load weights + dataloader re-seek per restart
+lost_h = expected_failures * (ckpt_interval_h / 2.0 + restart_overhead_h)
+overhead_pct = 100.0 * lost_h / hours
+
+print("=== Pretraining run plan ===")
+print(f"model                : {P/1e9:.0f}B params, {n_layers} layers, d_model={d_model}")
+print(f"token budget         : {tokens/1e12:.0f}T tokens  ->  {total_flops:.2e} FLOPs (6*P*T)")
+print(f"cluster              : {n_gpus} GPUs ({n_gpus//gpu_per_node} nodes x {gpu_per_node})")
+print("--- chosen parallel degrees ---")
+print(f"tensor  (intra-node) : TP={tp}")
+print(f"pipeline (cross-node): PP={pp}  ->  {n_layers//pp} layers/stage")
+print(f"data    (replicas)   : DP={dp}")
+print(f"check  TP*PP*DP       : {tp}*{pp}*{dp} = {tp*pp*dp} == world size {n_gpus}")
+print("--- performance &amp; economics ---")
+print(f"target MFU           : {mfu*100:.0f}%")
+print(f"sustained throughput : {sustained/1e15:.2f} PFLOP/s")
+print(f"wall-clock           : {hours:,.0f} GPU-step-hours  ->  {days:.1f} days")
+print(f"GPU-hours            : {gpu_hours:,.0f}")
+print(f"compute cost         : ${cost/1e6:.2f}M  (@ ${dollars_per_gpu_hour:.2f}/GPU-h)")
+print("--- reliability budget ---")
+print(f"expected failures    : {expected_failures:.1f} over the run")
+print(f"time lost to restarts: {lost_h:.1f} h  ({overhead_pct:.1f}% overhead)")
+print(f"effective wall-clock : {days*(1+overhead_pct/100):.1f} days incl. restarts")
+</code></pre>
+<div class="code-caption"><strong>Code 19.6.1:</strong> A pure-Python pretraining-run planner. It tiles the cluster into tensor, pipeline, and data-parallel degrees, then turns the $6PT$ FLOP count and a target MFU into wall-clock, GPU-hours, dollar cost, and an expected-failure budget, all before any hardware is reserved.</div>
+<pre><code class="language-text">=== Pretraining run plan ===
+model                : 70B params, 80 layers, d_model=8192
+token budget         : 15T tokens  ->  6.30e+24 FLOPs (6*P*T)
+cluster              : 2048 GPUs (256 nodes x 8)
+--- chosen parallel degrees ---
+tensor  (intra-node) : TP=8
+pipeline (cross-node): PP=8  ->  10 layers/stage
+data    (replicas)   : DP=32
+check  TP*PP*DP       : 8*8*32 = 2048 == world size 2048
+--- performance & economics ---
+target MFU           : 45%
+sustained throughput : 911.46 PFLOP/s
+wall-clock           : 1,920 GPU-step-hours  ->  80.0 days
+GPU-hours            : 3,932,142
+compute cost         : $9.83M  (@ $2.50/GPU-h)
+--- reliability budget ---
+expected failures    : 78.6 over the run
+time lost to restarts: 59.0 h  (3.1% overhead)
+effective wall-clock : 82.5 days incl. restarts</code></pre>
+<div class="code-caption"><strong>Output 19.6.1:</strong> The planned run for a 70B model on 15T tokens across 2048 H100s: 80 days of wall-clock, roughly 3.9 million GPU-hours, near 10 million dollars of compute, and about 79 hardware failures to absorb, the restarts adding only 3 percent overhead because checkpointing is frequent. Halving the target MFU would nearly double every cost line, which is why MFU is the number teams obsess over.</div>
+<p>The planner makes the chapter's economics tangible. A foundation-model run is months of wall-clock, thousands of GPUs, tens of failures, and an eight-figure compute bill, and the one knob that scales every line at once is Model FLOPs Utilization. Notice what the output does not say: it assumes the parallel degrees were placed correctly against the bandwidth hierarchy. If tensor parallelism had been spread across nodes, the achieved MFU in the same formula would be a fraction of the target, and the 80-day plan would balloon past 150 days at the same cost per GPU-hour.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Where Every Axis of Distribution Meets</div>
+<p>This section is the convergence point promised back in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>, where the six axes of distribution were first named. A pretraining run distributes the data (the streaming loader of Chapter 8), distributes the training (the gradient all-reduce of Chapter 15), distributes the model (the tensor and pipeline shards of Chapter 16, the experts of Chapter 17), and coordinates the cluster (the elastic checkpointing of Chapter 18), all on the same step, for months. No earlier chapter could compose these because each owned only one axis. Foundation-model pretraining is the system in which the whole book's thesis, distribute the essential work and keep many machines behaving as one, is exercised at full scale.</p>
+</div>
+
+<h2>5. Why Model FLOPs Utilization Is the Central Performance Goal <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Model FLOPs Utilization is the fraction of the hardware's theoretical peak that your run actually spends doing the model's useful arithmetic. If $C = 6PT$ is the model's FLOP count, $N$ the GPU count, $F_{\text{peak}}$ the per-GPU peak, and $\tau$ the wall-clock seconds, then</p>
+$$\text{MFU} = \frac{6PT}{N \cdot F_{\text{peak}} \cdot \tau}.$$
+<p>Every loss in the system, communication that does not overlap with computation, pipeline bubbles, dataloader stalls, recomputation for memory, and restart overhead, shows up as a smaller MFU and a longer $\tau$. This is why MFU, not raw teraflops or step time, is the number a pretraining team treats as its north star: it is dimensionless, comparable across model sizes and clusters, and directly proportional to dollars saved. The measurement discipline behind it, throughput, utilization, and efficiency as first-class metrics, is the subject of <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.5.html">Chapter 5</a>, and the babysitting loop watches it on the same dashboard as the loss. A run whose loss is falling beautifully but whose MFU has quietly dropped from 45 to 30 percent is burning a third of its budget on nothing, and catching that is as important as catching a loss spike.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Megatron-LM, NeMo, and DeepSpeed Orchestrate the Whole Run</div>
+<p>The planner in Code 19.6.1 estimates a run; production frameworks execute it. NVIDIA's Megatron-LM and NeMo, and Microsoft's DeepSpeed, take the tensor, pipeline, data, and expert degrees as configuration and assemble the entire stack of Figure 19.6.1 for you: the sharded model, the overlapped collectives, the pipeline schedule, the distributed optimizer, the resumable data loader, asynchronous checkpointing, and an MFU report on every log line. Launching a 3D-parallel run becomes a config block rather than the thousands of lines of distributed plumbing it represents:</p>
+<pre><code class="language-bash"># Megatron-LM / NeMo: the parallel degrees are flags, not code.
+torchrun --nproc_per_node=8 --nnodes=256 pretrain_gpt.py \
+  --tensor-model-parallel-size 8 \
+  --pipeline-model-parallel-size 8 \
+  --use-distributed-optimizer \
+  --lr 3e-4 --lr-warmup-iters 2000 --lr-decay-style cosine \
+  --clip-grad 1.0 --global-batch-size 2048 \
+  --save /ckpt --save-interval 500 --log-throughput
+</code></pre>
+<div class="code-caption"><strong>Code 19.6.2:</strong> The same 3D-parallel mapping and training recipe as Code 19.6.1, expressed as launcher flags. The framework handles process-group setup, collective scheduling, the pipeline bubble, gradient clipping, the warmup-cosine schedule, resumable checkpointing, and per-step MFU logging that you would otherwise build by hand across Chapters 15 to 18.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Chasing MFU on a Stalling 70B Run</div>
+<p><strong>Who:</strong> A training-infrastructure engineer on a foundation-model team running a 70B dense model on 2048 H100s.</p>
+<p><strong>Situation:</strong> The run was live and the loss was descending normally, but the per-step MFU reported on the dashboard had drifted from a planned 45 percent down to 31 percent over the first week.</p>
+<p><strong>Problem:</strong> At 31 percent MFU the run was on track for roughly 115 days instead of the planned 80, adding millions of dollars and missing the release window, even though no error had been thrown.</p>
+<p><strong>Dilemma:</strong> Stop a healthy run to investigate, losing days of progress, or let it continue and hope the drop was transient, risking a far larger overrun if it was structural.</p>
+<p><strong>Decision:</strong> They paused, because the planner showed the MFU gap alone dwarfed any restart cost, and profiled one step end to end.</p>
+<p><strong>How:</strong> Profiling revealed the dataloader was stalling the pipeline: a slow storage tier was failing to prefetch shards ahead of the GPUs, so accelerators idled between batches. They moved the hot shards to faster storage and increased prefetch depth, then resumed from the last checkpoint with the data-loader offset intact.</p>
+<p><strong>Result:</strong> MFU recovered to 44 percent, the run returned to its 80-day trajectory, and the one-day pause paid for itself many times over in compute not wasted.</p>
+<p><strong>Lesson:</strong> A falling MFU is a silent budget leak that no exception will surface. Watching it with the same vigilance as the loss curve is what separates a run that finishes on plan from one that quietly doubles in cost.</p>
+</div>
+
+<h2>6. The Practical Reality: Months, Failures, and a Team on Dashboards <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Strip away the equations and a pretraining run is a human and operational endeavor. It occupies thousands of GPUs continuously for weeks to months, costs millions of dollars in compute, and runs on hardware that is, at this scale, always partly broken: as the planner showed, a single run absorbs dozens of failures, and the team's job is to make each one a brief restart rather than a lost run. People watch dashboards in shifts, tracking the loss, the gradient norm, the throughput, and the MFU, ready to roll back a divergence or chase a utilization drop. The babysitting loop, watch, diagnose, intervene, resume, is as much a part of foundation-model training as the optimizer, and the frameworks of the previous shortcut exist precisely to make that loop survivable across a run that no single person can sit through end to end.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Production Pretraining Infrastructure (2024 to 2026)</div>
+<p>The orchestration of pretraining is now a published research subject of its own. ByteDance's MegaScale (Jiang et al., NSDI 2024) reports training an LLM across more than 10,000 GPUs and documents the full-stack engineering, parallelism placement, communication overlap, and a fault-tolerance system that automatically detects and recovers from failures, needed to sustain about 55 percent MFU at that scale. Meta's Llama 3 herd paper (2024) describes a 16,000-GPU run on its training infrastructure and is unusually candid about operational reality, cataloguing hundreds of interruptions over the run and the checkpointing and health-monitoring systems that kept effective utilization high despite them. Across the field, sustained MFU has become the headline efficiency record that infrastructure papers compete on, and the open frameworks (Megatron-LM, NeMo, DeepSpeed) now ship the overlap, scheduling, and async-checkpointing techniques those papers introduced. The frontier is pushing the same orchestration toward larger clusters, FP8 training, and increasingly geo-distributed runs.</p>
+</div>
+<p>With the run orchestrated, the parallelism composed, the recipe tuned, and the MFU defended, a pretrained foundation model emerges. The next step is to take that general model and adapt it to specific tasks without repeating the full expense, which moves the story from pretraining to distributed fine-tuning in <a href="section-19.7.html">Section 19.7</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.6.1: Re-map the Cluster <span class="exercise-type conceptual">Conceptual</span></div>
+<p>The run in Output 19.6.1 used $d_{\text{TP}}=8$, $d_{\text{PP}}=8$, $d_{\text{DP}}=32$ on 2048 GPUs. Suppose the model now needs 16-way tensor parallelism to fit a wider layer, but each node still holds only 8 GPUs. Explain what goes wrong if you naively set $d_{\text{TP}}=16$, identify which bandwidth tier the tensor-parallel traffic would now cross, and propose an alternative degree assignment (using pipeline or sharded-data parallelism instead) that fits the model without forcing tensor parallelism across nodes. State the new $d_{\text{TP}} \cdot d_{\text{PP}} \cdot d_{\text{DP}}$ and check it equals 2048.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.6.2: The MFU-to-Dollars Sensitivity <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 19.6.1 to sweep the target MFU over the set $\{0.30, 0.35, 0.40, 0.45, 0.50\}$ and print, for each, the wall-clock in days and the compute cost in millions of dollars, holding everything else fixed. Then add a second sweep over the per-GPU MTBF $\{20000, 50000, 100000\}$ hours and report how the expected-failure count and restart overhead change. Write one sentence on which of the two knobs, MFU or MTBF, moves the total cost more, and why that justifies the chapter's claim that MFU is the central performance goal.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.6.3: Budget the Restart Overhead <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the planner's reliability model, derive an expression for the wall-clock lost to restarts as a function of the checkpoint interval $I$ (in hours), assuming each failure wastes $I/2$ of progress plus a fixed reload overhead $r$, and that failures arrive at the rate implied by the cluster's MTBF. Show that there is a trade-off: very frequent checkpointing (small $I$) wastes time writing checkpoints, while infrequent checkpointing (large $I$) wastes time re-computing after each failure. If writing one checkpoint costs $c$ hours of stalled training, write the total overhead as a function of $I$ and find the $I$ that minimizes it. Relate your answer to the asynchronous-checkpointing techniques of <a href="../module-18-elastic-fault-tolerant-training/index.html">Chapter 18</a> that drive $c$ toward zero.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-19.5.html"><span class="nav-label">Previous</span><span class="nav-num">Section 19.5</span><span class="nav-title">Tokenization at Scale</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 19</span><span class="nav-num">Contents</span><span class="nav-title">Training Foundation Models at Scale</span></a>
+<a class="next" href="section-19.7.html"><span class="nav-label">Next</span><span class="nav-num">Section 19.7</span><span class="nav-title">Distributed Fine-Tuning</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

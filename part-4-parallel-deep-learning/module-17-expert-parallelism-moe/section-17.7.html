@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 17.7: Capacity Factors, Token Dropping, and Stability. Why each expert gets a fixed-size buffer, how the capacity factor trades dropped tokens against wasted compute, and how router z-loss keeps sparse training stable." name="description"/>
+<title>Section 17.7: Capacity Factors, Token Dropping, and Stability | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 17: Expert Parallelism and Sparse Distributed Models</a></div>
+<h1>Capacity Factors, Token Dropping, and Stability</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They gave me a buffer for exactly five hundred tokens. On a good batch I sat half empty; on a bad one I turned good tokens away at the door. Nobody asked me how I felt about it."</p>
+<cite>An Expert at Capacity</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A mixture-of-experts layer is mathematically dynamic, but the hardware that runs it is stubbornly static: the all-to-all exchange and the per-expert matrix multiply both need buffer sizes fixed before the batch arrives.</strong> The reconciliation is a single engineering knob, the capacity factor, which gives every expert a fixed maximum number of tokens per batch. Set it too low and an overloaded expert drops the tokens it cannot fit, costing model quality; set it too high and underused experts pad their buffers with empty slots, costing compute and communication you paid for and never used. This section makes that trade-off quantitative, shows how it couples to the load imbalance of <a href="section-17.6.html">Section 17.6</a> and the all-to-all of <a href="section-17.5.html">Section 17.5</a>, and then turns to the separate hazard that sparse routers introduce: training instability, router collapse, and loss spikes, with the small set of fixes that tame them.</p>
+</div>
+<p>The previous sections built a layer that can route each token to a chosen expert and exchange tokens across machines so that every expert receives its assigned work. That description is complete at the level of mathematics, where an expert simply processes however many tokens happen to be routed to it. It is incomplete at the level of hardware. A GPU kernel that multiplies a batch of tokens by an expert's weight matrix must know the batch dimension before it launches, and the all-to-all collective that ships tokens between nodes must allocate send and receive buffers before it runs. Neither can resize itself in the middle of a step to absorb whatever the router decided this time. The number of tokens per expert, however, is data-dependent and varies batch to batch, which is exactly the quantity these static structures cannot accommodate. Expert capacity is how the system squares that circle.</p>
+
+<h2>1. Why Experts Need a Fixed Capacity <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Imagine you are sizing the receive buffer on each device before a batch arrives. You do not yet know how many tokens the router will send to the expert living there, because routing depends on the tokens themselves. You have two honest options. You could allocate a worst-case buffer large enough for the unlikely event that every token in the batch picks this one expert, which wastes almost all of that memory on every normal batch. Or you could pick a fixed, modest buffer size and decide in advance what happens when more tokens arrive than fit. Real systems take the second option, and the fixed size they choose is called the expert capacity.</p>
+<p>Capacity is set relative to the average, because the average is the load each expert would carry under perfect balance. With $T$ tokens in a batch (counting each token once per expert it is routed to, so a top-$k$ router contributes $k$ copies) and $E$ experts, the balanced share is $T/E$ tokens per expert. The capacity factor $c$ scales that share into the actual buffer size,</p>
+$$\text{capacity} = \left\lceil c \cdot \frac{T}{E} \right\rceil,$$
+<p>so $c = 1$ provisions exactly the balanced load and nothing more, while $c = 1.5$ leaves each expert room for fifty percent more tokens than it would receive under perfect balance. The ceiling makes the buffer an integer number of token slots. This one number, multiplied across every expert and every layer, fixes the memory footprint and the communication volume of the whole MoE block before a single token is routed, which is precisely what the static all-to-all and the static matmul kernels require.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Capacity Factor Converts a Dynamic Layer into a Static One</div>
+<p>A mixture-of-experts layer is conditionally computed: which expert runs, and on how many tokens, is decided at runtime. Yet every system primitive underneath it (the all-to-all collective, the per-expert GEMM, the activation buffers) is allocated statically before the step begins. The capacity factor is the single scalar that bridges the two worlds. It declares, in advance, the maximum tokens any expert will process, turning an unpredictable workload into a fixed-shape one that the hardware can schedule, at the price of being wrong in two directions at once: too small for overloaded experts and too large for underloaded ones.</p>
+</div>
+
+<h2>2. Token Dropping and Padding Waste <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Because the buffer is fixed, every batch resolves into one of two failure modes per expert, and usually both happen somewhere in the layer at once. When an expert is assigned more tokens than its capacity, the surplus is dropped: those tokens skip the expert entirely and pass through unchanged on the residual connection, as if the MoE layer were the identity for them. The forward computation still produces an output, so training does not crash, but those tokens received no expert transformation at this layer, which is a real loss of model quality. When an expert is assigned fewer tokens than its capacity, the unused slots are padded with zeros so the buffer is full-shaped for the kernel; the expert dutifully multiplies those zero rows by its weights and discards the result, which is compute and communication spent on nothing.</p>
+<p>Both quantities have clean definitions. Let $n_e$ be the number of tokens routed to expert $e$ and let $\text{cap} = \lceil c\,T/E \rceil$ be the capacity. The fraction of tokens dropped across the layer is</p>
+$$\text{drop rate} = \frac{1}{T}\sum_{e=1}^{E} \max(n_e - \text{cap},\, 0),$$
+<p>the total overflow summed over experts and normalized by the batch. The padding waste is the mirror image, the fraction of provisioned slots that go unused,</p>
+$$\text{pad waste} = \frac{1}{E \cdot \text{cap}}\sum_{e=1}^{E} \max(\text{cap} - n_e,\, 0).$$
+<p>These two numbers move in opposite directions as you turn the capacity knob, and the figure below shows why. The diagram references the same picture the demo in Section 4 will quantify.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three expert buffers each with a dashed capacity line. The first expert overflows, its excess tokens dropped to the residual path. The second is exactly full. The third is underfilled, its empty slots marked as padding waste.">
+<defs>
+<marker id="arr177" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b83232"/></marker>
+</defs>
+<style>
+.box177 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.tok177 { fill:#cfe0f0; stroke:#14385c; stroke-width:1; }
+.pad177 { fill:#eef0f2; stroke:#b9c0c8; stroke-width:1; stroke-dasharray:3 3; }
+.ovf177 { fill:#f6d3d3; stroke:#b83232; stroke-width:1; }
+.t177 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s177 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.r177 { font:600 11.5px sans-serif; fill:#b83232; text-anchor:middle; }
+.cap177 { fill:none; stroke:#b86b1f; stroke-width:1.8; stroke-dasharray:6 4; }
+.drop177 { fill:none; stroke:#b83232; stroke-width:1.8; marker-end:url(#arr177); }
+</style>
+<text class="t177" x="430" y="26">Three experts, one fixed capacity (dashed orange line)</text>
+<!-- capacity reference line across all three -->
+<line class="cap177" x1="60" y1="90" x2="800" y2="90"/>
+<text class="s177" x="800" y="86" text-anchor="end">capacity = c &#183; T/E</text>
+
+<!-- Expert A: overflow -->
+<text class="t177" x="150" y="320">Expert A</text>
+<text class="r177" x="150" y="338">over capacity</text>
+<rect class="box177" x="100" y="90" width="100" height="180" rx="4"/>
+<rect class="tok177" x="100" y="120" width="100" height="150"/>
+<rect class="ovf177" x="100" y="50" width="100" height="36"/>
+<text class="r177" x="150" y="72">overflow</text>
+<path class="drop177" d="M 205 60 L 280 60"/>
+<text class="r177" x="320" y="56">dropped</text>
+<text class="s177" x="320" y="72">(skip via residual)</text>
+
+<!-- Expert B: exactly full -->
+<text class="t177" x="450" y="320">Expert B</text>
+<text class="s177" x="450" y="338">exactly full</text>
+<rect class="box177" x="400" y="90" width="100" height="180" rx="4"/>
+<rect class="tok177" x="400" y="90" width="100" height="180"/>
+<text class="s177" x="450" y="185" fill="#14385c">no drop,</text>
+<text class="s177" x="450" y="201" fill="#14385c">no waste</text>
+
+<!-- Expert C: underfilled -->
+<text class="t177" x="700" y="320">Expert C</text>
+<text class="s177" x="700" y="338">under capacity</text>
+<rect class="box177" x="650" y="90" width="100" height="180" rx="4"/>
+<rect class="tok177" x="650" y="190" width="100" height="80"/>
+<rect class="pad177" x="650" y="90" width="100" height="100"/>
+<text class="s177" x="700" y="135">padding</text>
+<text class="s177" x="700" y="151">(wasted compute)</text>
+</svg>
+<figcaption><strong>Figure 17.7.1:</strong> The two-sided cost of a fixed capacity. Every expert gets the same buffer, sized at $c\cdot T/E$ (dashed orange line). Expert A is overloaded, so its tokens above the line are dropped and routed through the residual connection unchanged. Expert B happens to fill exactly. Expert C is underused, so the empty slots below the line are padded with zeros and multiplied for nothing. Raising $c$ lifts the line, shrinking A's drops but enlarging C's waste; lowering it does the reverse.</figcaption>
+</figure>
+<p>The asymmetry of the two costs matters. A dropped token is a quality cost that the optimizer pays silently: the loss is slightly worse than it could have been, and no error is raised. Padding is a throughput cost that shows up directly in the wall-clock of every step and in the bytes moved by the all-to-all of <a href="section-17.5.html">Section 17.5</a>, because padded slots are real rows that travel across the network. A team tuning an MoE layer is therefore balancing an invisible quality leak against a visible speed tax, which is why the capacity factor is one of the most-tuned hyperparameters in sparse training.</p>
+
+<h2>3. The Capacity-Factor Trade-Off, and Why Load Balance Sets the Floor <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Turning the capacity factor up has a monotone effect on each cost: higher $c$ means a taller buffer, so fewer tokens overflow (drop rate falls) but more slots sit empty (padding waste rises), and the all-to-all moves more bytes per step. Turning it down does the reverse. There is no setting that zeroes both costs unless the load is perfectly balanced, and it never is. The crucial dependency, the one that ties this section back to <a href="section-17.6.html">Section 17.6</a>, is that the load distribution decides how expensive the trade-off is. Under near-balanced routing, a modest $c$ close to $1$ drops almost nothing and wastes little, because every expert sits near the average the capacity was sized for. Under skewed routing, where a few popular experts attract a large share of tokens, even a generous $c$ leaves the hot experts overflowing while the cold ones pad heavily, so you pay on both sides at once.</p>
+<p>This is the practical reason the load-balancing loss of <a href="section-17.6.html">Section 17.6</a> exists. Its job is not balance for its own sake; it is to flatten the load distribution enough that a small capacity factor suffices, which keeps both the drop rate and the padding waste low simultaneously. Capacity and balance are two halves of one mechanism: the balancing loss reshapes the demand, and the capacity factor provisions the supply, and they are tuned together. Typical production values for the capacity factor sit between $1.0$ and $2.0$ during training, with inference often using a different (sometimes larger) value because a served request cannot tolerate a dropped token the way a training batch can, a point developed in <a href="section-17.8.html">Section 17.8</a>.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The MoE Run Bleeding Quality From a Knob Nobody Watched</div>
+<p><strong>Who:</strong> A research engineer pretraining a 64-expert language model on a 256-GPU cluster.</p>
+<p><strong>Situation:</strong> Validation perplexity was plateauing higher than a dense baseline with comparable active parameters, despite the MoE having far more total parameters.</p>
+<p><strong>Problem:</strong> The default capacity factor of $1.0$ had been copied from a tutorial, and the load-balancing coefficient was small, so a handful of experts were chronically overloaded.</p>
+<p><strong>Dilemma:</strong> Raise the capacity factor, which costs throughput and memory on every step across 256 GPUs, or strengthen the balancing loss, which is free at inference but can pull the router toward less useful, more uniform assignments if pushed too hard.</p>
+<p><strong>Decision:</strong> They did both, in measured amounts: lifted the capacity factor from $1.0$ to $1.25$ and roughly doubled the balancing coefficient, then read the per-step drop rate off the training logs to confirm the change landed.</p>
+<p><strong>How:</strong> The framework already logged tokens-dropped per layer; they had simply never plotted it. Dumping it revealed a drop rate above eight percent concentrated in three experts.</p>
+<p><strong>Result:</strong> Drop rate fell below one percent, validation perplexity dropped to beat the dense baseline, and the throughput cost of the larger buffer was under four percent per step.</p>
+<p><strong>Lesson:</strong> The capacity factor is not a set-and-forget constant. Log the drop rate, treat it as a first-class training metric, and tune capacity and balance together rather than in isolation.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Capacity Is One Argument in Modern MoE Layers</div>
+<p>The bookkeeping of sizing buffers, dropping overflow, padding underflow, and reporting the drop rate is exactly what production MoE implementations encapsulate. In DeepSpeed-MoE and Megatron-Core you do not compute $\lceil c\,T/E\rceil$ or manage the overflow mask yourself; you pass the capacity factor and the layer handles the dispatch, the all-to-all, and the metrics. What the dozen lines of Code 17.7.1 spell out by hand collapses to a constructor argument:</p>
+<pre><code class="language-python"># DeepSpeed-MoE: capacity and dropping handled inside the layer.
+from deepspeed.moe.layer import MoE
+
+moe_layer = MoE(
+    hidden_size=4096,
+    expert=expert_mlp,            # the per-expert feed-forward module
+    num_experts=64,
+    k=1,                          # top-1 routing
+    capacity_factor=1.25,         # train-time buffer = ceil(1.25 * tokens / experts)
+    eval_capacity_factor=2.0,     # larger buffer at inference to avoid drops
+    use_residual=False,
+)
+# The layer dispatches tokens, runs the expert all-to-all, drops overflow onto
+# the residual, pads underflow, and exposes the drop rate through its metrics.
+</code></pre>
+<div class="code-caption"><strong>Code 17.7.1:</strong> The capacity machinery as a single layer argument. The framework internally performs the dispatch, the all-to-all of <a href="section-17.5.html">Section 17.5</a>, the overflow drop, and the padding that the from-scratch demo in Section 4 measures explicitly.</div>
+</div>
+
+<h2>4. From Scratch: Drop Rate and Padding Waste Versus Capacity <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The cleanest way to feel the trade-off is to route a batch under both a balanced and a skewed load and read off the two costs as the capacity factor varies. The code below uses only NumPy. It draws a top-1 routing assignment from a probability vector that is either uniform (balanced) or tilted so half the experts are six times more attractive (skewed), counts the tokens per expert, then applies the drop-rate and pad-waste formulas from Section 2 across a sweep of capacity factors.</p>
+<pre><code class="language-python">import numpy as np
+
+def route_and_measure(num_tokens, num_experts, capacity_factor, skew, rng):
+    avg = num_tokens / num_experts
+    capacity = int(np.ceil(capacity_factor * avg))         # ceil(c * T / E)
+    base = np.ones(num_experts)
+    base[: num_experts // 2] *= skew                       # half the experts attract `skew`x more
+    probs = base / base.sum()
+    assign = rng.choice(num_experts, size=num_tokens, p=probs)   # top-1 routing
+    counts = np.bincount(assign, minlength=num_experts)          # tokens per expert
+    dropped = np.maximum(counts - capacity, 0).sum()             # overflow above the buffer
+    padding = np.maximum(capacity - counts, 0).sum()            # empty slots below the buffer
+    total_slots = capacity * num_experts
+    return capacity, dropped / num_tokens, padding / total_slots
+
+rng = np.random.default_rng(0)
+N, E = 8192, 16
+print(f"tokens={N}  experts={E}  (top-1 routing)")
+print(f"{'cap_factor':>10} {'load':>9} {'capacity':>9} {'drop_rate':>10} {'pad_waste':>10}")
+for skew, label in [(1.0, 'balanced'), (6.0, 'skewed')]:
+    for cf in (1.0, 1.25, 1.5, 2.0):
+        cap, drop, pad = route_and_measure(N, E, cf, skew, rng)
+        print(f"{cf:>10.2f} {label:>9} {cap:>9d} {drop*100:>9.2f}% {pad*100:>9.2f}%")
+</code></pre>
+<div class="code-caption"><strong>Code 17.7.2:</strong> A pure-NumPy MoE capacity simulator. It assigns tokens to experts under a chosen skew, sizes the per-expert buffer from the capacity factor, and reports the drop rate and padding waste defined in Section 2 across a capacity sweep.</div>
+<pre><code class="language-text">tokens=8192  experts=16  (top-1 routing)
+cap_factor      load  capacity  drop_rate  pad_waste
+      1.00  balanced       512      1.55%      1.55%
+      1.25  balanced       640      0.00%     20.00%
+      1.50  balanced       768      0.00%     33.33%
+      2.00  balanced      1024      0.00%     50.00%
+      1.00    skewed       512     36.17%     36.17%
+      1.25    skewed       640     23.24%     38.59%
+      1.50    skewed       768     10.44%     40.29%
+      2.00    skewed      1024      0.00%     50.00%
+</code></pre>
+<div class="code-caption"><strong>Output 17.7.2:</strong> The capacity-factor trade-off, measured. Under balanced load a capacity factor of $1.25$ already drops nothing, so any larger buffer is pure padding waste. Under skewed load the same $1.25$ still drops over twenty-three percent of tokens, and you must push the factor all the way to $2.0$ to eliminate drops, at which point half of every buffer is wasted. Load balance, not capacity alone, sets how cheap the trade can be.</div>
+<p>Read the two halves of the table against each other and the lesson of Section 3 is stark. In the balanced regime, drops vanish by $c = 1.25$ and everything above that is wasted slots, so a tight capacity is both cheap and safe. In the skewed regime, the drop rate stays double-digit until $c = 1.5$ and only reaches zero at $c = 2.0$, where padding waste hits fifty percent because the cold experts are half empty by construction. The same capacity factor buys a clean run under balance and a leaky, wasteful one under skew. This is the quantitative form of the claim that the balancing loss of <a href="section-17.6.html">Section 17.6</a> and the capacity factor must be tuned as a pair.</p>
+
+<h2>5. Training Stability: Router Collapse and Loss Spikes <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Capacity governs efficiency and the slow quality leak of dropped tokens. A second, sharper hazard is unique to sparse models: the router can destabilize training outright. The router is a small learned layer that produces a logit per expert and selects the top one, and that discrete top-$k$ selection sits in a feedback loop with the experts. If an expert gets chosen slightly more often early in training, it receives more gradient, improves faster, and so looks even more attractive to the router, which chooses it still more. Left unchecked this positive feedback drives router collapse, where the model funnels nearly all tokens to a tiny clutch of experts and the rest go cold and untrained, defeating the entire point of having many experts. The load-balancing loss of <a href="section-17.6.html">Section 17.6</a> is the first line of defense against collapse, but it is not the whole story.</p>
+<p>The second symptom is loss spikes. Because the router's logits feed a softmax and a hard selection, large logit magnitudes make routing decisions brittle: a small weight update can flip many tokens from one expert to another, causing a sudden jump in the loss that can in the worst case diverge the run. The standard remedy is the router z-loss, an auxiliary penalty on the magnitude of the router logits. With logits $\ell_{i,e}$ for token $i$ and expert $e$ across a batch of $T$ tokens, the z-loss penalizes the log-partition-function so the logits stay small and the softmax stays numerically calm,</p>
+$$L_{z} = \frac{1}{T}\sum_{i=1}^{T}\left(\log \sum_{e=1}^{E} e^{\,\ell_{i,e}}\right)^{2}.$$
+<p>It is added to the task loss with a small coefficient and was a key stabilizer in the ST-MoE work that made large sparse models trainable without the loss spikes that plagued earlier attempts. Two further practices round out the toolkit. Careful router initialization keeps the initial logits small and the early assignments near-uniform, so no expert wins the feedback race before the experts have learned anything. And lower-precision-safe routing computes the router's softmax and selection in float32 even when the rest of the model runs in bfloat16 or float16, because the router's discrete decision is exactly the place where a few bits of rounding can flip an assignment and inject noise into the feedback loop. These are cheap insurance: the router is a tiny fraction of the model's compute, so keeping it in higher precision costs almost nothing.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Expert That Ate the Batch</div>
+<p>Router collapse has a recognizable failure signature in the logs: the per-expert token counts, which should hover near $T/E$, instead show one or two experts pinned at capacity every step while a dozen others read zero for thousands of steps. Practitioners call these the "dead experts," and a model that ships with half its experts dead has quietly paid for parameters it never uses. The fix is rarely a bigger capacity factor; it is the balancing loss and the z-loss doing their job of keeping every expert in the game.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Drop-Free and Expert-Choice Routing (2024 to 2026)</div>
+<p>The cleanest way to remove the capacity-factor trade-off is to remove dropping itself, and several 2024 to 2026 lines pursue exactly that. Expert-choice routing inverts the assignment so each expert selects its top tokens up to capacity, which guarantees perfect balance by construction and eliminates overflow, at the cost that some tokens may be chosen by no expert. The DeepSeek-V3 and DeepSeekMoE work (2024) popularized an auxiliary-loss-free balancing scheme that adjusts per-expert routing biases directly, reporting strong balance without the gradient interference a balancing loss can introduce, and pairs it with fine-grained and shared experts to keep capacity pressure low. A parallel thread on dropless MoE (in the lineage of MegaBlocks) reformulates the expert computation as block-sparse matrix multiplication so that variable-sized expert batches run efficiently without padding to a fixed capacity at all, dissolving the padding-waste side of the trade entirely. The throughline is that the capacity factor, a 2020-era compromise with static kernels, is increasingly something the systems layer engineers away rather than the model tolerates. We return to the serving-time version of these choices in <a href="section-17.8.html">Section 17.8</a>.</p>
+</div>
+
+<h2>6. How Capacity, Balance, and the All-to-All Interlock <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>It is worth stating plainly how the three mechanisms of this chapter compose, because they are easy to treat as separate knobs when they are really one coupled system. The all-to-all of <a href="section-17.5.html">Section 17.5</a> moves a fixed-shape tensor whose size is set by the capacity, so the capacity factor directly determines the communication volume per step: doubling $c$ doubles the bytes the all-to-all ships, padding included. The load balance of <a href="section-17.6.html">Section 17.6</a> determines how much of that fixed-shape traffic carries real tokens versus padding, and how many real tokens get dropped before they ever enter the collective. And the stability machinery of Section 5 keeps the router producing the kind of spread-out assignments that let a small capacity factor work, by preventing the collapse that would make any fixed buffer overflow on the hot experts and starve on the cold ones.</p>
+<p>So the design loop is circular in a productive way. A well-balanced, stable router lets you run a small capacity factor, which shrinks the all-to-all and speeds every step; a small capacity factor in turn pressures the router, via dropped-token quality loss, to stay balanced. When any one of the three fails, the symptom appears in the others: an unstable router shows up as a spiking drop rate, a weak balancing loss shows up as padding waste you cannot tune away, and an over-large capacity factor shows up as an all-to-all that dominates the step time. Reading the three together, rather than tuning each in isolation, is what separates an MoE layer that delivers its promised throughput from one that merely runs. The serving picture in <a href="section-17.8.html">Section 17.8</a> revisits these same trade-offs under the harder constraint that an inference request cannot quietly drop its tokens, and the broader comparison against dense distributed models in <a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a> puts the whole sparse approach in context.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.7.1: Sizing the Buffer by Hand <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A top-2 MoE layer processes a batch of $T = 4096$ tokens across $E = 8$ experts with a capacity factor $c = 1.5$. Remember that top-2 routing sends each token to two experts, so the total number of token-to-expert assignments is $2T$. Compute the per-expert capacity, the total number of buffer slots across the layer, and the number of real assignments. If routing were perfectly balanced, what would the drop rate and padding waste be? Now suppose one expert receives $1.4\times$ its balanced share while the rest split the remainder evenly; does that expert overflow, and by how many tokens?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.7.2: Finding the Cheapest Safe Capacity <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 17.7.2 to sweep the capacity factor finely (for example from $1.0$ to $2.5$ in steps of $0.05$) under a chosen skew, and for each value record the drop rate and the padding waste. Define a simple combined cost that adds the drop rate (weighted by a quality penalty $\lambda$) to the padding waste (a throughput penalty), and plot or print the capacity factor that minimizes it for $\lambda = 1$, $\lambda = 5$, and $\lambda = 20$. Explain how the optimal capacity shifts as you weight dropped quality more heavily, and connect that to why inference (Section 17.8) often uses a larger capacity factor than training.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.7.3: When Balance Buys More Than Capacity <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the skewed-load numbers in Output 17.7.2, the run drops $23.24\%$ of tokens at $c = 1.25$ and reaches zero drops only at $c = 2.0$, where padding waste is $50\%$. Suppose instead a stronger balancing loss flattens the skew so the load becomes nearly uniform. Argue from the balanced rows of the same table how low a capacity factor you could then run while keeping the drop rate under one percent, and estimate the resulting reduction in all-to-all bytes per step relative to the $c = 2.0$ skewed configuration. Use this to explain the section's claim that balancing the load is often cheaper than enlarging the buffer.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-17.6.html"><span class="nav-label">Previous</span><span class="nav-num">Section 17.6</span><span class="nav-title">Load Balancing Across Experts</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 17</span><span class="nav-num">Contents</span><span class="nav-title">Expert Parallelism and Sparse Distributed Models</span></a>
+<a class="next" href="section-17.8.html"><span class="nav-label">Next</span><span class="nav-num">Section 17.8</span><span class="nav-title">Serving Distributed MoE Models</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

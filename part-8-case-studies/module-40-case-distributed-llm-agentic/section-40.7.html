@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 40.7: Distributed Model Serving with vLLM. The serving backend every agent step calls, applying continuous batching, PagedAttention, prefill/decode disaggregation, and tensor-parallel sharding behind an autoscaling fleet." name="description"/>
+<title>Section 40.7: Distributed Model Serving with vLLM | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Case Studies and Capstone Projects</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 40: Distributed LLM and Agentic Applications</a></div>
+<h1>Distributed Model Serving with vLLM</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"A KV cache, paged like virtual memory, serving a hundred conversations at once and pretending each one is the only one that matters."</p>
+<cite>A Decode Step That Never Stops to Wait</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Every reasoning step the agents of Section 40.6 take ends in the same place: a token request sent to a model-serving backend, and the whole application is only as fast, as cheap, and as available as that backend.</strong> A single agent run fans out into dozens of short generations, all sharing a long system prompt, arriving in bursts. The serving tier must turn that ragged, concurrent traffic into a steady stream of tokens at a tight latency budget, and no single GPU can do it: the model is sharded across several accelerators to fit in memory, and that shard group is then replicated across nodes to meet demand. This section assembles the production serving fleet that powers the agent application, built on vLLM, applying the per-node efficiency of <a href="../../part-5-distributed-inference/module-22-per-node-inference-efficiency/index.html">Chapter 22</a> and the distributed LLM serving theory of <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>. We do not re-derive those mechanisms here; we deploy them, and we size them for the agentic workload.</p>
+</div>
+<p>The agents of <a href="section-40.6.html">Section 40.6</a> are clients. They plan, call tools, and reflect, but the substance of every step is a call to a large language model that returns the next action as text. In a toy demo that model is a hosted API behind a key. In the system this chapter builds, the application owns its serving tier, because the agent fleet issues far too many calls, with too much shared structure and too strict a cost target, to leave on a metered public endpoint. Owning the backend means owning the engineering that <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a> teaches: continuous batching, paged key-value (KV) caches, prefill and decode scheduling, and tensor parallelism, all wrapped in a replicated, autoscaling fleet. vLLM is the open engine that packages those mechanisms, and it is the backend behind a large share of self-hosted agent deployments today.</p>
+<p>The shape of the agentic workload makes the choice of engine consequential rather than incidental. A web-serving stack treats requests as independent and roughly uniform. Agent traffic is neither: a single user task spawns a tree of model calls (plan, then several tool-formatting calls, then a reflection), most of them short, a few of them long, and almost all of them prefixed by an identical multi-thousand-token system prompt that names the tools and the rules. A serving engine that exploits that structure, by batching across requests continuously and by storing the shared prefix once, serves several times more agents per GPU than one that does not. Figure 40.7.1 shows the fleet we are about to build.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 880 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of a vLLM serving fleet: an agent fleet sends requests through a router and load balancer to several replicas; one replica is expanded to show two tensor-parallel GPU shards holding half the model each, a continuous-batching scheduler, and a paged KV cache with a shared prefix block.">
+<defs>
+<marker id="arr407" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b407 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w407 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g407 { fill:#eef6ef; stroke:#2f7d39; stroke-width:1.6; }
+.t407 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s407 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l407 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr407); }
+</style>
+<text class="t407" x="90" y="30">Agent fleet</text>
+<rect class="b407" x="24" y="44" width="132" height="40" rx="7"/>
+<text class="s407" x="90" y="69">many short bursty calls</text>
+<rect class="b407" x="24" y="92" width="132" height="40" rx="7"/>
+<text class="s407" x="90" y="117">shared system prompt</text>
+<rect class="b407" x="24" y="140" width="132" height="40" rx="7"/>
+<text class="s407" x="90" y="165">fan-out per task</text>
+
+<rect class="b407" x="206" y="86" width="120" height="56" rx="8"/>
+<text class="t407" x="266" y="110">Router /</text>
+<text class="t407" x="266" y="127">load balancer</text>
+<line x1="156" y1="112" x2="200" y2="112" class="l407"/>
+
+<rect class="b407" x="380" y="40" width="120" height="40" rx="7"/>
+<text class="t407" x="440" y="64">Replica 1</text>
+<rect class="b407" x="380" y="300" width="120" height="40" rx="7"/>
+<text class="t407" x="440" y="324">Replica R</text>
+<text class="s407" x="440" y="362">autoscaled by queue depth</text>
+<path class="l407" d="M 326 104 L 360 64 L 374 60"/>
+<path class="l407" d="M 326 124 L 360 318 L 374 320"/>
+
+<rect class="g407" x="380" y="100" width="470" height="180" rx="10"/>
+<text class="t407" x="440" y="120">Replica 2</text>
+<text class="s407" x="615" y="120">(one shard group, tensor-parallel)</text>
+
+<rect class="w407" x="400" y="138" width="180" height="46" rx="7"/>
+<text class="t407" x="490" y="158">Continuous-batch</text>
+<text class="t407" x="490" y="174">scheduler</text>
+
+<rect class="b407" x="620" y="134" width="100" height="54" rx="7"/>
+<text class="t407" x="670" y="156">GPU 0</text>
+<text class="s407" x="670" y="174">model half A</text>
+<rect class="b407" x="730" y="134" width="100" height="54" rx="7"/>
+<text class="t407" x="780" y="156">GPU 1</text>
+<text class="s407" x="780" y="174">model half B</text>
+<path class="l407" d="M 670 188 L 670 206 L 720 206 L 720 188"/>
+<text class="s407" x="725" y="220">all-reduce per layer</text>
+
+<rect class="b407" x="400" y="210" width="430" height="56" rx="8"/>
+<text class="t407" x="615" y="230">Paged KV cache (PagedAttention)</text>
+<rect class="g407" x="414" y="240" width="86" height="18" rx="3"/>
+<text class="s407" x="457" y="253">shared prefix</text>
+<rect class="w407" x="506" y="240" width="40" height="18" rx="3"/>
+<rect class="w407" x="550" y="240" width="40" height="18" rx="3"/>
+<rect class="w407" x="594" y="240" width="40" height="18" rx="3"/>
+<rect class="w407" x="638" y="240" width="40" height="18" rx="3"/>
+<text class="s407" x="760" y="253">per-sequence blocks</text>
+<path class="l407" d="M 490 184 L 490 206"/>
+</svg>
+<figcaption><strong>Figure 40.7.1:</strong> The serving fleet behind the agent application. Bursty, prefix-sharing calls from the agent fleet enter a router that balances them across $R$ replicas. Each replica is one tensor-parallel shard group: the model is split across GPU 0 and GPU 1, which exchange activations with an all-reduce per layer (the model-parallel axis of <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>). Inside the replica, a continuous-batching scheduler feeds a PagedAttention KV cache whose shared system-prompt block is stored once and referenced by every sequence. Replicas are the data-parallel axis: the same shard group, copied to meet demand.</figcaption>
+</figure>
+
+<h2>1. The Serving Engine: Continuous Batching and PagedAttention <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A language model generates one token at a time. Each step runs the full network over the current context and emits the next token, so a request of $T$ output tokens needs $T$ sequential forward passes through the model. Per-node efficiency, the subject of <a href="../../part-5-distributed-inference/module-22-per-node-inference-efficiency/index.html">Chapter 22</a>, is about making each of those passes cheap; serving throughput is about running as many requests through each pass as possible. The two combine multiplicatively, which is why the fleet inherits Chapter 22 as a labeled prerequisite rather than re-deriving it.</p>
+<p>The naive way to batch is static: collect a fixed group of requests, run them together until the last one finishes, then start the next group. Agent traffic punishes this badly, because the generation lengths vary by an order of magnitude. A batch holding fifteen twenty-token tool calls and one five-hundred-token plan runs for five hundred steps, and for most of those steps the short sequences have already finished and their slots sit idle. Continuous batching, also called in-flight batching, fixes this by scheduling at the granularity of a single decode step: the moment a sequence emits its end-of-sequence token and frees a slot, a waiting request is admitted into that slot on the very next step. The engine never stalls on the slowest member of a batch. If we write $g_i$ for the output length of request $i$ in a window and $d$ for the per-step decode time of the batch, static batching keeps a batch of size $B$ busy for $\max_i g_i$ steps while only $\sum_i g_i$ are useful, so its slot utilization is</p>
+$$U_{\text{static}} = \frac{\sum_{i=1}^{B} g_i}{B \cdot \max_i g_i} \le 1, \qquad U_{\text{continuous}} \to 1,$$
+<p>and the achieved throughput in tokens per second rises in direct proportion to that utilization. Under the heavy length variance of agent traffic, $U_{\text{static}}$ can fall well below one half, and continuous batching recovers the lost fraction. The demo in Code 40.7.1 measures exactly this gap.</p>
+<p>The second mechanism is memory management for the KV cache. During generation, each layer caches the key and value vectors of every past token so they are not recomputed; this cache grows with the context length and dominates the memory budget once the weights are resident. The bytes a single sequence consumes are</p>
+$$M_{\text{KV}} = 2 \cdot L \cdot H_{\text{kv}} \cdot d_{\text{head}} \cdot T \cdot b,$$
+<p>where $L$ is the number of layers, $H_{\text{kv}}$ the number of key-value heads, $d_{\text{head}}$ the head dimension, $T$ the context length, $b$ the bytes per element (the factor $2$ counts keys and values). Reserving the maximum possible $T$ for every sequence up front, as early servers did, wastes most of the cache on contexts that never grow that long. PagedAttention, the mechanism vLLM is built around (Kwon et al., 2023), borrows the idea of paged virtual memory from operating systems: it splits the KV cache into fixed-size blocks and allocates them on demand as a sequence grows, so physical memory holds only the tokens that actually exist. Fragmentation drops from roughly sixty percent in the reserve-the-maximum scheme to a few percent, which is the same as multiplying the number of sequences that fit by a factor of two or more. Quantizing the cache to a smaller $b$, the scale-up lever of Chapter 22, shrinks $M_{\text{KV}}$ further.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Serving Throughput Is a Memory Problem Wearing a Compute Costume</div>
+<p>It is tempting to think a faster GPU serves more agents. Past a point it does not, because the binding constraint during decode is not arithmetic but the KV-cache memory that caps how many sequences can be in flight at once. Continuous batching keeps the compute saturated; PagedAttention and quantization decide how many sequences that saturated compute is allowed to serve. The two levers are orthogonal, and a serving tier that pulls only one of them leaves most of its capacity unclaimed.</p>
+</div>
+
+<h2>2. Sizing the Cache: How Many Agents Fit on One GPU? <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The formulas above turn into a capacity number the moment we plug in a real model and a real card. The demo below does this for a 13-billion-parameter decoder served in half precision on one 80 GB accelerator. It computes the KV bytes per token, subtracts the resident weights and a working-memory reserve to find the budget left for the cache, and divides to get the number of concurrent sequences. It then models the prefix-sharing win that is specific to agents, and finally compares continuous against static batching on a length distribution drawn from agentic traffic. The numbers it prints are the ones you would use to decide how many replicas the fleet needs.</p>
+<pre><code class="language-python">import math, random
+
+# ---- Model / hardware configuration (a 13B-class decoder served in fp16) ----
+n_layers, n_kv_heads, head_dim, bytes_per = 40, 40, 128, 2   # fp16 -> 2 bytes
+gpu_mem_gb, weights_gb, overhead_gb = 80, 26, 6              # one A100-80GB
+
+# KV-cache bytes per token = 2 (K and V) * layers * kv_heads * head_dim * bytes
+kv_per_token = 2 * n_layers * n_kv_heads * head_dim * bytes_per
+kv_budget_bytes = (gpu_mem_gb - weights_gb - overhead_gb) * (1024 ** 3)
+
+avg_ctx = 2048                                  # tokens per sequence
+kv_per_seq = kv_per_token * avg_ctx
+max_seqs = int(kv_budget_bytes // kv_per_seq)
+print("=== KV-cache sizing (13B fp16, A100-80GB) ===")
+print(f"KV bytes per token        : {kv_per_token:,} B  ({kv_per_token/1024:.1f} KB)")
+print(f"Memory free for KV cache  : {gpu_mem_gb-weights_gb-overhead_gb} GB")
+print(f"KV bytes per sequence     : {kv_per_seq/1e6:.1f} MB  (ctx={avg_ctx})")
+print(f"Max concurrent sequences  : {max_seqs}")
+
+# ---- Prefix sharing: agents share a long system prompt, stored ONCE ----
+sys_prompt_tokens, unique_tokens = 1500, 548
+shared_once = kv_per_token * sys_prompt_tokens
+unique_each = kv_per_token * unique_tokens
+seqs_with_caching = int((kv_budget_bytes - shared_once) // unique_each)
+print("\n=== Prefix caching for an agent fleet ===")
+print(f"Concurrent seqs, no cache : {max_seqs}")
+print(f"Concurrent seqs, prefix-cached : {seqs_with_caching}  "
+      f"({seqs_with_caching/max_seqs:.2f}x)")
+
+# ---- Continuous (in-flight) batching vs static batching ----
+def static(batch, lens, d_ms):
+    steps = max(lens)                            # wait for the slowest sequence
+    return sum(lens) / (steps*d_ms/1000), sum(lens) / (batch*steps)
+def continuous(batch, lens, d_ms):
+    return sum(lens) / ((sum(lens)/batch)*d_ms/1000), 1.0   # refill freed slots
+
+random.seed(7)
+batch, d_ms = 16, 12
+lens = [random.choice([20, 30, 40, 350, 512]) for _ in range(batch)]
+s_tps, s_u = static(batch, lens, d_ms)
+c_tps, c_u = continuous(batch, lens, d_ms)
+print("\n=== Continuous vs static batching (variable agent outputs) ===")
+print(f"Static  batching: {s_tps:6.1f} tok/s   slot utilization {s_u:.2f}")
+print(f"Continuous batch: {c_tps:6.1f} tok/s   slot utilization {c_u:.2f}")
+print(f"Speedup from continuous batching : {c_tps/s_tps:.2f}x")
+</code></pre>
+<div class="code-caption"><strong>Code 40.7.1:</strong> Capacity sizing for the agent serving tier. The first block applies $M_{\text{KV}}$ to count concurrent sequences; the second prices the shared-system-prompt win of prefix caching; the third measures continuous against static batching on a length mix typical of agent traffic.</div>
+<pre><code class="language-text">=== KV-cache sizing (13B fp16, A100-80GB) ===
+KV bytes per token        : 819,200 B  (800.0 KB)
+Memory free for KV cache  : 48 GB
+KV bytes per sequence     : 1677.7 MB  (ctx=2048)
+Max concurrent sequences  : 30
+
+=== Prefix caching for an agent fleet ===
+Concurrent seqs, no cache : 30
+Concurrent seqs, prefix-cached : 112  (3.73x)
+
+=== Continuous vs static batching (variable agent outputs) ===
+Static  batching:  463.2 tok/s   slot utilization 0.35
+Continuous batch: 1333.3 tok/s   slot utilization 1.00
+Speedup from continuous batching : 2.88x
+</code></pre>
+<div class="code-caption"><strong>Output 40.7.1:</strong> One 80 GB GPU holding a 13B model in fp16 has 48 GB left for the cache, enough for thirty full 2048-token sequences. Storing the shared 1500-token system prompt once instead of per sequence raises that to 112 concurrent agents, a $3.7\times$ gain, and continuous batching lifts decode throughput $2.9\times$ over static batching on the variable-length agent mix.</div>
+<p>The three numbers tell a coherent story for the fleet planner. Bare capacity is thirty sequences. Because the agents share a long system prompt, prefix caching nearly quadruples that to over a hundred, which is the single largest lever the agentic structure offers. And whatever the concurrency, continuous batching roughly triples the token rate the GPU actually delivers under the bursty, ragged traffic the agents produce. A replica is therefore not "one GPU equals one agent" but "one shard group equals a hundred-odd agents," and the replica count follows from dividing the fleet's peak concurrency by that figure.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Agent Platform That Stopped Renting Tokens</div>
+<p><strong>Who:</strong> A platform engineer running a customer-support agent product on a metered hosted LLM API.</p>
+<p><strong>Situation:</strong> Each support ticket spawned eight to twelve model calls, all carrying the same 1800-token system prompt and tool catalog, and the monthly API bill scaled linearly with ticket volume.</p>
+<p><strong>Problem:</strong> The hosted endpoint billed the full shared prompt on every call and offered no control over batching, so most of the spend bought re-processing of identical prefix tokens.</p>
+<p><strong>Dilemma:</strong> Stay on the simple metered API and watch the bill grow with usage, or stand up a self-hosted vLLM fleet that demanded GPU operations but priced the shared prefix once.</p>
+<p><strong>Decision:</strong> They self-hosted, because the prefix-sharing and continuous-batching gains of Output 40.7.1 applied directly to their traffic shape, where the same prompt led every call.</p>
+<p><strong>How:</strong> They deployed a 13B model on two GPUs per replica with tensor parallelism, enabled automatic prefix caching, and placed three replicas behind a queue-depth autoscaler on their cluster (<a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/index.html">Chapter 33</a>).</p>
+<p><strong>Result:</strong> Effective per-agent serving cost fell by roughly four-fifths at peak, because the GPUs that had been re-encoding the prompt now spent their cycles generating distinct tokens, and tail latency improved because requests no longer waited behind a metered queue.</p>
+<p><strong>Lesson:</strong> When traffic has heavy shared structure, owning the serving engine that exploits that structure beats renting one that bills as if every request were unique.</p>
+</div>
+
+<h2>3. Prefill, Decode, and the Agentic Traffic Shape <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>A generation request has two phases with opposite resource profiles, and the agentic workload makes the split unusually sharp. Prefill processes the entire input prompt in one parallel pass to populate the KV cache; it is compute-bound and its cost grows with the prompt length. Decode then emits output tokens one at a time, each pass reading the whole cache to produce a single token; it is memory-bandwidth-bound and its cost grows with the output length. Agent calls are prefill-heavy: the prompt is a multi-thousand-token system message plus tool schemas plus history, while the output is often a short tool-call object of a few dozen tokens. A scheduler that lets a giant prefill monopolize the engine stalls every in-flight decode behind it, spiking the latency of the short calls that dominate agent traffic.</p>
+<p>Two refinements address this. Chunked prefill splits a long prompt into pieces and interleaves them with ongoing decode steps, so a large prompt no longer freezes the batch. Prefill-decode disaggregation, the more aggressive design that <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a> develops, runs the two phases on separate pools of GPUs: a prefill pool optimized for throughput populates the cache, ships the KV blocks to a decode pool optimized for low-latency token streaming, and each pool is sized to its own bottleneck. For an agent fleet, where every call pays a heavy prefill but most calls decode briefly, disaggregation lets the two pools scale independently rather than forcing one GPU profile to straddle both regimes. Prefix caching compounds the benefit: the shared system prompt is prefilled once and its KV blocks are reused across every agent that carries it, so the expensive phase is largely amortized away.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: From a Python Object to an OpenAI-Compatible Fleet</div>
+<p>vLLM packages continuous batching, PagedAttention, prefix caching, and tensor parallelism behind two interfaces. Offline, the <code>LLM</code> object runs a batched generation in a handful of lines; the engine schedules the batch continuously without any orchestration code from you:</p>
+<pre><code class="language-python">from vllm import LLM, SamplingParams
+
+llm = LLM(model="meta-llama/Llama-2-13b-chat-hf",
+          tensor_parallel_size=2,            # shard the model across 2 GPUs
+          enable_prefix_caching=True,        # store the shared prompt once
+          gpu_memory_utilization=0.92)       # leave headroom for the KV cache
+params = SamplingParams(max_tokens=128, temperature=0.0)
+
+system = "You are an agent. Tools: search(q), calc(expr). Rules: ..."  # shared prefix
+prompts = [system + f"\nUser task {i}: ..." for i in range(256)]       # one fan-out
+for out in llm.generate(prompts, params):     # continuous batching, automatic
+    handle(out.outputs[0].text)
+</code></pre>
+<p>Online, one command exposes the same engine as a drop-in OpenAI-compatible server, so the agent code of <a href="section-40.6.html">Section 40.6</a> points its client at a local URL and changes nothing else:</p>
+<pre><code class="language-bash">vllm serve meta-llama/Llama-2-13b-chat-hf \
+    --tensor-parallel-size 2 --enable-prefix-caching \
+    --max-num-seqs 128 --port 8000
+# agents call http://localhost:8000/v1/chat/completions exactly as a hosted API
+</code></pre>
+<div class="code-caption"><strong>Code 40.7.2:</strong> The capacity model of Code 40.7.1 realized in production. The manual KV accounting, batch scheduling, prefix deduplication, and cross-GPU sharding all collapse into a constructor and a serve command; vLLM owns the scheduler, the paged allocator, and the tensor-parallel all-reduce internally.</div>
+</div>
+
+<h2>4. A Model Too Big for One GPU: Tensor and Pipeline Parallelism <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The capacity arithmetic of Section 2 assumed the weights fit on one card. Many serving models do not. A 70-billion-parameter model in half precision needs roughly 140 GB for weights alone, well beyond a single 80 GB GPU before any KV cache is allocated. The model must then be split across devices, and this is the model-parallel axis that <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a> develops for training and that serving reuses almost unchanged. Tensor parallelism partitions each layer's weight matrices across $N$ GPUs, so each device holds and computes on a $1/N$ slice; the partial results are combined with an all-reduce within every layer, the same collective introduced in <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> and used for gradients in <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>. If the per-GPU compute time of a layer is $c$ and the all-reduce of its activations costs $a$, the tensor-parallel time per layer is approximately</p>
+$$t_{\text{TP}}(N) \approx \frac{c}{N} + a(N),$$
+<p>so adding GPUs shrinks the compute term but inflates the communication term; tensor parallelism therefore stays inside a single node where the interconnect (NVLink) is fast, and the practical degree is small (two, four, or eight). Pipeline parallelism is the complementary split: it assigns whole contiguous layers to different GPUs and streams micro-batches through the stages, which moves far less data per step and so tolerates slower cross-node links, at the cost of pipeline fill-and-drain bubbles. A model too large even for one node combines them, tensor-parallel within each node and pipeline-parallel across nodes, the two-axis layout of Chapter 16. In Figure 40.7.1 each replica is a two-way tensor-parallel group; scaling the model to 70B would deepen each replica to eight-way tensor parallelism, or add a pipeline axis, without changing the fleet structure around it.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Distributed Twice Over, to Meet One Demand Curve</div>
+<p>This serving tier is the book's thesis in its most concrete form. The model is distributed <em>across GPUs</em> because it does not fit on one (model parallelism, <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>), and that whole shard group is then distributed <em>across nodes</em> because one copy cannot answer enough requests (data-parallel serving, <a href="../../part-5-distributed-inference/module-23-distributed-inference-systems/index.html">Chapter 23</a>). Two orthogonal axes of distribution, model and replica, are composed to satisfy a single agent fleet's demand. Neither alone suffices: model parallelism makes the model runnable, replication makes it scalable, and only together do they serve the workload at its latency budget and its cost target.</p>
+</div>
+
+<h2>5. The Serving Fleet: Replicas, Router, and Autoscaling <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>One replica, however well tuned, has a ceiling: the hundred-odd concurrent agents of Output 40.7.1, at some token rate. The agent fleet at peak wants more, so the replica is copied. Each replica is an identical shard group, and a router in front of them spreads incoming requests across the pool, the data-parallel serving pattern of <a href="../../part-5-distributed-inference/module-23-distributed-inference-systems/index.html">Chapter 23</a>. The router is not a plain round-robin balancer; because prefix caching makes a replica far cheaper for a request whose prefix it has already cached, a prefix-aware router sends agents sharing a system prompt to the same replica, raising the cache-hit rate across the fleet rather than scattering the shared prefix across every node.</p>
+<p>Demand is not constant. Agent traffic is bursty: a batch job or a wave of users fans out into thousands of concurrent calls, then subsides. Autoscaling matches replica count to load, and the right signal is not CPU but the serving queue, the number of requests waiting and the time they wait. The cluster layer of <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/index.html">Chapter 33</a> places each new replica on GPUs that satisfy its tensor-parallel group's topology (all $N$ shards on one node, on the fast interconnect), and scales the pool down when the queue drains. The metric that ties capacity to the service-level objective (SLO) is goodput: the rate of requests served <em>within</em> the latency target, not the raw throughput. Writing $\lambda$ for the offered request rate and $\Pr[\text{latency} \le \text{SLO}]$ for the fraction meeting the budget,</p>
+$$\text{goodput} = \lambda \cdot \Pr[\text{latency} \le \text{SLO}],$$
+<p>and the fleet is sized so that goodput tracks $\lambda$ across the bursts. Push concurrency too high on a replica and per-token latency rises until requests miss the SLO; goodput then falls even as raw throughput climbs, which is the quantitative signal to add a replica rather than pack the existing ones tighter. This goodput-under-SLO framing is the same one <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a> uses to size LLM fleets, applied here to the agent workload, and it feeds directly into the cost model that <a href="section-40.8.html">Section 40.8</a> builds next.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Disaggregated and Prefix-Aware Serving (2024 to 2026)</div>
+<p>The serving engine is a fast-moving research target precisely because it gates the cost of every agent product. Prefill-decode disaggregation, proven at scale by DistServe (Zhong et al., 2024) and Mooncake (Qin et al., 2024), splits the two phases onto separate GPU pools and reports large goodput gains under tight SLOs by sizing each pool to its own bottleneck. KV-cache offloading and reuse push the shared cache into CPU memory or a distributed store so prefixes survive across requests and even across replicas, turning prefix caching into a fleet-wide rather than per-replica asset. Speculative decoding, where a small draft model proposes several tokens that the large model verifies in one pass, cuts decode latency for the short agent calls that dominate the traffic. vLLM has absorbed continuous batching, PagedAttention, chunked prefill, and speculative decoding into one engine; the open question the field is now working is how to schedule a heterogeneous fleet, mixing prefill nodes, decode nodes, and draft models, so that agentic goodput per dollar is maximized. We turn that per-dollar question into an explicit budget in <a href="section-40.8.html">Section 40.8</a>.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Prompt Everyone Carries</div>
+<p>The shared system prompt that PagedAttention stores once is the serving tier's version of a group chat where everyone has read the same pinned message. Output 40.7.1 quadrupled capacity not by making any single agent faster but by noticing that a hundred agents were all dragging the identical 1500-token rulebook into the cache and agreeing to keep just one copy. The cheapest token to generate is the one you already generated for somebody else.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 40.7.1: Read the Capacity Off the Formula <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using $M_{\text{KV}} = 2 L H_{\text{kv}} d_{\text{head}} T b$, explain in words why a model that uses grouped-query attention (which sets $H_{\text{kv}}$ to, say, one eighth of the number of query heads) can serve many more concurrent sequences than one with full multi-head attention, even though both have the same number of parameters. Then state which of the three levers in Section 1 (continuous batching, paged allocation, cache quantization) attacks $M_{\text{KV}}$ directly and which attacks utilization instead, and why a fleet planner needs both.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 40.7.2: Size the Fleet for the Agent Burst <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 40.7.1 into a fleet sizer. Take a peak offered load of agent calls per second, an average output length, and a target per-call latency, and compute (a) the concurrent sequences each replica supports with prefix caching enabled, (b) the token rate per replica from the continuous-batching model, and (c) the number of replicas needed so that goodput keeps up with the offered load. Then plot goodput against concurrency per replica and mark the point where pushing concurrency higher starts to violate the SLO. Discuss how enabling prefix caching shifts that point.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 40.7.3: Tensor Parallel or More Replicas? <span class="exercise-type analysis">Analysis</span></div>
+<p>A 70B model in fp16 needs about 140 GB of weights and must be sharded. Compare two fleet layouts that use the same eight GPUs: four replicas of two-way tensor parallelism versus two replicas of four-way tensor parallelism (assume the model fits in both, ignoring KV cache for the weight question, then revisit). Using $t_{\text{TP}}(N) \approx c/N + a(N)$, argue which layout gives lower per-token latency and which gives higher aggregate goodput, and explain why the answer depends on whether the binding constraint is single-call latency or fleet throughput. State why tensor parallelism is kept within a node, citing the all-reduce cost.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-40.6.html"><span class="nav-label">Previous</span><span class="nav-num">Section 40.6</span><span class="nav-title">Distributed Agent Orchestration</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 40</span><span class="nav-num">Contents</span><span class="nav-title">Distributed LLM and Agentic Applications</span></a>
+<a class="next" href="section-40.8.html"><span class="nav-label">Next</span><span class="nav-num">Section 40.8</span><span class="nav-title">Cost Control Across the Fleet</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

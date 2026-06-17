@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 12.3: Distributed Decision Trees. How to grow a tree over sharded data by all-reducing per-feature histograms instead of moving rows, why communication scales with bins times features rather than N, and the data-parallel versus feature-parallel trade-off." name="description"/>
+<title>Section 12.3: Distributed Decision Trees | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Distributed Machine Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 12: Distributed Classical Machine Learning</a></div>
+<h1>Distributed Decision Trees</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I asked every worker not for its data but for a tally. Sixteen numbers came back from each, we added them up, and the whole forest agreed on where to cut."</p>
+<cite>A Split Finder Who Never Saw a Single Row</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A decision tree can be grown over data sharded across hundreds of machines without ever moving a single training row, because the only thing a node needs to choose its split is a small table of per-feature, per-bin statistics, and tables add.</strong> The expensive part of tree growth is split finding: deciding, at each node, which feature and threshold most reduce impurity. Done naively that requires looking at every example at the node, which is fatal when the examples live on different machines. The histogram method replaces the scan with a tally. Each worker bins its own rows and accumulates a tiny histogram of label statistics per feature; an all-reduce sums those histograms so every worker holds the global tally and computes the identical best split. The traffic is proportional to bins times features, not to the number of examples $N$, and that single fact is what lets gradient-boosted trees, the workhorses of tabular machine learning, scale to billions of rows. This section builds that mechanism from first principles and verifies the sharded split matches the single-machine split exactly.</p>
+</div>
+<p>The previous sections distributed models with smooth, additive objectives: linear and logistic regression, then support vector machines, where the gradient or the dual update decomposes cleanly across data shards. A decision tree is a different animal. It has no global parameter vector and no gradient of a single loss; it is grown greedily, one node at a time, by a discrete search for the split that best separates the data reaching that node. That discreteness is exactly what makes the distributed version interesting. We cannot all-reduce a gradient, because there is no gradient. What we can all-reduce is the set of sufficient statistics the split search consumes, and the art of the chapter is recognizing that those statistics are small, additive, and therefore cheap to combine.</p>
+
+<h2>1. The Split-Finding Bottleneck <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Growing a tree is a recursion. At the root, all $N$ training examples are present; the algorithm picks one feature and one threshold that splits them into a left child and a right child so that each child is purer (more dominated by one label, or lower in variance) than the parent. It then recurses on each child with the examples that fell into it, stopping when a node is pure enough, small enough, or deep enough. Everything expensive about this recursion lives in one step, repeated at every node: find the best split.</p>
+<p>To score a candidate split of a node on a feature, you need to know, for the examples at that node, how the label statistics divide between the two sides of the threshold. For classification that means counts of each class on the left and on the right; for regression it means the sum and sum of squares of the targets. The standard quality measure is the impurity reduction, often called the gain. Writing $\text{imp}(\cdot)$ for a node's impurity (Gini or entropy for classification, variance for regression), a split of a parent node into a left child $L$ and a right child $R$ has gain</p>
+$$\text{gain} = \text{imp}(\text{parent}) - \frac{n_L}{n}\,\text{imp}(L) - \frac{n_R}{n}\,\text{imp}(R),$$
+<p>where $n_L$ and $n_R$ are the numbers of examples falling left and right, and $n = n_L + n_R$. The greedy tree picks, over all features and all thresholds, the split that maximizes this gain. Notice what the formula actually consumes: only counts and label sums on each side of the threshold. It never needs the rows themselves, only their tallies. That observation is the seed of the entire distributed construction.</p>
+<p>On a single machine the classic way to evaluate every threshold for a feature is to sort the node's examples by that feature and sweep, maintaining running left and right statistics. That is $O(N \log N)$ per feature per node, and worse, it assumes the rows are all in one place. When the $N$ examples are sharded across $K$ machines, no machine can sort the global order, and shipping the rows to one machine to sort them would move exactly the terabytes we sharded to avoid. The bottleneck is not the arithmetic of the gain; it is gathering the statistics the gain needs from data that lives everywhere at once.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Split Needs Statistics, Not Rows</div>
+<p>The gain of a candidate split is a function of counts and label sums on each side of a threshold, nothing more. Those quantities are additive: the count of class-one examples in a bin, taken over the whole dataset, is the sum of the per-shard counts in that bin. So the distributed split problem is not "move the data to one place and search," it is "summarize the data where it lives and add the summaries." The summary is a histogram, and addition of histograms is an all-reduce. This turns an $O(N)$ data-movement problem into an $O(\text{bins} \times \text{features})$ communication problem.</p>
+</div>
+
+<h2>2. The Histogram Method <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The histogram method, the idea behind every scalable tree library, removes the sort entirely and replaces continuous thresholds with a fixed, small set of candidate cut points. Before training, each feature's range is divided into $B$ bins (typically 64 or 255), and every feature value is replaced by its bin index. A node's statistics for one feature are then a histogram with $B$ buckets: for classification, each bucket holds the count of examples and the count of positives that landed in that bin; for boosting, each bucket holds the sum of gradients and the sum of Hessians. Evaluating splits for that feature becomes a single left-to-right sweep over $B$ buckets, accumulating a running prefix on the left and reading the complement on the right, which costs $O(B)$ rather than $O(N \log N)$.</p>
+<p>The distributed payoff is immediate. A histogram is additive across data shards. If worker $k$ builds the histogram of its own rows for a feature, then the global histogram for that feature is the bucket-wise sum of the $K$ local histograms. Summing one vector held on each worker and sharing the result is precisely the all-reduce collective introduced in <a href="../../part-1-foundations/module-04-communication-primitives/section-4.3.html">Section 4.3</a>; here it carries histogram buckets instead of gradient components. After the all-reduce every worker holds the identical merged histogram, runs the identical $O(B)$ sweep, and selects the identical best split. No worker ever saw another worker's rows; they exchanged only tallies. Figure 12.3.1 traces the flow for one feature.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 880 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three workers each holding a row shard build a local per-bin histogram of label statistics; an all-reduce sums the histograms bucket by bucket into one global histogram, from which every worker reads the identical best split threshold.">
+<defs>
+<marker id="arr123" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b123 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w123 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g123 { fill:#eaf4ec; stroke:#2f7d4f; stroke-width:1.6; }
+.bar123 { fill:#b86b1f; }
+.barg123 { fill:#2f7d4f; }
+.t123 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s123 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l123 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr123); }
+.cut123 { stroke:#c0392b; stroke-width:2; stroke-dasharray:4 3; }
+</style>
+<text class="t123" x="440" y="22">One feature, B = 8 bins: each worker tallies its own rows, then an all-reduce sums the histograms</text>
+<!-- worker shards -->
+<text class="t123" x="120" y="58">Worker 1 (shard 1)</text>
+<rect class="w123" x="40" y="68" width="160" height="78" rx="8"/>
+<rect class="bar123" x="50" y="120" width="14" height="20"/><rect class="bar123" x="68" y="112" width="14" height="28"/><rect class="bar123" x="86" y="118" width="14" height="22"/><rect class="bar123" x="104" y="108" width="14" height="32"/><rect class="bar123" x="122" y="124" width="14" height="16"/><rect class="bar123" x="140" y="116" width="14" height="24"/><rect class="bar123" x="158" y="122" width="14" height="18"/><rect class="bar123" x="176" y="126" width="14" height="14"/>
+<text class="t123" x="440" y="58">Worker 2 (shard 2)</text>
+<rect class="w123" x="360" y="68" width="160" height="78" rx="8"/>
+<rect class="bar123" x="370" y="124" width="14" height="16"/><rect class="bar123" x="388" y="118" width="14" height="22"/><rect class="bar123" x="406" y="120" width="14" height="20"/><rect class="bar123" x="424" y="110" width="14" height="30"/><rect class="bar123" x="442" y="116" width="14" height="24"/><rect class="bar123" x="460" y="122" width="14" height="18"/><rect class="bar123" x="478" y="114" width="14" height="26"/><rect class="bar123" x="496" y="120" width="14" height="20"/>
+<text class="t123" x="760" y="58">Worker K (shard K)</text>
+<rect class="w123" x="680" y="68" width="160" height="78" rx="8"/>
+<rect class="bar123" x="690" y="118" width="14" height="22"/><rect class="bar123" x="708" y="122" width="14" height="18"/><rect class="bar123" x="726" y="114" width="14" height="26"/><rect class="bar123" x="744" y="108" width="14" height="32"/><rect class="bar123" x="762" y="120" width="14" height="20"/><rect class="bar123" x="780" y="116" width="14" height="24"/><rect class="bar123" x="798" y="124" width="14" height="16"/><rect class="bar123" x="816" y="118" width="14" height="22"/>
+<text class="s123" x="120" y="160">local histogram (count, positives)</text>
+<text class="s123" x="440" y="160">local histogram (count, positives)</text>
+<text class="s123" x="760" y="160">local histogram (count, positives)</text>
+<!-- arrows to all-reduce -->
+<path class="l123" d="M 120 168 L 120 200 L 410 200 L 410 232"/>
+<path class="l123" d="M 440 168 L 440 232"/>
+<path class="l123" d="M 760 168 L 760 200 L 470 200 L 470 232"/>
+<!-- all-reduce -->
+<rect class="b123" x="300" y="234" width="280" height="50" rx="8"/>
+<text class="t123" x="440" y="256">All-reduce: sum histograms bucket by bucket</text>
+<text class="s123" x="440" y="274">traffic = bins &#215; features, independent of N</text>
+<path class="l123" d="M 440 286 L 440 318"/>
+<!-- global histogram -->
+<text class="t123" x="440" y="338">Global histogram (identical on every worker)</text>
+<rect class="g123" x="320" y="346" width="240" height="68" rx="8"/>
+<rect class="barg123" x="330" y="392" width="20" height="14"/><rect class="barg123" x="354" y="384" width="20" height="22"/><rect class="barg123" x="378" y="388" width="20" height="18"/><rect class="barg123" x="402" y="372" width="20" height="34"/><rect class="barg123" x="426" y="378" width="20" height="28"/><rect class="barg123" x="450" y="386" width="20" height="20"/><rect class="barg123" x="474" y="382" width="20" height="24"/><rect class="barg123" x="498" y="390" width="20" height="16"/>
+<line class="cut123" x1="420" y1="350" x2="420" y2="410"/>
+<text class="s123" x="600" y="384">best threshold</text>
+<text class="s123" x="600" y="398">(max Gini gain)</text>
+</svg>
+<figcaption><strong>Figure 12.3.1:</strong> The histogram method for one feature across $K$ workers. Each worker bins only its own shard and builds a local histogram of label statistics per bin (orange). A single all-reduce sums the histograms bucket by bucket into one global histogram (green) that every worker holds identically, and the dashed red line marks the threshold of maximum gain found by the $O(B)$ sweep. The data never moves; only the small histograms travel, so the traffic scales with bins times features, never with $N$.</figcaption>
+</figure>
+
+<p>The cost accounting is the whole point. Each worker sends, per node, one histogram per feature: $F$ features times $B$ bins times the bytes of the per-bucket statistics. For 200 features, 255 bins, and two 4-byte statistics per bucket, that is about 400 kilobytes per node, regardless of whether the shard holds ten thousand rows or ten billion. The all-reduce cost depends on $B$, $F$, and the number of workers, but not on $N$. Doubling the data per worker doubles the local binning work, which is embarrassingly parallel, and changes the communication not at all. This is why the histogram tree is the scalable tree: it converts a data-movement problem whose size is the dataset into a communication problem whose size is a fixed summary.</p>
+
+<h2>3. A Sharded Split That Matches the Whole-Data Split <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The claim worth verifying is exactness. Because histogram addition is just integer and floating-point summation, the merged histogram is bit-for-bit the histogram you would have built on the pooled data, so the split chosen from it is the split a single machine would have chosen. The code below grows the work of one node. It bins a single feature, builds the full-data histogram as a reference, then shards the rows across $K$ workers, has each worker build a local histogram, all-reduces them by summation, and finds the best Gini-gain threshold from the merged result. It then checks that the merged histogram equals the full one and that the two splits agree.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+N, K, B = 60_000, 6, 16            # examples, workers (row shards), feature bins
+# One feature, binned to B buckets; binary label. Find the best threshold split.
+feat_bin = rng.integers(0, B, size=N)            # pre-quantized feature value in [0, B)
+# Label probability rises with the bin index, so a real split exists.
+p = 0.15 + 0.70 * (feat_bin / (B - 1))
+y = (rng.random(N) &lt; p).astype(np.int64)
+
+def local_histogram(bins, labels, B):
+    """Per-bin (count, positive-count) statistics over THIS worker's shard."""
+    cnt = np.bincount(bins, minlength=B).astype(np.float64)
+    pos = np.bincount(bins, weights=labels, minlength=B).astype(np.float64)
+    return np.stack([cnt, pos])               # shape (2, B): row 0 count, row 1 positives
+
+def gini(pos, cnt):
+    """Gini impurity of a node with `pos` positives out of `cnt` examples."""
+    if cnt == 0:
+        return 0.0
+    p1 = pos / cnt
+    return 1.0 - p1 * p1 - (1.0 - p1) ** 2
+
+def best_split_from_hist(hist):
+    """Scan thresholds t: left = bins &lt; t, right = bins &gt;= t. Maximize Gini gain."""
+    cnt, pos = hist[0], hist[1]
+    total_cnt, total_pos = cnt.sum(), pos.sum()
+    parent = gini(total_pos, total_cnt)
+    best_gain, best_t = -1.0, None
+    cum_cnt = np.cumsum(cnt)                   # examples with bin &lt; t, for t = 1..B-1
+    cum_pos = np.cumsum(pos)
+    for t in range(1, len(cnt)):
+        lc, lp = cum_cnt[t - 1], cum_pos[t - 1]
+        rc, rp = total_cnt - lc, total_pos - lp
+        if lc == 0 or rc == 0:
+            continue
+        child = (lc / total_cnt) * gini(lp, lc) + (rc / total_cnt) * gini(rp, rc)
+        gain = parent - child
+        if gain &gt; best_gain:
+            best_gain, best_t = gain, t
+    return best_t, best_gain
+
+# --- Single-machine reference: one histogram over ALL data, then split. ---
+full_hist = local_histogram(feat_bin, y, B)
+t_full, g_full = best_split_from_hist(full_hist)
+
+# --- Distributed: shard rows, each worker builds a LOCAL histogram. ---
+shards = np.array_split(np.arange(N), K)
+local_hists = [local_histogram(feat_bin[s], y[s], B) for s in shards]   # K workers
+
+# All-reduce: sum the (2, B) histograms element-wise across workers.
+merged_hist = np.sum(local_hists, axis=0)
+t_dist, g_dist = best_split_from_hist(merged_hist)
+
+bytes_per_worker = local_hists[0].size * 8       # one shard's histogram payload
+print("workers (row shards)      :", K)
+print("feature bins B            :", B)
+print("histogram floats / worker :", local_hists[0].size, f"({bytes_per_worker} bytes)")
+print("full-data best threshold  :", t_full, " gain =", f"{g_full:.6f}")
+print("all-reduce best threshold :", t_dist, " gain =", f"{g_dist:.6f}")
+print("merged == full histogram  :", bool(np.array_equal(merged_hist, full_hist)))
+print("splits identical          :", t_full == t_dist and abs(g_full - g_dist) &lt; 1e-15)
+</code></pre>
+<div class="code-caption"><strong>Code 12.3.1:</strong> Distributed split finding by histogram all-reduce. Six workers each bin only their own shard; the histograms are summed (the all-reduce), and the best Gini-gain threshold is read from the merged tally. The payload per worker is a handful of numbers, independent of how many rows the shard holds.</div>
+<pre><code class="language-text">workers (row shards)      : 6
+feature bins B            : 16
+histogram floats / worker : 32 (256 bytes)
+full-data best threshold  : 8  gain = 0.069405
+all-reduce best threshold : 8  gain = 0.069405
+merged == full histogram  : True
+splits identical          : True
+</code></pre>
+<div class="code-caption"><strong>Output 12.3.1:</strong> The merged histogram equals the full-data histogram bucket for bucket, so the sharded search picks threshold 8 with gain 0.069405, exactly the split a single machine would have chosen. Each worker shipped only 256 bytes for this feature, a number that would not change if every shard held a billion rows instead of ten thousand.</div>
+<p>The split found over six blind shards is the split found over the pooled data, down to the last digit of the gain, and the histogram each worker sent was 256 bytes whether its shard held ten thousand rows or ten billion. To grow a full tree you repeat Code 12.3.1 at every node, building one histogram per feature and all-reducing the stack; a useful efficiency trick, the histogram subtraction property, lets a child reuse its parent's histogram minus its sibling's so only the smaller child is ever scanned. The mechanism, though, is exactly what you just ran: summarize locally, all-reduce, decide identically everywhere.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: All-Reduce Returns, Carrying Histograms</div>
+<p>In <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a> the all-reduce summed gradient vectors and gave back the exact single-machine gradient. Here the same collective sums histogram buckets and gives back the exact single-machine split, for a model that has no gradient at all. The pattern is the book's spine: find the small additive sufficient statistic a step consumes, all-reduce it, and every worker reaches the identical decision without seeing each other's data. The collectives of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> are not a deep-learning convenience; they are the combine step of distributed machine learning in general, the same combine step that drove <a href="../module-10-distributed-optimization/index.html">Chapter 10</a>'s communication-efficient optimization and that returns as the engine of distributed boosting in Section 12.5.</p>
+</div>
+
+<h2>4. Data-Parallel Versus Feature-Parallel Trees <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Code 12.3.1 shards the rows: every worker holds all features for a slice of the examples and builds the full set of feature histograms over its slice. This is data-parallel tree building, and it is the default for the common case where rows vastly outnumber features. Its communication per node is the all-reduce of $F$ histograms of $B$ buckets, so $O(F \cdot B)$ traffic, and its local work is binning the shard, which parallelizes perfectly in $N$. The weakness shows when $F \cdot B$ itself is large, a wide dataset with thousands of features, because then the histogram payload, repeated at every node, becomes the bottleneck even though it is independent of $N$.</p>
+<p>The alternative is to shard the columns. In feature-parallel tree building, each worker holds all rows but only a subset of the features. Each worker finds the best split among its own features locally, with no histogram exchange at all, and the workers then exchange only the single best candidate each found, a few numbers, to elect the global winner. Communication per node is tiny, $O(K)$ candidates rather than $O(F \cdot B)$ buckets. The catch is twofold: every worker must hold every row, so the data cannot exceed one machine's capacity in the row dimension, and once the winning split is chosen, the partition of rows into left and right child must be broadcast to all workers so they can re-segment their columns, which costs $O(N)$ communication per node and grows with the data. Table 12.3.1 lays the two strategies side by side.</p>
+<div class="table-caption"><strong>Table 12.3.1:</strong> Data-parallel versus feature-parallel tree building. The right choice follows from whether rows or features dominate, and from whether the row count exceeds one machine's memory.</div>
+<table>
+<thead>
+<tr><th scope="col">Aspect</th><th scope="col">Data-parallel (shard rows)</th><th scope="col">Feature-parallel (shard columns)</th></tr>
+</thead>
+<tbody>
+<tr><td>Each worker holds</td><td>all features for a slice of rows</td><td>all rows for a subset of features</td></tr>
+<tr><td>Communicated per node</td><td>histograms, $O(F \cdot B)$</td><td>best candidates $O(K)$, plus split partition $O(N)$</td></tr>
+<tr><td>Scales with</td><td>row count $N$ (rows split across workers)</td><td>feature count $F$ (features split across workers)</td></tr>
+<tr><td>Binding limit</td><td>$F \cdot B$ histogram payload per node</td><td>every worker must fit all $N$ rows</td></tr>
+<tr><td>Best when</td><td>many rows, moderate features (the usual case)</td><td>very wide data, rows fit one machine</td></tr>
+</tbody>
+</table>
+<p>Production systems mix the two. LightGBM offers both a data-parallel and a feature-parallel mode and a voting-parallel variant that all-reduces only the top-$k$ candidate features per worker to shrink the $O(F \cdot B)$ payload; XGBoost's distributed mode is histogram all-reduce over row shards. The decision is the recurring one from <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>: estimate the communication volume each strategy implies for your $N$, $F$, $B$, and $K$, and pick the one whose dominant term is smallest. There is no universally best partition, only the one matched to the shape of your data.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Tree That Phoned In Its Vote</div>
+<p>Voting-parallel training is the tree-building equivalent of a committee that, instead of mailing everyone the full minutes, lets each member nominate their two favorite motions and only circulates the shortlist. Most of the time the globally best split is somebody's local favorite, so the shortlist contains it and the full histogram exchange was never needed. Occasionally the true winner is nobody's top pick and the committee settles for second best, a small, bounded loss of split quality traded for a large cut in network traffic. It is a rare case where phoning it in is the principled engineering choice.</p>
+</div>
+
+<h2>5. Choosing the Bin Boundaries with Quantile Sketches <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>One question was assumed away above: where do the bin edges come from? For the histogram method to be both accurate and balanced, each feature's bins should carry roughly equal numbers of examples, which means the cut points should sit at the quantiles of that feature's distribution, the median, the quartiles, and so on for $B$ buckets. Computing exact quantiles requires sorting the feature globally, the very $O(N \log N)$ all-to-one operation we sharded to avoid. The way out is the same way out as everywhere else in this book: an approximate, mergeable summary.</p>
+<p>A quantile sketch is a small, fixed-size data structure that summarizes the distribution of a stream of values and answers "what value sits at quantile $q$?" to within a bounded error, using memory that does not grow with the number of values seen. Crucially, sketches are mergeable: the sketch of a shard plus the sketch of another shard combine into a sketch of the union, with the same error guarantee. So each worker builds a sketch of its own feature values, the sketches are merged across workers (one more all-reduce-shaped combine), and the merged sketch yields the global bin boundaries that every worker then uses to bin its rows. These structures, the Greenwald-Khanna sketch and the t-digest among them, were introduced as a streaming and MapReduce tool in <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/section-6.8.html">Section 6.8</a>; distributed tree building is one of their most important consumers, because XGBoost's weighted quantile sketch is exactly how it proposes candidate splits over sharded data.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Boosting a Click Model on Six Billion Rows</div>
+<p><strong>Who:</strong> A machine learning engineer on the ranking team of a large advertising platform.</p>
+<p><strong>Situation:</strong> A gradient-boosted click-through model trained on six billion impression rows with around 300 features; the data lived as Parquet shards on cluster storage and did not fit on any single machine.</p>
+<p><strong>Problem:</strong> A single-machine boosting run was impossible, the data exceeded one node's disk, and an early attempt to subsample to a trainable size cost measurable AUC on the long tail of rare ad categories.</p>
+<p><strong>Dilemma:</strong> Subsample to fit one big machine and lose tail accuracy, or distribute the tree growth across the cluster and pay for histogram all-reduce at every node of every tree.</p>
+<p><strong>Decision:</strong> They went data-parallel with distributed XGBoost over 32 workers, keeping all six billion rows in play, because the binding ceiling was data volume and the feature count was moderate enough that the $O(F \cdot B)$ histogram traffic stayed small.</p>
+<p><strong>How:</strong> Each worker held a slice of the rows, a merged weighted quantile sketch fixed 255 bins per feature once at the start, and every node's split came from an all-reduce of 300 histograms; the histogram subtraction trick halved the per-node binning work.</p>
+<p><strong>Result:</strong> Full-data training finished in under an hour, recovered the tail AUC lost to subsampling, and the per-node network payload stayed near 600 kilobytes regardless of the six-billion-row scale, exactly the $N$-independence Output 12.3.1 demonstrates in miniature.</p>
+<p><strong>Lesson:</strong> When data volume is the ceiling and features are moderate, data-parallel histogram trees let you train on everything; the communication you pay for is set by bins and features, not by the rows you refused to throw away.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: XGBoost All-Reduces the Histograms for You</div>
+<p>Code 12.3.1 built histograms, summed them, and swept for the best split by hand to expose the mechanism. In practice you declare the data partitioning and the library runs the histogram all-reduce, the quantile sketch, and the tree recursion internally. With XGBoost's distributed Dask backend the whole sharded training is a few lines:</p>
+<pre><code class="language-python">import xgboost as xgb
+from dask.distributed import Client
+from xgboost import dask as dxgb
+
+client = Client("scheduler-address:8786")     # K workers, data already sharded across them
+dtrain = dxgb.DaskDMatrix(client, X_sharded, y_sharded)   # rows stay on their workers
+
+out = dxgb.train(
+    client,
+    {"tree_method": "hist", "max_bin": 255, "objective": "binary:logistic"},
+    dtrain, num_boost_round=300,
+)                                              # histogram all-reduce + quantile sketch, internal
+model = out["booster"]
+</code></pre>
+<div class="code-caption"><strong>Code 12.3.2:</strong> The same sharded split finding as Output 12.3.1, now production-grade. The roughly forty lines of manual binning, all-reduce, and sweep collapse to a single <code>dxgb.train</code> call; <code>tree_method="hist"</code> selects the histogram algorithm and the framework handles the quantile sketch for bin boundaries, the per-node histogram all-reduce, and the histogram subtraction optimization across all 300 boosting rounds.</div>
+</div>
+
+<h2>6. From One Tree to the Forest <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Everything in this section grew a single tree over sharded data. Two large structures are built on exactly this foundation. The first is the random forest, many independent trees each grown on a bootstrap sample of rows and a random subset of features; because the trees are independent, they parallelize along a second axis (one tree per worker group, or even one tree per worker), and <a href="section-12.4.html">Section 12.4</a> takes up that ensemble-level parallelism and how it composes with the node-level histogram all-reduce you just built. The second is gradient boosting, where trees are grown in sequence, each correcting the errors of those before it, so the per-node histogram, now of gradients and Hessians rather than class counts, is all-reduced for every node of every tree in a long dependent chain. That dependent chain is what makes boosting the harder and more interesting distributed problem, and Section 12.5 develops it as the production workhorse of tabular machine learning. The histogram all-reduce of Code 12.3.1 is the atom from which both are assembled.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Trees Where the Data Cannot Move (2024 to 2026)</div>
+<p>The histogram-all-reduce structure has become the template for tree learning under constraints stronger than mere scale. Federated gradient boosting (the SecureBoost lineage, with FATE and NVFlare implementations actively developed through 2024 to 2025) keeps each party's rows or columns on its own premises and exchanges only encrypted or differentially private histogram statistics, so a hospital consortium can train one boosted model without pooling patient records, the federated theme this book develops in <a href="../module-14-federated-decentralized-learning/index.html">Chapter 14</a>. A parallel line tightens the privacy of the summaries themselves: DP-boosting work adds calibrated noise to the all-reduced histograms with tracked privacy budgets, and recent studies quantify the accuracy cost of that noise on tabular benchmarks. GPU histogram kernels, meanwhile, keep pushing the per-node binning, the embarrassingly parallel half of the computation, onto accelerators so the all-reduce, not the binning, is the only remaining serial cost. The common thread is the one you ran in Output 12.3.1: when the histogram is the only thing that crosses the network, you can protect it, compress it, or accelerate around it without ever touching the data.</p>
+</div>
+<p>The distributed decision tree is, in the end, a small idea with large consequences. A tree needs only tallies to choose its splits; tallies add; addition across machines is an all-reduce; and the all-reduce of a fixed-size summary costs the same whether the data is gigabytes or petabytes. Hold that atom firmly, because <a href="section-12.4.html">Section 12.4</a> replicates it across an ensemble and Section 12.5 chains it through boosting, and both are just this section's histogram all-reduce, scaled out.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 12.3.1: Why Histograms and Not Rows <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A colleague proposes distributing a decision tree by, at each node, shipping every example at that node to a single coordinator machine that sorts them and finds the exact best split, then broadcasting the chosen split back. Explain why this is correct but does not scale, and quantify the difference: for $N$ examples across $K$ workers, $F$ features, and $B$ bins, state the per-node communication volume of the coordinator scheme and of the histogram all-reduce, and identify which terms depend on $N$. Then explain why the histogram method's slight loss of split precision (thresholds restricted to $B$ bin edges) is usually a price worth paying.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 12.3.2: Regression Histograms and Histogram Subtraction <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 12.3.1 to regression. Replace the (count, positives) per-bin statistics with (count, sum of targets, sum of squared targets), and change the split score from Gini gain to variance reduction, where a node's impurity is the variance of its targets. Verify that the sharded split still matches the full-data split exactly. Then implement the histogram subtraction property: after splitting a parent into a left and a right child, build the histogram of the smaller child directly from its rows and obtain the larger child's histogram as parent minus smaller-child, confirming it equals the histogram you would have built from the larger child's rows. Report how much binning work this saves over a full tree.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 12.3.3: Pick the Partition <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the cost columns of Table 12.3.1, decide between data-parallel and feature-parallel tree building for three workloads, justifying each with the dominant communication term: (a) 2 billion rows, 80 features, 255 bins, 16 workers; (b) 500,000 rows, 50,000 features, 64 bins, 16 workers; (c) 50 million rows, 4,000 features, 255 bins, 64 workers, where each worker can hold at most 20 million rows. For (c), explain why neither pure strategy is ideal and describe how voting-parallel training, which all-reduces only each worker's top-$k$ candidate features, changes the dominant term. State the assumption about the relative sizes of $N$ and $F \cdot B$ that makes data-parallel the default for most tabular problems.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-12.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 12.2</span><span class="nav-title">Distributed Support Vector Machines</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 12</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Classical Machine Learning</span></a>
+<a class="next" href="section-12.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 12.4</span><span class="nav-title">Random Forests at Scale</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

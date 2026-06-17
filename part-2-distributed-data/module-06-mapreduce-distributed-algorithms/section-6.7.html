@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 6.7: MinHash and Locality-Sensitive Hashing. Near-duplicate detection at web scale with MinHash signatures and LSH banding, expressed as a MapReduce job for building clean training corpora without quadratic all-pairs comparison." name="description"/>
+<title>Section 6.7: MinHash and Locality-Sensitive Hashing | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Distributed Data Processing for AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 6: The MapReduce Model and Distributed Algorithms</a></div>
+<h1>MinHash and Locality-Sensitive Hashing</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I compared every document to every other document. Halfway through the second trillion comparisons, I began to suspect there was a better way."</p>
+<cite>A Reducer That Counted Too High</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Finding near-duplicate documents in a web-scale corpus is a similarity-join problem, and the naive solution compares every pair, which is quadratic and therefore impossible at scale. MinHash and Locality-Sensitive Hashing replace that impossible comparison with two ideas that fit the MapReduce model exactly: compress each document into a short signature that preserves set similarity, then hash similar signatures into the same bucket so that only documents already likely to be near-duplicates are ever compared.</strong> This is not a niche trick. Deduplicating the petabytes of text used to pretrain a modern language model is a mandatory cleaning step, and it is built on the algorithms in this section. The same banding idea reappears later as approximate nearest-neighbor search inside vector retrieval. We develop it here as a concrete MapReduce job: map documents to signatures, band the signatures into buckets, reduce the buckets to candidate pairs.</p>
+</div>
+<p>Earlier sections of this chapter computed exact answers: an exact word count, an exact sort, an exact join. This section confronts a problem where the exact answer is the obstacle rather than the goal. Suppose you hold a billion documents and you want every pair that is "almost the same" so you can drop the redundant copies. The exact formulation, compare all pairs and keep the similar ones, requires on the order of $N^2 / 2$ comparisons. For a billion documents that is roughly $5 \times 10^{17}$ comparisons, and no cluster of any size makes that tractable. The way out is to stop insisting on examining every pair, and instead arrange the computation so that dissimilar pairs are never compared at all. That arrangement is the subject of this section, and it is the first place in the book where we trade an exact computation for a probabilistic one to make scale possible, a trade that <a href="section-6.8.html">Section 6.8</a> generalizes into a whole toolkit of approximate algorithms.</p>
+
+<h2>1. Why Deduplication Decides Model Quality <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A web crawl is full of repetition. The same news article appears on hundreds of syndicating sites, boilerplate headers and footers recur across every page of a domain, and scraped forums echo the same answer in thread after thread. If this redundancy is fed verbatim into a pretraining corpus, the model sees some passages thousands of times more often than others, which wastes compute, inflates the apparent size of the dataset, encourages memorization of the over-represented text, and can leak benchmark questions that happen to be duplicated across the web. Removing near-duplicates, not just exact duplicates, measurably improves the resulting model and reduces the tokens needed to train it. Clean data is not a luxury applied after the interesting work; at corpus scale it is the interesting work, and it is why a data-processing chapter sits early in a book about training large models. The downstream payoff is developed when we reach foundation-model data pipelines in <a href="../../part-4-parallel-deep-learning/module-19-training-foundation-models/index.html">Chapter 19</a>.</p>
+<p>The unit of comparison is a document represented as a set. The standard construction is to slide a window of $k$ consecutive words (or characters) across the text and collect the resulting <em>shingles</em>, so that "the distributed system scaled out" with $k = 3$ becomes the set {"the distributed system", "distributed system scaled", "system scaled out"}. Two documents that share most of their shingles are near-duplicates; two that share few are unrelated. The natural measure of set overlap is the Jaccard similarity, and everything in this section is built to estimate it cheaply and to find high-Jaccard pairs without examining all pairs.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Turn an Impossible Join Into Two Cheap MapReduce Passes</div>
+<p>Near-duplicate detection is a similarity self-join, and the exact self-join is quadratic in the number of documents. The MinHash plus LSH method never forms that quadratic set. It spends one linear pass to compress each document into a short signature (map), and a second pass to group signatures that are likely to match into shared buckets (shuffle), so the only pairs ever compared are the ones that already collided in a bucket (reduce). The quadratic blowup is replaced by work proportional to the number of documents plus the number of genuinely similar pairs.</p>
+</div>
+
+<h2>2. Jaccard Similarity and the MinHash Estimator <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Let document $A$ and document $B$ be sets of shingles. Their Jaccard similarity is the size of their intersection over the size of their union,</p>
+$$J(A, B) = \frac{|A \cap B|}{|A \cup B|}.$$
+<p>This is exactly the quantity we want, and computing it directly for one pair is easy. The trouble is that storing the full shingle set of every document is expensive, and comparing all pairs of sets is the quadratic cost we are trying to avoid. MinHash attacks both problems at once by replacing each set with a short fixed-length signature whose agreement rate estimates $J$ directly.</p>
+<p>Pick a random permutation $\pi$ of the universe of all possible shingles, and define $h(A) = \min_{x \in A} \pi(x)$, the smallest rank that any element of $A$ receives under $\pi$. The defining property of this <em>min-hash</em> is that the element achieving the minimum over the union $A \cup B$ is equally likely to be any element of the union, and the hashes of $A$ and $B$ agree exactly when that minimizing element lies in the intersection. Therefore</p>
+$$\Pr[\, h(A) = h(B) \,] = \frac{|A \cap B|}{|A \cup B|} = J(A, B).$$
+<p>A single min-hash is a coin whose probability of heads is precisely the Jaccard similarity. Using $n$ independent permutations gives a signature of $n$ min-hashes per document, and the fraction of the $n$ positions where the two signatures agree is an unbiased estimator of $J$. Because the positions are independent, the estimator's variance is $J(1 - J)/n$, so the error shrinks like $1/\sqrt{n}$: quadruple the signature length and you halve the typical error. A signature of a few hundred integers stands in for a shingle set of any size, which is the compression that makes the whole pipeline fit in memory and in the shuffle.</p>
+<p>The code below makes both claims concrete. It builds two near-duplicate documents, computes their true Jaccard exactly, then estimates it from MinHash signatures of growing length, repeating each length two hundred times so the shrinking spread of the estimator is visible. It then runs the LSH banding stage that the next section explains, finding near-duplicate candidate pairs in a small corpus.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Pipeline diagram: documents become shingle sets, then short MinHash signatures, then the signatures are split into LSH bands, and matching bands route documents into shared candidate buckets.">
+<defs>
+<marker id="arr67" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b67 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w67 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g67 { fill:#eef6ee; stroke:#2f7d32; stroke-width:1.6; }
+.t67 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s67 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.m67 { font:600 11.5px monospace; fill:#14385c; text-anchor:middle; }
+.l67 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr67); }
+</style>
+<text class="t67" x="78" y="26">Documents</text>
+<rect class="b67" x="24" y="42" width="108" height="40" rx="7"/>
+<text class="m67" x="78" y="66">doc0</text>
+<rect class="b67" x="24" y="92" width="108" height="40" rx="7"/>
+<text class="m67" x="78" y="116">doc1</text>
+<rect class="b67" x="24" y="142" width="108" height="40" rx="7"/>
+<text class="m67" x="78" y="166">doc2</text>
+<text class="s67" x="78" y="206">map: shingle</text>
+<text class="t67" x="270" y="26">Shingle sets</text>
+<rect class="g67" x="196" y="42" width="148" height="40" rx="7"/>
+<text class="s67" x="270" y="66">{3-grams of doc0}</text>
+<rect class="g67" x="196" y="92" width="148" height="40" rx="7"/>
+<text class="s67" x="270" y="116">{3-grams of doc1}</text>
+<rect class="g67" x="196" y="142" width="148" height="40" rx="7"/>
+<text class="s67" x="270" y="166">{3-grams of doc2}</text>
+<text class="t67" x="500" y="26">MinHash signatures</text>
+<rect class="w67" x="416" y="42" width="168" height="40" rx="7"/>
+<text class="m67" x="500" y="66">[h1 h2 ... hn]</text>
+<rect class="w67" x="416" y="92" width="168" height="40" rx="7"/>
+<text class="m67" x="500" y="116">[h1 h2 ... hn]</text>
+<rect class="w67" x="416" y="142" width="168" height="40" rx="7"/>
+<text class="m67" x="500" y="166">[h1 h2 ... hn]</text>
+<text class="s67" x="500" y="206">split into b bands of r rows</text>
+<text class="t67" x="760" y="26">Candidate buckets</text>
+<rect class="b67" x="664" y="42" width="180" height="58" rx="7"/>
+<text class="t67" x="754" y="64">bucket (band, hash)</text>
+<text class="s67" x="754" y="84">doc0, doc1, doc2</text>
+<rect class="b67" x="664" y="124" width="180" height="58" rx="7"/>
+<text class="t67" x="754" y="146">bucket (band, hash)</text>
+<text class="s67" x="754" y="166">doc3 (alone, dropped)</text>
+<text class="s67" x="754" y="206">reduce: emit pairs in shared buckets</text>
+<line x1="132" y1="62" x2="194" y2="62" class="l67"/>
+<line x1="132" y1="112" x2="194" y2="112" class="l67"/>
+<line x1="132" y1="162" x2="194" y2="162" class="l67"/>
+<line x1="344" y1="62" x2="414" y2="62" class="l67"/>
+<line x1="344" y1="112" x2="414" y2="112" class="l67"/>
+<line x1="344" y1="162" x2="414" y2="162" class="l67"/>
+<path class="l67" d="M 584 62 L 624 62 L 624 70 L 662 70"/>
+<path class="l67" d="M 584 112 L 624 112 L 624 75 L 662 75"/>
+<path class="l67" d="M 584 162 L 644 162 L 644 153 L 662 153"/>
+<text class="s67" x="270" y="284" style="font-weight:600;fill:#2f7d32">MAP</text>
+<text class="s67" x="500" y="284" style="font-weight:600;fill:#b86b1f">SHUFFLE (band keys)</text>
+<text class="s67" x="754" y="284" style="font-weight:600;fill:#14385c">REDUCE</text>
+<line x1="160" y1="300" x2="840" y2="300" stroke="#cbd2da" stroke-width="1"/>
+</svg>
+<figcaption><strong>Figure 6.7.1:</strong> The MinHash plus LSH pipeline as a MapReduce job. The map stage turns each document into a shingle set and then a short MinHash signature. The signature is split into $b$ bands of $r$ rows; each band emits a key, and the shuffle groups documents whose band matches into the same bucket. The reduce stage emits a candidate pair for every two documents sharing a bucket. A document that collides with nobody (doc3) is never compared and is dropped from the candidate set.</figcaption>
+</figure>
+<pre><code class="language-python">import numpy as np
+
+def shingles(text, k=3):                       # set of k-word windows
+    words = text.split()
+    return {" ".join(words[i:i + k]) for i in range(len(words) - k + 1)}
+
+doc_a = ("the distributed system scaled out across many machines and kept "
+         "every worker busy processing its own shard of the training corpus")
+doc_b = ("the distributed system scaled out across several machines and kept "
+         "each worker busy processing its own shard of the training corpus")
+
+A, B = shingles(doc_a), shingles(doc_b)
+true_jaccard = len(A &amp; B) / len(A | B)          # exact Jaccard, for reference
+
+rng = np.random.default_rng(7)
+universe = sorted(A | B)
+idx = {s: i for i, s in enumerate(universe)}
+P = 2_147_483_647                              # a large prime modulus
+
+def make_hashes(n):                            # n random hash functions a*x+b mod P
+    return rng.integers(1, P, size=n), rng.integers(0, P, size=n)
+
+def signature(members, a, b):                  # MinHash: min over the set per hash
+    rows = np.array([idx[s] for s in members])
+    return ((np.outer(a, rows) + b[:, None]) % P).min(axis=1)
+
+print("true Jaccard            :", f"{true_jaccard:.4f}")
+print(" sig length |  mean MinHash est |  est std dev (across 200 trials)")
+for n in [16, 64, 256, 1024, 4096]:
+    ests = []
+    for _ in range(200):                       # repeat to expose shrinking variance
+        a, b = make_hashes(n)
+        ests.append(np.mean(signature(A, a, b) == signature(B, a, b)))
+    ests = np.array(ests)
+    print(f"  {n:&gt;6d}    |      {ests.mean():.4f}       |          {ests.std():.4f}")
+</code></pre>
+<div class="code-caption"><strong>Code 6.7.1:</strong> MinHash as an unbiased Jaccard estimator. Each random hash plays the role of one permutation; the fraction of signature positions where two documents agree estimates $J(A, B)$, and averaging over many trials at each length exposes how the estimator's spread shrinks.</div>
+<pre><code class="language-text">true Jaccard            : 0.5200
+ sig length |  mean MinHash est |  est std dev (across 200 trials)
+ -----------|-------------------|---------------------------------
+      16    |      0.5184       |          0.1323
+      64    |      0.5259       |          0.0650
+     256    |      0.5245       |          0.0322
+    1024    |      0.5213       |          0.0164
+    4096    |      0.5211       |          0.0077
+</code></pre>
+<div class="code-caption"><strong>Output 6.7.1:</strong> The mean estimate stays pinned near the true Jaccard of $0.52$ at every signature length, confirming the estimator is unbiased. The standard deviation roughly halves each time the signature length quadruples, the $1/\sqrt{n}$ decay predicted by the variance $J(1 - J)/n$.</div>
+<p>The mean column never drifts from the true value of $0.52$, which is what "unbiased" means: more positions do not move the target, they only tighten the spread around it. The standard deviation falls from $0.13$ at sixteen hashes to $0.008$ at four thousand, a clean halving for every quadrupling, exactly as the variance formula promises. A signature of a few hundred integers already estimates Jaccard to within a few percent, and it does so in a fixed amount of space no matter how long the documents are.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: One Coin, Tossed in Lockstep</div>
+<p>It helps to picture a single min-hash as a coin that two documents toss together. The coin is rigged: it lands heads exactly when the rarest shingle under this particular permutation happens to live in both documents, which is the Jaccard probability. One toss tells you almost nothing. Two hundred tosses of two hundred independently rigged coins, all reporting the same hidden bias, pin that bias down. MinHash is just the discipline of tossing many rigged coins and counting heads.</p>
+</div>
+
+<h2>3. LSH Banding: Finding Candidates Without Comparing All Pairs <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>MinHash shrinks each document to a short signature, but comparing all pairs of signatures is still quadratic. Locality-Sensitive Hashing removes the quadratic step by hashing signatures so that similar ones collide and dissimilar ones almost never do. Split each signature of length $n$ into $b$ bands of $r$ rows, so $n = b \cdot r$. For each band, hash the $r$ values in that band to a bucket; two documents land in the same bucket for a given band only if all $r$ of their values in that band are identical. Two documents become a <em>candidate pair</em> if they share a bucket in at least one band.</p>
+<p>The probability analysis is what makes this work as a tunable filter. For two documents with Jaccard $s$, each row matches with probability $s$, so an entire band of $r$ rows matches with probability $s^r$, a band fails to match with probability $1 - s^r$, all $b$ bands fail with probability $(1 - s^r)^b$, and therefore the pair becomes a candidate with probability</p>
+$$\Pr[\text{candidate}] = 1 - (1 - s^{r})^{b}.$$
+<p>As a function of $s$ this is an S-curve with a sharp threshold near $s \approx (1/b)^{1/r}$. Below the threshold the candidate probability is almost zero, above it almost one. By choosing $b$ and $r$ you place the threshold exactly where you want the line between "near-duplicate" and "unrelated" to fall. A common choice for aggressive deduplication is to put the threshold around $0.8$, so that only genuinely redundant documents survive the filter while unrelated pairs are discarded before any direct comparison happens.</p>
+<p>Expressed as MapReduce, the banding stage is the most natural job imaginable. The map function takes a document, computes its signature, and emits one key-value pair per band, where the key is the (band index, band hash) and the value is the document id. The shuffle groups by that key, so every bucket arrives at a reducer with the list of documents that fell into it. The reduce function emits a candidate pair for each pair of documents in a bucket, optionally verifying the true similarity before keeping it. This is the same map, shuffle, reduce skeleton from <a href="section-6.2.html">Section 6.2</a>, with band keys playing the role that words played in word count.</p>
+<pre><code class="language-python"># continued from Code 6.7.1; builds a small corpus and runs the LSH banding job
+from collections import defaultdict
+
+base = ("machine learning models trained on web scale text corpora require "
+        "careful deduplication of the pretraining data before any training begins")
+syn = {"careful": "thorough", "require": "need", "begins": "starts",
+       "models": "networks", "trained": "fitted"}
+
+def variant(text, swaps):                      # make a controlled near-duplicate
+    out, done = [], 0
+    for w in text.split():
+        if done &lt; swaps and w in syn:
+            out.append(syn[w]); done += 1
+        else:
+            out.append(w)
+    return " ".join(out)
+
+corpus = {"doc0": base, "doc1": variant(base, 1), "doc2": variant(base, 2),
+          "doc3": "completely unrelated content about gardening tomatoes in summer heat",
+          "doc4": base + " and it must be reproducible"}
+
+n_hashes, bands = 128, 32                       # 32 bands of 4 rows
+rows = n_hashes // bands
+a128, b128 = make_hashes(n_hashes)
+gshingles = sorted(set().union(*(shingles(t) for t in corpus.values())))
+gidx = {s: i for i, s in enumerate(gshingles)}
+
+def sig128(text):
+    r = np.array([gidx[s] for s in shingles(text)])
+    return ((np.outer(a128, r) + b128[:, None]) % P).min(axis=1)
+
+sigs = {d: sig128(t) for d, t in corpus.items()}
+
+buckets = defaultdict(list)                      # MAP + SHUFFLE: emit (band, hash) keys
+for d, s in sigs.items():
+    for band in range(bands):
+        chunk = tuple(s[band * rows:(band + 1) * rows].tolist())
+        buckets[(band, hash(chunk))].append(d)
+
+candidates = set()                               # REDUCE: pairs sharing any bucket
+for members in buckets.values():
+    for i in range(len(members)):
+        for j in range(i + 1, len(members)):
+            candidates.add(tuple(sorted((members[i], members[j]))))
+
+print("LSH candidate near-duplicate pairs (128 rows, 32 bands of 4):")
+for pa, pb in sorted(candidates):
+    sa, sb = shingles(corpus[pa]), shingles(corpus[pb])
+    print(f"   {pa} ~ {pb}   true Jaccard = {len(sa &amp; sb) / len(sa | sb):.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 6.7.2:</strong> The LSH banding stage as a MapReduce job. Each document emits one (band, hash) key per band (map and shuffle); each bucket with more than one member yields candidate pairs (reduce). The unrelated doc3 shares no band with any other document and never enters the candidate set.</div>
+<pre><code class="language-text">LSH candidate near-duplicate pairs (128 rows, 32 bands of 4):
+   doc0 ~ doc1   true Jaccard = 0.714
+   doc0 ~ doc2   true Jaccard = 0.636
+   doc0 ~ doc4   true Jaccard = 0.783
+   doc1 ~ doc2   true Jaccard = 0.714
+   doc1 ~ doc4   true Jaccard = 0.577
+   doc2 ~ doc4   true Jaccard = 0.519
+</code></pre>
+<div class="code-caption"><strong>Output 6.7.2:</strong> Every recovered pair is a true near-duplicate (Jaccard above $0.5$), and the four redundant variants of the same base document are all linked. The unrelated doc3 produced no candidate pair, so it was filtered out before any direct comparison, which is precisely the quadratic work the method avoids.</div>
+<p>The output recovers exactly the near-duplicate pairs among the four variants of the base document and produces nothing for the unrelated doc3, which never shared a band with anything. On five documents the saving is invisible, but the structure is the point: the number of (band, hash) keys emitted is linear in the number of documents, the shuffle groups them, and the only comparisons performed are inside buckets that already collided. Scale the corpus to a billion documents and the candidate set stays proportional to the number of genuinely similar pairs rather than to $N^2$. Figure 6.7.1 traces this flow from documents through signatures and bands into buckets, and the reduce arrow back to candidate pairs is the only place a direct comparison ever happens.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: datasketch Builds the MinHash LSH Index for You</div>
+<p>Code 6.7.1 and Code 6.7.2 spell out the permutations, the signature, and the banding so the mechanism is visible. In production you do not hand-roll any of it. The <code>datasketch</code> library implements MinHash and an LSH index that handles signature construction, band hashing, and bucket lookup, so inserting documents and querying for near-duplicates is a few lines:</p>
+<pre><code class="language-python">from datasketch import MinHash, MinHashLSH
+
+def make_minhash(text, num_perm=128):
+    m = MinHash(num_perm=num_perm)
+    for sh in shingles(text):                  # same shingles as above
+        m.update(sh.encode("utf8"))
+    return m
+
+lsh = MinHashLSH(threshold=0.6, num_perm=128)  # picks b and r to hit the threshold
+mh = {d: make_minhash(t) for d, t in corpus.items()}
+for d, m in mh.items():
+    lsh.insert(d, m)
+
+print(lsh.query(mh["doc0"]))                   # near-duplicates of doc0, no all-pairs scan
+</code></pre>
+<div class="code-caption"><strong>Code 6.7.3:</strong> The same near-duplicate search with <code>datasketch</code>. The roughly forty lines of explicit permutation, signature, and banding logic in Code 6.7.1 and Code 6.7.2 collapse to a handful, and the library chooses the band layout from a target Jaccard threshold and stores the buckets for fast querying.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Deduplicating a Crawl Before a Pretraining Run</div>
+<p><strong>Who:</strong> A data engineer on a team preparing a multi-terabyte web crawl for language-model pretraining.</p>
+<p><strong>Situation:</strong> The raw crawl held roughly two billion documents, and an exact-duplicate hash pass removed only a fraction of the redundancy, because syndicated articles and near-identical boilerplate differed by a few words and so hashed differently.</p>
+<p><strong>Problem:</strong> An all-pairs Jaccard comparison would have been on the order of $10^{18}$ comparisons, which no budget or cluster could absorb, yet leaving the near-duplicates in would waste training compute and risk benchmark leakage.</p>
+<p><strong>Dilemma:</strong> Keep the redundant data and accept a worse model and inflated cost, or attempt the impossible quadratic join, or adopt an approximate method that might miss some duplicates or admit some false candidates.</p>
+<p><strong>Decision:</strong> They ran MinHash with 128 permutations and LSH banding tuned to a Jaccard threshold near $0.8$, as a two-stage Spark job over the cluster, accepting the small approximation in exchange for a tractable cost.</p>
+<p><strong>How:</strong> The map stage shingled each document and emitted band keys; the shuffle grouped documents into buckets; the reduce stage formed candidate pairs and verified their true Jaccard before unioning them into duplicate clusters, keeping one representative per cluster.</p>
+<p><strong>Result:</strong> The pipeline ran in linear time over the corpus, removed a large fraction of near-duplicate text that the exact-hash pass had missed, and cut the effective token count enough to shorten the pretraining run, with no measurable loss of genuine content.</p>
+<p><strong>Lesson:</strong> At corpus scale the right answer to a quadratic similarity join is to not compute it. MinHash plus LSH turns "compare everything" into "compare only what already collided", and the small probability of a missed pair is a price worth paying for a job that finishes.</p>
+</div>
+
+<h2>4. The Same Banding Returns as Vector Search <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The banding idea you just built for set similarity is one instance of a general principle: design a hash family that makes nearby points collide, and you turn nearest-neighbor search into a bucket lookup. MinHash is the locality-sensitive family for Jaccard distance over sets. Other distances have their own families, for example random-projection hashing for cosine and Euclidean distance over dense vectors, but the LSH banding mechanism is identical, group by hash, compare only within buckets. This is why the algorithm reappears far from data cleaning.</p>
+<p>When a retrieval system must find the embedding vectors closest to a query among billions of stored vectors, the exact search is again quadratic and again avoided by approximate nearest-neighbor methods, of which LSH is the conceptual ancestor. We meet approximate nearest-neighbor search as a tool for classical models in <a href="../../part-3-distributed-ml/module-12-distributed-classical-ml/index.html">Chapter 12</a>, and as the indexing engine of distributed vector databases in <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a>. The banding you implemented in Code 6.7.2 and the bucket lookup in Code 6.7.3 are the same shape as the index probe inside a vector database; only the hash family and the distance change.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: One Hashing Idea, Scaled Across the Book</div>
+<p>Locality-Sensitive Hashing is a primitive that returns scaled out. Here it deduplicates a training corpus as a MapReduce job, where the band key is the shuffle key and the bucket is the reducer's input. In <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a> the same banding becomes a sharded index that serves nearest-neighbor queries across a fleet at inference time, where the bucket lookup is a network fan-out to index shards. When you see approximate nearest-neighbor search later, recognize the S-curve of Section 3: a hash family chosen so that similar things collide and dissimilar things do not, with the threshold tuned by how many bands you use.</p>
+</div>
+
+<h2>5. Where the Approximation Bites <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Because the method is probabilistic, it makes two kinds of error, and an honest pipeline budgets for both. A false negative is a near-duplicate pair that never shares a bucket, possible because every one of its bands happened to differ; its probability is $(1 - s^r)^b$, small for high-similarity pairs but never exactly zero. A false positive is an unrelated pair that collides in some band by chance and enters the candidate set; the reduce stage controls these cheaply by recomputing the true Jaccard on each candidate and discarding the ones below threshold, since the candidate set is small. The tuning knobs $b$ and $r$ trade these errors against each other and against cost: more bands raise recall and the candidate count, longer bands raise precision and the false-negative rate. The S-curve of Section 3 is the design tool, and the communication cost of the shuffle, which carries $b$ keys per document, is the budget it is tuned against, the kind of cost model developed in <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>.</p>
+<p>There is also a data-skew hazard specific to the shuffle. A boilerplate fragment shared by millions of documents produces a single enormous bucket, and the reducer that receives it faces a near-quadratic blowup inside that one bucket, the straggler problem this chapter keeps returning to. Practical systems cap bucket sizes, sample within giant buckets, or strip common boilerplate before shingling. The lesson is that the algorithm removes the global quadratic but can reintroduce a local one through skew, which is exactly the shuffle-skew problem that <a href="../module-07-spark-dataframes/index.html">Chapter 7</a> treats in depth for Spark.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Near-Deduplication of Pretraining Corpora (2024 to 2026)</div>
+<p>Data-centric work on language models has made corpus deduplication a first-class research topic rather than a preprocessing afterthought. The lineage runs from the demonstration that deduplicated training data improves models (Lee et al., 2022) through large open pipelines that publish their MinHash-LSH recipes: the RefinedWeb and FineWeb efforts document fuzzy deduplication over trillions of tokens, and the Dolma and SlimPajama corpora ship reproducible MinHash deduplication code. Current questions are sharper than "should we deduplicate". They ask how aggressive deduplication should be before it removes useful diversity, how to deduplicate across languages and modalities, how to make the billion-document MinHash-LSH shuffle cheaper and skew-resistant, and how semantic near-duplicate detection over embeddings, an LSH cousin, complements the surface-form MinHash approach. The 2024 to 2026 open-data releases treat the MinHash-LSH job in this section as the workhorse and compete largely on how well they tune and scale it.</p>
+</div>
+<p>You now have a method that replaces a quadratic similarity join with two linear MapReduce passes, the probability theory that explains why MinHash signatures estimate Jaccard and why LSH banding finds the right candidates, and the cost and skew caveats that keep it honest. This is the first deliberately approximate algorithm in the book, and it opens a door. The next section widens it, building a family of small-space sketches, counting distinct items with HyperLogLog and frequencies with count-min, that answer otherwise impossible questions over streams and corpora. That family continues in <a href="section-6.8.html">Section 6.8</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.7.1: Place the Threshold <span class="exercise-type conceptual">Conceptual</span></div>
+<p>You have signatures of length $n = 128$ and want candidate generation to switch on near a Jaccard of $s = 0.8$, using the approximation that the S-curve's threshold sits near $(1/b)^{1/r}$ with $n = b \cdot r$. Evaluate the candidate probability $1 - (1 - s^r)^b$ at $s = 0.8$ and at $s = 0.5$ for the layouts $(b, r) = (32, 4)$ and $(b, r) = (16, 8)$. Which layout more sharply separates near-duplicates from merely similar documents, and what does choosing a longer band $r$ do to the false-negative rate for genuine duplicates? Explain in terms of the S-curve's steepness.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.7.2: Measure the Candidate Saving <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 6.7.2 to a synthetic corpus of $2000$ documents, built as $200$ clusters of $10$ near-duplicates each (generate each cluster from a random base sentence with a few word swaps) plus pure noise documents. Count the number of candidate pairs the LSH job produces and compare it to the $\binom{2000}{2}$ pairs an all-pairs scan would examine. Report the ratio, then add the reduce-stage verification that recomputes true Jaccard and keeps only pairs above $0.6$. State how many true near-duplicate pairs you recovered and how many you missed (false negatives), and relate the miss count to $(1 - s^r)^b$.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.7.3: Diagnose the Skewed Bucket <span class="exercise-type analysis">Analysis</span></div>
+<p>Suppose one boilerplate paragraph appears verbatim in $1\%$ of a billion-document corpus, so its shingles are shared by ten million documents. Argue why these documents collide in nearly every band and therefore land in one giant bucket, and estimate the number of candidate pairs that one bucket alone generates in the reduce stage. Explain why this single bucket can dominate the entire job's runtime even though the global method is linear, and propose two mitigations (one at shingling time, one at bucket-processing time). Connect your answer to the shuffle-skew treatment in <a href="../module-07-spark-dataframes/index.html">Chapter 7</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-6.6.html"><span class="nav-label">Previous</span><span class="nav-num">Section 6.6</span><span class="nav-title">Top-K, Matrix Multiplication, and PageRank</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 6</span><span class="nav-num">Contents</span><span class="nav-title">The MapReduce Model and Distributed Algorithms</span></a>
+<a class="next" href="section-6.8.html"><span class="nav-label">Next</span><span class="nav-num">Section 6.8</span><span class="nav-title">Approximate Algorithms at Scale</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

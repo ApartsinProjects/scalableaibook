@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 2.6: Coordination and Consensus in the Control Plane. Why AI training's data plane runs collectives, not Paxos, while leader election, cluster membership, and the model registry live in a consensus-backed control plane built on Raft, etcd, and ZooKeeper." name="description"/>
+<title>Section 2.6: Coordination and Consensus in the Control Plane | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Distributed AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 2: Distributed Systems Concepts for AI</a></div>
+<h1>Coordination and Consensus in the Control Plane</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Nobody asked me to agree on a gradient. They asked me to agree on who is allowed to write the next checkpoint, and that turned out to be the hard part."</p>
+<cite>A Consensus Round That Refuses to Commit</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A distributed AI job has two planes with two completely different coordination styles, and confusing them is one of the most common conceptual errors in the field.</strong> The <em>data plane</em>, where gradients and activations flow between workers, does not run a consensus protocol; it runs deterministic collectives such as all-reduce, where every worker already agrees on the schedule and only the numbers move. The <em>control plane</em>, where the cluster decides which scheduler is in charge, who is rank 0, which nodes are alive, and which model version is current, is where genuine agreement under failure is required, and that is the home of consensus algorithms such as Raft and the systems built on them, etcd and ZooKeeper. This section explains the agreement problem, why failures make it hard, how Raft solves it in practice, and exactly which AI decisions sit on top of it.</p>
+</div>
+<p>The previous section examined consistency models, from the bounded staleness a parameter server tolerates to the CAP trade-off a storage layer must confront. Consistency asks how stale a value any one reader may see. This section asks a sharper question: when several machines must commit to a single value that all of them will treat as authoritative, such as the identity of the current leader or the contents of the configuration, how do they reach that single value while some of them are crashing, restarting, or temporarily unreachable? That is the agreement problem, and the surprising news is that AI training, the headline workload of this book, deliberately avoids it on its hot path and pays for it only in a small, slow, carefully isolated corner called the control plane.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram with two horizontal bands. The lower band is the data plane, showing four GPU workers connected in an all-reduce ring exchanging gradients with no voting. The upper band is the control plane, showing a three-node consensus group running Raft with one leader and a replicated log, which tells the workers who is rank zero and which checkpoint is current.">
+<defs>
+<marker id="arr26" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arg26" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.box26 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.lead26 { fill:#e7f0e7; stroke:#2f7d32; stroke-width:2; }
+.wk26 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.band26 { fill:none; stroke:#c2c9d2; stroke-width:1.2; stroke-dasharray:5 4; }
+.t26 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s26 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.hd26 { font:700 13px sans-serif; fill:#14385c; text-anchor:start; }
+.cl26 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr26); }
+.gl26 { fill:none; stroke:#b86b1f; stroke-width:1.6; marker-end:url(#arg26); }
+</style>
+<rect class="band26" x="20" y="20" width="840" height="150" rx="10"/>
+<text class="hd26" x="34" y="40">Control plane: consensus required (Raft / etcd / ZooKeeper)</text>
+<rect class="lead26" x="120" y="60" width="150" height="62" rx="8"/>
+<text class="t26" x="195" y="84">Leader</text>
+<text class="s26" x="195" y="102">holds the lease</text>
+<rect class="box26" x="360" y="60" width="150" height="62" rx="8"/>
+<text class="t26" x="435" y="84">Follower</text>
+<text class="s26" x="435" y="102">replicates log</text>
+<rect class="box26" x="600" y="60" width="150" height="62" rx="8"/>
+<text class="t26" x="675" y="84">Follower</text>
+<text class="s26" x="675" y="102">replicates log</text>
+<line x1="270" y1="82" x2="358" y2="82" class="cl26"/>
+<line x1="510" y1="82" x2="598" y2="82" class="cl26"/>
+<text class="s26" x="435" y="148">replicated log: { leader=node0, rank0=W1, current_checkpoint=step_8000 }</text>
+<rect class="band26" x="20" y="195" width="840" height="150" rx="10"/>
+<text class="hd26" x="34" y="216">Data plane: no consensus, deterministic collectives (Chapter 4)</text>
+<rect class="wk26" x="70" y="238" width="120" height="56" rx="8"/>
+<text class="t26" x="130" y="262">Worker W1</text>
+<text class="s26" x="130" y="280">rank 0</text>
+<rect class="wk26" x="270" y="238" width="120" height="56" rx="8"/>
+<text class="t26" x="330" y="262">Worker W2</text>
+<rect class="wk26" x="470" y="238" width="120" height="56" rx="8"/>
+<text class="t26" x="530" y="262">Worker W3</text>
+<rect class="wk26" x="670" y="238" width="120" height="56" rx="8"/>
+<text class="t26" x="730" y="262">Worker W4</text>
+<line x1="190" y1="266" x2="268" y2="266" class="gl26"/>
+<line x1="390" y1="266" x2="468" y2="266" class="gl26"/>
+<line x1="590" y1="266" x2="668" y2="266" class="gl26"/>
+<path class="gl26" d="M 730 296 L 730 320 L 130 320 L 130 296"/>
+<text class="s26" x="430" y="338">all-reduce ring: gradients flow, no votes</text>
+<line x1="195" y1="122" x2="130" y2="236" class="cl26"/>
+<text class="s26" x="120" y="200" text-anchor="end">tells workers who is rank 0</text>
+</svg>
+<figcaption><strong>Figure 2.6.1:</strong> Two planes, two coordination styles. In the lower band, the data plane moves gradients through a deterministic all-reduce ring (<a href="../module-04-communication-primitives/index.html">Chapter 4</a>); every worker already agrees on the schedule, so no voting happens. In the upper band, the control plane runs a small consensus group (Raft) that elects one leader, replicates a log of decisions, and answers authoritative questions: who holds the lease, who is rank 0, which checkpoint is current. The single arrow crossing between planes is the control plane telling the workers how to configure themselves.</figcaption>
+</figure>
+
+<h2>1. The Agreement Problem, and Where AI Does Not Have It <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Agreement, also called consensus, is the problem of getting a set of processes to decide on a single value such that three properties hold: every non-faulty process that decides chooses the same value (agreement), the chosen value was proposed by some process and is not invented out of thin air (validity), and every non-faulty process eventually decides (termination). Stated that abstractly it sounds like a puzzle, so it helps to see the concrete questions a real AI cluster needs answered: Which one of the three candidate schedulers currently holds the lease and is allowed to place jobs? When a worker crashes and a spare takes its place, which surviving worker is now rank 0, the coordinator that the others rendezvous with? Of the four model versions that finished training this week, which single one is tagged "production" right now? Each of those is a request for one authoritative answer that every participant will act on, and getting it wrong, two schedulers both believing they own the cluster, two workers both believing they are rank 0, produces exactly the kind of split-brain corruption that distributed systems exist to prevent.</p>
+<p>Here is the editorial point this book insists on. The arithmetic core of distributed training does <em>not</em> need consensus. When eight workers run data-parallel SGD, they do not vote on the gradient; they each compute a partial sum and combine it with all-reduce, a collective operation in which the communication schedule is fixed in advance and agreed before the first byte moves. There is no proposal, no election, no possibility of two different answers, because addition is deterministic and the participants are known. That is why <a href="../module-04-communication-primitives/index.html">Chapter 4</a> can build the entire data plane out of collectives and never mention Paxos or Raft. Consensus is expensive and slow precisely because it tolerates uncertainty about who is alive and who proposed what, and the data plane buys its speed by refusing to tolerate that uncertainty on the hot path. The uncertainty does not vanish, though. It is pushed into the control plane, and the control plane pays for it with a consensus protocol.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Collectives Are Not Consensus</div>
+<p>All-reduce and Raft both make many machines "agree", but on entirely different things and at entirely different costs. All-reduce produces an agreed <em>numerical result</em> from a fixed, pre-arranged set of participants running a deterministic schedule; it is fast and runs millions of times per training job. Raft produces an agreed <em>decision</em> (a leader, a config value, a log entry) in the presence of crashes and uncertain membership; it is comparatively slow and runs rarely. AI training puts the high-frequency numerical agreement in the data plane (collectives) and the low-frequency decision agreement in the control plane (consensus). Mixing them up, for instance reaching for Raft to average gradients, would be a serious performance mistake.</p>
+</div>
+
+<h2>2. Why Agreement Is Hard Under Failure <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>If every machine were perfectly reliable and the network never delayed a message, agreement would be trivial: appoint machine 0 as the decider, let it broadcast the answer, done. Real clusters are not reliable, and the difficulty comes from one specific impossibility of distinguishing a crashed machine from a slow one. When a coordinator stops hearing from a worker, it cannot tell whether the worker died or whether its reply is merely stuck behind a congested link; the two look identical from the outside. This is not an engineering gap that a better library closes. It is a theorem.</p>
+<p>The Fischer, Lynch, and Paterson result of 1985, universally called FLP, states that in an asynchronous system, one with no bound on message delay, no deterministic protocol can guarantee both safety and liveness for consensus if even a single process may crash. Informally: any protocol that always reaches a decision can be forced to run forever by an adversary who delays exactly the right message at exactly the right moment, and any protocol that always terminates can be forced into an inconsistent decision. There is no deterministic algorithm that is simultaneously always-correct and always-terminating when one crash is possible and delays are unbounded.</p>
+<p>Practical systems do not repeal FLP; they sidestep it. Raft and its relatives keep <strong>safety</strong> unconditionally, they never elect two leaders in one term or commit two different values at one log position, and they obtain <strong>liveness</strong> only under a partial-synchrony assumption: once the network behaves well enough for long enough (messages arrive within some bound the protocol does not need to know in advance), an election completes and progress resumes. Randomized election timeouts break the symmetric stalemates that FLP exploits. The takeaway for an AI systems engineer is precise and worth internalizing: a consensus system will always refuse to do the wrong thing, but it may pause and do nothing while the network is misbehaving. That pause is a feature, and a training job that stalls because its coordination store lost quorum is behaving exactly as designed, choosing consistency over availability.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Two Generals Never Mail Back</div>
+<p>The oldest cousin of FLP is the Two Generals Problem: two allied generals on opposite hills can coordinate an attack only by messengers crossing a contested valley, and no finite sequence of confirmations ever makes both fully certain the other will attack, because the last messenger might always be the one captured. A distributed training job feels this every time a worker goes quiet. Did it crash, or is its acknowledgment captured in the valley of a congested switch? The control plane's answer is delightfully blunt: stop waiting for certainty, set a timeout, and hold an election.</p>
+</div>
+
+<h2>3. Raft: A Leader and a Replicated Log <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Raft is the consensus algorithm most worth knowing because it was designed to be understandable, and because etcd and Consul, which run underneath a great deal of modern AI infrastructure, implement it. Raft reduces consensus to two intertwined mechanisms: electing a single leader, and replicating an append-only log of commands through that leader. Time is divided into <em>terms</em>, numbered $1, 2, 3, \dots$, and each term has at most one leader. A node that stops hearing heartbeats from the current leader times out, increments the term, becomes a candidate, and asks every other node for a vote. The rule that makes this safe is the <strong>majority quorum</strong>: a candidate becomes leader only if it collects votes from a strict majority of the cluster, and each node grants at most one vote per term. With $n$ nodes a majority is</p>
+$$ q = \left\lfloor \frac{n}{2} \right\rfloor + 1, $$
+<p>and because any two majorities of the same set must overlap in at least one node, and that node votes only once per term, two candidates can never both reach a majority in the same term. One term, at most one leader, guaranteed, no matter how the messages are delayed or reordered. This single overlap argument is the whole safety story for elections.</p>
+<p>Once elected, the leader is the only node that accepts client writes. It appends each command (set this config key, register this model version, grant this lease) to its log and replicates the entry to the followers; an entry is <em>committed</em> only after a majority have stored it, at which point the leader applies it and tells the followers to apply it too. The same majority that prevents two leaders also guarantees that a committed entry survives any minority failure, because at least one node in every future majority already holds it. The simulation below makes the election-safety property concrete: it runs a five-node cluster through three terms, including a split-vote race and a network partition, and checks that two leaders never coexist and that a minority partition cannot elect anyone.</p>
+<pre><code class="language-python">import random
+random.seed(7)
+
+class Node:
+    def __init__(self, node_id):
+        self.id = node_id
+        self.voted_for = {}              # term -> candidate it already voted for
+
+    def request_vote(self, term, candidate_id):
+        if term not in self.voted_for:   # at most ONE vote per term
+            self.voted_for[term] = candidate_id
+            return True
+        return False
+
+def run_election(cluster, term, candidate_id, reachable):
+    majority = len(cluster) // 2 + 1     # strict majority of the WHOLE cluster
+    votes = 1                            # a candidate always votes for itself
+    for node in cluster:
+        if node.id != candidate_id and node.id in reachable \
+           and node.request_vote(term, candidate_id):
+            votes += 1
+    return votes, majority, votes >= majority
+
+N = 5
+cluster = [Node(i) for i in range(N)]
+allnodes = set(range(N))
+print("cluster size            :", N)
+print("majority quorum needed  :", N // 2 + 1, "\n")
+
+# Term 1: two candidates race in the SAME term; only one may win.
+v0, maj, won0 = run_election(cluster, 1, 0, allnodes)
+v2, maj, won2 = run_election(cluster, 1, 2, allnodes)
+print("Term 1: nodes 0 and 2 both stand for election")
+print(f"  candidate 0: {v0}/{N} votes (needs {maj})  -> leader={won0}")
+print(f"  candidate 2: {v2}/{N} votes (needs {maj})  -> leader={won2}")
+print(f"  two leaders in one term? {won0 and won2}   (safety: must be False)\n")
+
+# Term 3: a partition isolates {3,4}; a minority cannot reach quorum.
+v3, maj, won3 = run_election(cluster, 3, 3, reachable={3, 4})
+print("Term 3: a partition isolates nodes 3 and 4")
+print(f"  candidate 3 sees only [3, 4]: {v3}/{N} votes -> leader={won3}")
+</code></pre>
+<div class="code-caption"><strong>Code 2.6.1:</strong> A self-contained Raft election simulation. The two safety levers are the single line that records at most one vote per term and the strict-majority threshold; together they make split-brain impossible. Run with <code>C:\Python314\python.exe</code>.</div>
+<pre><code class="language-text">cluster size            : 5
+majority quorum needed  : 3
+
+Term 1: nodes 0 and 2 both stand for election
+  candidate 0: 5/5 votes (needs 3)  -> leader=True
+  candidate 2: 2/5 votes (needs 3)  -> leader=False
+  two leaders in one term? False   (safety: must be False)
+
+Term 3: a partition isolates nodes 3 and 4
+  candidate 3 sees only [3, 4]: 2/5 votes -> leader=False</code></pre>
+<div class="code-caption"><strong>Output 2.6.1:</strong> Candidate 0 reached the cluster first and collected the votes; candidate 2 found most nodes already committed for the term and fell short of the quorum of three, so it lost. Two leaders never coexist. In Term 3 the isolated minority gathered just two of the five votes, one short of quorum, so it stayed leaderless and (correctly) refused to act, choosing consistency over availability exactly as the FLP discussion predicts.</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: A Majority of Two Is Not a Majority</div>
+<p>The most common five-node-cluster outage is operators "saving money" by running etcd on two nodes instead of three. With two nodes the majority is also two, so a single failure drops you below quorum and the whole control plane freezes. Odd cluster sizes (3, 5, 7) are the convention precisely because adding an even node raises the quorum without improving fault tolerance: a 4-node cluster tolerates the same single failure as a 3-node one, while paying for an extra machine and a slower commit.</p>
+</div>
+
+<h2>4. etcd and ZooKeeper: Consensus You Rent, Not Build <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Almost nobody implements Raft inside their AI platform. Instead they delegate every consensus-requiring decision to a small, battle-tested coordination service and treat it as a reliable shared notebook. The two dominant choices are <strong>etcd</strong>, a Raft-based key-value store that is the brain of Kubernetes, and <strong>ZooKeeper</strong>, an older ZAB-based service that underpins Hadoop, Kafka, and many on-premises ML clusters. Both expose the same handful of primitives that turn raw consensus into something an application can use: a consistent key-value store, ephemeral keys that vanish when a client disconnects (perfect for liveness), watches that notify clients when a key changes, and compare-and-swap writes that implement locks and leases. A distributed lock is just an agreed key that only one holder may own; a leader election is a race to create one ephemeral key, where the winner leads and the losers watch the key so they learn the instant the leader's session dies.</p>
+<p>This is the layer where AI infrastructure actually touches consensus. The cluster scheduler stores the authoritative job and node state in etcd, so that even if the scheduler process is replaced, the new instance reads the same truth and no two schedulers place conflicting jobs; we develop that machinery in <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/index.html">Chapter 33</a>. A distributed training launcher uses an etcd or ZooKeeper rendezvous to agree on the worker set and assign ranks before the first all-reduce, which is how a worker learns it is rank 0; <code>torchrun</code>'s elastic backend does exactly this. And the model registry that records which version is "production" is, at its core, a consensus-backed compare-and-swap on a version key, which is why the MLOps systems of <a href="../../part-5-distributed-inference/module-26-mlops-distributed-ai/index.html">Chapter 26</a> lean on these stores to make promotion atomic.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Leader Election in a Dozen Lines of etcd</div>
+<p>Code 2.6.1 simulated the <em>mechanism</em> of election for teaching. In production you never run that loop yourself; you ask etcd, which has already run Raft for you, to grant a short-lived lease and let exactly one client claim a leadership key. The <code>python-etcd3</code> client makes the whole protocol a few calls:</p>
+<pre><code class="language-python">import etcd3
+client = etcd3.client(host="etcd.cluster.local", port=2379)
+
+# A lease is a timer; if this process dies, the lease expires and the key vanishes.
+lease = client.lease(ttl=10)
+
+# Atomically claim leadership ONLY if nobody holds the key (compare-and-swap).
+won, _ = client.transaction(
+    compare=[client.transactions.version("/scheduler/leader") == 0],
+    success=[client.transactions.put("/scheduler/leader", "scheduler-A", lease=lease)],
+    failure=[],
+)
+if won:
+    lease.refresh()           # keep refreshing to stay leader; stop and you abdicate
+    run_as_leader()
+else:
+    client.add_watch_callback("/scheduler/leader", on_leader_change)  # wait your turn
+</code></pre>
+<div class="code-caption"><strong>Code 2.6.2:</strong> Fault-tolerant leader election against a real etcd cluster. The compare-and-swap and lease replace the entire hand-rolled term-and-vote loop of Code 2.6.1; etcd runs Raft internally, and the only application logic left is "try to claim, otherwise watch". ZooKeeper's <code>kazoo</code> library and its <code>Election</code> recipe offer the same pattern.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Two Schedulers That Both Owned the Cluster</div>
+<p><strong>Who:</strong> A platform engineer running the training scheduler for a 600-GPU research cluster.</p>
+<p><strong>Situation:</strong> For high availability they ran two identical scheduler processes, expecting the spare to take over if the primary died.</p>
+<p><strong>Problem:</strong> A network blip made each scheduler believe the other was dead, so both began placing jobs; two of them landed eight workers each on the same GPUs, and both training runs corrupted their shared checkpoints.</p>
+<p><strong>Dilemma:</strong> Add ad-hoc heartbeats between the two schedulers (fast to write, but reinvents consensus badly and will split-brain again under the next partition), or route leadership through the etcd cluster the platform already ran for Kubernetes.</p>
+<p><strong>Decision:</strong> They put the scheduler behind an etcd lease, exactly the pattern in Code 2.6.2, so that at most one scheduler could ever hold the leadership key.</p>
+<p><strong>How:</strong> Each scheduler tried to claim <code>/scheduler/leader</code> with a 10-second lease on startup and on every loss-of-leadership event; the loser watched the key and stayed idle until the lease expired.</p>
+<p><strong>Result:</strong> During the next real partition the minority-side scheduler could not refresh its lease, lost leadership within ten seconds, and stopped placing jobs; the cluster paused briefly rather than double-booking. No corrupted checkpoint recurred.</p>
+<p><strong>Lesson:</strong> "Run two of them for availability" without a consensus layer manufactures split-brain. One quorum-backed lease is worth more than any number of hand-rolled heartbeats, and the brief pause it causes is the correct behavior, not a bug.</p>
+</div>
+
+<h2>5. What the Control Plane Decides for an AI Job <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>It is worth listing the concrete decisions so the boundary between the planes is unmistakable. Table 2.6.1 puts the recurring AI control-plane decisions next to the consensus primitive that backs each one and the chapter that develops it. Read down the right column and notice that none of these decisions is on the gradient hot path; every one is a rare, authoritative choice that, if duplicated or lost, breaks the whole job. That rarity is what makes paying for consensus affordable: a Raft commit measured in milliseconds is invisible next to a training run measured in days, but a split-brain in any of these rows is fatal.</p>
+<div class="table-caption"><strong>Table 2.6.1:</strong> Control-plane decisions in a distributed AI system, the consensus primitive each one rests on, and where the book develops it. None sits on the data plane's gradient path.</div>
+<table>
+<thead>
+<tr><th scope="col">Control-plane decision</th><th scope="col">Consensus primitive</th><th scope="col">Developed in</th></tr>
+</thead>
+<tbody>
+<tr><td>Which scheduler holds the lease</td><td>Leader election (ephemeral lease)</td><td>Chapter 33</td></tr>
+<tr><td>Which workers are alive (membership)</td><td>Ephemeral keys + watches</td><td>Chapter 18</td></tr>
+<tr><td>Which worker is rank 0 (rendezvous)</td><td>Agreed key-value, barrier</td><td>Chapter 15</td></tr>
+<tr><td>Current cluster configuration</td><td>Replicated log of writes</td><td>Chapter 33</td></tr>
+<tr><td>Which model version is "production"</td><td>Compare-and-swap on a version key</td><td>Chapter 26</td></tr>
+<tr><td>Who owns this shard / partition right now</td><td>Distributed lock</td><td>Chapter 11</td></tr>
+</tbody>
+</table>
+<p>The rendezvous row is the cleanest bridge back to the data plane. Before any all-reduce can run, the workers must agree on who is in the group and which one is rank 0, the coordinator that initializes the process group. Elastic training launchers route exactly that agreement through a consensus-backed rendezvous, and when a worker dies and a spare joins, the group re-forms through the same store; this is the membership machinery that <a href="../../part-4-parallel-deep-learning/module-18-elastic-fault-tolerant-training/index.html">Chapter 18</a> builds into fault-tolerant training. Once the control plane has answered "you are rank 0, your peers are these, the world size is eight", the data plane takes over and never consults consensus again until the membership changes. The two planes meet only at the seams: setup, recovery, and reconfiguration.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Synchronous/Asynchronous Axis, One Level Up</div>
+<p>Chapter 2 keeps returning to the choice between synchronous and asynchronous coordination, and consensus is that choice raised from numbers to decisions. A synchronous all-reduce makes workers agree on a gradient value every step (<a href="../module-04-communication-primitives/index.html">Chapter 4</a>); a Raft commit makes nodes agree on a decision only when one is needed. The same tension, agree-now-and-wait versus proceed-and-reconcile-later, reappears as synchronous versus asynchronous SGD in <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a> and as bounded staleness in the parameter server of <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a>. Recognizing that the control plane is the strict-consistency end of one continuous spectrum, with the staleness-tolerant data plane at the other end, is a load-bearing idea for the rest of the book.</p>
+</div>
+
+<h2>6. Research Frontier <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Consensus Off the Critical Path of Giant Jobs (2024 to 2026)</div>
+<p>As training jobs grew to tens of thousands of accelerators, the control plane became a measurable bottleneck and a fresh research target. Meta's report on training Llama 3 (Grattafiori et al., 2024) documents how, at 16,000-GPU scale, failure handling and membership churn dominated operational effort, motivating coordination layers that detect, evict, and re-rendezvous failed workers in seconds rather than minutes. A parallel systems line keeps consensus correct while shrinking its latency: etcd's move to a v3.5/v3.6 lineage hardened the Raft implementation and its learner (non-voting) members, and learner replicas let a cluster add capacity without enlarging the voting quorum that every commit must cross. On the algorithmic side, leaderless and flexible-quorum protocols such as the EPaxos and Flexible Paxos families continue to attract attention for letting reads and writes use differently sized quorums, which matters when a model registry is read constantly but written rarely. The throughline for AI infrastructure is consistent: keep the unconditional safety of consensus, but get its rare decisions off the critical path of jobs whose worker counts, and therefore whose failure rates, keep climbing. We return to the failure-rate arithmetic that forces this in <a href="../../part-4-parallel-deep-learning/module-18-elastic-fault-tolerant-training/index.html">Chapter 18</a>.</p>
+</div>
+<p>We now hold the second half of Chapter 2's coordination story. Section 2.5 fixed how stale a reader may be; this section fixed how a cluster commits to a single authoritative value despite crashes, and drew the bright line between the consensus-backed control plane and the collective-driven data plane. What remains is the performance consequence of all this coordination: even with leadership settled and membership agreed, the slowest worker still sets the pace of every synchronous step. That problem, the straggler, is the subject of <a href="section-2.7.html">Section 2.7</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.6.1: Sort Each Decision Into a Plane <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each of the following, state whether it belongs to the data plane (deterministic collective, no consensus) or the control plane (consensus required), and justify the choice in one sentence: (a) averaging gradients across 32 data-parallel workers; (b) deciding which of three replicas of the parameter server is the current primary; (c) summing a loss scalar across a pipeline stage; (d) promoting model version v7 to the "production" tag; (e) agreeing, after a worker crash, on the new world size and rank assignment before training resumes. For any control-plane item, name which row of Table 2.6.1 it matches.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.6.2: Quorum and Fault Tolerance <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the majority rule $q = \lfloor n/2 \rfloor + 1$, fill in, for cluster sizes $n = 3, 4, 5, 6, 7$, both the quorum $q$ and the number of simultaneous node failures the cluster can survive while still committing (which is $n - q$). Explain from your table why production consensus clusters use odd sizes, and state precisely what an operator loses by running a 2-node etcd cluster "for redundancy". Then argue why a minority partition must refuse writes, connecting your answer to the FLP discussion in Section 2.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.6.3: Extend the Election Simulation <span class="exercise-type coding">Coding</span></div>
+<p>Start from Code 2.6.1. (a) Add a <code>leader_for_term</code> dictionary and an assertion, after running many randomized elections across many terms, that no term ever records two distinct leaders; confirm the assertion never fires. (b) Add a committed-log model: a leader appends an entry only if a majority of reachable nodes acknowledge it, and verify that an entry committed under full connectivity is still present in the next leader's log after you partition away a minority. (c) Briefly explain which property your code demonstrates (safety) and which it cannot (liveness under unbounded delay), tying the limitation back to FLP.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-2.5.html"><span class="nav-label">Previous</span><span class="nav-num">Section 2.5</span><span class="nav-title">Consistency Models</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 2</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Systems Concepts for AI</span></a>
+<a class="next" href="section-2.7.html"><span class="nav-label">Next</span><span class="nav-num">Section 2.7</span><span class="nav-title">Stragglers and Bottlenecks</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

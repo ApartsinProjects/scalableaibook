@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 36.3: Distributed Cleaning and Deduplication. Turning a raw web crawl into a clean, deduplicated corpus at scale, with boilerplate removal, quality filtering, and near-duplicate detection via MinHash and Locality-Sensitive Hashing parallelized as a Spark shuffle." name="description"/>
+<title>Section 36.3: Distributed Cleaning and Deduplication | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Case Studies and Capstone Projects</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 36: Web-Scale Text Processing and Distributed RAG</a></div>
+<h1>Distributed Cleaning and Deduplication</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I crawled the open web for a month and came back proud of three billion documents. The deduplicator looked at me, sighed, and quietly informed me that I had brought home roughly four hundred million."</p>
+<cite>A Document, Discovering It Is the Millionth Copy of Itself</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A raw web crawl is mostly noise and repetition; the single step that most determines the quality of everything downstream, both the corpus you train a language model on and the documents your retrieval system will serve, is turning that crawl into clean, deduplicated text at scale.</strong> The crawl arrives as terabytes of HTML wrapped in navigation bars, cookie banners, and ad markup, riddled with machine-generated junk, mirror sites, and the same press release copied across ten thousand domains. Before a single embedding is computed or a single training token is consumed, that mess must be extracted into plain text, filtered for quality, and deduplicated so that no fact is learned a thousand times and no near-identical page wastes a slot in the index. None of this fits on one machine, so the work is expressed as a sequence of distributed passes, and the centerpiece, near-duplicate detection, becomes a textbook shuffle: hash documents into buckets, then compare only within a bucket. This section builds that pipeline and shows why its quality, more than any model architecture choice, sets the ceiling on retrieval and training that follows.</p>
+</div>
+<p>In <a href="section-36.2.html">Section 36.2</a> we crawled and stored the raw web at scale, landing billions of pages as compressed records in distributed storage. That crawl is not a corpus; it is raw material. A large fraction of it is boilerplate that surrounds the actual content, another large fraction is low-quality or machine-generated text, and a startlingly large fraction is duplicated, the same article syndicated across domains, the same template instantiated a million times, the same document re-crawled on successive passes. Left untreated, this material poisons everything downstream. A retrieval index built on it returns ten copies of the same page for one query; a language model trained on it memorizes the duplicated spans verbatim and wastes compute relearning them. This section is about the cleaning pipeline that stands between the crawl and the corpus, and it is the step where most of the corpus-quality battle is won or lost.</p>
+<p>The pipeline has three stages, each a distributed pass over the data. First, text extraction strips the HTML scaffolding and recovers the main content. Second, quality filtering discards documents that are not worth keeping: wrong language, too short, too repetitive, or flagged by a learned classifier. Third, and most demanding, deduplication removes exact and near-duplicate documents so that each distinct piece of content appears essentially once. We treat the three in order, then spend the bulk of the section on the deduplication algorithm, because it is the one that does not have an obvious parallelization and the one whose cleverness, MinHash combined with Locality-Sensitive Hashing, repays careful study.</p>
+
+<h2>1. Text Extraction and Boilerplate Removal <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A crawled page is an HTML document, and the text a reader cares about is a minority of the bytes. The rest is structure: the document head, navigation menus, sidebars, footers, cookie notices, comment widgets, and advertising markup. Boilerplate removal is the task of recovering the main textual content and discarding the chrome. The classical heuristics exploit the observation that boilerplate tends to live in short, link-dense, repeated blocks while main content lives in long runs of prose with high text-to-markup ratio; production extractors such as the descendants of <code>boilerpipe</code>, <code>trafilatura</code>, and <code>resiliparse</code> combine these signals with the DOM tree structure to segment the page. This is an embarrassingly parallel operation: every document is processed independently, so it maps cleanly onto the MapReduce pattern of <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a>, one map task per page, no shuffle required.</p>
+<p>The cost that matters here is not algorithmic but throughput: extracting text from billions of pages is bounded by how fast bytes can be read from storage and fed to worker cores, which is exactly the data-loading problem of <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/index.html">Chapter 8</a>. Extraction quality nonetheless propagates all the way to the model. If the extractor leaves navigation text in, that boilerplate becomes training tokens and index entries; if it cuts too aggressively, it amputates real content. Because the operation is per-document and stateless, it parallelizes without coordination, which is why we dispatch it quickly and reserve the section's depth for the stage that does require coordination.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Cheap Stages Parallelize Trivially; The Expensive One Needs a Shuffle</div>
+<p>Extraction and quality filtering are per-document operations: each page is decided on its own, so they are pure map steps with no data movement between workers, and they scale by simply adding machines. Deduplication is fundamentally different, because deciding whether a document is a duplicate requires comparing it to other documents that may live on any machine in the cluster. That comparison is a relation, not a function of one record, and relations across a partitioned dataset are resolved by a shuffle: move records that might match into the same place, then compare locally. Recognizing which stages are map-only and which demand a shuffle tells you exactly where the engineering effort and the network cost will concentrate.</p>
+</div>
+
+<h2>2. Quality Filtering: Heuristics, Language ID, and Classifiers <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Extraction yields plain text, but plenty of that text is not worth keeping. Quality filtering is the second per-document pass, and it stacks three kinds of filter. The first is language identification: a fast model (the <code>fastText</code> language identifier is the standard choice) labels each document with its language and confidence, so that a corpus targeting English can drop everything else or route other languages to their own pipelines. The second is a battery of cheap heuristics drawn from the lineage of the C4, Gopher, and RefinedWeb cleaning rules: discard documents that are too short, that have too high a fraction of symbols or digits, that repeat the same line or n-gram excessively, that lack terminal punctuation, or that contain blocklisted patterns. These rules are blunt but remove a large mass of obvious junk for almost no compute.</p>
+<p>The third filter is learned. A lightweight classifier, often nothing heavier than a logistic-regression or <code>fastText</code> model trained to distinguish a curated reference set (for example, pages cited on a high-quality reference site) from random web text, scores each document for a model-quality notion of "is this the kind of text we want." This classifier-based filtering is what separated the corpora that produced strong language models from those that did not, and it remains a per-document map operation: the model is small enough to replicate to every worker, so each worker scores its own shard with no communication. The same discipline that picks training data also picks retrieval data; a document too low-quality to train on is usually too low-quality to retrieve, so a RAG corpus inherits these filters directly.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The RAG Index That Kept Answering With the Same Press Release</div>
+<p><strong>Who:</strong> A platform engineer building an internal RAG assistant over a 40-terabyte web crawl for a financial-news company.</p>
+<p><strong>Situation:</strong> The first index was built straight from extracted text, with language ID and a length filter but no deduplication.</p>
+<p><strong>Problem:</strong> For many queries the top ten retrieved passages were the same wire-service article republished across dozens of partner domains, so the language model saw ten copies of one fact and nothing else, and its answers cited a single source as though it were ten.</p>
+<p><strong>Dilemma:</strong> Patch the symptom by deduplicating retrieval results at query time, cheap but leaving the bloated index and its wasted storage and recall, or fix the cause by deduplicating the corpus before indexing, a heavier distributed batch job but a permanent cure.</p>
+<p><strong>Decision:</strong> They deduplicated the corpus, because query-time deduplication cannot recover the relevant-but-distinct documents that the duplicates had crowded out of the top results.</p>
+<p><strong>How:</strong> They added a MinHash plus LSH near-duplicate pass (the algorithm of Section 4) as a Spark job between extraction and indexing, collapsing each cluster of near-identical pages to one representative.</p>
+<p><strong>Result:</strong> The index shrank by 38 percent, retrieval latency dropped with it, and answer quality rose sharply because the top results now spanned genuinely distinct sources.</p>
+<p><strong>Lesson:</strong> Deduplicate the corpus, not the answer. Duplicates do not merely waste space; they evict the diverse evidence that makes retrieval useful.</p>
+</div>
+
+<h2>3. Why Deduplication Matters So Much <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>It is tempting to treat deduplication as housekeeping, a tidy-up that saves some disk. It is far more consequential than that, and three distinct harms motivate it. The first is memorization. A language model trained on text that contains a passage a thousand times will memorize that passage verbatim, which inflates the risk of regurgitating copyrighted or private strings and distorts the model's sense of how common a fact is; the empirical finding, established across several studies, is that deduplicating training data reduces memorization and improves downstream quality at the same time. The second harm is wasted compute. Every duplicated token that survives into the training set is a token the model pays to process without learning anything new from it, so duplication is a direct tax on the most expensive resource in the entire enterprise of <a href="../../part-4-parallel-deep-learning/module-19-training-foundation-models/index.html">Chapter 19</a>, the training run itself.</p>
+<p>The third harm, and the one most specific to the case study of this chapter, is evaluation contamination. If a benchmark's test documents, or near-paraphrases of them, leak into the training corpus through duplication, the model's reported accuracy becomes meaningless, because it is being tested on what it has already seen. Deduplication against held-out evaluation sets is therefore not optional hygiene but a precondition for trustworthy numbers. For the RAG system specifically, duplication degrades retrieval directly, as the practical example showed: a deduplicated index returns a more diverse and therefore more informative set of passages for the same query budget. Clean, deduplicated text is the common upstream cause of both a better-trained model and a better-retrieving index, which is why this single stage carries so much of the corpus-quality weight.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The MapReduce Shuffle Returns, Doing Real Work</div>
+<p>Near-duplicate detection is the clearest application in this book of the idea that a hard relational problem over a partitioned dataset becomes tractable the moment you can express it as "group by a key, then act within each group." That is precisely the MapReduce shuffle of <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a>: the LSH band hash is the key, the map step emits one key per band, and the shuffle gathers all documents that share a band into the same reducer, where the only comparisons that remain are local. The same shuffle that grouped words for a distributed word count, and that returns as gradient all-reduce in <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>, here groups documents by a similarity-preserving hash. The art of distributed deduplication is almost entirely the art of choosing a key under which similar things collide.</p>
+</div>
+
+<h2>4. Exact Deduplication: Hashing and Suffix Arrays <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Exact duplicates, byte-identical documents, are easy and should be removed first because the method is cheap and shrinks the input to the harder near-duplicate pass. Compute a strong content hash of each document (a 64-bit or 128-bit hash such as those in the <code>xxhash</code> or SHA family), then group by that hash and keep one document per group. This is a one-line MapReduce: map each document to a key-value pair of (hash, document id), shuffle by hash, and in each reducer keep a single representative. Because the hash is a deterministic function of the bytes, identical documents always land in the same bucket and the comparison within a bucket is a trivial equality check.</p>
+<p>A more refined notion of exact duplication operates at the substring level rather than the document level: long verbatim spans that recur across otherwise-different documents, such as a license header or a boilerplate disclaimer embedded mid-article. Detecting these calls for a suffix array, a sorted array of all suffixes of the concatenated corpus that lets you find every repeated substring of a minimum length in near-linear time; the influential deduplication work of Lee and colleagues used exactly this structure to excise long duplicated spans from training data. Suffix-array construction parallelizes, though less trivially than hashing, and it is the right tool when the duplication you care about is substring-level rather than whole-document. For the corpus-scale, whole-document near-duplicate problem that dominates web cleaning, we turn to the probabilistic method that is the heart of this section.</p>
+
+<h2>5. Near-Duplicate Detection With MinHash and LSH <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Most web duplication is not byte-identical. The same article appears with a different ad inserted, a different timestamp, a one-word edit, a re-ordered paragraph. We need a notion of "almost the same," and the standard one for documents is the Jaccard similarity of their sets of shingles, where a shingle is a contiguous run of $k$ tokens. Represent each document $d$ as the set $S(d)$ of its $k$-token shingles; the similarity of two documents is</p>
+$$J(S(d_1), S(d_2)) = \frac{|S(d_1) \cap S(d_2)|}{|S(d_1) \cup S(d_2)|},$$
+<p>a number in $[0,1]$ that is $1$ for identical shingle sets and $0$ for disjoint ones. The naive way to find all near-duplicate pairs, comparing every document to every other, costs $O(N^2)$ Jaccard computations, which for $N$ in the billions is utterly out of reach. MinHash and LSH together replace that quadratic search with a near-linear one, and they do it in two ideas that compose beautifully.</p>
+<p>The first idea, MinHash, compresses each document's shingle set into a short fixed-length signature whose agreement estimates Jaccard. Pick a hash function $h$ that maps shingles to integers, and define $\text{minhash}_h(d) = \min_{s \in S(d)} h(s)$. The defining property is that the probability two documents share the same MinHash value equals their Jaccard similarity:</p>
+$$\Pr\big[\text{minhash}_h(d_1) = \text{minhash}_h(d_2)\big] = J(S(d_1), S(d_2)).$$
+<p>The reason is elegant: the minimum is achieved by whichever shingle in the union $S(d_1) \cup S(d_2)$ hashes lowest, and the two documents agree exactly when that lowest-hashing shingle lies in the intersection, an event with probability equal to the intersection-over-union ratio. Using $n$ independent hash functions gives a signature of $n$ MinHash values, and the fraction of positions at which two signatures agree is an unbiased estimate of their Jaccard similarity, with error shrinking like $1/\sqrt{n}$. A document of any length collapses to $n$ numbers, and similarity estimation becomes counting agreements between two short vectors.</p>
+<p>The second idea, Locality-Sensitive Hashing by banding, turns the signature into a bucketing scheme that brings likely-similar documents together without comparing all pairs. Split the length-$n$ signature into $b$ bands of $r$ rows each, so $n = b \cdot r$, and hash each band to a bucket. Two documents become a candidate pair if they land in the same bucket for at least one band. Figure 36.3.1 traces the whole flow from shingles to candidate pairs.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Pipeline from a document to its k-token shingles, to an n-value MinHash signature, split into b bands of r rows that hash to buckets, with two documents becoming a candidate pair when any band collides.">
+<defs>
+<marker id="arr363" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.bx363 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.sg363 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.bn363 { fill:#eaf5ee; stroke:#1f7a44; stroke-width:1.6; }
+.t363 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s363 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.m363 { font:600 12px monospace; fill:#14385c; text-anchor:middle; }
+.l363 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr363); }
+</style>
+<text class="t363" x="80" y="26">Document</text>
+<rect class="bx363" x="20" y="40" width="120" height="50" rx="8"/>
+<text class="s363" x="80" y="62">"the crawler</text>
+<text class="s363" x="80" y="78">fetched pages"</text>
+<line x1="142" y1="65" x2="178" y2="65" class="l363"/>
+<text class="t363" x="255" y="26">k-shingles</text>
+<rect class="sg363" x="182" y="40" width="146" height="50" rx="8"/>
+<text class="s363" x="255" y="60">{(the,crawler,fetched),</text>
+<text class="s363" x="255" y="78">(crawler,fetched,pages)}</text>
+<line x1="330" y1="65" x2="366" y2="65" class="l363"/>
+<text class="t363" x="470" y="26">MinHash signature (n values)</text>
+<rect class="bx363" x="370" y="40" width="200" height="50" rx="8"/>
+<text class="m363" x="470" y="63">[ 7, 31, 4, 88, 12, 5, ... ]</text>
+<text class="s363" x="470" y="80">min over hashed shingles</text>
+<text class="t363" x="700" y="26">Split into b bands of r rows</text>
+<rect class="bn363" x="600" y="40" width="62" height="50" rx="6"/>
+<text class="m363" x="631" y="60">7,31</text>
+<text class="s363" x="631" y="80">band 1</text>
+<rect class="bn363" x="668" y="40" width="62" height="50" rx="6"/>
+<text class="m363" x="699" y="60">4,88</text>
+<text class="s363" x="699" y="80">band 2</text>
+<rect class="bn363" x="736" y="40" width="62" height="50" rx="6"/>
+<text class="m363" x="767" y="60">12,5</text>
+<text class="s363" x="767" y="80">band 3</text>
+<line x1="572" y1="65" x2="596" y2="65" class="l363"/>
+<text class="t363" x="440" y="150">Hash each band to a bucket; shuffle groups equal buckets together</text>
+<path class="l363" d="M 631 92 L 631 120 L 250 120 L 250 168"/>
+<path class="l363" d="M 699 92 L 699 120 L 440 120 L 440 168"/>
+<path class="l363" d="M 767 92 L 767 120 L 630 120 L 630 168"/>
+<rect class="bn363" x="170" y="170" width="160" height="44" rx="8"/>
+<text class="t363" x="250" y="190">bucket 0x1a</text>
+<text class="s363" x="250" y="206">doc A, doc A'</text>
+<rect class="bn363" x="360" y="170" width="160" height="44" rx="8"/>
+<text class="t363" x="440" y="190">bucket 0x9c</text>
+<text class="s363" x="440" y="206">doc B</text>
+<rect class="bn363" x="550" y="170" width="160" height="44" rx="8"/>
+<text class="t363" x="630" y="190">bucket 0x44</text>
+<text class="s363" x="630" y="206">doc C, doc C'</text>
+<path class="l363" d="M 250 216 L 250 250"/>
+<path class="l363" d="M 630 216 L 630 250"/>
+<rect class="bx363" x="150" y="252" width="200" height="50" rx="8"/>
+<text class="t363" x="250" y="274">Candidate pair (A, A')</text>
+<text class="s363" x="250" y="291">verify true Jaccard, keep one</text>
+<rect class="bx363" x="530" y="252" width="200" height="50" rx="8"/>
+<text class="t363" x="630" y="274">Candidate pair (C, C')</text>
+<text class="s363" x="630" y="291">verify true Jaccard, keep one</text>
+<text class="s363" x="440" y="330">doc B shares no band with anyone, so it is never a candidate and survives untouched</text>
+</svg>
+<figcaption><strong>Figure 36.3.1:</strong> The MinHash plus LSH pipeline for one document and its near-duplicates. A document becomes a set of $k$-token shingles, then an $n$-value MinHash signature, which is split into $b$ bands of $r$ rows. Each band hashes to a bucket; the shuffle gathers documents sharing a band into the same bucket (here $A$ with $A'$ and $C$ with $C'$), and only those within-bucket pairs are verified. The distinct document $B$ collides with nobody and is never compared.</figcaption>
+</figure>
+<p>The banding scheme gives a tunable similarity threshold. For two documents with true Jaccard $s$, the probability that they agree on all $r$ rows of one specific band is $s^r$, so the probability they differ in at least one row of that band is $1 - s^r$, the probability they differ in every one of the $b$ bands is $(1 - s^r)^b$, and therefore the probability they collide in at least one band, which is to say become a candidate pair, is</p>
+$$\Pr[\text{candidate}] = 1 - (1 - s^r)^b.$$
+<p>As a function of $s$ this is the famous S-curve: near-zero for low similarity, near-one for high similarity, with a sharp transition around $s^* \approx (1/b)^{1/r}$. By choosing $b$ and $r$ (subject to $b \cdot r = n$) you slide that threshold to whatever similarity you consider a duplicate. Figure 36.3.2 plots the curve for the configuration used in this section's demonstration.</p>
+<figure class="diagram">
+<svg viewBox="0 0 720 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The LSH S-curve: probability that two documents become a candidate pair as a function of their Jaccard similarity, rising sharply near a threshold around 0.29 for forty bands of three rows.">
+<style>
+.ax363 { fill:none; stroke:#14385c; stroke-width:1.6; }
+.gr363 { fill:none; stroke:#d4dae2; stroke-width:1; }
+.cv363 { fill:none; stroke:#b86b1f; stroke-width:2.6; }
+.thr363 { fill:none; stroke:#1f7a44; stroke-width:1.6; stroke-dasharray:5 4; }
+.tt363 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.ss363 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+</style>
+<line class="gr363" x1="90" y1="60" x2="660" y2="60"/>
+<line class="gr363" x1="90" y1="150" x2="660" y2="150"/>
+<line class="gr363" x1="90" y1="240" x2="660" y2="240"/>
+<line class="ax363" x1="90" y1="300" x2="660" y2="300"/>
+<line class="ax363" x1="90" y1="30" x2="90" y2="300"/>
+<text class="ss363" x="80" y="304" text-anchor="end">0</text>
+<text class="ss363" x="80" y="244" text-anchor="end">0.33</text>
+<text class="ss363" x="80" y="154" text-anchor="end">0.67</text>
+<text class="ss363" x="80" y="64" text-anchor="end">1.0</text>
+<text class="ss363" x="90" y="318">0</text>
+<text class="ss363" x="375" y="318">0.5</text>
+<text class="ss363" x="660" y="318">1.0 Jaccard s</text>
+<text class="tt363" x="375" y="345">true Jaccard similarity s</text>
+<text class="tt363" x="28" y="165" transform="rotate(-90 28 165)">Pr[candidate]</text>
+<!-- S-curve: P = 1-(1-s^3)^40, sampled -->
+<path class="cv363" d="M 90 300 L 119 300 L 147 299 L 176 298 L 204 294 L 233 288 L 261 277 L 290 260 L 318 235 L 347 202 L 375 163 L 404 124 L 432 92 L 461 67 L 489 51 L 518 41 L 546 36 L 575 33 L 603 31 L 632 31 L 660 30"/>
+<line class="thr363" x1="347" y1="30" x2="347" y2="300"/>
+<text class="ss363" x="347" y="46">threshold s* &#8776; 0.29</text>
+<text class="tt363" x="200" y="280">distinct docs:</text>
+<text class="ss363" x="200" y="296">rarely candidates</text>
+<text class="tt363" x="560" y="90">near-dups:</text>
+<text class="ss363" x="560" y="106">almost always candidates</text>
+</svg>
+<figcaption><strong>Figure 36.3.2:</strong> The Locality-Sensitive Hashing S-curve $\Pr[\text{candidate}] = 1 - (1 - s^r)^b$ for $b = 40$ bands of $r = 3$ rows, the configuration of Code 36.3.1. Document pairs below the threshold $s^* \approx 0.29$ are almost never made candidates, those above it almost always are; widening $b$ or shrinking $r$ slides the threshold left, making the filter more permissive.</figcaption>
+</figure>
+<p>The payoff for distribution is that this scheme is a shuffle and nothing more. Each document emits one (band-bucket, document-id) pair per band; the shuffle of <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a> groups all documents that share any band bucket onto the same reducer; and within each reducer the only candidate pairs are those that landed together, a set vastly smaller than all pairs. A final verification step computes the true Jaccard (or compares full signatures) within each bucket to drop the false positives that banding inevitably admits. The expensive $O(N^2)$ comparison has become an $O(N)$ emission followed by a shuffle and a pile of tiny local comparisons, which is exactly the shape that the Spark DataFrame pipeline of <a href="../../part-2-distributed-data/module-07-spark-dataframes/index.html">Chapter 7</a> executes well.</p>
+
+<h2>6. A Runnable MinHash and LSH Demonstration <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The code in Code 36.3.1 implements MinHash signatures and LSH banding on five short documents: two near-duplicate pairs (a sentence and its one-word edit) and one entirely distinct document. It builds an $n = 120$ signature split into $b = 40$ bands of $r = 3$ rows, forms candidate pairs from shared band buckets, and reports for every pair the true Jaccard, the signature-estimated Jaccard, and whether LSH flagged it as a candidate. The point to watch is that the two genuine near-duplicate pairs become candidates while the distinct document collides with no one, and that the estimated Jaccard tracks the true Jaccard closely.</p>
+<pre><code class="language-python">import random, hashlib
+from collections import defaultdict
+
+def shingles(text, k=3):                       # set of k-token shingles
+    t = text.lower().split()
+    if len(t) &lt; k:
+        return {tuple(t)}
+    return {tuple(t[i:i+k]) for i in range(len(t) - k + 1)}
+
+def true_jaccard(a, b):
+    return len(a &amp; b) / len(a | b)
+
+def make_hashes(num, seed=7):                  # a family of (a, b) hash params
+    rng = random.Random(seed)
+    M = (1 &lt;&lt; 61) - 1
+    return [(rng.randrange(1, M), rng.randrange(0, M)) for _ in range(num)]
+
+def shingle_hash(s):                           # stable, salt-free hash of a shingle
+    h = hashlib.blake2b(" ".join(s).encode(), digest_size=8).digest()
+    return int.from_bytes(h, "little")
+
+def signature(sh, hashes):                     # one MinHash value per hash function
+    M = (1 &lt;&lt; 61) - 1
+    return tuple(min(((a * (shingle_hash(s) % M) + b) % M) for s in sh) for a, b in hashes)
+
+def lsh_buckets(sig, bands, rows):             # one bucket key per band
+    return [sig[i*rows:(i+1)*rows] for i in range(bands)]
+
+docs = {
+    "A":  "the distributed crawler fetched billions of web pages overnight",
+    "A2": "the distributed crawler fetched billions of web pages last night",      # near-dup of A
+    "B":  "minhash and locality sensitive hashing find near duplicate documents",
+    "B2": "minhash and locality sensitive hashing detect near duplicate documents", # near-dup of B
+    "C":  "a quiet garden held three sleeping cats under warm sun",                 # distinct
+}
+
+NUM, BANDS, ROWS = 120, 40, 3                  # signature length = BANDS * ROWS
+hashes = make_hashes(NUM)
+sh   = {k: shingles(v) for k, v in docs.items()}
+sigs = {k: signature(sh[k], hashes) for k in docs}
+
+bucket_map = defaultdict(list)                 # the LSH shuffle, in one process
+for k in docs:
+    for b in lsh_buckets(sigs[k], BANDS, ROWS):
+        bucket_map[b].append(k)
+
+candidates = set()                             # pairs sharing at least one band bucket
+for members in bucket_map.values():
+    for i in range(len(members)):
+        for j in range(i + 1, len(members)):
+            candidates.add(tuple(sorted((members[i], members[j]))))
+
+def est_jaccard(x, y):                          # fraction of agreeing signature slots
+    return sum(1 for i in range(NUM) if sigs[x][i] == sigs[y][i]) / NUM
+
+print(f"signature length = {NUM}, bands b = {BANDS}, rows r = {ROWS}")
+print("LSH candidate near-duplicate pairs:", sorted(candidates))
+print()
+print(f"{'pair':&lt;8}{'true J':&gt;10}{'est J':&gt;10}{'candidate?':&gt;12}")
+keys = list(docs)
+for i in range(len(keys)):
+    for j in range(i + 1, len(keys)):
+        x, y = keys[i], keys[j]
+        flag = "yes" if tuple(sorted((x, y))) in candidates else "no"
+        print(f"{x}-{y:&lt;6}{true_jaccard(sh[x], sh[y]):&gt;10.3f}{est_jaccard(x, y):&gt;10.3f}{flag:&gt;12}")
+</code></pre>
+<div class="code-caption"><strong>Code 36.3.1:</strong> MinHash signatures and LSH banding on five short documents. The <code>bucket_map</code> dictionary plays the role of the distributed shuffle: in a cluster, emitting (band-bucket, doc-id) pairs and grouping by the bucket key is exactly the MapReduce shuffle, here collapsed into one process so it runs on a laptop.</div>
+<pre><code class="language-text">signature length = 120, bands b = 40, rows r = 3
+LSH candidate near-duplicate pairs: [('A', 'A2'), ('B', 'B2')]
+
+pair        true J     est J  candidate?
+A-A2         0.667     0.742         yes
+A-B          0.000     0.000          no
+A-B2         0.000     0.000          no
+A-C          0.000     0.000          no
+A2-B          0.000     0.000          no
+A2-B2         0.000     0.000          no
+A2-C          0.000     0.000          no
+B-B2         0.400     0.400         yes
+B-C          0.000     0.000          no
+B2-C          0.000     0.000          no
+</code></pre>
+<div class="code-caption"><strong>Output 36.3.1:</strong> The two near-duplicate pairs $A$-$A2$ (true Jaccard $0.667$) and $B$-$B2$ (true Jaccard $0.400$) are both flagged as LSH candidates, while every pair involving the distinct document $C$ has Jaccard $0$ and is never a candidate. The estimated Jaccard from signature agreement ($0.742$ and $0.400$) tracks the true value within the $1/\sqrt{n}$ sampling error of a $120$-value signature.</div>
+<p>The demonstration shows the whole method in miniature: shingling, signature estimation that tracks the true similarity within the sampling error of a short signature, and LSH bucketing that surfaces exactly the two duplicate pairs while ignoring the distinct document and every cross-cluster pair. Scaling this from five documents to five billion changes nothing conceptual; it changes only where the <code>bucket_map</code> lives. On a cluster the emission of band buckets is the map, the grouping is the shuffle, and the within-bucket verification is the reduce, so the laptop dictionary becomes a Spark stage and the algorithm carries over without modification.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: datasketch and Spark Do the Banding For You</div>
+<p>The roughly forty lines of Code 36.3.1 exist to make the mechanism visible; in production you reach for a library that has tuned the hashing, the banding, and the storage. The <code>datasketch</code> package provides <code>MinHash</code> and an <code>MinHashLSH</code> index that inserts signatures and queries candidates in a few calls, and at corpus scale the same logic runs as a Spark job where the banding becomes a <code>groupBy</code> on the band-bucket column:</p>
+<pre><code class="language-python">from datasketch import MinHash, MinHashLSH
+
+def sig(text, k=3, perm=128):                   # build a 128-permutation MinHash
+    m = MinHash(num_perm=perm)
+    toks = text.lower().split()
+    for i in range(max(1, len(toks) - k + 1)):
+        m.update(" ".join(toks[i:i+k]).encode())
+    return m
+
+lsh = MinHashLSH(threshold=0.6, num_perm=128)   # banding chosen for you from threshold
+for name, text in docs.items():
+    lsh.insert(name, sig(text))                 # internally splits the signature into bands
+
+print(lsh.query(sig(docs["A2"])))               # -> near-duplicates of A2, e.g. ['A', 'A2']
+</code></pre>
+<div class="code-caption"><strong>Code 36.3.2:</strong> The same near-duplicate query with <code>datasketch</code>. Passing a <code>threshold</code> lets the library pick the optimal $b$ and $r$ for you, and on a cluster this index becomes a Spark <code>groupBy</code> over the band-bucket key, the <code>spark.ml</code> <code>MinHashLSH</code> transformer, or a dedicated tool such as the <code>text-dedup</code> pipeline used to clean open LLM corpora.</div>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Deduplication as a First-Class Data Quality Lever (2024 to 2026)</div>
+<p>Large-scale corpus construction has turned deduplication from a preprocessing footnote into a headline design decision. The open datasets that defined recent practice, RefinedWeb (Penedo et al., 2023), the FineWeb and FineWeb-Edu releases (Penedo et al., 2024), and Dolma (Soldaini et al., 2024), all document MinHash-LSH near-deduplication as central to their quality, and the FineWeb ablations show measurable gains in downstream model accuracy from the dedup and filtering choices alone. A live debate concerns how aggressive to be: global deduplication across the whole corpus can strip away useful repeated signal and sometimes underperforms per-snapshot deduplication, so the frontier is not "more dedup" but "dedup tuned to its effect on the model." Semantic deduplication, which clusters by embedding similarity rather than shingle overlap to catch paraphrases that share few exact tokens (SemDeDup, Abbas et al., 2023), pushes the same idea beyond Jaccard, trading the cheap LSH shuffle for a distributed nearest-neighbor search of the kind built in <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a>.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Hash That Forgets the Document's Length</div>
+<p>The quiet magic of MinHash is that a document of ten thousand shingles and a document of ten shingles both collapse to the same $n$ numbers, and two such wildly different-sized documents can still register their true overlap correctly. The signature does not remember how big the document was, only what its smallest hashed shingles were. It is a little like recognizing a song from the same three notes no matter how long the recording: the minimum carries the identity, and the length politely steps aside.</p>
+</div>
+
+<h2>7. The Cleaning Pipeline as One Distributed Job <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Assembled, the three stages form a single distributed batch job that consumes the raw crawl of <a href="section-36.2.html">Section 36.2</a> and emits the clean, deduplicated corpus that the indexing and retrieval sections downstream will use. Extraction and quality filtering run as map-only stages, reading crawl records from distributed storage and writing extracted, filtered text back, bounded by I/O throughput and trivially scalable. Exact deduplication runs as a hash-group-by, and near-duplicate deduplication runs as the MinHash-LSH shuffle, the one stage that moves real data across the network. Expressing the whole thing as Spark DataFrame transformations, the way <a href="../../part-2-distributed-data/module-07-spark-dataframes/index.html">Chapter 7</a> teaches, lets the engine schedule the map stages, plan the shuffle, and recover failed tasks without the pipeline author writing any coordination code.</p>
+<p>The output of this job is the artifact on which the rest of the chapter depends. Clean, deduplicated text is simultaneously the training corpus for any model the project fine-tunes and the document collection that the retrieval index of the next sections is built over. Both uses inherit the same quality: a duplicate not removed here is a memorized span in the model and a redundant hit in the index; a quality filter applied here lifts both the model's training distribution and the retriever's candidate pool. The single most leveraged hour of engineering in a web-scale RAG project is the one spent on this pipeline, because everything that follows is a function of its output. With the corpus clean, <a href="section-36.4.html">Section 36.4</a> turns it into a sharded lexical index, where the documents this section deduplicated become the posting lists a query will search.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 36.3.1: Choosing the Bands <span class="exercise-type conceptual">Conceptual</span></div>
+<p>You have a MinHash signature of length $n = 128$ and you consider two documents near-duplicates when their Jaccard similarity is at least $0.8$. Using the S-curve $\Pr[\text{candidate}] = 1 - (1 - s^r)^b$ and the threshold approximation $s^* \approx (1/b)^{1/r}$, pick a banding $(b, r)$ with $b \cdot r = 128$ whose threshold sits near $0.8$, and explain in words what goes wrong if you instead pick a banding whose threshold sits near $0.4$: which kind of error (false candidates or missed duplicates) does each mistake produce, and how does each error cost you when the candidate set then goes to an exact-Jaccard verification step?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 36.3.2: Measure the S-Curve Empirically <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 36.3.1 into a small experiment. Generate many synthetic document pairs with known, controlled Jaccard similarity (for example, start from one shingle set and remove a tunable fraction of its shingles to produce a partner of target similarity). For a fixed $n = 120$ and several bandings $(b, r)$, estimate the empirical probability that a pair becomes an LSH candidate as a function of true Jaccard, and plot it against the theoretical curve $1 - (1 - s^r)^b$. Confirm that the empirical and theoretical thresholds agree, and report how the transition sharpens as you increase $r$ at fixed threshold.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 36.3.3: The Cost of the Shuffle <span class="exercise-type analysis">Analysis</span></div>
+<p>Consider deduplicating $N = 5 \times 10^9$ documents with a signature of $n = 128$ split into $b = 32$ bands. Each document emits one (band-bucket, doc-id) pair per band. Estimate the number of records that cross the shuffle and, assuming each emitted record is about 24 bytes, the total bytes the shuffle moves. Compare this to the cost of the naive all-pairs approach by estimating how many Jaccard comparisons $O(N^2)$ would require, and argue from the two numbers why the LSH shuffle is the only feasible option. Then explain what a heavily populated band bucket (a "hot" bucket where thousands of documents collide) does to the within-bucket verification cost, and connect this to the shuffle-skew problem of <a href="../../part-2-distributed-data/module-07-spark-dataframes/index.html">Chapter 7</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-36.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 36.2</span><span class="nav-title">Distributed Crawling</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 36</span><span class="nav-num">Contents</span><span class="nav-title">Web-Scale Text Processing and Distributed RAG</span></a>
+<a class="next" href="section-36.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 36.4</span><span class="nav-title">Distributed Indexing</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

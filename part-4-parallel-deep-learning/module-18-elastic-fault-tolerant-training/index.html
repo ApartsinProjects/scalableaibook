@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 18: Elastic and Fault-Tolerant Distributed Training. Why failure is the norm at thousand-GPU scale, distributed and asynchronous checkpointing, deterministic restart and replay, elastic training with dynamic membership, straggler detection and mitigation, preemption and spot-instance training, memory offload across the hierarchy, and monitoring and debugging a long-running distributed training job." name="description"/>
+<title>Chapter 18: Elastic and Fault-Tolerant Distributed Training | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 18: Elastic and Fault-Tolerant Distributed Training</a></div>
+<h1>Elastic and Fault-Tolerant Distributed Training</h1>
+<p class="chapter-subtitle">The three chapters before this one built a parallel training job and quietly assumed the cluster underneath it would hold still: a fixed set of devices, each pinned to its shard, expert, or pipeline stage, all alive from the first step to the last. That assumption is a fiction at the scale these methods demand. A job that holds thousands of accelerators for weeks will see hardware die, networks partition, and preemptible instances reclaimed mid-step, and any one of those events can corrupt a single all-reduce and crash every rank at once. This chapter is about training that expects to be interrupted. It develops the checkpointing that lets a job resume instead of restart, the determinism that lets a resumed run reproduce the one it replaced, the elastic membership that lets the worker set grow and shrink without tearing down the run, and the straggler, preemption, offload, and monitoring machinery that keeps a long job moving on hardware that will not cooperate for its full duration.</p>
+</header>
+<main class="content" id="main-content">
+<figure class="chapter-hero">
+<img src="images/hero.png" alt="Conceptual illustration for Chapter 18: Elastic and Fault-Tolerant Distributed Training" loading="lazy">
+</figure>
+<blockquote class="epigraph">
+<p>"I have ninety seconds. The all-reduce I am holding will not finish in ninety seconds. Somewhere a coordinator is about to discover that 'highly available' was always a statement about the fleet, never about me."</p>
+<cite>A Spot Instance, Moments Before Preemption</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Fault-tolerant distributed training treats node failure, preemption, and stragglers as expected events rather than emergencies, and builds the job so that the loss can keep going down across a cluster whose membership changes underneath it.</strong> The pressure that drives this chapter is statistical, and it is unforgiving. The previous three chapters spread one model across thousands of tightly coupled devices, and that coupling is exactly what makes the whole job fragile: a synchronous data-parallel, tensor-parallel, or pipeline-parallel step is a single distributed barrier, so the failure of any one rank stalls or kills all of them. When the per-device mean time between failures is measured in months but the device count is in the thousands, the job-level mean time between failures collapses to hours, and a run that does nothing to prepare will spend more time crashing and recovering from scratch than making progress. The first response is checkpointing, but at this scale a naive global checkpoint is its own bottleneck, so the chapter develops sharded and asynchronous checkpointing that writes each rank's slice of state in parallel and overlaps the write with computation. A checkpoint is only useful if the resumed run is faithful to the one it replaced, which forces a hard look at determinism: data-loader order, RNG state, and the non-associativity of floating-point reductions all conspire to make "resume from step $k$" mean something subtler than it sounds. From there the chapter relaxes the fixed-cluster assumption entirely. Elastic training lets the worker set change size at runtime, re-forming process groups and rescaling the global batch as nodes join and leave, which is what makes it possible to run on cheap preemptible and spot capacity at all. Stragglers, the ranks that fall behind without failing outright, get their own treatment because a synchronous job runs at the speed of its slowest member. The chapter then takes up memory offload across the hierarchy, moving optimizer state and parameters down to host memory and NVMe so a job can fit and survive on fewer or smaller devices, and it closes on the monitoring and debugging that let an operator see a hang, a slow rank, or a silent divergence inside a job spread across a thousand machines. The thread that runs through all of it: at this scale, reliability is not a property you add at the end, it is a parallelism axis you design for from the start.</p>
+</div>
+
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+This is the fourth chapter of Part IV, and it changes the question the previous three were answering. Chapters 15 through 17 asked how to cut one model's computation across many devices and move data between them efficiently; this chapter asks how that carefully laid-out job survives the devices themselves failing, vanishing, or slowing down. The binding constraint is no longer memory or bandwidth, it is the job-level failure rate that grows with the device count, and the design goal is to make recovery cheap enough that the expected progress per wall-clock hour stays high even when interruptions are frequent. The recurring fact to keep in view: every synchronous collective from Chapter 4 is also a synchronous point of failure, so the same coupling that makes parallel training fast is what makes a single lost rank able to take the whole run down.
+</p>
+<p>
+The eight sections fall into four groups. The first quantifies the problem and lays the foundation: Section 18.1 shows why failure is the norm once a job spans thousands of GPUs, and Section 18.2 builds the distributed checkpointing that turns a crash from a total loss into a bounded one. The second group makes recovery trustworthy and dynamic: Section 18.3 develops the restart, replay, and determinism that let a resumed run faithfully continue, and Section 18.4 introduces elastic training that lets the worker set grow and shrink while the job keeps running. The third group attacks the slowdowns and reclamations that elasticity invites: Section 18.5 detects and mitigates the stragglers that throttle a synchronous job to its slowest rank, and Section 18.6 turns preemption and cheap spot capacity from a hazard into a deliberate cost strategy. The fourth group fits the job onto the hardware and keeps it observable: Section 18.7 offloads optimizer state and parameters across the memory hierarchy so the job survives on less, and Section 18.8 builds the monitoring and debugging that make a hang or a silent divergence visible inside a thousand-machine run.
+</p>
+<p>
+Read in order, the eight sections take you from "a thousand-GPU job will fail every few hours and lose everything if it is not ready" to "a job checkpoints cheaply, resumes deterministically, rescales its worker set on demand, tolerates stragglers and preemptions, fits within the memory it has, and stays observable, so the loss keeps descending across a cluster that never stops changing." The argument is cumulative: the failure statistics create the need, checkpointing bounds the damage, determinism makes recovery faithful, elasticity makes the cluster itself flexible, and straggler, preemption, offload, and monitoring machinery is what keeps the bargain holding through a multi-week run.
+</p>
+</div>
+
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>This chapter builds directly on two earlier ones. From <a href="../../part-1-foundations/module-02-distributed-systems-concepts/index.html">Chapter 2: Distributed Systems Concepts for AI</a> you carry the vocabulary of failure itself: what a fail-stop crash is, why partial failure and network partitions are the defining difficulty of any distributed system, how heartbeats and timeouts detect a dead participant, and why agreeing on who is still alive is a coordination problem and not a free observation. This chapter takes those concepts and applies them to the one workload where every participant is locked in a tight synchronous barrier, which is the worst case for fault tolerance. From <a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16: Model, Pipeline, and Sharded Parallelism</a> you carry the picture of a single model's state spread across devices as shards, because the checkpoint you must write and restore is exactly that distributed state, and the process groups you must rebuild after a failure are the ones that map tensor, pipeline, and sharded parallelism onto the interconnect. The chapter assumes comfortable Python and PyTorch, the ranks-and-process-groups model of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>, and a working memory of how a synchronous data-parallel step is structured from <a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a>. No prior experience with checkpointing systems or elastic schedulers is required; Section 18.1 motivates the entire chapter from the failure arithmetic before any recovery mechanism is introduced.</p>
+</div>
+
+<div class="objectives">
+<h3>Learning Objectives</h3>
+<ul>
+<li>Derive why the job-level mean time between failures collapses as the device count grows, and explain why a synchronous collective is also a synchronous point of failure.</li>
+<li>Design sharded and asynchronous checkpointing that writes distributed model and optimizer state in parallel and overlaps the write with computation.</li>
+<li>Compute an optimal checkpoint interval from the failure rate and checkpoint cost, balancing wasted work against checkpoint overhead.</li>
+<li>Explain the sources of nondeterminism in a training job (data order, RNG state, reduction order) and the steps that make a resumed run faithful to the original.</li>
+<li>Describe elastic training with dynamic membership, including how process groups re-form and how the global batch is rescaled when workers join or leave.</li>
+<li>Detect stragglers in a synchronous job and apply mitigation strategies that keep the run from proceeding at the speed of its slowest rank.</li>
+<li>Architect a training job for preemptible and spot capacity, treating reclamation as an expected event with a graceful drain-and-resume path.</li>
+<li>Offload optimizer state and parameters across the GPU, host-memory, and NVMe hierarchy so a job fits and survives on fewer or smaller devices.</li>
+<li>Instrument a distributed training job to make hangs, slow ranks, and silent divergence observable, and debug failures that span many machines.</li>
+</ul>
+</div>
+
+<div class="callout key-takeaway">
+<div class="callout-title">Remember the Chapter as One Sentence</div>
+<p>If you keep one thing from this chapter, keep this: <strong>at thousand-GPU scale failure is a certainty rather than an exception, so a training job must be built to checkpoint cheaply, resume deterministically, rescale its worker set on demand, and tolerate stragglers and preemptions, treating reliability as a parallelism axis designed in from the start rather than a recovery script bolted on at the end</strong>. Read forward, the sections build the craft in layers: first the failure arithmetic that makes recovery non-optional, then the sharded and asynchronous checkpointing that bounds the loss from any one crash, then the determinism that makes a resume faithful and the elasticity that makes the cluster itself flexible, then the straggler and preemption handling that keeps a synchronous job moving on uncooperative hardware, and finally the memory offload and monitoring that fit the job onto its devices and keep it observable. Read as a question, the chapter asks of any long job running on a large, unreliable cluster: how do you save its state without stalling it, how do you bring it back exactly where it was, how do you let the cluster change size around it, and how do you keep the slow and the doomed ranks from dragging or killing the whole run. The roadmap below walks the eight sections that answer it.</p>
+</div>
+
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num">18.1</span>
+<a class="section-title" href="section-18.1.html">Failure Is the Norm at Thousand-GPU Scale</a>
+<span class="section-desc">Works out how the job-level failure rate grows with the device count and why a single lost rank stalls or kills every other one, establishing that recovery is a design requirement and not a contingency.</span>
+</li>
+<li>
+<span class="section-num">18.2</span>
+<a class="section-title" href="section-18.2.html">Distributed Checkpointing</a>
+<span class="section-desc">Builds sharded and asynchronous checkpointing that writes each rank's slice of model and optimizer state in parallel and overlaps the write with computation, turning a crash from a total loss into a bounded one.</span>
+</li>
+<li>
+<span class="section-num">18.3</span>
+<a class="section-title" href="section-18.3.html">Restart, Replay, and Determinism</a>
+<span class="section-desc">Tracks the data-order, RNG, and reduction-order nondeterminism that make a resumed run diverge from the original, and develops the controls that let a job replay faithfully from a checkpoint.</span>
+</li>
+<li>
+<span class="section-num">18.4</span>
+<a class="section-title" href="section-18.4.html">Elastic Training</a>
+<span class="section-desc">Introduces dynamic membership, where the worker set grows and shrinks at runtime, and shows how process groups re-form and the global batch rescales without tearing down the run.</span>
+</li>
+<li>
+<span class="section-num">18.5</span>
+<a class="section-title" href="section-18.5.html">Straggler Detection and Mitigation</a>
+<span class="section-desc">Develops the detection and mitigation that keep a synchronous job from running at the speed of its slowest rank, distinguishing a transient slowdown from an outright failure.</span>
+</li>
+<li>
+<span class="section-num">18.6</span>
+<a class="section-title" href="section-18.6.html">Preemption and Spot-Instance Training</a>
+<span class="section-desc">Turns cheap preemptible and spot capacity from a hazard into a cost strategy by treating reclamation as an expected event with a graceful drain-and-resume path.</span>
+</li>
+<li>
+<span class="section-num">18.7</span>
+<a class="section-title" href="section-18.7.html">Memory Offload Across the Hierarchy</a>
+<span class="section-desc">Moves optimizer state and parameters down to host memory and NVMe so a job fits and survives on fewer or smaller devices, weighing the bandwidth cost of each tier against the capacity it buys.</span>
+</li>
+<li>
+<span class="section-num">18.8</span>
+<a class="section-title" href="section-18.8.html">Monitoring and Debugging Distributed Training</a>
+<span class="section-desc">Instruments the job so a hang, a slow rank, or a silent divergence becomes visible inside a thousand-machine run, and develops the techniques for debugging failures that span the whole cluster.</span>
+</li>
+</ul>
+
+<p>Read the eight sections in order and you will hold a working blueprint for a training job that expects interruption and keeps descending anyway: <a href="section-18.1.html">Section 18.1</a> establishes why failure is certain at scale, <a href="section-18.2.html">Sections 18.2</a> and <a href="section-18.3.html">18.3</a> make recovery cheap and faithful, <a href="section-18.4.html">Section 18.4</a> lets the cluster itself change size around the run, <a href="section-18.5.html">Sections 18.5</a> and <a href="section-18.6.html">18.6</a> tame the stragglers and preemptions that elasticity invites, and <a href="section-18.7.html">Sections 18.7</a> and <a href="section-18.8.html">18.8</a> fit the job onto its hardware and keep it observable. The thread to watch is the synchronous barrier of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> reappearing as a liability, and the failure model of <a href="../../part-1-foundations/module-02-distributed-systems-concepts/index.html">Chapter 2</a> moving from the background into the center of how the job is engineered.</p>
+
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>This chapter armored a training job against a cluster that fails, shrinks, and slows underneath it, but it stayed deliberately agnostic about what is being trained. The mechanisms here are general: checkpoint, resume, rescale, and survive applies to a recommender as much as to a language model. <a href="../module-19-training-foundation-models/index.html">Chapter 19: Training Foundation Models at Scale</a> puts every axis from this part to work on one concrete target, the multi-week, multi-thousand-GPU pre-training run that produces a frontier foundation model. It composes the data, tensor, pipeline, sharded, and expert parallelism of Chapters 15 through 17 with the fault tolerance and elasticity of this chapter into a single end-to-end recipe, and it adds the pieces that only matter at that scale: the data pipeline that feeds trillions of tokens, the learning-rate and stability engineering of a run too expensive to repeat, and the operational discipline of babysitting a job that cannot be allowed to fail silently for a single hour. Read it next, and watch every reliability mechanism you just built become load-bearing on a run where a lost week is a lost fortune.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+<h3 class="bib-category">Failure, Recovery, and Optimal Checkpoint Intervals</h3>
+<div class="bib-entry-card">
+<p class="bib-ref">Dean, J., Ghemawat, S. "MapReduce: Simplified Data Processing on Large Clusters." OSDI 2004 / Communications of the ACM, 2008. <a href="https://research.google/pubs/pub62/" target="_blank" rel="noopener">research.google/pubs/pub62</a></p>
+<p class="bib-annotation">The system whose re-execution-on-failure model is the canonical example of treating worker failure as routine and recovering by replaying lost work, the conceptual root of Section 18.1.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Young, J. W. "A First Order Approximation to the Optimum Checkpoint Interval." Communications of the ACM, 17(9), 1974. <a href="https://dl.acm.org/doi/10.1145/361147.361115" target="_blank" rel="noopener">dl.acm.org/doi/10.1145/361147.361115</a></p>
+<p class="bib-annotation">The classic result that derives the optimal checkpoint interval from the failure rate and checkpoint cost, the analytical backbone for the checkpoint-frequency reasoning of Section 18.2.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Daly, J. T. "A Higher Order Estimate of the Optimum Checkpoint Interval for Restart Dumps." Future Generation Computer Systems, 22(3), 2006. <a href="https://doi.org/10.1016/j.future.2004.11.016" target="_blank" rel="noopener">doi.org/10.1016/j.future.2004.11.016</a></p>
+<p class="bib-annotation">The refinement of Young's formula to a higher-order estimate, the more accurate model for choosing checkpoint frequency under realistic restart costs in Section 18.2.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<h3 class="bib-category">Distributed and Frequent Checkpointing Systems</h3>
+<div class="bib-entry-card">
+<p class="bib-ref">Mohan, J., Phanishayee, A., Chidambaram, V. "CheckFreq: Frequent, Fine-Grained DNN Checkpointing." USENIX FAST 2021. <a href="https://www.usenix.org/conference/fast21/presentation/mohan" target="_blank" rel="noopener">usenix.org/conference/fast21/presentation/mohan</a></p>
+<p class="bib-annotation">The system that makes checkpointing frequent and asynchronous by overlapping the write with computation and auto-tuning the interval, a direct reference for the asynchronous checkpointing of Section 18.2.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Eisenman, A., Matam, K. K., Ingram, S., Mudigere, D., Krishnamoorthi, R., Nair, K., Smelyanskiy, M., Annavaram, M. "Check-N-Run: A Checkpointing System for Training Deep Learning Recommendation Models." arXiv:2010.08679, 2020. <a href="https://arxiv.org/abs/2010.08679" target="_blank" rel="noopener">arxiv.org/abs/2010.08679</a></p>
+<p class="bib-annotation">A production checkpointing system that uses differential and quantized checkpoints to cut the write cost of enormous embedding tables, illustrating the engineering of Section 18.2 at fleet scale.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Wang, Z., Jia, Z., Zheng, S., Zhang, Z., Fu, X., Ng, T. S. E., Wang, Y. "Gemini: Fast Failure Recovery in Distributed Training with In-Memory Checkpoints." SOSP 2023. <a href="https://dl.acm.org/doi/10.1145/3600006.3613145" target="_blank" rel="noopener">dl.acm.org/doi/10.1145/3600006.3613145</a></p>
+<p class="bib-annotation">The system that checkpoints to peer CPU memory across the cluster for near-instant recovery, pushing the recovery cost in Section 18.1 and Section 18.2 toward the limit.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">PyTorch Team. "Distributed Checkpoint (DCP)." PyTorch Documentation. <a href="https://pytorch.org/docs/stable/distributed.checkpoint.html" target="_blank" rel="noopener">pytorch.org/docs/stable/distributed.checkpoint.html</a></p>
+<p class="bib-annotation">The official API for saving and loading sharded distributed state in parallel across ranks, the production tool behind the sharded checkpointing of Section 18.2.</p>
+<span class="bib-meta">🛠️ Tool</span>
+</div>
+<h3 class="bib-category">Elastic, Straggler-Tolerant, and Preemptible Training</h3>
+<div class="bib-entry-card">
+<p class="bib-ref">PyTorch Team. "Torch Distributed Elastic (torchrun)." PyTorch Documentation. <a href="https://pytorch.org/docs/stable/elastic/run.html" target="_blank" rel="noopener">pytorch.org/docs/stable/elastic/run.html</a></p>
+<p class="bib-annotation">The official elastic launcher that re-forms process groups and restarts workers on membership change, the production reference for the dynamic membership of Section 18.4.</p>
+<span class="bib-meta">🛠️ Tool</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Jang, I., Yang, Z., Zhang, Z., Jin, X., Chowdhury, M. "Oobleck: Resilient Distributed Training of Large Models Using Pipeline Templates." SOSP 2023. <a href="https://dl.acm.org/doi/10.1145/3600006.3613152" target="_blank" rel="noopener">dl.acm.org/doi/10.1145/3600006.3613152</a></p>
+<p class="bib-annotation">The system that recovers from failures by reconfiguring among precomputed pipeline templates, keeping a large-model run going without a full restart, a key reference for Sections 18.4 and 18.6.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Thorpe, J., Zhao, P., Eyolfson, J., Qiao, Y., Jia, Z., Zhang, M., Netravali, R., Xu, G. H. "Bamboo: Making Preemptible Instances Resilient for Affordable Training of Large DNNs." USENIX NSDI 2023. <a href="https://www.usenix.org/conference/nsdi23/presentation/thorpe" target="_blank" rel="noopener">usenix.org/conference/nsdi23/presentation/thorpe</a></p>
+<p class="bib-annotation">The system that uses redundant computation across pipeline stages to ride out spot-instance preemptions, the direct foundation for the spot-instance strategy of Section 18.6.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<h3 class="bib-category">Memory Offload Across the Hierarchy</h3>
+<div class="bib-entry-card">
+<p class="bib-ref">Ren, J., Rajbhandari, S., Aminabadi, R. Y., Ruwase, O., Yang, S., Zhang, M., Li, D., He, Y. "ZeRO-Offload: Democratizing Billion-Scale Model Training." arXiv:2101.06840, 2021. <a href="https://arxiv.org/abs/2101.06840" target="_blank" rel="noopener">arxiv.org/abs/2101.06840</a></p>
+<p class="bib-annotation">The system that offloads optimizer state and gradients to host memory so a single GPU can train far larger models, the foundation for the host-memory tier of Section 18.7.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Rajbhandari, S., Ruwase, O., Rasley, J., Smith, S., He, Y. "ZeRO-Infinity: Breaking the GPU Memory Wall for Extreme Scale Deep Learning." arXiv:2104.07857, 2021. <a href="https://arxiv.org/abs/2104.07857" target="_blank" rel="noopener">arxiv.org/abs/2104.07857</a></p>
+<p class="bib-annotation">The system that extends offload down to NVMe storage to train trillion-parameter models on limited GPU memory, the full-hierarchy reference for Section 18.7.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="../index.html"><span class="nav-label">Previous</span><span class="nav-num">Part IV</span><span class="nav-title">Parallel Deep Learning and Large Models</span></a>
+<a class="up" href="../index.html"><span class="nav-label">Part IV</span><span class="nav-num">Contents</span><span class="nav-title">Parallel Deep Learning and Large Models</span></a>
+<a class="next" href="section-18.1.html"><span class="nav-label">Next</span><span class="nav-num">Section 18.1</span><span class="nav-title">Failure Is the Norm at Thousand-GPU Scale</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

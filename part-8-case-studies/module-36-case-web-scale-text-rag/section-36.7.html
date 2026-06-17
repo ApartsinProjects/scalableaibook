@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 36.7: RAG Integration Across a Fleet. Wiring distributed retrieval into LLM generation as one online service: the request path, a retrieval fleet plus an LLM-serving fleet behind a single latency SLO, context-budget assembly, caching, streaming, and graceful degradation under tail latency." name="description"/>
+<title>Section 36.7: RAG Integration Across a Fleet | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Case Studies and Capstone Projects</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 36: Web-Scale Text Processing and Distributed RAG</a></div>
+<h1>RAG Integration Across a Fleet</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I am a prompt, stitched together from shards that will never thank me, handed to a replica that has never met them, and somehow we agree on an answer before the timer runs out."</p>
+<cite>A Context Window, Assembled Just In Time</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>An online retrieval-augmented generation service is not one model answering a question; it is two distributed subsystems, a retrieval fleet and a generation fleet, composed behind a single latency budget so that, to the caller, they look like one model that happens to know things.</strong> Everything earlier in this chapter built the offline machinery: a crawled and deduplicated corpus, a sharded vector index, and a distributed retriever that returns the right passages for a query. This section wires that retriever into a large language model and turns the pair into a request-serving system. The hard part is no longer "can we find the passages" or "can we generate text"; both are solved by Chapters 24 and 25. The hard part is composition: making a query flow through retrieval, context assembly, and generation, on different fleets of machines, fast enough and reliably enough to meet one service-level objective even when a shard is slow or a replica is busy.</p>
+</div>
+<p>By this point in the chapter the offline side of web-scale RAG is in place. The corpus has been crawled and cleaned, near-duplicates have been removed, passages have been embedded, and the resulting vectors live in a sharded index that a distributed retriever queries in <a href="section-36.6.html">Section 36.6</a>. None of that is yet a product. A user does not type a query into an index; they type it into a chat box and wait for a sentence to appear. Turning the offline artifacts into that experience means standing up an online service whose job is to receive a query, fetch the right context from the retrieval fleet, fold that context into a prompt, send the prompt to the generation fleet, and stream the answer back, all inside a few hundred milliseconds to a couple of seconds. This section is about that service: its request path, its topology, its budgets, its caches, and the ways it degrades when part of the fleet misbehaves.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Online RAG topology. A client sends a query to a gateway. The gateway checks a retrieval cache, then fans out to a fleet of retrieval shard services, assembles a context within a token budget, and sends the prompt to a fleet of LLM serving replicas that share a prompt and KV cache, streaming tokens back through the gateway to the client.">
+<defs>
+<marker id="arr367" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b367 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.g367 { fill:#eef6ee; stroke:#2f7d32; stroke-width:1.6; }
+.r367 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.c367 { fill:#f3eefb; stroke:#5b3b8c; stroke-width:1.6; }
+.t367 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.tg367 { font:600 13px sans-serif; fill:#2f7d32; text-anchor:middle; }
+.tr367 { font:600 13px sans-serif; fill:#b86b1f; text-anchor:middle; }
+.tc367 { font:600 12px sans-serif; fill:#5b3b8c; text-anchor:middle; }
+.s367 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l367 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr367); }
+.ld367 { fill:none; stroke:#5b3b8c; stroke-width:1.4; stroke-dasharray:4 3; marker-end:url(#arr367); }
+</style>
+<text class="t367" x="70" y="118">Client</text>
+<rect class="b367" x="20" y="130" width="100" height="50" rx="8"/>
+<text class="s367" x="70" y="160">query in,</text>
+<text class="s367" x="70" y="174">tokens out</text>
+<line x1="120" y1="155" x2="180" y2="155" class="l367"/>
+<rect class="b367" x="182" y="120" width="120" height="74" rx="8"/>
+<text class="t367" x="242" y="148">Gateway</text>
+<text class="s367" x="242" y="166">orchestrate,</text>
+<text class="s367" x="242" y="180">enforce SLO</text>
+<rect class="c367" x="182" y="232" width="120" height="46" rx="8"/>
+<text class="tc367" x="242" y="252">Retrieval cache</text>
+<text class="s367" x="242" y="268">query -&gt; passages</text>
+<path class="ld367" d="M 242 194 L 242 230"/>
+<text class="tr367" x="470" y="40">Retrieval fleet (Ch 25)</text>
+<rect class="r367" x="360" y="56" width="100" height="44" rx="8"/>
+<text class="tr367" x="410" y="82">Shard 1</text>
+<rect class="r367" x="470" y="56" width="100" height="44" rx="8"/>
+<text class="tr367" x="520" y="82">Shard 2</text>
+<rect class="r367" x="580" y="56" width="100" height="44" rx="8"/>
+<text class="tr367" x="630" y="82">Shard S</text>
+<path class="l367" d="M 302 140 L 340 105 L 408 102"/>
+<path class="l367" d="M 302 148 L 340 130 L 518 102"/>
+<path class="l367" d="M 302 156 L 340 150 L 628 102"/>
+<text class="s367" x="345" y="118">fan-out top-k</text>
+<rect class="b367" x="360" y="138" width="200" height="54" rx="8"/>
+<text class="t367" x="460" y="162">Context assembly</text>
+<text class="s367" x="460" y="180">rank, dedup, fit token budget</text>
+<path class="l367" d="M 460 100 L 460 136"/>
+<path class="l367" d="M 560 165 L 600 165"/>
+<text class="tg367" x="770" y="40">LLM serving fleet (Ch 24)</text>
+<rect class="g367" x="660" y="56" width="100" height="44" rx="8"/>
+<text class="tg367" x="710" y="82">Replica A</text>
+<rect class="g367" x="770" y="56" width="110" height="44" rx="8"/>
+<text class="tg367" x="825" y="82">Replica B</text>
+<rect class="c367" x="660" y="138" width="220" height="46" rx="8"/>
+<text class="tc367" x="770" y="158">Prompt cache + paged KV cache</text>
+<text class="s367" x="770" y="176">reuse shared prefixes across requests</text>
+<path class="l367" d="M 600 158 L 656 120 L 706 102"/>
+<path class="l367" d="M 600 165 L 656 150 L 818 102"/>
+<path class="ld367" d="M 710 100 L 710 136"/>
+<path class="ld367" d="M 825 100 L 825 136"/>
+<path class="l367" d="M 710 56 C 600 18, 320 18, 244 116" />
+<text class="s367" x="470" y="14">stream tokens back through gateway to client</text>
+<line x1="182" y1="150" x2="122" y2="150" class="l367"/>
+</svg>
+<figcaption><strong>Figure 36.7.1:</strong> The online RAG topology. A gateway receives the query, consults a retrieval cache, and on a miss fans out top-$k$ requests to a fleet of retrieval shard services (the distributed retriever of <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a> and <a href="section-36.6.html">Section 36.6</a>). Returned passages are ranked, deduplicated, and packed into a context that fits the token budget, then sent to a fleet of LLM-serving replicas (<a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>) that share a prompt cache and a paged KV cache. Tokens stream back through the gateway to the client. The dashed arrows are cache lookups that can short-circuit a stage.</figcaption>
+</figure>
+
+<h2>1. The Request Path: From Query to Streamed Answer <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A single RAG request, traced from the client's keystroke to the last streamed token, passes through five stages, and naming them in order is the prerequisite for reasoning about latency, caching, and failure. The gateway receives the query and normalizes it. It retrieves: an embedding model turns the query into a vector, and that vector is sent to the retrieval fleet, which returns the top-$k$ candidate passages from across its shards. The gateway then assembles a context, ranking and trimming those passages so the most useful evidence fits inside the prompt. It generates: the assembled prompt goes to an LLM-serving replica, which decodes an answer token by token. Finally it responds, streaming those tokens back to the client as they are produced rather than waiting for the full answer. Figure 36.7.1 shows the same five stages laid out across the two fleets that perform them.</p>
+<p>The reason to insist on this decomposition is that each stage lives on different hardware with a different bottleneck. Retrieval is bound by index lookups and the slowest shard in the fan-out, the tail-latency problem of <a href="../../part-7-infrastructure/module-34-edge-fog-on-device/section-34.7.html">Section 34.7</a> reappearing here at the passage-fetch step. Generation is bound by accelerator memory bandwidth and the length of the answer, the per-token decoding economics of <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>. Context assembly is cheap in compute but consequential in quality, because what you put in the prompt is what the model can use. Treating the request as one opaque "ask the AI" call hides exactly the seams where latency accumulates and where the system can fail independently, so we keep the seams visible.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: RAG Online Serving Is the Composition of Two Distributed Systems Under One SLO</div>
+<p>A retrieval fleet and a generation fleet are each, on their own, a full distributed system with its own sharding, replication, and failure modes. Online RAG does not add a third system; it composes the two behind a single service-level objective. Every design choice in this section, where to cache, what to do when a shard is slow, how to budget the context, follows from the fact that the user's latency clock spans both fleets at once, and the slowest stage on the critical path sets the answer's arrival time.</p>
+</div>
+
+<h2>2. The Serving Topology: Two Fleets Behind a Gateway <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The physical layout that implements the request path is a gateway tier in front of two independently scaled fleets. The retrieval fleet is the sharded vector-search service of <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a>: the index is partitioned across $S$ shards because no single machine holds all the vectors, and a query fans out to all shards in parallel so that the top-$k$ is computed over the whole corpus. The generation fleet is the LLM-serving cluster of <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>: a set of replicas, each typically itself a tensor-parallel group of accelerators holding one copy of the model, fronted by a scheduler that batches incoming prompts to keep the accelerators busy. The gateway owns neither fleet's internals; it owns the orchestration between them and the contract with the client.</p>
+<p>Decoupling the fleets is what makes the service scalable, because the two have different scaling laws. Retrieval throughput scales with the number of index shards and the replicas per shard; it is memory-and-network bound and cheap per query. Generation throughput scales with the number of model replicas and the batch size each can sustain; it is accelerator bound and expensive per token. A surge of short queries over a large corpus stresses retrieval; a surge of long-answer requests stresses generation. Because the fleets are separate tiers, each can be sized and autoscaled against its own load without disturbing the other, which is the same separation-of-concerns argument that justified splitting storage from compute back in <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/index.html">Chapter 8</a>, now applied to an online inference path.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Sharding and Replication, Met Again on the Serving Path</div>
+<p>The two fleets reuse the two primitives that have organized this whole book. The retrieval fleet is <em>sharded</em>: the index is partitioned so the corpus can exceed one machine, exactly the partitioning arc from <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a>'s sharded embedding tables through <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a>'s index shards. The generation fleet is <em>replicated</em>: many copies of one model serve many users, the replication-for-throughput move from <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>'s third ceiling. Online RAG is novel not because it invents a primitive but because it places sharding and replication on the same request's critical path and asks them to meet a shared deadline.</p>
+</div>
+
+<h2>3. Context Assembly and the Token Budget <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Between retrieval and generation sits a step that is computationally trivial and strategically decisive: deciding which retrieved passages enter the prompt. The model has a finite context window, and the prompt must hold the system instructions, the conversation history, the user's query, and the retrieved evidence, all inside that window. Let the window hold $C$ tokens, the fixed scaffolding (instructions plus query plus history) cost $f$ tokens, and each candidate passage $j$ cost $t_j$ tokens. Context assembly chooses a subset $R$ of the retrieved passages to satisfy</p>
+$$\sum_{j \in R} t_j \;\le\; C - f - g,$$
+<p>where $g$ reserves room for the generated answer itself, since output tokens also consume the window. The objective is to maximize the evidential value of $R$ under that budget, which is a packing problem solved in practice by ranking passages by relevance and adding them greedily until the budget is exhausted. Passages that survived retrieval but do not fit are dropped, which is why the retriever returns more candidates than the prompt will ultimately hold.</p>
+<p>The budget is not a formality; it is where retrieval quality and generation cost collide. Pack too few passages and the model lacks the evidence to answer, so it guesses or refuses. Pack too many and three costs rise at once: the prompt is longer so generation is slower and dollar-costlier, the irrelevant passages dilute the useful ones and can mislead the model, and the larger key-value cache crowds the serving fleet's accelerator memory, reducing how many requests each replica can batch. Good context assembly is therefore a throughput decision as much as a quality decision, and it is the cheapest lever in the whole pipeline because it runs on the gateway in microseconds while every token it admits or rejects changes the bill on the expensive generation fleet.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Prompt That Quietly Doubled the GPU Bill</div>
+<p><strong>Who:</strong> A platform engineer running a customer-support RAG assistant for a software vendor.</p>
+<p><strong>Situation:</strong> The assistant retrieved the top twenty passages and pasted all of them into the prompt, on the theory that more context is always safer.</p>
+<p><strong>Problem:</strong> Average prompt length crept to nine thousand tokens, the serving replicas could batch far fewer requests because each one's key-value cache was enormous, and the monthly accelerator bill nearly doubled with no measurable answer-quality gain.</p>
+<p><strong>Dilemma:</strong> Cut passages and risk dropping the one that holds the answer, or keep the fat prompts and keep paying for accelerators that sit half-idle waiting on memory.</p>
+<p><strong>Decision:</strong> They added a reranking step on the gateway and capped the context at the top five passages after reranking, reserving the rest of the window for the answer.</p>
+<p><strong>How:</strong> A small cross-encoder reranked the twenty candidates by query relevance; only the top five entered the prompt, and the budget inequality above was enforced as a hard cap before each call to the generation fleet.</p>
+<p><strong>Result:</strong> Prompts shrank to roughly three thousand tokens, batch sizes on the serving fleet tripled, the bill fell back below its starting point, and a blind evaluation found answer quality slightly improved because the model was no longer distracted by weakly relevant passages.</p>
+<p><strong>Lesson:</strong> The token budget is a load-bearing wall between retrieval and generation. Spend it on the few passages that matter, not on the many that merely matched.</p>
+</div>
+
+<h2>4. Caching at Every Stage <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Because both fleets are expensive and many requests overlap, caching is the single largest lever on the cost and latency of an online RAG service, and it appears at three distinct layers. The <em>retrieval cache</em> sits on the gateway and maps a (normalized query, or query embedding) to its top-$k$ passages, so a repeated or near-repeated query skips the entire fan-out to the retrieval fleet, the dashed short-circuit in Figure 36.7.1. The <em>prompt cache</em> and the <em>paged key-value cache</em> live on the generation fleet: when many prompts share a common prefix, the system instructions, a long static document, the same retrieved passage, the serving replica reuses the key-value tensors computed for that prefix instead of recomputing attention over it, a direct application of the KV-cache economics introduced per node in <a href="../../part-5-distributed-inference/module-22-per-node-inference-efficiency/index.html">Chapter 22</a> and multiplied across the fleet in <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>.</p>
+<p>The economics of a cache are governed by its hit rate. If a fraction $h$ of requests hit the retrieval cache, the average retrieval cost per request falls to $(1 - h)\, c_{\text{miss}} + h\, c_{\text{hit}}$, where $c_{\text{hit}} \ll c_{\text{miss}}$ because a hit is a memory lookup and a miss is a fleet-wide fan-out. Since cache hits also free retrieval-fleet capacity, the effective query throughput the fleet can sustain rises by roughly a factor of $1/(1-h)$ at fixed hardware: a 50% hit rate doubles capacity, an 80% hit rate quintuples it. The same hit-rate arithmetic governs the prompt cache on the generation side, where a hit removes the prefill cost of a shared prefix. Real query streams are skewed (a small set of popular questions dominates), so these hit rates are achievable, which is why a cache layer is not an optimization to add later but a load-bearing part of the topology from day one.</p>
+
+<h2>5. Latency Budget, Throughput, and the Cost of a Miss <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The end-to-end latency the user feels is the sum of the stages on the critical path,</p>
+$$L_{\text{e2e}} \;=\; L_{\text{retrieve}} + L_{\text{assemble}} + L_{\text{generate}},$$
+<p>with $L_{\text{assemble}}$ negligible, $L_{\text{retrieve}}$ set by the slowest shard in the fan-out, and $L_{\text{generate}}$ dominated by decoding and roughly proportional to the number of output tokens. A cache hit collapses $L_{\text{retrieve}}$ toward zero, which is why caching helps latency and not only cost. The service-level objective is usually written on a tail percentile of $L_{\text{e2e}}$ (for example, "95% of answers begin streaming within 800 ms"), and because the retrieve term is a maximum over shards, the tail of $L_{\text{retrieve}}$ is governed by the straggler analysis of <a href="../../part-7-infrastructure/module-34-edge-fog-on-device/section-34.7.html">Section 34.7</a>: one slow shard out of $S$ can dominate the percentile.</p>
+<p>Capacity follows from latency by the same concurrency law that governs every queueing system. With per-request service time $L$ and a target concurrency $N$ of simultaneous in-flight requests, the sustainable rate is</p>
+$$\text{QPS} \;=\; \frac{N}{L} \;=\; \text{concurrency} \times \frac{1}{L_{\text{e2e}}},$$
+<p>so anything that lowers $L_{\text{e2e}}$ raises throughput at fixed concurrency, and anything that lets the fleets sustain higher concurrency raises throughput at fixed latency. This is the lever the demonstration below pulls: by raising the retrieval cache hit rate, it shortens the average request, and the shorter average request both meets a tighter latency target and lifts the queries per second the same hardware can serve, with a direct drop in cost per thousand queries. Code 36.7.1 makes the arithmetic concrete.</p>
+<pre><code class="language-python">import random
+
+# Toy latency budget (milliseconds) for one online RAG request.
+L_RETRIEVE_MISS = 120.0   # fan-out to the retrieval fleet, slowest shard wins
+L_RETRIEVE_HIT  = 4.0     # retrieval-cache memory lookup
+L_ASSEMBLE      = 3.0     # rank + pack the context on the gateway
+L_GENERATE      = 220.0   # decode the answer on the LLM-serving fleet
+CONCURRENCY     = 64      # simultaneous in-flight requests the fleet sustains
+GEN_COST_PER_REQ = 0.0009 # dollars of accelerator time per generated answer
+RET_COST_PER_MISS = 0.0002  # dollars of retrieval-fleet work per cache miss
+
+def simulate(hit_rate, n=200_000, seed=0):
+    rng = random.Random(seed)
+    total_latency = 0.0
+    total_cost = 0.0
+    for _ in range(n):
+        hit = rng.random() < hit_rate
+        l_ret = L_RETRIEVE_HIT if hit else L_RETRIEVE_MISS
+        total_latency += l_ret + L_ASSEMBLE + L_GENERATE
+        total_cost += GEN_COST_PER_REQ + (0.0 if hit else RET_COST_PER_MISS)
+    avg_latency_ms = total_latency / n
+    qps = CONCURRENCY / (avg_latency_ms / 1000.0)   # Little's law: QPS = N / L
+    cost_per_1k = (total_cost / n) * 1000.0
+    return avg_latency_ms, qps, cost_per_1k
+
+print(f"{'hit rate':>9} | {'avg latency':>12} | {'effective QPS':>14} | {'$ / 1k queries':>15}")
+print("-" * 60)
+for h in (0.0, 0.5, 0.8):
+    lat, qps, cost = simulate(h)
+    print(f"{h:>9.0%} | {lat:>10.1f}ms | {qps:>14.1f} | {cost:>15.4f}")
+</code></pre>
+<div class="code-caption"><strong>Code 36.7.1:</strong> Simulating the RAG request path latency budget with and without a retrieval cache. The retrieve term collapses from a fleet fan-out (<code>L_RETRIEVE_MISS</code>) to a memory lookup (<code>L_RETRIEVE_HIT</code>) on a cache hit; effective queries per second follow from Little's law (<code>QPS = concurrency / latency</code>), and cost per thousand queries drops as misses are avoided.</div>
+<pre><code class="language-text"> hit rate |  avg latency |  effective QPS |  $ / 1k queries
+------------------------------------------------------------
+       0% |      343.0ms |          186.6 |          1.1000
+      50% |      284.9ms |          224.6 |          0.9998
+      80% |      250.3ms |          255.7 |          0.9401
+</code></pre>
+<div class="code-caption"><strong>Output 36.7.1:</strong> As the retrieval-cache hit rate rises from 0% to 80%, the average request shortens from 343 ms to 250 ms, effective throughput on the same fleet climbs from 187 to 256 queries per second (a 37% gain), and cost per thousand queries falls from $1.10 to $0.94 by skipping retrieval-fleet work on hits. Generation still dominates the budget, which is why the headline lever for further savings is the prompt and key-value cache on the serving fleet.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Retrieve-Then-Generate Service in a Dozen Lines</div>
+<p>The five-stage request path of Section 1 is exactly what a RAG framework wires for you. LangChain composes a distributed retriever and a streaming LLM client into one callable; the retriever can point at the sharded vector service of <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a> and the LLM client at a vLLM-served replica fleet from <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>, with the gateway orchestration, prompt templating, and token streaming handled for you:</p>
+<pre><code class="language-python">from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+
+# retriever -> distributed vector service (Ch 25); llm -> vLLM replica fleet (Ch 24)
+prompt = ChatPromptTemplate.from_template(
+    "Answer using only the context.\n\nContext:\n{context}\n\nQuestion: {question}"
+)
+
+def assemble(docs):                       # context assembly under a token budget
+    return "\n\n".join(d.page_content for d in docs[:5])   # top-5 after rerank
+
+rag = (
+    {"context": retriever | assemble, "question": RunnablePassthrough()}
+    | prompt
+    | llm                                 # streams tokens back to the gateway
+)
+
+for token in rag.stream("How does the cache affect QPS?"):  # streamed response
+    print(token.content, end="", flush=True)
+</code></pre>
+<div class="code-caption"><strong>Code 36.7.2:</strong> The same retrieve, assemble, generate, stream path as Figure 36.7.1, expressed as one composed runnable. Roughly a hundred lines of hand-written gateway orchestration, prompt assembly, and streaming collapse to a dozen; the framework manages the calls to both fleets, the token-budget trim in <code>assemble</code>, and the streamed response.</div>
+</div>
+
+<h2>6. Reliability and Graceful Degradation Across the Fleet <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>A service that spans two fleets has two fleets' worth of failure modes on every request, and the reliability discipline of <a href="../../part-7-infrastructure/module-35-reliable-secure-distributed-ai/index.html">Chapter 35</a> applies directly. The governing principle is that a slow or missing component should degrade the answer, not the availability of the service. If one retrieval shard out of $S$ is slow, the gateway does not wait for it past a deadline; it returns the top-$k$ from the shards that answered in time and proceeds to generation with slightly less evidence, the hedged-request and deadline-budget tactics of <a href="../../part-7-infrastructure/module-34-edge-fog-on-device/section-34.7.html">Section 34.7</a> that keep the tail of $L_{\text{retrieve}}$ bounded. A degraded retrieval is almost always better than a timed-out request, because the language model can often still answer well from partial context, and the user gets a sentence instead of an error.</p>
+<p>The same logic cascades through the other stages. If the entire retrieval fleet is unreachable, a well-built service can fall back to generating from the model's parametric knowledge alone, clearly flagged as un-sourced, rather than failing. If a generation replica stalls mid-stream, the request can be retried on another replica, and because answers are streamed, the gateway can detect a stalled stream and fail over before the user notices. Each fallback trades a little answer quality for a large gain in availability, and the art is choosing the trade deliberately: a medical or legal assistant may refuse rather than answer un-sourced, while a casual chat assistant may prefer any answer to none. When the RAG service is itself one tool call inside a larger multi-step agent, these per-call fallbacks become the reliability substrate the orchestrator of <a href="../../part-6-multi-agent-systems/module-32-distributed-agent-orchestration/index.html">Chapter 32</a> builds on, since an agent that retries a flaky sub-task is only as reliable as that sub-task's own degradation behavior.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Co-Optimizing Retrieval and Generation Serving (2024 to 2026)</div>
+<p>The frontier in online RAG is treating the two fleets as one jointly scheduled system rather than two services bolted together. Prefix- and prompt-caching schedulers in the lineage of vLLM's automatic prefix caching and SGLang's RadixAttention (Zheng et al., 2024) share key-value state across requests that reuse retrieved passages, turning the retrieval cache and the generation cache into a single reuse surface. A parallel thread on speculative and pipelined RAG overlaps retrieval with the model's prefill so the two fleets work concurrently instead of in series, shrinking $L_{\text{retrieve}} + L_{\text{generate}}$ toward $\max(L_{\text{retrieve}}, L_{\text{generate}})$. Disaggregated serving, which splits prefill and decode onto separate hardware pools, is being extended to place the retrieval fan-out on the same critical-path budget, and learned routers now decide per query whether to retrieve at all, skipping the retrieval fleet for questions the model can answer from parameters. The common theme is that the SLO spans both fleets, so the largest wins come from scheduling them together.</p>
+</div>
+<p>With retrieval wired into generation as a reliable, cached, budgeted online service, the chapter has assembled an end-to-end web-scale RAG system from the crawled corpus to the streamed answer. What remains is to measure it as one system rather than as two: the end-to-end evaluation, cost accounting, and failure-injection testing that decide whether the composed service actually meets its objective in production, which is where <a href="section-36.8.html">Section 36.8</a> goes next.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 36.7.1: Where Does the SLO Break First? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>An online RAG service has an 800 ms tail-latency SLO on time-to-first-token. Retrieval fans out to $S = 16$ shards; one shard occasionally takes 600 ms while the others take 90 ms. Generation's time-to-first-token is 150 ms. (a) Using $L_{\text{e2e}} = L_{\text{retrieve}} + L_{\text{assemble}} + L_{\text{generate}}$ and the fact that $L_{\text{retrieve}}$ is the maximum over shards, explain which stage threatens the SLO and why adding more generation replicas would not fix it. (b) Describe two tactics from <a href="../../part-7-infrastructure/module-34-edge-fog-on-device/section-34.7.html">Section 34.7</a> that bound the retrieval tail, and state what answer-quality cost each one pays.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 36.7.2: Extend the Cache Simulation <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 36.7.1 to add a second cache layer on the generation side: with prompt-cache hit probability $p$, the generation latency falls from <code>L_GENERATE</code> to a reduced value (model the prefill saving as, say, a 40% cut) and its per-request cost falls proportionally. Sweep the joint space of retrieval hit rate $h \in \{0, 0.5, 0.8\}$ and prompt-cache hit rate $p \in \{0, 0.5\}$, and report effective QPS and cost per thousand queries for each combination. Which cache buys more throughput per percentage point of hit rate, and why does that match the claim in Output 36.7.1 that generation dominates the budget?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 36.7.3: Size the Two Fleets <span class="exercise-type analysis">Analysis</span></div>
+<p>A service must sustain 1,000 QPS at a 70% retrieval-cache hit rate. A retrieval shard replica handles 400 misses per second; a generation replica handles 12 requests per second. Using the cache arithmetic of Section 4 (only misses reach the retrieval fleet) and the concurrency law of Section 5, estimate the minimum number of retrieval replicas and generation replicas required, and identify which fleet is the cost driver. Then argue, with numbers, how the required generation-replica count changes if average answer length doubles, and connect your answer to why the token budget of Section 3 is a throughput decision.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-36.6.html"><span class="nav-label">Previous</span><span class="nav-num">Section 36.6</span><span class="nav-title">Sharded Retrieval and Ranking</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 36</span><span class="nav-num">Contents</span><span class="nav-title">Web-Scale Text Processing and Distributed RAG</span></a>
+<a class="next" href="section-36.8.html"><span class="nav-label">Next</span><span class="nav-num">Section 36.8</span><span class="nav-title">Evaluation</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

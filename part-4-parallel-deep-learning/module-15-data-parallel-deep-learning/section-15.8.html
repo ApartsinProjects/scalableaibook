@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 15.8: Mixed Precision as a Per-Node Enabler. How FP16/BF16 compute with an FP32 master copy speeds each worker, halves the all-reduce volume, and fits bigger local batches, with loss scaling and the FP8 frontier." name="description"/>
+<title>Section 15.8: Mixed Precision as a Per-Node Enabler | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Data-Parallel Deep Learning</a></div>
+<h1>Mixed Precision as a Per-Node Enabler</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They told me to carry sixteen bits instead of thirty-two, and somehow the whole convoy moved twice as fast. Nobody mentioned I would have to whisper to keep the small numbers awake."</p>
+<cite>An All-Reduce That Has Seen Some Gradients</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Mixed-precision training is a single-node efficiency technique, but it pays its biggest dividend out on the network: when each worker carries gradients in sixteen bits instead of thirty-two, every all-reduce moves half the bytes and every accelerator fits a larger local batch.</strong> This is a scale-up trick that directly serves scale-out. We keep the high-precision master weights and a few delicate reductions in FP32 for numerical safety, push the heavy matrix multiplies and the gradient exchange into FP16 or BF16, and recover the small gradients that would otherwise vanish with a technique called loss scaling. The collectives of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> and the parallelism strategies of the next chapters remain the main event; mixed precision is the labeled enabler that makes them cheaper per step.</p>
+</div>
+<p>Everything in this chapter so far has treated a gradient as a vector of numbers and asked how to move it between machines correctly and quickly. We never asked how wide each of those numbers is. The default in deep learning was once a 32-bit float for every weight, activation, and gradient, and that default is wasteful: modern accelerators compute low-precision matrix multiplies several times faster than full-precision ones, and a 32-bit gradient costs twice the memory and twice the network bytes of a 16-bit one. Mixed-precision training keeps the parts that need accuracy in 32 bits and runs everything else in 16, capturing most of the speed and memory of pure low precision while preserving the numerical stability of full precision. It is a per-node technique, firmly on the scale-up side of the book's central distinction, but it is included here because it changes the arithmetic of distribution: smaller gradients mean smaller all-reduce payloads, and lower memory means bigger batches per worker, both of which improve the scaling efficiency we study in <a href="section-15.9.html">Section 15.9</a>.</p>
+
+<h2>1. The Numerical Formats and Their Trade-Off <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A floating-point number spends its bits on two things: an exponent that sets the dynamic range (how large or small a value it can represent) and a mantissa that sets the precision (how finely it resolves values within that range). The formats used in deep learning differ in how they divide a fixed bit budget between these two, and that split is the whole story. A 32-bit IEEE float (FP32) spends 8 bits on the exponent and 23 on the mantissa, giving both wide range and fine precision. To go smaller you must sacrifice one or the other.</p>
+<p>The classic 16-bit format, IEEE half precision (FP16), keeps 10 mantissa bits but shrinks the exponent to 5, which narrows its range badly: its smallest positive normal value is about $6.1 \times 10^{-5}$, and anything below roughly $6 \times 10^{-8}$ flushes to zero. Google's brain-float (BF16) makes the opposite choice, keeping the full 8-bit exponent of FP32 and accepting only 7 mantissa bits. BF16 therefore covers the same enormous range as FP32 (so gradients rarely underflow) at the cost of coarser precision. NVIDIA's TF32, used internally by Tensor Cores, is a 19-bit compute format with FP32's 8-bit exponent and 10 mantissa bits, a middle ground applied automatically inside matrix multiplies. The 2024-era frontier pushes further to 8-bit floats (FP8), available as E4M3 (4 exponent, 3 mantissa bits, more precision) and E5M2 (5 exponent, 2 mantissa bits, more range). Table 15.8.1 lays out the trade-off.</p>
+<div class="table-caption"><strong>Table 15.8.1:</strong> Numerical formats used in deep-learning training, ordered by width. Range is governed by the exponent bits, precision by the mantissa bits. BF16's wide range is what lets it skip the loss scaling that FP16 requires.</div>
+<table>
+<thead>
+<tr><th scope="col">Format</th><th scope="col">Total bits</th><th scope="col">Exponent</th><th scope="col">Mantissa</th><th scope="col">What it buys</th></tr>
+</thead>
+<tbody>
+<tr><td>FP32</td><td>32</td><td>8</td><td>23</td><td>Wide range, fine precision; the master-weight baseline</td></tr>
+<tr><td>TF32</td><td>19</td><td>8</td><td>10</td><td>FP32 range at Tensor-Core speed, used inside matmuls</td></tr>
+<tr><td>BF16</td><td>16</td><td>8</td><td>7</td><td>FP32 range, coarse precision; no loss scaling needed</td></tr>
+<tr><td>FP16</td><td>16</td><td>5</td><td>10</td><td>Fine precision, narrow range; needs loss scaling</td></tr>
+<tr><td>FP8 (E4M3)</td><td>8</td><td>4</td><td>3</td><td>Frontier compute format; more precision than E5M2</td></tr>
+<tr><td>FP8 (E5M2)</td><td>8</td><td>5</td><td>2</td><td>Frontier; more range, used for gradients</td></tr>
+</tbody>
+</table>
+<p>The relationship between bits and the dynamic range is exponential. With an exponent field of $e$ bits, the representable magnitudes span roughly</p>
+$$\text{range} \approx 2^{2^{e}-1}, \qquad \text{so FP16's } e=5 \text{ gives } \sim\!2^{31}, \quad \text{BF16's } e=8 \text{ gives } \sim\!2^{255}.$$
+<p>That gulf, $2^{31}$ against $2^{255}$, is exactly why a gradient that comfortably fits in BF16 can silently underflow to zero in FP16. The precision side scales the same way with mantissa bits: $m$ mantissa bits resolve values to a relative step of about $2^{-(m+1)}$, so BF16's 7 bits give coarser steps than FP16's 10. The practical lesson is that you choose the format by which failure mode you fear more. Fear vanishing gradients, and BF16's range saves you with no extra machinery; need to resolve nearby values finely, and FP16's mantissa serves better, provided you add loss scaling to protect its range.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Mixed Precision Is a Scale-Up Trick That Pays Off in Scale-Out</div>
+<p>The speed and memory savings of 16-bit arithmetic are a single-node, scale-up benefit, the same family as the quantization and KV-cache paging treated as per-node efficiency in <a href="../../part-5-distributed-inference/module-22-per-node-inference-efficiency/index.html">Chapter 22</a>. What makes mixed precision belong in a chapter about <em>distributed</em> training is that the gradient is the thing you communicate. Halving its width halves the all-reduce payload on every single step, and the freed memory lets each worker hold a larger local batch, which raises the compute-to-communication ratio. The technique is scale-up in mechanism but scale-out in payoff.</p>
+</div>
+
+<h2>2. The Mixed-Precision Recipe: Master Weights and FP32 Reductions <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Naively casting an entire training step to 16 bits diverges, because two operations genuinely need the extra bits. The first is the weight update itself. An update adds a tiny step (the learning rate times the gradient) to a comparatively large weight; in 16 bits that small addend rounds away entirely, so the weights stop moving. Mixed-precision training fixes this by keeping a master copy of the weights in FP32 that accumulates every update faithfully, and casting a 16-bit working copy from it for the forward and backward passes. The second is reductions over many terms, such as the sum inside a batch-normalization statistic or a large dot product, where accumulating thousands of 16-bit values compounds rounding error; these accumulate in FP32 even when their inputs are 16-bit. Figure 15.8.1 shows how these pieces fit together with the distributed all-reduce.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Mixed-precision training loop: FP32 master weights cast a 16-bit working copy, forward and backward run in 16-bit, the loss is scaled up before backprop, gradients are all-reduced in 16-bit at half the volume, then unscaled and applied to the FP32 master weights.">
+<defs>
+<marker id="arr158" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.f32 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.f16 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.scl { fill:#eef7ef; stroke:#2f7d4f; stroke-width:1.6; }
+.t158 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.to158 { font:600 13px sans-serif; fill:#b86b1f; text-anchor:middle; }
+.tg158 { font:600 13px sans-serif; fill:#2f7d4f; text-anchor:middle; }
+.s158 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l158 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr158); }
+</style>
+<text class="t158" x="120" y="26">FP32 (high precision)</text>
+<text class="to158" x="450" y="26">FP16 / BF16 (fast, half the bytes)</text>
+<rect class="f32" x="40" y="46" width="160" height="70" rx="10"/>
+<text class="t158" x="120" y="78">Master weights</text>
+<text class="s158" x="120" y="98">FP32, accumulate updates</text>
+<rect class="f16" x="330" y="46" width="150" height="70" rx="10"/>
+<text class="to158" x="405" y="78">Working copy</text>
+<text class="s158" x="405" y="98">FP16/BF16 forward</text>
+<rect class="scl" x="540" y="46" width="150" height="70" rx="10"/>
+<text class="tg158" x="615" y="72">Loss x S</text>
+<text class="s158" x="615" y="92">scale up (FP16)</text>
+<rect class="f16" x="540" y="160" width="150" height="64" rx="10"/>
+<text class="to158" x="615" y="188">Backward</text>
+<text class="s158" x="615" y="208">grads in FP16/BF16</text>
+<rect class="f16" x="330" y="160" width="150" height="64" rx="10"/>
+<text class="to158" x="405" y="188">All-reduce</text>
+<text class="s158" x="405" y="208">16-bit: half the volume</text>
+<rect class="scl" x="120" y="160" width="150" height="64" rx="10"/>
+<text class="tg158" x="195" y="188">Unscale / S</text>
+<text class="s158" x="195" y="208">back to FP32</text>
+<rect class="f32" x="40" y="280" width="230" height="64" rx="10"/>
+<text class="t158" x="155" y="308">FP32 weight update</text>
+<text class="s158" x="155" y="328">w &#8592; w - lr &#183; grad</text>
+<path class="l158" d="M 200 81 L 326 81"/>
+<text class="s158" x="263" y="72">cast down</text>
+<path class="l158" d="M 480 81 L 536 81"/>
+<path class="l158" d="M 615 116 L 615 156"/>
+<path class="l158" d="M 540 192 L 484 192"/>
+<path class="l158" d="M 330 192 L 274 192"/>
+<path class="l158" d="M 195 224 L 195 276"/>
+<path class="l158" d="M 155 280 L 130 280 L 130 120"/>
+<text class="s158" x="118" y="150">apply to master</text>
+<text class="s158" x="615" y="252">smaller all-reduce payload feeds the next step</text>
+</svg>
+<figcaption><strong>Figure 15.8.1:</strong> The mixed-precision training loop. FP32 master weights (left, blue) cast a 16-bit working copy that runs the forward and backward passes (orange). The loss is multiplied by a scale $S$ before backprop so small gradients stay representable; the gradients are exchanged across workers by a 16-bit all-reduce that moves half the bytes of an FP32 one; then the result is unscaled in FP32 and applied to the master weights. Only the green boxes touch the scale factor, and only FP16 needs them.</figcaption>
+</figure>
+<p>For BF16 the picture simplifies: because its exponent matches FP32, gradients almost never underflow, so the two green scaling boxes in Figure 15.8.1 disappear and the loop is just cast-down, compute, all-reduce, apply. That simplicity is why BF16 has become the default on hardware that supports it. FP16 remains valuable on hardware without fast BF16, and on workloads where its extra mantissa bit matters, but it carries the loss-scaling obligation we turn to next.</p>
+
+<h2>3. Loss Scaling: Keeping Small Gradients Alive in FP16 <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The narrow range of FP16 creates a specific, measurable failure: gradients whose magnitude falls below about $6 \times 10^{-8}$ become exactly zero when cast to half precision, so the corresponding weights receive no update and the model fails to learn from them. Because backpropagated gradients in deep networks are routinely this small, especially in early layers, the loss is real, not hypothetical. Loss scaling fixes it with a multiplication. Before the backward pass, multiply the loss by a large constant $S$ (a power of two such as $1024$ or $65536$); by the chain rule every gradient is then scaled by the same $S$, shifting the whole distribution up into FP16's representable range. After the all-reduce and before the optimizer step, divide the gradients back by $S$ in FP32. The update is mathematically unchanged; only the intermediate representation was protected.</p>
+<p>The code below demonstrates both halves of this section in pure NumPy. It first shows what fraction of a batch of tiny gradients vanishes under a naive FP16 cast and how a scale of $S = 1024$ rescues every one of them, then quantifies the memory and communication halving of 16-bit versus 32-bit on a billion-parameter gradient.</p>
+<pre><code class="language-python">import numpy as np
+
+# ---- Part 1: FP16 gradient underflow and how loss scaling recovers it ----
+# FP16's smallest positive normal is ~6.1e-5; below ~6e-8 everything flushes to 0.
+rng = np.random.default_rng(0)
+# A batch of realistic tiny gradient magnitudes (e.g. deep-net early layers).
+grads_fp32 = (rng.uniform(1e-9, 2e-7, size=20000)).astype(np.float32)
+
+naive_fp16 = grads_fp32.astype(np.float16)              # cast straight to half
+underflowed = np.sum(np.asarray(naive_fp16) == 0.0)     # how many vanished?
+
+S = 1024.0                                              # loss-scale factor
+scaled_fp16 = (grads_fp32 * S).astype(np.float16)       # scale UP, then cast
+recovered = np.asarray(scaled_fp16).astype(np.float32) / S   # unscale in FP32
+underflowed_scaled = np.sum(np.asarray(scaled_fp16) == 0.0)
+
+mask = grads_fp32 &gt; 0
+rel_err = np.mean(np.abs(recovered[mask] - grads_fp32[mask]) / grads_fp32[mask])
+print("underflowed to 0 without scaling:", int(underflowed),
+      f"({100*underflowed/grads_fp32.size:.1f}%)")
+print("underflowed to 0 with S=1024    :", int(underflowed_scaled),
+      f"({100*underflowed_scaled/grads_fp32.size:.1f}%)")
+print("mean rel. error after recovery  :", f"{rel_err:.2e}")
+
+# ---- Part 2: memory and all-reduce volume, 16-bit vs 32-bit ----
+P = 1_000_000_000                                       # 1-billion-param gradient
+print("FP32 all-reduce payload (GB)   :", f"{P*4/1e9:.2f}")
+print("FP16 all-reduce payload (GB)   :", f"{P*2/1e9:.2f}")
+print("communication volume reduction :", f"{(P*4)/(P*2):.1f}x")
+print("local memory saved (GB)        :", f"{(P*4-P*2)/1e9:.2f}")
+</code></pre>
+<div class="code-caption"><strong>Code 15.8.1:</strong> Loss scaling and the 16-bit payload halving from first principles. Part 1 casts tiny gradients to FP16 with and without a scale of $S=1024$; Part 2 contrasts the FP32 and FP16 all-reduce payloads for a billion-parameter gradient.</div>
+<pre><code class="language-text">underflowed to 0 without scaling: 2882 (14.4%)
+underflowed to 0 with S=1024    : 0 (0.0%)
+mean rel. error after recovery  : 4.22e-04
+FP32 all-reduce payload (GB)   : 4.00
+FP16 all-reduce payload (GB)   : 2.00
+communication volume reduction : 2.0x
+local memory saved (GB)        : 2.00
+</code></pre>
+<div class="code-caption"><strong>Output 15.8.1:</strong> Without scaling, 14.4% of the tiny gradients flushed to zero and were lost; with $S = 1024$ none did, and the recovered values match the FP32 reference to within $4 \times 10^{-4}$, the resolution of FP16's mantissa. The billion-parameter gradient shrinks from a 4 GB all-reduce to a 2 GB one, a clean halving of both communication and local memory.</div>
+<p>The two results in Output 15.8.1 are the whole argument of this section in numbers. The first block is the stability problem and its fix: a 14.4% loss of gradient signal, erased by one multiplication. The second block is the distributed payoff: every all-reduce that this chapter's collectives perform moves half the bytes, and every worker frees 2 GB it can spend on a larger batch. In production the scale factor is not fixed; a dynamic loss scaler raises $S$ when no overflow is seen for a while and halves it the moment a gradient becomes infinite, automatically tracking the largest safe value. We reproduce that controller in the exercises.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Power-of-Two Free Lunch</div>
+<p>Loss scaling multiplies and later divides by the same $S$, so why choose a power of two like $1024$ rather than, say, $1000$? Because multiplying a float by a power of two only changes its exponent, never its mantissa: the operation is exact, with zero rounding error introduced by the scaling itself. The only rounding that happens is the unavoidable cast into FP16. Pick $1000$ and you would pay a tiny tax twice for nothing. The numerics quietly reward you for respecting binary.</p>
+</div>
+
+<h2>4. Why This Matters for Distribution <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The connection to the rest of the chapter runs through two quantities that <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a> taught us to track: bytes moved and bytes resident. On the communication side, the gradient all-reduce of <a href="../../part-1-foundations/module-04-communication-primitives/section-4.1.html">Section 4.1</a> moves a volume proportional to the gradient's byte size. Halving the width of every element halves that volume directly, which in the alpha-beta cost model of <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.7.html">Section 3.7</a> halves the bandwidth term of every step. For a communication-bound training job, that is close to a doubling of scaling efficiency for free. On the memory side, the model weights, the optimizer state, the activations cached for backprop, and the gradients themselves all shrink, and the freed memory buys a larger local batch. A larger local batch means more compute per all-reduce, raising the compute-to-communication ratio that determines whether adding workers helps or merely adds overhead, the central question of <a href="section-15.9.html">Section 15.9</a>. Mixed precision thus pushes on both levers that govern scaling at once.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: torch.amp Handles Casting, Scaling, and Unscaling</div>
+<p>The manual recipe of Figure 15.8.1, casting a working copy, choosing where to keep FP32, scaling the loss, and unscaling before the step, is provided by PyTorch's automatic mixed precision in two objects. <code>torch.autocast</code> picks the right precision per operation (16-bit matmuls, FP32 reductions) inside its context, and <code>GradScaler</code> runs a dynamic loss scaler with overflow detection. The roughly thirty lines of bookkeeping collapse to a wrapper and three calls, and it composes transparently with <code>DistributedDataParallel</code>: the all-reduce simply carries 16-bit gradients.</p>
+<pre><code class="language-python"># model already wrapped in DistributedDataParallel; per worker:
+import torch
+scaler = torch.amp.GradScaler("cuda")          # dynamic loss scaler
+
+for x, y in loader:
+    optimizer.zero_grad()
+    with torch.autocast("cuda", dtype=torch.bfloat16):   # or torch.float16
+        loss = loss_fn(model(x), y)            # forward in 16-bit
+    scaler.scale(loss).backward()              # scale up, backward, DDP all-reduce
+    scaler.step(optimizer)                     # unscale in FP32, then step
+    scaler.update()                            # adjust S for next iteration
+</code></pre>
+<div class="code-caption"><strong>Code 15.8.2:</strong> The same master-weights, loss-scaling, FP32-reduction recipe as Figure 15.8.1, now as <code>torch.autocast</code> plus <code>GradScaler</code>. With <code>dtype=torch.bfloat16</code> the scaler is effectively a no-op because BF16's range removes the underflow; with <code>torch.float16</code> it does the real work shown in Output 15.8.1.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The All-Reduce That Stopped Being the Bottleneck</div>
+<p><strong>Who:</strong> A deep-learning platform engineer scaling a 1.3-billion-parameter language model across 32 GPUs on a commodity 100 Gb/s Ethernet cluster.</p>
+<p><strong>Situation:</strong> Training ran in FP32 and spent nearly 40% of each step waiting on the gradient all-reduce; adding more GPUs made the wait worse, not the throughput better.</p>
+<p><strong>Problem:</strong> The interconnect was the binding ceiling. A 1.3-billion-parameter FP32 gradient is a 5.2 GB all-reduce every step, and the network could not move it fast enough to keep the accelerators busy.</p>
+<p><strong>Dilemma:</strong> Buy faster interconnect (a capital scale-up nobody had budget for) or shrink the bytes on the wire without changing the math, accepting the small risk of numerical instability.</p>
+<p><strong>Decision:</strong> Switch to BF16 mixed precision, because the hardware supported it and BF16's FP32-matching range meant no loss scaling and no tuning to get wrong.</p>
+<p><strong>How:</strong> They wrapped the forward in <code>torch.autocast(dtype=torch.bfloat16)</code> as in Code 15.8.2, left <code>DistributedDataParallel</code> untouched, and let the all-reduce carry 16-bit gradients.</p>
+<p><strong>Result:</strong> The all-reduce payload fell from 5.2 GB to 2.6 GB per step, communication wait dropped below 20%, and the freed GPU memory let them double the local batch, which raised the compute-to-communication ratio further. End-to-end throughput rose about 1.8x with no measurable accuracy change.</p>
+<p><strong>Lesson:</strong> When communication binds, the cheapest lever is often the width of the numbers, not the speed of the network. A per-node format choice fixed a cluster-level bottleneck.</p>
+</div>
+
+<h2>5. The FP8 Frontier <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>If 16 bits halve the cost of 32, the obvious next question is whether 8 bits halve it again, and the 2024-2026 research and hardware frontier is answering yes for an expanding fraction of the training step. The difficulty is that 8 bits leave almost no room: E4M3 resolves values to a handful of levels and E5M2 covers range with only two mantissa bits, so a single global scale factor that worked for FP16 is far too coarse. The breakthrough has been finer-grained scaling, and we look at where that is heading next.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: FP8 Training and Microscaling Formats (2024 to 2026)</div>
+<p>NVIDIA's Hopper and Blackwell Tensor Cores and the Transformer Engine library brought FP8 (E4M3 and E5M2) into mainstream training, and large public runs now use it: DeepSeek-V3 (2024) trained a 671-billion-parameter mixture-of-experts model substantially in FP8, reporting the communication and memory savings as central to its cost. The key enabler is fine-grained, per-block scaling rather than one scale per tensor. The Open Compute Project's Microscaling (MX) formats, standardized in 2023 and adopted across vendors, attach a shared scale to small blocks of 32 elements (MXFP8, MXFP6, MXFP4), so each block lands in range independently; Blackwell hardware decodes these natively. Active questions for 2025-2026 are how low the gradient all-reduce itself can go (FP8 and even FP6 gradient compression), how to keep the optimizer state stable at these widths, and whether MXFP4 can train, not merely serve, without accuracy loss. The trajectory is clear: each halving of element width is a halving of the bytes this chapter's collectives must move.</p>
+</div>
+<p>We have now placed mixed precision where it belongs: a per-node, scale-up technique whose payoff is felt out on the network and in the memory budget of every worker, sharpening the very scaling efficiency that the collectives and parallelism strategies aim for. With the gradient now half its former size on the wire, the next section confronts what is left: the practical bottlenecks, stragglers, and diminishing returns that decide how far data parallelism actually scales, in <a href="section-15.9.html">Section 15.9</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.8.1: Range Versus Precision <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using Table 15.8.1, explain in two or three sentences why BF16 needs no loss scaling while FP16 does, referring to the exponent-bit counts and the resulting dynamic ranges. Then describe a workload where FP16's extra mantissa bit (10 versus BF16's 7) would matter enough to justify the loss-scaling machinery, and one where BF16 is the clear choice. Why does the field default to BF16 on hardware that supports it?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.8.2: A Dynamic Loss Scaler <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 15.8.1 into a dynamic loss scaler. Start with $S = 2^{15}$. On each simulated step, cast the scaled gradients to FP16 and check for overflow (any non-finite value); if overflow occurs, halve $S$ and skip the update, otherwise apply the update and, after a fixed number of clean steps (say 2000), double $S$. Run it on a stream of gradient batches whose magnitudes drift over time and plot $S$ against the step index. Explain how this controller automatically finds the largest safe scale without any manual tuning, and what happens if you make the growth interval too short.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.8.3: Mixed Precision in the Scaling Model <span class="exercise-type analysis">Analysis</span></div>
+<p>A data-parallel step spends $T_\text{comp}$ on computation and $T_\text{comm} = \alpha + \beta \cdot B$ on the gradient all-reduce, where $B$ is the gradient byte size and $\beta$ is the inverse bandwidth from <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.7.html">Section 3.7</a>. Suppose FP32 training is communication-bound with $T_\text{comm} = 2\,T_\text{comp}$. Switching to BF16 halves $B$ (so halves the $\beta B$ term) and, by freeing memory, lets you double the local batch (so doubles $T_\text{comp}$ and the work done per step). Estimate the new ratio of communication to computation and the change in useful throughput per step, treating $\alpha$ as negligible. Which of the two effects, the smaller payload or the larger batch, helps more here, and how would your answer change if $\alpha$ dominated $\beta B$?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-15.7.html"><span class="nav-label">Previous</span><span class="nav-num">Section 15.7</span><span class="nav-title">Horovod</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 15</span><span class="nav-num">Contents</span><span class="nav-title">Data-Parallel Deep Learning</span></a>
+<a class="next" href="section-15.9.html"><span class="nav-label">Next</span><span class="nav-num">Section 15.9</span><span class="nav-title">Practical Bottlenecks and Scaling Efficiency</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

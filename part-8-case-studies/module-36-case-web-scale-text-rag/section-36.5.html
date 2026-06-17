@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 36.5: Distributed Embedding Generation. Turning a billion-document corpus into dense vectors as an embarrassingly parallel batch-inference job, with throughput and cost engineering, incremental embedding, and writing to the vector store." name="description"/>
+<title>Section 36.5: Distributed Embedding Generation | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Case Studies and Capstone Projects</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 36: Web-Scale Text Processing and Distributed RAG</a></div>
+<h1>Distributed Embedding Generation</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"A GPU batch of ten thousand chunks, all becoming vectors at once. I never read any of them; I just turned meaning into geometry and moved on to the next ten thousand."</p>
+<cite>An Embedding Worker That Saw Only Its Shard</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Embedding a web-scale corpus is distributed batch inference: a single deterministic forward pass applied independently to billions of text chunks, with no dependency between chunks, which makes it the most embarrassingly parallel stage in the entire retrieval pipeline.</strong> The previous sections cleaned, deduplicated, and chunked the corpus; this one turns those chunks into the dense vectors that the retriever will search. Because each chunk is embedded in isolation, throughput scales almost linearly with the number of accelerators, so the engineering problem is not correctness but economics: how to drive each GPU to its throughput ceiling, how many GPUs to rent, and how to keep the running cost in the hundreds of dollars rather than the tens of thousands. This is the offline twin of online serving. The same encoder that answers one query at a time in production here processes the corpus once, in bulk, at maximum batch size, and the result is written to the vector store that Section 36.6 will query.</p>
+</div>
+<p>By the time a corpus reaches this stage it has already been gathered, filtered, deduplicated, and segmented into retrievable chunks. What remains is the step that converts text into the representation the retriever actually searches: a dense vector for every chunk. A billion source documents, segmented into a handful of chunks each, becomes several billion short forward passes through an embedding model. None of those forward passes depends on any other, which is the defining property of the job. There is no gradient to synchronize, no parameter to update, no collective to wait on; each worker can embed its slice of the corpus in complete isolation and the union of the results is the finished index. That independence is what makes the job both simple to reason about and ruthless to optimize, because every inefficiency on one GPU is multiplied by the thousands of GPUs running beside it.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of a sharded corpus feeding many embedding workers in parallel, each running a chunk-embed-write pipeline, all writing dense vectors into a shared vector store.">
+<defs>
+<marker id="arr365" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b365 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w365 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.v365 { fill:#eef6ef; stroke:#2f7d4f; stroke-width:1.6; }
+.t365 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s365 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l365 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr365); }
+</style>
+<text class="t365" x="90" y="26">Sharded corpus</text>
+<rect class="b365" x="30" y="42" width="120" height="40" rx="7"/>
+<text class="s365" x="90" y="66">shard 1 chunks</text>
+<rect class="b365" x="30" y="92" width="120" height="40" rx="7"/>
+<text class="s365" x="90" y="116">shard 2 chunks</text>
+<rect class="b365" x="30" y="200" width="120" height="40" rx="7"/>
+<text class="s365" x="90" y="224">shard K chunks</text>
+<text class="s365" x="90" y="168">.</text>
+<text class="s365" x="90" y="178">.</text>
+<rect class="w365" x="250" y="40" width="230" height="44" rx="8"/>
+<text class="t365" x="365" y="58">Worker 1</text>
+<text class="s365" x="365" y="74">batch &#8594; embed &#8594; write</text>
+<rect class="w365" x="250" y="92" width="230" height="44" rx="8"/>
+<text class="t365" x="365" y="110">Worker 2</text>
+<text class="s365" x="365" y="126">batch &#8594; embed &#8594; write</text>
+<rect class="w365" x="250" y="198" width="230" height="44" rx="8"/>
+<text class="t365" x="365" y="216">Worker K</text>
+<text class="s365" x="365" y="232">batch &#8594; embed &#8594; write</text>
+<text class="s365" x="365" y="168">.</text>
+<text class="s365" x="365" y="178">.</text>
+<line x1="150" y1="62" x2="246" y2="62" class="l365"/>
+<line x1="150" y1="112" x2="246" y2="114" class="l365"/>
+<line x1="150" y1="220" x2="246" y2="220" class="l365"/>
+<rect class="v365" x="600" y="100" width="240" height="120" rx="10"/>
+<text class="t365" x="720" y="140">Distributed vector store</text>
+<text class="s365" x="720" y="162">index shard A &#183; B &#183; C</text>
+<text class="s365" x="720" y="184">(id, vector, metadata)</text>
+<text class="s365" x="720" y="206">Chapter 25, Section 36.6</text>
+<path class="l365" d="M 480 62 L 540 62 L 540 130 L 596 130"/>
+<path class="l365" d="M 480 114 L 596 150"/>
+<path class="l365" d="M 480 220 L 540 220 L 540 180 L 596 180"/>
+<text class="s365" x="365" y="300">no cross-worker communication: each chunk becomes a vector independently</text>
+</svg>
+<figcaption><strong>Figure 36.5.1:</strong> The embedding job as a fan-out of independent pipelines. The chunked corpus is partitioned into $K$ shards; each worker reads its shard, groups chunks into GPU batches, runs one forward pass per batch, and streams the resulting vectors into the distributed vector store. Because the forward passes are independent, there is no collective communication between workers, in sharp contrast to the gradient all-reduce of data-parallel training in <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>.</figcaption>
+</figure>
+
+<h2>1. From Chunks to Forward Passes <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The unit of embedding is the chunk, not the document. A retriever returns passages, so the corpus is first segmented into spans short enough to be a coherent answer and to fit the encoder's context window, typically a few hundred tokens with a small overlap so that a fact straddling a boundary survives in at least one chunk. Segmentation strategy belongs to the chunking section that precedes this one; what matters here is the multiplier it produces. A corpus of $N_{\text{docs}}$ documents averaging $c$ chunks each yields</p>
+$$N_{\text{chunks}} = c \cdot N_{\text{docs}}$$
+<p>forward passes. For a billion documents at six chunks each, that is six billion forward passes, and the entire cost model of this section follows from that single number. The embedding model itself is a compact encoder, usually a sentence-transformer in the 100-to-500-million-parameter range that maps a chunk to a vector of dimension $d$ (commonly 384, 768, or 1024). It is small enough to fit in one accelerator's memory with room to spare, which is precisely why this job never needs the model-sharding machinery of <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>: the model is replicated, not split. What is split is the data.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Embedding Is Data-Parallel Inference, Not Data-Parallel Training</div>
+<p>Both replicate the model and shard the data, but the resemblance ends there. Data-parallel training (<a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>) must all-reduce gradients after every step, so its scaling is capped by communication cost. Embedding has no backward pass and no gradient, so there is nothing to synchronize and scaling stays linear until you run out of corpus to feed the workers. The binding constraint moves from the network to the input pipeline: a GPU starved of chunks is as wasteful as a GPU stalled on a slow all-reduce, which is why the data-loading techniques of <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/index.html">Chapter 8</a> matter as much here as the model does.</p>
+</div>
+
+<h2>2. Sizing the Job: GPU-Hours, Wall-Clock, and Cost <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The most useful thing to compute before launching a billion-document embedding run is its bill. Let $r$ be the throughput of one accelerator in chunks per second at the chosen batch size. The total accelerator work is fixed by the corpus and the per-GPU rate, independent of how many GPUs you use:</p>
+$$T_{\text{gpu-hours}} = \frac{N_{\text{chunks}}}{r \cdot 3600}.$$
+<p>Add $G$ workers and the wall-clock time divides, because the chunks split cleanly across them with no coordination overhead to claw any of it back:</p>
+$$T_{\text{wall}} = \frac{T_{\text{gpu-hours}}}{G}, \qquad \text{Cost} = T_{\text{gpu-hours}} \cdot p,$$
+<p>where $p$ is the price per GPU-hour. The cost depends only on the total GPU-hours and the price, not on $G$: renting four thousand GPUs for half an hour costs the same as renting eight GPUs for ten days, give or take the overhead of spinning the larger fleet up. That decoupling, total cost set by the workload and wall-clock set by the fleet size, is the practical meaning of an embarrassingly parallel job, and it is what lets a team trade money against time freely. Code 36.5.1 turns these three identities into a sizing calculator and sweeps the worker count to show the linear scale-out explicitly.</p>
+<pre><code class="language-python">import math
+
+# --- Corpus and model parameters ---
+N_docs = 1_000_000_000          # one billion documents
+chunks_per_doc = 6              # average chunks after segmentation
+N_chunks = N_docs * chunks_per_doc
+tput_per_gpu = 800             # chunks/sec embedded per GPU at the chosen batch size
+gpu_price = 1.10               # USD per GPU-hour (cloud accelerator)
+
+# --- Core sizing identities ---
+# total GPU-seconds is independent of how many GPUs run in parallel
+gpu_seconds = N_chunks / tput_per_gpu
+gpu_hours = gpu_seconds / 3600.0
+job_cost = gpu_hours * gpu_price
+
+print(f"corpus: {N_docs:,} docs x {chunks_per_doc} chunks = {N_chunks:,} chunks")
+print(f"per-GPU throughput : {tput_per_gpu:,} chunks/sec")
+print(f"total GPU-hours    : {gpu_hours:,.0f}")
+print(f"job cost (@ ${gpu_price}/gpu-hr): ${job_cost:,.0f}")
+print()
+
+# --- Linear scale-out: sweep worker count, wall-clock = GPU-hours / num_gpus ---
+print(f"{'GPUs':>8} {'wall-clock (h)':>16} {'speedup':>10} {'efficiency':>12}")
+base = None
+for num_gpus in [8, 64, 256, 1024, 4096]:
+    wall_h = gpu_hours / num_gpus
+    if base is None:
+        base = wall_h * 8         # reference: wall-clock that 1 GPU would take
+    speedup = base / wall_h
+    eff = speedup / num_gpus
+    print(f"{num_gpus:>8} {wall_h:>16,.1f} {speedup:>10,.0f}x {eff:>11.0%}")
+
+print()
+# --- Throughput vs batch size (illustrative saturation curve) ---
+# small batches underuse the GPU; throughput rises then plateaus at the FLOPs ceiling
+print(f"{'batch':>8} {'chunks/sec':>14}")
+peak = 900.0
+for bs in [8, 32, 128, 512, 2048]:
+    # saturating model: half-saturation batch size = 96
+    tput = peak * bs / (bs + 96)
+    print(f"{bs:>8} {tput:>14,.0f}")
+</code></pre>
+<div class="code-caption"><strong>Code 36.5.1:</strong> An embedding-job sizing calculator. It computes total GPU-hours and dollar cost from the corpus size and per-GPU throughput, sweeps the worker count to demonstrate linear wall-clock scale-out at constant cost, then shows throughput rising with batch size toward a saturation ceiling.</div>
+<pre><code class="language-text">corpus: 1,000,000,000 docs x 6 chunks = 6,000,000,000 chunks
+per-GPU throughput : 800 chunks/sec
+total GPU-hours    : 2,083
+job cost (@ $1.1/gpu-hr): $2,292
+
+    GPUs   wall-clock (h)    speedup   efficiency
+       8            260.4          8x        100%
+      64             32.6         64x        100%
+     256              8.1        256x        100%
+    1024              2.0      1,024x        100%
+    4096              0.5      4,096x        100%
+
+   batch     chunks/sec
+       8             69
+      32            225
+     128            514
+     512            758
+    2048            860
+</code></pre>
+<div class="code-caption"><strong>Output 36.5.1:</strong> Six billion chunks cost roughly 2,083 GPU-hours and about $2,292 in total, regardless of fleet size. Adding workers buys proportional wall-clock reduction at perfect efficiency, so 1,024 GPUs finish in two hours what one GPU would grind through in eighty-seven days. The batch-size table shows why the chosen throughput of 800 chunks per second requires a large batch: at batch 8 the GPU is starved and delivers under a tenth of its peak.</div>
+<p>The efficiency column staying pinned at 100% is the signature of the embarrassingly parallel regime, and it is exactly what data-parallel <em>training</em> cannot achieve, because there the all-reduce tax erodes efficiency as workers multiply. The honest caveat is that this idealization ignores the input pipeline and the write path; a real run loses a few percent to reading chunks from storage and committing vectors to the index, which is why Sections 3 and 5 treat those two boundaries as the places where the linear curve actually bends.</p>
+
+<h2>3. Driving the GPU: Batch Size, Mixed Precision, and Sharding <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The per-GPU throughput $r$ that the cost model treats as a constant is in fact the most important knob in the job, and three settings determine it. The first is batch size. An encoder forward pass is a sequence of matrix multiplications, and a modern accelerator reaches its arithmetic peak only when those multiplications are wide enough to keep every core busy. A batch of eight chunks leaves most of the hardware idle; a batch of several hundred or a few thousand saturates it, which is the rising curve in the bottom of Output 36.5.1. The relationship is the same per-node arithmetic-intensity argument developed in <a href="../../part-5-distributed-inference/module-22-per-node-inference-efficiency/index.html">Chapter 22</a>: throughput climbs with batch size until the kernel becomes compute-bound, then plateaus. Offline embedding is the ideal place to exploit this, because, unlike online serving, there is no latency budget to respect; you may use the largest batch that fits in memory and pay nothing for the queuing delay that would be unacceptable in production.</p>
+<p>The second knob is numerical precision. Embedding does not need full 32-bit floating point; the encoder runs comfortably in half precision (FP16 or BF16), which doubles arithmetic throughput and halves the memory the activations consume, so a larger batch fits and the saturation point arrives sooner. The output vectors are typically stored at lower precision still, since retrieval quality is robust to vector quantization, a point Section 36.6 and <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a> develop when they compress the index. The third knob is corpus sharding: the chunked corpus is partitioned into $G$ disjoint shards, one per worker, sized so that no worker finishes long before the others and leaves a GPU idle at the tail of the job. Uneven shards reintroduce the straggler problem from <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>, so shards are balanced by chunk count, and a work-stealing queue lets an idle worker pull from a slow one's remaining backlog. The aggregate effect of these three settings is captured by the throughput identity that feeds the cost model:</p>
+$$r(b) = r_{\max} \cdot \frac{b}{b + b_{1/2}},$$
+<p>where $b$ is the batch size, $r_{\max}$ the saturated per-GPU rate, and $b_{1/2}$ the batch at which the GPU reaches half its peak. The curve in Output 36.5.1 is this function with $b_{1/2} = 96$; reading it tells you the smallest batch that still earns most of the hardware's throughput, which is the batch you actually run.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: sentence-transformers Encodes a Sharded Batch in Three Lines</div>
+<p>The manual batching, half-precision cast, and per-worker sharding above collapse into a short loop with <code>sentence-transformers</code>. Each worker loads the same encoder, takes its shard index, and streams batches through <code>encode</code>, which handles tokenization, padding, the forward pass, and the move back to host memory:</p>
+<pre><code class="language-python"># Launched once per worker; rank and world_size come from the cluster launcher.
+from sentence_transformers import SentenceTransformer
+
+model = SentenceTransformer("BAAI/bge-base-en-v1.5", device="cuda")
+model.half()                                   # FP16: ~2x throughput, larger batch fits
+
+for batch_ids, batch_texts in shard_batches(rank, world_size, batch_size=512):
+    vecs = model.encode(batch_texts,           # one forward pass over the whole batch
+                        batch_size=512,
+                        normalize_embeddings=True,   # unit vectors for cosine retrieval
+                        convert_to_numpy=True)
+    vector_store.write(batch_ids, vecs)        # stream straight to the index shard
+</code></pre>
+<div class="code-caption"><strong>Code 36.5.2:</strong> A per-worker embedding loop. The roughly forty lines of explicit tokenization, padding, batching, and device management collapse to a single <code>encode</code> call; the library handles the tokenizer, dynamic padding, the FP16 forward pass, and the device-to-host copy, leaving the application to own only sharding and the write to the store.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Embedding Run That Was Stalled on Its Own Disk</div>
+<p><strong>Who:</strong> A retrieval engineer building the index for a 400-million-document enterprise search corpus.</p>
+<p><strong>Situation:</strong> A 128-GPU embedding job was projected at four hours but ran for over twelve, with the cluster's accelerator utilization sitting near 30%.</p>
+<p><strong>Problem:</strong> The GPUs were idle most of the time. The cost model assumed they ran at the saturated rate, but they were waiting for input.</p>
+<p><strong>Dilemma:</strong> Rent more GPUs to finish sooner, which would have multiplied the waste and the bill, or find why each GPU was starved before adding any hardware at all.</p>
+<p><strong>Decision:</strong> Fix the input pipeline first. Profiling showed chunks were being read one small file at a time from object storage, so each batch waited on dozens of tiny synchronous reads.</p>
+<p><strong>How:</strong> They repacked the chunked corpus into large sequential shard files, prefetched several batches ahead on background threads, and overlapped reading with the forward pass, applying the data-loading patterns of <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/index.html">Chapter 8</a>.</p>
+<p><strong>Result:</strong> Accelerator utilization rose above 90%, the job finished in just under four hours on the same 128 GPUs, and the bill fell by two thirds, with no change to the model or the fleet size.</p>
+<p><strong>Lesson:</strong> In an embarrassingly parallel inference job the GPU is rarely the bottleneck; the input pipeline is. Saturate the accelerator before you buy more of them, or you pay full price for idle silicon.</p>
+</div>
+
+<h2>4. Incremental and Streaming Embedding <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The bulk job embeds the corpus once, but a corpus is never finished. New documents arrive continuously, old ones are revised, and a few are deleted, so the index must be kept current without re-embedding the billions of chunks that did not change. The principle is to embed only the delta. A change-data-capture feed identifies which documents are new or modified since the last run; those are re-chunked and embedded by a small standing pool of workers, and the resulting vectors are upserted into the store while the vectors of deleted documents are tombstoned. This is the offline embedding pipeline reframed as a stream-processing job, and it inherits its design directly from the online-AI and stream-processing material of <a href="../../part-2-distributed-data/module-09-stream-processing-online-ai/index.html">Chapter 9</a>: the same windowing, exactly-once delivery, and watermark discipline that govern any streaming pipeline govern this one.</p>
+<p>The economics flip in the incremental regime. The bulk job is throughput-bound and runs at maximum batch size, because a billion chunks are waiting and latency does not matter. The streaming job is latency-bound: a freshly published document should become retrievable within seconds or minutes, so the workers run small batches and accept lower per-GPU efficiency in exchange for low end-to-end delay. A mature system runs both, a periodic bulk re-embed that rebuilds the index when the encoder itself is upgraded, and a continuous streaming embed that keeps it current between rebuilds. The decision of which mode to use is the same throughput-versus-latency tension that separates offline batch inference from online serving throughout Part V, and recognizing that an embedding pipeline sits on both sides of it is the key to running it economically.</p>
+
+<h2>5. Writing the Vectors to the Store <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A vector that is computed but not written is wasted GPU-hours, so the write path deserves the same care as the forward pass. Each worker emits, for every chunk, a tuple of an identifier, the dense vector, and a small bundle of metadata (the source document, the chunk offset, any filterable attributes the retriever will use). These tuples flow into the distributed vector store of <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a>, which is itself sharded across machines so that no single node holds the whole index. The natural and efficient arrangement aligns the two shardings: a worker writes to the index shard that co-locates with it, so the vectors land where they will be searched without a network shuffle, the same partition-alignment principle that makes a co-partitioned join cheap in <a href="../../part-2-distributed-data/module-07-spark-dataframes/index.html">Chapter 7</a>.</p>
+<p>The write must be idempotent, because at corpus scale some worker will crash and its shard will be retried, and a retried chunk must overwrite rather than duplicate its earlier vector. Keying every write on the chunk identifier makes a re-run safe: the second write of a chunk simply replaces the first, so the job can be restarted from a checkpoint of completed shards without producing a single duplicate vector. Vectors are typically written in large batched commits rather than one at a time, both to amortize the index-update cost and because the approximate-nearest-neighbor structures that <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a> builds are far cheaper to construct from a bulk load than from a stream of singletons. When the last shard commits, the index is complete and the corpus has become geometry, ready for the retriever that Section 36.6 builds on top of it.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Inference Scales Out, Offline and Online Alike</div>
+<p>This section is the offline face of a primitive that returns online in Section 36.7 and in <a href="../../part-5-distributed-inference/module-23-distributed-inference-systems/index.html">Chapter 23</a>: replicate the model, shard the inputs, and let independent workers run forward passes in parallel. The two faces differ only in their binding constraint. Offline embedding is throughput-bound and runs at maximum batch size with no latency budget, so it scales out at near-perfect efficiency; online serving is latency-bound and trades batch size for response time. The same encoder, the same forward pass, the same fleet of replicas, pointed at a static corpus instead of a live query stream. Whenever you meet a model applied to many independent inputs, ask which constraint binds, and you will know which way to scale it.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Cheaper Vectors at Web Scale (2024 to 2026)</div>
+<p>Because total cost is set by GPU-hours per chunk and bytes per vector, two research lines attack each factor. On the per-chunk side, late-interaction and multi-vector encoders such as the ColBERT lineage raise retrieval quality but multiply the vectors per chunk, so recent work (PLAID and its successors, 2024 onward) compresses those multi-vector representations aggressively to keep the index affordable. On the per-vector side, Matryoshka Representation Learning (Kusupati et al., 2022, and its 2024-2025 adoption in production embedding APIs) trains a single encoder whose vectors can be truncated to a shorter prefix at query time, letting one embedding job serve both a high-recall full-length index and a cheap short-vector tier without re-embedding. A parallel thread pushes binary and product-quantized embeddings so the store holds bytes, not floats, shrinking both the write path of Section 5 and the search cost of <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a>. The common thread is that the embedding stage is increasingly co-designed with the store it feeds, rather than treated as an isolated batch job.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 36.5.1: Read the Cost Model <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the identities of Section 2, explain why renting 4,096 GPUs and 8 GPUs for the same corpus produce nearly the same dollar cost but wildly different wall-clock times, and state the one real effect that makes the large fleet slightly more expensive in practice. Then argue why this constant-cost property holds for embedding but fails for data-parallel training, referring to the gradient all-reduce of <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>. Which stage of the embedding job, if any, breaks the perfect-efficiency assumption, and where in the pipeline does it sit?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 36.5.2: Tune the Batch and the Fleet <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 36.5.1 so that the per-GPU throughput is computed from the saturation curve $r(b) = r_{\max} \cdot b / (b + b_{1/2})$ rather than taken as a constant, with $r_{\max} = 900$ and $b_{1/2} = 96$. For a fixed corpus of six billion chunks and a budget of two wall-clock hours, find the smallest fleet size $G$ and batch size $b$ that meet the deadline, and report the resulting GPU-hours and cost. Then add a per-GPU memory limit that caps the batch at 2,048 and show how it changes your answer. Explain why pushing the batch past the knee of the curve buys almost nothing.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 36.5.3: Bulk Versus Streaming Crossover <span class="exercise-type analysis">Analysis</span></div>
+<p>A corpus of one billion documents grows by 0.5% per day. Estimate the steady-state streaming embedding load in chunks per second (using six chunks per document) and the number of GPUs needed to keep up at a small batch size of 32, reading the per-GPU rate from the saturation curve in Output 36.5.1. Compare that standing fleet to the bulk run from Output 36.5.1. At what daily growth rate would the continuous streaming cost exceed the cost of simply re-embedding the entire corpus once a week? Connect your reasoning to the latency-versus-throughput trade-off of <a href="../../part-2-distributed-data/module-09-stream-processing-online-ai/index.html">Chapter 9</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-36.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 36.4</span><span class="nav-title">Distributed Indexing</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 36</span><span class="nav-num">Contents</span><span class="nav-title">Web-Scale Text Processing and Distributed RAG</span></a>
+<a class="next" href="section-36.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 36.6</span><span class="nav-title">Sharded Retrieval and Ranking</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 2.2: Communication, Synchronization, and Coordination. Message passing versus shared state, synchronous versus asynchronous exchange, barriers and the Bulk Synchronous Parallel model, and why gradient synchronization is a BSP barrier." name="description"/>
+<title>Section 2.2: Communication, Synchronization, and Coordination | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Distributed AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 2: Distributed Systems Concepts for AI</a></div>
+<h1>Communication, Synchronization, and Coordination</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I finished my gradient in twenty milliseconds and then stood at the barrier for seventeen more, watching the slow worker, learning patience I never asked for."</p>
+<cite>A GPU Idling on a Communication Barrier</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Workers that compute in isolation are useless; the value of a distributed AI system lives entirely in how its workers exchange information and agree on when to do so.</strong> The previous section gave us the cast of processes, nodes, workers, and coordinators. This section is about the verbs that connect them: how one worker hands a value to another (communication), and how the group decides who waits for whom (synchronization). Almost every distributed training method you will meet is a particular answer to two questions: do workers share memory or pass messages, and do they march in lockstep or run free? The dominant answer for deep learning, lockstep message passing organized into repeating rounds, has a precise name borrowed from parallel computing, the Bulk Synchronous Parallel model, and once you see a training step as one of its supersteps, the rest of the book's synchronization machinery falls into place.</p>
+</div>
+<p>In the previous section we separated the roles a machine can play: a worker that holds a shard of the computation, a coordinator that hands out work, a process that may live on the same node as another or across the network. That gave us nouns. By themselves they do nothing useful, because a distributed computation is defined not by its parts but by the information flowing between them. A data-parallel training cluster is exactly its gradient exchange; remove the exchange and you have eight machines computing eight different, useless models. This section supplies the verbs, and it does so along two independent axes that, taken together, classify nearly every coordination strategy in this book.</p>
+<p>The first axis is how information moves: through memory two workers can both read, or through explicit messages one worker sends to another. The second axis is when information moves relative to computation: synchronously, where the group waits at agreed-upon points, or asynchronously, where workers proceed without waiting. We take the two axes in turn, then assemble them into the model that organizes synchronous distributed training, and finally contrast it with the relaxed alternatives that later chapters exploit when the barrier becomes too expensive.</p>
+
+<h2>1. Message Passing Versus Shared State <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>There are two fundamental ways for two workers to share a value. In the <em>shared-state</em> model, both workers can read and write the same piece of memory; communication is implicit in the act of reading what another wrote. In the <em>message-passing</em> model, each worker has only its own private memory, and the only way to move a value is to send it explicitly across a channel that the receiver explicitly reads. The distinction sounds academic until you notice that it is forced by physics: two threads on one machine can share an address space, but two GPUs in two servers in two racks cannot, so any computation spanning machines is message passing whether the programmer sees it or not.</p>
+<p>This is why distributed AI is overwhelmingly a message-passing world. When a data-parallel training job runs across eight GPUs, no shared variable holds "the gradient"; each worker holds its own copy and the framework moves bytes between them over an interconnect. The shared-state illusion that a single optimizer is updating a single model is reconstructed, on top of message passing, by a collective operation that makes every worker's copy identical after each step. The parameter-server architecture of <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a> goes a step further and provides an explicit shared store that workers push to and pull from, a deliberate piece of shared-state semantics built out of messages. Knowing which model you are in tells you immediately where your costs and your bugs will come from: shared state breeds race conditions and lock contention, message passing breeds latency and the question of who waits for whom.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Across Machines, There Is No Shared Memory, Only the Illusion of It</div>
+<p>Every value that crosses a machine boundary is a message, full stop. Shared-state abstractions like a parameter server or a replicated optimizer state are conveniences built on top of message passing, and they cost real network bytes and real waiting. When you reason about a distributed AI system, start from "what messages move, and when", because that is the layer where performance and correctness actually live. The synchronization question, who waits for whom before the next message, is the subject of the rest of this section.</p>
+</div>
+
+<h2>2. Synchronous Versus Asynchronous Communication <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Given that workers pass messages, the next question is whether the sender and the group wait. A <em>synchronous</em> exchange couples the participants in time: the workers reach an agreed point, exchange, and only then continue, so every worker observes the same combined result before taking its next step. An <em>asynchronous</em> exchange decouples them: a worker sends its contribution and proceeds immediately, reading whatever combined value happens to be available, which may be slightly out of date. Synchronous exchange buys determinism and a clean mental model at the price of waiting for the slowest participant; asynchronous exchange buys speed and straggler tolerance at the price of working with stale information.</p>
+<p>It helps to separate two senses of the word "blocking" that often get conflated. A <em>blocking</em> call does not return to the caller until the operation completes locally; a <em>non-blocking</em> call returns immediately with a handle the caller can wait on later. This is a local property of one call. Synchronous versus asynchronous, by contrast, is a global property of the group's coordination. A collective such as all-reduce can be issued as a non-blocking call so that a worker launches the exchange and overlaps it with other computation, yet the algorithm as a whole can still be globally synchronous because every worker must complete the all-reduce before the next training step begins. The most important performance idea in distributed training, hiding communication behind computation, lives exactly in this gap: keep the group synchronous for correctness, but use non-blocking collectives so no worker sits idle while the bytes are in flight. We return to this overlap as a research frontier at the end of the section, and the collectives chapter, <a href="../module-04-communication-primitives/index.html">Chapter 4</a>, makes the blocking and non-blocking variants concrete.</p>
+
+<h2>3. Barriers and the Bulk Synchronous Parallel Model <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A <em>barrier</em> is the primitive that makes a group synchronous. It is a point in the program that no worker may pass until every worker has reached it, so the fast workers wait for the slow ones and the group leaves the barrier together. A barrier carries no data by itself; it only synchronizes time. Yet it is the single most consequential line in many distributed programs, because the group's pace is set by its slowest member at every barrier, and a cluster of a thousand workers crossing a barrier every step inherits the speed of whichever worker happened to be slowest that step.</p>
+<p>The Bulk Synchronous Parallel model, introduced by Valiant in 1990, organizes an entire computation out of barriers. A BSP computation is a sequence of <em>supersteps</em>, and each superstep has exactly three phases in this order: a <em>compute</em> phase where every worker computes locally on the data it already holds, touching no other worker; a <em>communicate</em> phase where workers exchange the messages produced by that computation; and a <em>barrier</em> phase where all workers synchronize, so that messages sent in one superstep are guaranteed delivered before the next superstep's compute phase begins. The genius of the model is its simplicity: because communication and synchronization happen only at superstep boundaries, the programmer never reasons about messages arriving mid-computation, and the cost of the whole program is just the sum of the per-superstep costs. Figure 2.2.1 shows three workers moving through two supersteps, made uneven on purpose so the barrier idle is visible.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three worker timelines stacked vertically, each progressing left to right through two supersteps. Within each superstep, a compute block of varying length is followed by a communicate block, and a vertical barrier line aligns all three workers; faster workers show idle gaps before the barrier.">
+<defs>
+<marker id="arr22" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.cmp22 { fill:#dce8f6; stroke:#14385c; stroke-width:1.4; }
+.com22 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.4; }
+.idle22 { fill:#f0f1f3; stroke:#b6bcc4; stroke-width:1; stroke-dasharray:3 3; }
+.bar22 { stroke:#9b2226; stroke-width:2; }
+.t22 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.lbl22 { font:600 12px sans-serif; fill:#14385c; text-anchor:end; }
+.s22 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.sb22 { font:600 11px sans-serif; fill:#9b2226; text-anchor:middle; }
+</style>
+<text class="t22" x="430" y="22">One superstep = compute &#8594; communicate &#8594; barrier, repeated</text>
+<!-- column header labels -->
+<text class="s22" x="195" y="48">superstep 1</text>
+<text class="s22" x="615" y="48">superstep 2</text>
+<!-- worker rows -->
+<!-- Worker A (fast) -->
+<text class="lbl22" x="78" y="92">Worker A</text>
+<rect class="cmp22" x="90" y="74" width="150" height="34" rx="4"/>
+<text class="s22" x="165" y="96">compute</text>
+<rect class="idle22" x="240" y="74" width="60" height="34" rx="4"/>
+<text class="s22" x="270" y="95">idle</text>
+<rect class="com22" x="300" y="74" width="70" height="34" rx="4"/>
+<text class="s22" x="335" y="96">comm</text>
+<rect class="cmp22" x="390" y="74" width="170" height="34" rx="4"/>
+<text class="s22" x="475" y="96">compute</text>
+<rect class="idle22" x="560" y="74" width="60" height="34" rx="4"/>
+<rect class="com22" x="620" y="74" width="70" height="34" rx="4"/>
+<text class="s22" x="655" y="96">comm</text>
+<!-- Worker B (medium) -->
+<text class="lbl22" x="78" y="152">Worker B</text>
+<rect class="cmp22" x="90" y="134" width="210" height="34" rx="4"/>
+<text class="s22" x="195" y="156">compute</text>
+<rect class="com22" x="300" y="134" width="70" height="34" rx="4"/>
+<text class="s22" x="335" y="156">comm</text>
+<rect class="cmp22" x="390" y="134" width="230" height="34" rx="4"/>
+<text class="s22" x="505" y="156">compute</text>
+<rect class="com22" x="620" y="134" width="70" height="34" rx="4"/>
+<text class="s22" x="655" y="156">comm</text>
+<!-- Worker C (straggler) -->
+<text class="lbl22" x="78" y="212">Worker C</text>
+<rect class="cmp22" x="90" y="194" width="210" height="34" rx="4"/>
+<text class="s22" x="195" y="216">compute (slow)</text>
+<rect class="com22" x="300" y="194" width="70" height="34" rx="4"/>
+<text class="s22" x="335" y="216">comm</text>
+<rect class="cmp22" x="390" y="194" width="230" height="34" rx="4"/>
+<text class="s22" x="505" y="216">compute (slow)</text>
+<rect class="com22" x="620" y="194" width="70" height="34" rx="4"/>
+<text class="s22" x="655" y="216">comm</text>
+<!-- barriers -->
+<line class="bar22" x1="375" y1="62" x2="375" y2="244"/>
+<text class="sb22" x="375" y="262">barrier 1</text>
+<line class="bar22" x1="695" y1="62" x2="695" y2="244"/>
+<text class="sb22" x="695" y="262">barrier 2</text>
+<!-- legend -->
+<rect class="cmp22" x="200" y="300" width="22" height="16"/><text class="s22" x="262" y="313">compute</text>
+<rect class="com22" x="330" y="300" width="22" height="16"/><text class="s22" x="395" y="313">communicate</text>
+<rect class="idle22" x="470" y="300" width="22" height="16"/><text class="s22" x="540" y="313">idle (barrier wait)</text>
+<line class="bar22" x1="620" y1="300" x2="620" y2="316"/><text class="s22" x="660" y="313">barrier</text>
+</svg>
+<figcaption><strong>Figure 2.2.1:</strong> The Bulk Synchronous Parallel structure of one training cluster across two supersteps. Each worker computes locally (blue), then communicates (orange), and all three align at the red barrier before the next superstep begins. Because the barrier waits for the slowest worker, the fast worker A idles (gray) until straggler C arrives. The whole computation's wall-clock is the sum of each superstep's slowest path plus its communication, which is exactly the quantity the demo in Code 2.2.1 measures.</figcaption>
+</figure>
+<p>The reason BSP matters for this book is that one step of synchronous data-parallel training is precisely one BSP superstep. The compute phase is the forward and backward pass, where each worker computes a gradient on its own shard touching no other worker. The communicate phase is the gradient all-reduce, where workers exchange and sum their partial gradients. The barrier phase is the implicit synchronization that all-reduce contains: no worker can apply the optimizer update and start the next step until the all-reduce has completed on every worker, because the averaged gradient depends on all of them. The gradient synchronization that <a href="../module-01-scale-out-ai/section-1.1.html">Section 1.1</a> introduced as an exact reorganization of the math is, viewed through this lens, a BSP barrier wearing the costume of a collective operation.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Barrier Is Where Scale-Out Pays Its Tax</div>
+<p>Section 1.1 showed that data parallelism is mathematically exact: eight workers compute the identical gradient that one machine would. This section names the price of that exactness. The all-reduce that makes the gradient identical is a BSP barrier, and a barrier runs at the speed of its slowest worker. So the scale-out tax is not approximation error, it is waiting: every fast worker idling until the straggler arrives, every step. The rest of the book's synchronization machinery, from bounded-staleness parameter servers (<a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a>) to elastic training (<a href="../../part-4-parallel-deep-learning/module-18-elastic-fault-tolerant-training/index.html">Chapter 18</a>), is an attempt to lower this barrier tax without breaking the math.</p>
+</div>
+<p>The demo below makes the barrier tax measurable. It models a four-worker BSP computation over three supersteps, where one worker is a persistent straggler. Each superstep it records every worker's compute time, the idle each fast worker spends waiting at the barrier, and the superstep's total cost, which is set by the slowest worker plus the fixed communication. It then reports the wall-clock and how much of it was pure barrier idle.</p>
+<pre><code class="language-python">import random
+
+random.seed(7)
+WORKERS, STEPS = 4, 3
+# Per-worker compute time (ms) per superstep: workers are uneven, so one straggles.
+base = [20.0, 22.0, 21.0, 38.0]            # worker 3 is a persistent straggler
+comm = 6.0                                  # all-reduce (communicate) cost, ms
+
+print(f"{'step':&gt;4} | " + " | ".join(f"w{w} compute" for w in range(WORKERS))
+      + " | barrier wait (slowest-self) | superstep ms")
+
+bsp_total = 0.0
+for step in range(STEPS):
+    # SUPERSTEP PHASE 1: local compute (jitter around each worker's base cost).
+    compute = [c + random.uniform(-2, 2) for c in base]
+    slowest = max(compute)
+    # PHASE 3: the BARRIER. No worker leaves until the slowest arrives, so each
+    # fast worker idles for (slowest - its own compute) before the all-reduce.
+    waits = [slowest - c for c in compute]
+    # PHASE 2 (after barrier): communicate. One superstep = compute + barrier + comm.
+    superstep = slowest + comm
+    bsp_total += superstep
+    print(f"{step:&gt;4} | " + " | ".join(f"{c:8.2f}ms" for c in compute)
+          + f" | {' '.join(f'{w:4.1f}' for w in waits)} | {superstep:8.2f}")
+
+# Counterfactual: if every worker ran the straggler's load with NO barrier idle.
+ideal = sum(base) / WORKERS * STEPS
+print()
+print(f"BSP wall-clock (paced by slowest each step) : {bsp_total:7.2f} ms")
+print(f"idle injected by barriers (vs perfect balance): {bsp_total - ideal - comm*STEPS:7.2f} ms")
+print(f"straggler share of total compute time         : "
+      f"{base[3] / sum(base) * 100:5.1f}% of the work, but it sets the pace")
+</code></pre>
+<div class="code-caption"><strong>Code 2.2.1:</strong> A timing model of a four-worker BSP computation. Each superstep's cost is the slowest worker's compute plus a fixed communication; the per-worker <code>waits</code> column is the barrier idle that turns a fast worker into a waiting one.</div>
+<pre><code class="language-text">step | w0 compute | w1 compute | w2 compute | w3 compute | barrier wait (slowest-self) | superstep ms
+   0 |    19.30ms |    20.60ms |    21.60ms |    36.29ms | 17.0 15.7 14.7  0.0 |    42.29
+   1 |    20.14ms |    21.46ms |    19.23ms |    38.03ms | 17.9 16.6 18.8  0.0 |    44.03
+   2 |    18.15ms |    21.73ms |    19.28ms |    36.36ms | 18.2 14.6 17.1  0.0 |    42.36
+
+BSP wall-clock (paced by slowest each step) :  128.68 ms
+idle injected by barriers (vs perfect balance):   34.93 ms
+straggler share of total compute time         :  37.6% of the work, but it sets the pace</code></pre>
+<div class="code-caption"><strong>Output 2.2.1:</strong> The straggler (w3) reaches the barrier last every step, so the three faster workers idle 15 to 19 ms each. Of the 128.68 ms wall-clock, roughly 35 ms is pure barrier idle, the scale-out tax that the asynchronous models in Section 4 try to recover.</div>
+<p>The numbers tell the whole story of synchronous training. The straggler never does most of the work, only about 38 percent of the total compute, yet it sets the pace of every superstep, and the three faster workers collectively burn about 35 ms standing at barriers across just three steps. Multiply that by a hundred thousand steps and a thousand workers and the idle becomes the dominant cost. This is not a flaw in the model; it is the honest price of guaranteeing that every worker sees the same gradient before it steps. The question the next section asks is whether you can stop paying it.</p>
+
+<h2>4. Relaxing the Barrier: Asynchronous and Stale-Synchronous Models <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>If the barrier is the tax, the obvious move is to remove it. <em>Asynchronous</em> training does exactly that: each worker computes a gradient and applies it to a shared model immediately, without waiting for anyone, then fetches the latest model and continues. No worker ever idles at a barrier, so a straggler slows only itself, and a thousand workers run at close to a thousand workers' worth of throughput. The price is that the gradient a worker computes is stale: by the time it is applied, other workers have already moved the model, so the update is based on parameters that no longer exist. Asynchronous stochastic gradient descent, which we develop fully in <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a>, trades the determinism and clean convergence of BSP for raw throughput, and whether that trade pays off depends on how much staleness the optimization can absorb.</p>
+<p>Between the two extremes sits the <em>stale-synchronous parallel</em> model, which keeps a barrier but loosens it. Instead of forcing every worker to synchronize every step, it allows a worker to run ahead by up to $s$ steps before it must wait for the slowest worker to catch up. Formally, a worker at step $t$ may proceed as long as the slowest worker has completed step $t - s$, so the staleness any worker sees is bounded by $s$. Setting $s = 0$ recovers strict BSP, where every worker is exactly in step; letting $s \to \infty$ recovers fully asynchronous training, where no worker ever waits. The bounded-staleness parameter server of <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a> is built on exactly this idea, and the consistency models of Section 2.5 give it a formal vocabulary. The point for now is that synchronization is a dial, not a switch: BSP is one setting of it, the strictest, and most of the interesting engineering lives in how far you can relax the dial before the math stops converging.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Straggler Who Set the Schedule</div>
+<p>There is a recurring comedy in synchronous clusters: the most powerful, most expensive GPUs in the building spend much of their life waiting on one slow node, perhaps a machine whose cooling fan is failing and whose clocks have quietly throttled. A thousand accelerators, each costing more than a car, idling in unison because node 487 runs four percent slow. This is why straggler detection (Section 2.7) is not a luxury feature: in a strict-BSP world, your slowest worker is your whole cluster's clock speed, and finding it is finding free performance.</p>
+</div>
+
+<h2>5. Coordination Beyond the Training Loop <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>So far "coordination" has meant the data-plane question of when workers exchange gradients. There is a second, separate sense: the control-plane coordination of agreeing on facts that must be consistent across the cluster, such as which worker is the leader, which configuration is current, or whether a checkpoint committed. These two kinds of coordination use deliberately different machinery. The training data plane uses collectives and barriers because it values throughput and the participants are known and fixed. The control plane uses consensus protocols such as Raft because it values agreement and durability over raw speed, and it must tolerate participants joining and leaving. Section 2.6 develops this split in full; the thing to carry forward now is that "synchronization" in a distributed AI system is not one mechanism but two, chosen by what is being coordinated.</p>
+<p>The reason the training loop does not use a consensus protocol for its gradient exchange is instructive. Consensus protocols are built to agree on a value in the presence of failures and disagreement, and they pay for that robustness with multiple rounds of messages per decision. A training step cannot afford that; it needs to sum a billion-element vector across a thousand workers in milliseconds, and it can assume the participants agree on the goal because they are running the same program. The collective is the right tool precisely because it drops the generality that consensus provides and keeps only the fast path. Matching the coordination mechanism to the job, a barrier for the lockstep data plane, a consensus round for the durable control plane, is the same "right tool" discipline that runs through the whole book.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Barrier and a Collective in Two Lines</div>
+<p>You almost never implement a barrier or a superstep boundary by hand. PyTorch's distributed package exposes the BSP superstep structure directly: a blocking collective such as <code>all_reduce</code> already contains the barrier, because it cannot return until every worker has contributed, and <code>dist.barrier()</code> gives you a bare synchronization point when you need one without data. The roughly twenty lines of timing logic in Code 2.2.1 that modeled "wait for the slowest worker" are, in a real job, this:</p>
+<pre><code class="language-python"># Run with: torchrun --nproc_per_node=4 thisfile.py
+import torch, torch.distributed as dist
+
+dist.init_process_group("nccl")          # the group of workers in this superstep
+
+grad = compute_local_gradient()          # PHASE 1: compute, each worker on its shard
+dist.all_reduce(grad, op=dist.ReduceOp.SUM)   # PHASE 2+3: communicate AND barrier in one
+grad /= dist.get_world_size()                 # every worker now holds the identical mean
+
+dist.barrier()                           # a bare barrier: synchronize, exchange no data
+</code></pre>
+<div class="code-caption"><strong>Code 2.2.2:</strong> The BSP superstep as production code. The blocking <code>all_reduce</code> fuses the communicate and barrier phases of Figure 2.2.1 into one call, so the barrier idle measured in Output 2.2.1 happens inside the library; <code>dist.barrier()</code> is the bare synchronization primitive when no data needs to move.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Cluster That Was Fast on Paper and Slow in Production</div>
+<p><strong>Who:</strong> An ML platform engineer running data-parallel training for a computer-vision team on a shared 64-GPU cluster.</p>
+<p><strong>Situation:</strong> A training job benchmarked at near-linear scaling on a clean cluster suddenly ran 30 percent slower in production, with no change to the model or the data.</p>
+<p><strong>Problem:</strong> GPU utilization graphs showed every accelerator dropping to near-zero for a few milliseconds at the end of each step, in perfect unison, a sawtooth of full-then-idle.</p>
+<p><strong>Dilemma:</strong> Switch the whole job to asynchronous training to eliminate the waiting, which would have decoupled the workers but risked convergence changes the research team had not approved, or keep the synchronous BSP step and find the worker that was setting the pace.</p>
+<p><strong>Decision:</strong> They kept BSP and treated the unison idle as a barrier symptom, because the synchronized sawtooth is the unmistakable signature of fast workers waiting on a straggler, exactly the pattern in Output 2.2.1.</p>
+<p><strong>How:</strong> Per-worker step-time logging found one node consistently 25 percent slower; its GPU had silently throttled from a failing fan, and because the step is a BSP barrier, that one node was the cluster's clock.</p>
+<p><strong>Result:</strong> Draining the bad node restored near-linear scaling and recovered the lost 30 percent, with no change to the optimization at all. The fix was operational, not algorithmic.</p>
+<p><strong>Lesson:</strong> In a strict-BSP training loop, a synchronized idle sawtooth across all workers means one thing: a barrier waiting on the slowest member. Before you relax synchronization, find out whether you simply have a sick worker setting the pace.</p>
+</div>
+
+<h2>6. Overlapping Communication With Computation <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>There is a third way to lower the barrier tax that changes neither the math nor the staleness: hide the communication behind the computation so the waiting overlaps with useful work. Recall from Section 2 that a non-blocking collective returns immediately and runs in the background. In the backward pass of a deep network, gradients become available layer by layer, from the output layer first. So a worker can launch the all-reduce for the last layer's gradient the instant it is computed, while it continues computing gradients for the earlier layers. By the time the backward pass finishes, much of the communication has already happened in the shadow of the compute, and the worker waits at the barrier for far less time. The group stays globally synchronous, so the math of Section 1.1 is untouched, but the idle of Output 2.2.1 shrinks toward zero. This bucketing and overlap is what <code>DistributedDataParallel</code> does automatically, and it is the reason real data-parallel training scales far better than the naive "compute, then communicate, then barrier" model would predict.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Making the Barrier Disappear (2024 to 2026)</div>
+<p>Two research lines are actively attacking the barrier tax this section quantified. The first pushes communication-computation overlap to its limit: systems such as Google's overlap-centric compiler passes and the open <em>Centauri</em> and <em>FLUX</em> work (2024) fuse and schedule collectives so finely that the all-reduce nearly vanishes behind the matrix multiplies of the backward pass, driving barrier idle toward zero while keeping strict synchronous semantics. The second line relaxes the barrier itself across slow links: <em>DiLoCo</em> and its descendants (Douillard et al., 2024) let workers take many local steps between rare synchronizations, turning a per-step barrier into a per-hundred-step one, which makes training viable over the open internet and across data centers where a per-step barrier would be ruinous. Both lines accept the framing of this section, that the barrier is a cost to be engineered down, and differ only in whether they hide it (overlap) or thin it out (local steps). We give the optimization-side analysis in <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a> and the collective-scheduling side in <a href="../module-04-communication-primitives/index.html">Chapter 4</a>.</p>
+</div>
+<p>We now have both axes that classify distributed coordination: message passing versus shared state, and synchronous versus asynchronous, with the barrier and its BSP superstep as the synchronous workhorse and the stale-synchronous dial as the relaxation. We have also seen that one synchronous training step <em>is</em> a BSP superstep, which is why everything from straggler hunting to overlap scheduling is, at bottom, an argument about a barrier. The next section turns from when workers coordinate to how their data and model are split in the first place, the partitioning and sharding decisions that determine what each worker even has to communicate. That begins in <a href="section-2.3.html">Section 2.3</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.2.1: Classify the Coordination <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each system, place it on both axes of this section (message passing versus shared state, and synchronous versus asynchronous) and justify the placement in one sentence each: (a) eight GPUs in one server running data-parallel training with a per-step gradient all-reduce; (b) a parameter server where workers push gradients and pull parameters whenever they finish, never waiting for each other; (c) a stale-synchronous job that allows workers to run up to three steps ahead. Then state, for each, what single failure or slowdown would hurt it most, and connect that to the axis placement.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.2.2: Measure the Staleness Dial <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 2.2.1 into a stale-synchronous model. Add a staleness bound $s$ and let any worker run ahead until the slowest worker is within $s$ supersteps; a worker that would exceed $s$ must idle at a barrier, otherwise it proceeds. Sweep $s$ from $0$ (strict BSP) to a large value (effectively asynchronous) and plot total wall-clock and total barrier idle against $s$ for the same straggler profile. Explain the shape of both curves, and state what the plot does <em>not</em> capture that would make a large $s$ a bad choice in a real training job.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.2.3: The Overlap Budget <span class="exercise-type analysis">Analysis</span></div>
+<p>A data-parallel step takes 200 ms of backward-pass compute and needs a 60 ms gradient all-reduce. Under the naive "compute then communicate" model, estimate the per-step time and the fraction spent communicating. Now assume the gradient becomes available evenly across the backward pass and the all-reduce can be launched layer by layer as a non-blocking collective, overlapping with the remaining compute. Estimate the best-case overlapped step time and the residual communication that cannot be hidden. Argue from these numbers why overlap helps most when computation per step is large relative to communication, and connect this to the communication-cost model we build in <a href="../module-03-scalability-performance-models/index.html">Chapter 3</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-2.1.html"><span class="nav-label">Previous</span><span class="nav-num">Section 2.1</span><span class="nav-title">Processes, Nodes, Workers, and Coordinators</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 2</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Systems Concepts for AI</span></a>
+<a class="next" href="section-2.3.html"><span class="nav-label">Next</span><span class="nav-num">Section 2.3</span><span class="nav-title">Partitioning, Sharding, and Replication</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

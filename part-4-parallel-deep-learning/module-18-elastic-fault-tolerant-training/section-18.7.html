@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 18.7: Memory Offload Across the Hierarchy. Trading bandwidth for capacity by moving optimizer state, gradients, and parameters from GPU HBM down to host DRAM and NVMe, so a small GPU can train a model far larger than its memory." name="description"/>
+<title>Section 18.7: Memory Offload Across the Hierarchy | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 18: Elastic and Fault-Tolerant Distributed Training</a></div>
+<h1>Memory Offload Across the Hierarchy</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They moved me to host memory to make room. I am still part of the model; I just take the scenic route to every step now."</p>
+<cite>A Shard That Believes It Is the Whole Model</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>When even sharded training cannot make a model fit, you stop trying to keep all of its state in fast GPU memory and instead move the cold parts down the memory hierarchy: optimizer state and gradients to host DRAM, and if necessary parameters to NVMe SSD.</strong> Each step down trades bandwidth for capacity. The lower tiers are vastly larger but vastly slower, so a byte parked on NVMe costs hundreds of times more to read than a byte in HBM. The payoff is dramatic: a single modest GPU can train a model an order of magnitude or two larger than its own memory could ever hold, paying for that capacity in wall-clock time rather than in hardware you do not have. This section is about that trade, when it is the right one, and when it is too slow to bear.</p>
+</div>
+<p>Sharding the model across devices, the subject of <a href="../module-16-model-pipeline-sharded-parallelism/section-16.4.html">Chapter 16</a>, divides parameters, gradients, and optimizer state evenly across the GPUs you have, so that no single device holds the whole model. That works until you run out of GPUs. A practitioner with one accelerator, or a small budget-limited pool, cannot shard their way to a model that needs a hundred gigabytes of state when the cluster only offers sixteen. The state has to live somewhere, and if it cannot all live in GPU memory, the only direction left is down: into the host CPU's much larger DRAM, and below that into the still larger NVMe SSD attached to the machine. Training proceeds by hauling each piece of state back up to the GPU exactly when the step needs it, then sending it back down to make room. This is memory offload, and the technique that made it practical at scale is the ZeRO-Offload and ZeRO-Infinity line of work built into DeepSpeed.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of three memory tiers stacked from top to bottom: GPU HBM (small, very fast), host DRAM (large, medium speed over PCIe), and NVMe SSD (very large, slow). Optimizer state flows down to the lower tiers and is hauled back up to the GPU each training step.">
+<defs>
+<marker id="arr187" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr187b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.box187 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.hbm187 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.8; }
+.t187 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s187 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.bw187 { font:600 12px sans-serif; fill:#b86b1f; text-anchor:middle; }
+.up187 { fill:none; stroke:#b86b1f; stroke-width:1.8; marker-end:url(#arr187b); }
+.dn187 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr187); }
+</style>
+<text class="t187" x="430" y="26">One machine, three tiers of memory</text>
+<text class="s187" x="430" y="44">smaller and faster at the top, larger and slower below</text>
+
+<rect class="hbm187" x="300" y="62" width="260" height="66" rx="10"/>
+<text class="t187" x="430" y="90">GPU HBM</text>
+<text class="s187" x="430" y="110">16 GB &#183; 1500 GB/s &#183; params + grads live here</text>
+
+<rect class="box187" x="220" y="178" width="420" height="62" rx="10"/>
+<text class="t187" x="430" y="204">Host DRAM</text>
+<text class="s187" x="430" y="224">256 GB &#183; 25 GB/s (PCIe) &#183; optimizer state offloaded here</text>
+
+<rect class="box187" x="150" y="290" width="560" height="62" rx="10"/>
+<text class="t187" x="430" y="316">NVMe SSD</text>
+<text class="s187" x="430" y="336">4 TB &#183; 5 GB/s &#183; spilled state when even DRAM is full</text>
+
+<line x1="360" y1="178" x2="360" y2="130" class="up187"/>
+<text class="bw187" x="318" y="158">haul up</text>
+<line x1="500" y1="130" x2="500" y2="176" class="dn187"/>
+<text class="s187" x="540" y="158">save down</text>
+
+<line x1="300" y1="290" x2="300" y2="242" class="up187"/>
+<line x1="560" y1="242" x2="560" y2="288" class="dn187"/>
+<text class="s187" x="430" y="270">stage NVMe &#8596; DRAM &#8596; GPU, bottlenecked by the slowest link</text>
+</svg>
+<figcaption><strong>Figure 18.7.1:</strong> The memory hierarchy on a single training node. GPU HBM is small and fast; host DRAM is roughly an order of magnitude larger but reached only over the much slower PCIe link; NVMe is larger still and slower again. Offload pushes the optimizer state (and, in the extreme, parameters) into the lower tiers and pulls each piece back up to the GPU just in time for the step that needs it. The bandwidths shown are the same ones the model in Code 18.7.1 uses.</figcaption>
+</figure>
+
+<h2>1. Why the Hierarchy Exists, and Why It Is So Uneven <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Every machine that trains models has a memory hierarchy, and the defining fact about it is that the tiers differ by orders of magnitude in both directions. GPU HBM is measured in tens of gigabytes and delivers something like a terabyte or more per second; host DRAM is measured in hundreds of gigabytes but is reached only across the PCIe link at a few tens of gigabytes per second; an NVMe SSD is measured in terabytes but sustains only single-digit gigabytes per second. Capacity grows as you descend, and bandwidth collapses. This is the locality principle from <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.8.html">Chapter 2</a> applied inside a single node: data you touch constantly belongs in the fast, scarce tier, and data you touch rarely can be exiled to a slow, abundant one without much harm.</p>
+<p>Mixed-precision Adam training makes the tiering natural because not all of a model's state is touched with the same frequency. Per parameter, a typical setup keeps a half-precision parameter and gradient (two bytes each) that the forward and backward passes touch constantly, plus a full-precision master copy and the two Adam moments (twelve bytes total) that are read and written only once per optimizer step. That twelve-byte optimizer trio is three quarters of the memory and the least frequently touched, which makes it the obvious thing to push downhill. ZeRO-Offload's central insight is exactly this: keep the hot two-byte params and grads on the GPU, move the cold optimizer state to the CPU, and run the optimizer update on the CPU so the heavy state never has to climb back up.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Offload Trades Bandwidth for Capacity, One Tier at a Time</div>
+<p>You do not offload because the lower tiers are good; you offload because they are large. Every byte you move from HBM to DRAM or NVMe buys you room to fit a bigger model and costs you the bandwidth gap each time that byte is needed. The discipline is to offload the coldest state first (optimizer moments before gradients, gradients before parameters), so that the bytes you exile to the slow tiers are the ones the step touches least. Done well, the capacity grows by an order of magnitude while the slowdown stays bounded; done blindly, the GPU starves waiting on a disk.</p>
+</div>
+
+<h2>2. The Bandwidth-Capacity Trade, Made Quantitative <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>To decide whether offload is worth it, you need the cost in numbers, and the roofline reasoning of <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.7.html">Chapter 3</a> gives the shape of the answer. A training step does a fixed amount of GPU compute and, under offload, a fixed amount of data movement across a slow link. Let a model have $P$ parameters, let $b_{\text{off}}$ be the bytes of state offloaded per parameter, and let $B_{\text{link}}$ be the bandwidth of the slow link the offloaded state crosses. Each step must move that state down and back up, so the transfer time is</p>
+$$t_{\text{transfer}} = \frac{2 \, P \, b_{\text{off}}}{B_{\text{link}}}.$$
+<p>The GPU compute for a step depends on the model size and the number of tokens $T$ processed, at roughly six floating-point operations per parameter per token (the standard forward-plus-backward count), so with sustained throughput $F$ in FLOP/s,</p>
+$$t_{\text{compute}} = \frac{6 \, P \, T}{F}.$$
+<p>The two can overlap: while the GPU computes one slice of the step, the system prefetches the next slice's state and writes back the previous slice's. If a fraction $\rho$ of the transfer hides behind compute, the step takes $t_{\text{compute}} + (1 - \rho)\,t_{\text{transfer}}$. Two readings fall out immediately. First, the slowdown shrinks as $T$ grows, because more compute means more cover for the transfer; this is why offload pairs well with large micro-batches. Second, the slowdown grows sharply as $B_{\text{link}}$ falls, which is why moving from DRAM (PCIe, tens of GB/s) to NVMe (single-digit GB/s) hurts far more than moving from HBM to DRAM. The capacity, meanwhile, is simply how much state the combined tiers can hold: the largest model that fits is $(C_{\text{HBM}} + C_{\text{DRAM}} + C_{\text{NVMe}}) / b_{\text{total}}$, growing with every tier you enlist. The code below puts both sides of the trade on one screen.</p>
+<pre><code class="language-python">import sys
+
+# Mixed-precision Adam memory accounting, bytes per parameter.
+BYTES_PARAM_GRAD = 4   # fp16 param + fp16 grad: touched every step, stays on GPU
+BYTES_OPT        = 12  # fp32 master + momentum + variance: cold, offloadable
+BYTES_TOTAL      = BYTES_PARAM_GRAD + BYTES_OPT   # 16 B/param
+
+# One modest node and its three tiers (capacity GB, bandwidth GB/s).
+GPU_HBM_GB, BW_HBM   = 16.0,  1500.0   # on-package HBM
+HOST_DRAM_GB, BW_PCIE = 256.0,   25.0   # host DRAM over PCIe 4.0 x16
+NVME_GB, BW_NVME      = 4000.0,    5.0   # NVMe SSD sustained
+
+TOKENS_PER_STEP = 2 ** 13          # 8192 tokens of per-GPU work to hide behind
+FLOPS_PER_PARAM_PER_TOKEN = 6.0    # fwd + bwd, the standard 6N rule
+GPU_TFLOPS = 120.0                 # sustained fp16 throughput, TFLOP/s
+OVERLAP = 0.85                     # fraction of transfer prefetching can hide
+
+def largest_fit(cap_gb):           # max billions of params whose 16 B/param fits
+    return cap_gb * 1e9 / BYTES_TOTAL / 1e9
+
+def step_time(n_params_b, link_bw):
+    n = n_params_b * 1e9
+    compute  = n * TOKENS_PER_STEP * FLOPS_PER_PARAM_PER_TOKEN / (GPU_TFLOPS * 1e12)
+    transfer = 0.0 if link_bw is None else 2 * n * BYTES_OPT / (link_bw * 1e9)
+    return compute, transfer, compute + transfer * (1 - OVERLAP)
+
+print("CAPACITY: largest model that fits as state moves down the hierarchy")
+cap = {"HBM only": largest_fit(GPU_HBM_GB),
+       "HBM + CPU DRAM": largest_fit(GPU_HBM_GB + HOST_DRAM_GB),
+       "HBM + CPU + NVMe": largest_fit(GPU_HBM_GB + HOST_DRAM_GB + NVME_GB)}
+for name, b in cap.items():
+    print(f"  {name:<18}{b:>7.2f} B params   ({b/cap['HBM only']:>5.1f}x)")
+
+print("\nTHROUGHPUT COST: per-step time for a 3 B-param model under each tier")
+base = None
+for name, bw in [("HBM only", None), ("HBM + CPU", BW_PCIE), ("HBM + CPU + NVMe", BW_NVME)]:
+    comp, xfer, step = step_time(3.0, bw)
+    base = step if base is None else base
+    print(f"  {name:<18}compute {comp:6.3f}s  transfer {xfer:7.3f}s  "
+          f"step {step:6.3f}s  ({step/base:.2f}x)")
+</code></pre>
+<div class="code-caption"><strong>Code 18.7.1:</strong> A pure-arithmetic model of the offload trade. The capacity block counts how many parameters each combination of tiers can hold at 16 bytes per parameter; the throughput block applies the transfer-versus-compute formulas above to one fixed model, isolating the per-step cost of pushing the optimizer state to each lower tier.</div>
+<pre><code class="language-text">CAPACITY: largest model that fits as state moves down the hierarchy
+  HBM only             1.00 B params   (  1.0x)
+  HBM + CPU DRAM      17.00 B params   ( 17.0x)
+  HBM + CPU + NVMe   267.00 B params   (267.0x)
+
+THROUGHPUT COST: per-step time for a 3 B-param model under each tier
+  HBM only          compute  1.229s  transfer   0.000s  step  1.229s  (1.00x)
+  HBM + CPU         compute  1.229s  transfer   2.880s  step  1.661s  (1.35x)
+  HBM + CPU + NVMe  compute  1.229s  transfer  14.400s  step  3.389s  (2.76x)</code></pre>
+<div class="code-caption"><strong>Output 18.7.1:</strong> The two halves of the bargain. Enlisting host DRAM grows the largest trainable model from 1 to 17 billion parameters at a 1.35x per-step slowdown; adding NVMe reaches 267 billion at 2.76x. A 16 GB GPU that could never hold a 17 B model in HBM trains one by paying in time, not hardware.</div>
+<p>The output states the trade in one screen. The capacity column climbs by 17x and then by 267x as each tier joins; the throughput column shows the price, a 1.35x slowdown for the DRAM hop and 2.76x once NVMe is in the loop. Note how the transfer time for NVMe (14.4 seconds) dwarfs the compute (1.23 seconds), yet the exposed step time is only 3.39 seconds: prefetching hides 85 percent of the movement behind the GPU's work, which is the single engineering trick that keeps NVMe offload from being unusable. The numbers also make the regime boundaries visible, which is the subject of the next section.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Capacity Is Another Axis You Distribute</div>
+<p>Sharding (<a href="../module-16-model-pipeline-sharded-parallelism/section-16.4.html">Chapter 16</a>) distributes state across GPUs in space; offload distributes it across the memory hierarchy in a different dimension, trading the network for the PCIe and NVMe links. Both are the same scale-out move this book keeps returning to: when one resource runs out, split the work across more of something and pay a communication tax to recombine. Here the "more of something" is cheap, abundant, slow memory, and the tax is bandwidth instead of an all-reduce. The largest training systems combine the two, sharding across the GPUs they have and offloading the remainder downhill, so the two techniques are partners rather than rivals.</p>
+</div>
+
+<h2>3. When Offload Is the Right Tool, and When It Is Not <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Offload is a capacity technique, not a speed technique, and reading the numbers backward tells you exactly when to reach for it. It is the right tool when you are capacity-constrained or budget-constrained: when the model simply will not fit on the GPUs you can afford, and a slower run is strictly better than no run at all. A researcher fine-tuning a 13-billion-parameter model on a single workstation GPU, or a startup training on a handful of consumer cards rather than a rented cluster, is exactly the case offload was built for. The slowdown is real but bounded, and the alternative is not a faster run; it is an out-of-memory error.</p>
+<p>It is the wrong tool when throughput is what you are optimizing and you have the hardware to fit the model without it. A frontier training run that already shards across thousands of GPUs and is measured in cost-per-token does not want to multiply its step time to save memory it can buy. In that regime the PCIe and NVMe links become the bottleneck the whole system waits on, and the right answer is more GPUs and better sharding, not slower memory. The honest framing is that offload converts a hard capacity wall into a soft throughput penalty, which is a wonderful deal when you have hit the wall and a bad deal when you have not.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Fine-Tuning a 13B Model on One Workstation</div>
+<p><strong>Who:</strong> A graduate researcher with a single 24 GB workstation GPU and no cluster budget.</p>
+<p><strong>Situation:</strong> They needed to fine-tune a 13-billion-parameter language model whose mixed-precision Adam state needs roughly 200 GB, far beyond the GPU.</p>
+<p><strong>Problem:</strong> Sharding was not an option with one GPU, and renting an eight-GPU node for the weeks of experiments would have exhausted the grant.</p>
+<p><strong>Dilemma:</strong> Abandon the 13B model and fall back to a 1.3B one that fit in HBM, accepting weaker results, or keep the large model and find the memory somewhere off the GPU.</p>
+<p><strong>Decision:</strong> They kept the 13B model and turned on ZeRO-Infinity offload to the workstation's 256 GB of DRAM, with NVMe as a spill tier for the rare overflow.</p>
+<p><strong>How:</strong> A few lines of DeepSpeed config moved the optimizer state and parameters to CPU and NVMe; the params and grads stayed on the GPU, and the CPU ran the Adam update, exactly the split in Section 1.</p>
+<p><strong>Result:</strong> Each step ran roughly 1.4x slower than a hypothetical all-HBM run that the GPU could never have held, and the fine-tune finished over a long weekend instead of never.</p>
+<p><strong>Lesson:</strong> When the binding constraint is capacity and the budget forbids more GPUs, a bounded throughput penalty buys a model you otherwise could not train at all.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The SSD Is Now Part of the Training Loop</div>
+<p>There is something quietly absurd about a training step that reaches all the way down to a solid-state disk, the same kind of drive that holds your operating system, and pulls optimizer moments off it sixty times a minute. ZeRO-Infinity's name is only half a joke: by enlisting NVMe it makes the trainable model size depend on how many SSDs you are willing to bolt to the box, not on how much HBM you can afford. The optimizer state spends most of its life on a disk and visits the GPU only for its brief moment of glory each step.</p>
+</div>
+
+<h2>4. From the Model to the Library <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The arithmetic in Code 18.7.1 captures the trade, but the real machinery (prefetching the next slice while computing the current one, partitioning state across DRAM and NVMe, running the optimizer on the CPU, and overlapping every transfer with compute) is intricate enough that you should never build it by hand. DeepSpeed packages all of it behind a configuration file, as part of the same ZeRO family introduced for sharding in <a href="../module-16-model-pipeline-sharded-parallelism/section-16.6.html">Chapter 16</a>. ZeRO-Offload adds the CPU tier and ZeRO-Infinity adds the NVMe tier, both as a few keys in a JSON config rather than a change to your training loop.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: DeepSpeed ZeRO-Offload and ZeRO-Infinity</div>
+<p>The hand-rolled accounting and staging logic that any from-scratch offload would require, easily several hundred lines of asynchronous transfer management, collapses to a configuration block. You enable offload by naming the device for the optimizer state (and, for ZeRO-Infinity, the parameters) and pointing NVMe at a directory; DeepSpeed handles the prefetch scheduling, the CPU-side Adam update, and the overlap with compute internally:</p>
+<pre><code class="language-python"># deepspeed_config.json: ZeRO stage 3 with offload to CPU and NVMe.
+zero_config = {
+  "zero_optimization": {
+    "stage": 3,
+    "offload_optimizer": {"device": "cpu",  "pin_memory": True},
+    "offload_param":     {"device": "nvme", "nvme_path": "/local_nvme"},
+    "overlap_comm": True               # hide transfers behind compute
+  },
+  "train_micro_batch_size_per_gpu": 4,
+  "fp16": {"enabled": True}
+}
+
+# In code: wrap the model and let DeepSpeed place the tiers for you.
+import deepspeed
+engine, optimizer, _, _ = deepspeed.initialize(
+    model=model, model_parameters=model.parameters(), config=zero_config)
+for batch in loader:
+    loss = engine(batch)               # forward; params streamed up as needed
+    engine.backward(loss)              # grads computed on GPU
+    engine.step()                      # Adam runs on CPU over offloaded state
+</code></pre>
+<div class="code-caption"><strong>Code 18.7.2:</strong> The same tiered placement modeled in Code 18.7.1, now expressed as a DeepSpeed config. Switching the optimizer offload <code>device</code> from <code>"cpu"</code> to <code>"nvme"</code> moves from the 17x capacity regime to the 267x regime of Output 18.7.1, with no change to the training loop above.</div>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Pushing Offload Past the Bandwidth Wall (2024 to 2026)</div>
+<p>Because the slow links cap offload throughput, recent work attacks the bandwidth wall directly. Systems in the ZeRO-Infinity lineage have been extended with smarter activation and parameter prefetch scheduling and with GPU-direct storage paths that let NVMe feed the GPU without a CPU bounce, narrowing the gap the formulas in Section 2 penalize. Offload-aware fine-tuning stacks, including the FSDP-plus-CPU-offload paths in PyTorch and QLoRA-style quantized-plus-offloaded training, have made billion-parameter fine-tuning on a single consumer GPU a routine 2024-2026 practice rather than a stunt. A parallel thread fuses offload with the elastic and spot-instance training of this chapter, so that state spilled to DRAM and NVMe also serves as the checkpoint a preempted worker recovers from, tying capacity offload to the fault tolerance covered alongside it. The throughline is that the cost the model in Code 18.7.1 charges for each tier is treated as a quantity to be engineered down, not a fixed law.</p>
+</div>
+<p>With state spread across the memory hierarchy, a single node can now hold a model far beyond its GPU, but a run spread across many such nodes and many slow links becomes much harder to see into when something goes wrong. Knowing whether the bottleneck is compute, the PCIe link, or a straggler node requires instrumentation, which is where the chapter turns next, in <a href="section-18.8.html">Section 18.8</a> on monitoring and debugging distributed training.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.7.1: Where Does the Crossover Sit? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the formulas in Section 2, explain qualitatively how the per-step slowdown of NVMe offload changes as you (a) double the tokens per step $T$, (b) halve the NVMe bandwidth $B_{\text{link}}$, and (c) raise the overlap fraction $\rho$ from 0.85 to 0.95. For each, state whether the change makes offload more or less attractive and why. Then describe the workload profile (model size, batch size, hardware budget) for which CPU offload is clearly worth it but NVMe offload is clearly not.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.7.2: Add a Fourth Tier and a Realistic Overlap <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 18.7.1 in two ways. First, add a slower fourth tier (a network-attached store at 1 GB/s and 64 TB) and recompute both the largest-fit capacity and the per-step time, confirming that capacity keeps climbing while the slowdown worsens. Second, make the overlap fraction $\rho$ depend on the ratio of compute time to transfer time (more compute can hide more transfer, so $\rho$ should approach a ceiling as that ratio grows, and fall toward zero when transfer dominates). Plot or print the step-time multiplier against model size for each tier and identify, for the NVMe tier, the model size beyond which the GPU spends most of the step waiting on the link.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.7.3: Offload Versus One More GPU <span class="exercise-type analysis">Analysis</span></div>
+<p>You must train a model whose state needs 80 GB. Option A is a single 40 GB GPU with CPU offload at the 1.35x slowdown of Output 18.7.1; option B is renting a second 40 GB GPU and sharding the state across the two at near-full speed but double the hourly hardware cost. Given a job that takes 100 hours on the all-HBM baseline and the hourly prices of one and two such GPUs (pick realistic cloud numbers), compute the total dollar cost of each option. State the GPU price ratio at which offload becomes the cheaper choice, and connect your answer to the "match the remedy to the binding constraint" theme of <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Chapter 1</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-18.6.html"><span class="nav-label">Previous</span><span class="nav-num">Section 18.6</span><span class="nav-title">Preemption and Spot-Instance Training</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 18</span><span class="nav-num">Contents</span><span class="nav-title">Elastic and Fault-Tolerant Distributed Training</span></a>
+<a class="next" href="section-18.8.html"><span class="nav-label">Next</span><span class="nav-num">Section 18.8</span><span class="nav-title">Monitoring and Debugging Distributed Training</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

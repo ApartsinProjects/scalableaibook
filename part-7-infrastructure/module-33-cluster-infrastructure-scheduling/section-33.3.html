@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 33.3: Containers and Kubernetes for AI. How containers freeze the CUDA-driver-Python stack and how Kubernetes schedules GPU Pods, Jobs, and Deployments, including the GPU operator, resource requests, taints and affinity, and why vanilla scheduling is not gang-aware." name="description"/>
+<title>Section 33.3: Containers and Kubernetes for AI | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Cluster, Edge, and Reliable Infrastructure</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 33: Cluster Infrastructure and Scheduling</a></div>
+<h1>Containers and Kubernetes for AI</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They promised me eight identical siblings on eight identical machines. I was rescheduled onto a node that has no GPU, and now I am importing torch into the void."</p>
+<cite>A Pod, Rescheduled Onto a Node That Has No GPU</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A cluster does not run your model; it runs a container, and Kubernetes decides where that container lands.</strong> Before any distributed-training collective fires or any inference request is served, the work has to be packaged into an immutable image that pins the exact CUDA, driver-userspace, and Python stack, and then placed onto machines that actually have the accelerators the image expects. Kubernetes is the layer that turns "a YAML description of what I want" into "running processes on real nodes", advertising GPUs as schedulable resources, honoring placement rules, and enforcing per-tenant quotas. This section shows how containers freeze the environment and how Kubernetes schedules it, and it is honest about one sharp limitation: the default scheduler places one Pod at a time and knows nothing about the fact that a training job needs all of its Pods at once. That gap is the entire motivation for the gang and topology-aware scheduling that the next two sections build.</p>
+</div>
+<p>A distributed AI system is, at the level of an operating cluster, a population of processes that must be created, placed on machines with the right hardware, kept alive, and torn down. Doing that by hand (logging into nodes, checking which GPUs are free, copying environments, launching processes in the right order) does not survive contact with a fleet of hundreds of machines and dozens of concurrent jobs. Two technologies have become the near-universal answer. Containers package the software so that the environment a job runs in is identical on every node and reproducible months later. Kubernetes orchestrates those containers, deciding which node each one runs on, restarting the ones that die, and rationing scarce accelerators among competing teams. Together they are the substrate on which everything in Parts III through VI ultimately executes. The previous section introduced the cluster as a pool of heterogeneous resources; this section makes the resources schedulable and the workloads portable.</p>
+
+<h2>1. Why Containers: Freezing the CUDA Stack <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The defining pain of running AI software is that it depends on a tall, brittle stack of versioned components: a Python interpreter, a specific PyTorch or JAX build, a matching CUDA toolkit, cuDNN, NCCL, and a host GPU driver whose userspace libraries must be compatible with all of the above. Two machines that look identical can differ in one of these layers and produce a training run that either crashes on import or, worse, runs slightly differently. A container is a filesystem image plus metadata that bundles everything above the host kernel, the interpreter, the libraries, the CUDA userspace, and the application code, into one immutable artifact. When you run that image, the process sees exactly the files baked into it, regardless of what the host machine happens to have installed. The reproducibility this buys is the same reproducibility that makes a result trustworthy, which is why container images are the unit of deployment in the MLOps practices of <a href="../../part-5-distributed-inference/module-26-mlops-distributed-ai/index.html">Chapter 26</a>.</p>
+<p>The one component a container does not carry is the kernel-level GPU driver itself, which lives on the host. The container brings the CUDA userspace and expects the host driver to be present and new enough; on a GPU cluster this is arranged by a device runtime (historically the NVIDIA Container Toolkit) that injects the host driver libraries and device files into the container at launch. The practical rule, which we make precise in the next section, is that the image pins everything above the driver and the cluster guarantees a compatible driver below it. Get that contract right and the same image runs unchanged on a laptop with one GPU and on a node with eight.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Image Is the Reproducible Unit, the Driver Is the Contract</div>
+<p>A container freezes the entire software stack above the host kernel into one immutable image, so the environment is identical on every node and reconstructable later. The single layer it cannot freeze is the host GPU driver, which it borrows from the machine it lands on. Distributed AI on Kubernetes therefore rests on one contract: the image pins CUDA, cuDNN, NCCL, and the framework; the cluster guarantees a host driver compatible with them. Every reproducibility failure on a GPU cluster is, at bottom, a violation of one side of that contract.</p>
+</div>
+
+<h2>2. The GPU Operator and the Device Plugin <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Kubernetes by default understands two resources: CPU and memory. It has no native concept of a GPU. Accelerators enter the scheduler's vocabulary through the <em>device plugin</em> mechanism, a small agent running on every GPU node that discovers the local accelerators and advertises them to the node's kubelet as a custom countable resource, conventionally named <code>nvidia.com/gpu</code>. Once advertised, a GPU is treated like any other quantity the scheduler can hand out: a node reports it has eight of them, each Pod asks for some number, and the scheduler subtracts as it places. The device plugin also handles the low-level work of exposing the right device files into each container so the process can actually open the hardware.</p>
+<p>Installing the device plugin, the container runtime hooks, the driver, and the monitoring exporters by hand on every node is itself a distributed-systems chore. The common solution is the GPU Operator, a Kubernetes operator that installs and reconciles the entire GPU software stack (driver, container toolkit, device plugin, and metrics exporter) as managed cluster resources, so that adding a new GPU node is a matter of labeling it rather than configuring it. Operators encode operational knowledge as control loops, the same reconciliation pattern that makes Deployments self-healing, applied to infrastructure. With the operator in place, the abstraction the rest of this section relies on holds: a Pod that requests <code>nvidia.com/gpu: 1</code> will only ever be placed on a node that has a free GPU and the software to use it.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One Helm Install Replaces Per-Node Driver Surgery</div>
+<p>Manually installing a matching driver, the container toolkit, the device plugin, and a metrics exporter on every GPU node is dozens of error-prone steps per machine, repeated whenever a node is reimaged. The NVIDIA GPU Operator collapses the entire stack into one Helm release that reconciles itself across all current and future nodes:</p>
+<pre><code class="language-bash"># Install the full GPU software stack as a self-reconciling operator.
+helm install --wait gpu-operator nvidia/gpu-operator \
+  --namespace gpu-operator --create-namespace
+
+# Confirm every GPU node now advertises schedulable accelerators.
+kubectl get nodes -o custom-columns=NODE:.metadata.name,GPU:.status.allocatable.'nvidia\.com/gpu'
+</code></pre>
+<div class="code-caption"><strong>Code 33.3.1:</strong> The GPU Operator turns per-node driver and plugin installation into a single declarative release. The second command reads the <code>nvidia.com/gpu</code> allocatable count the device plugin advertised, the same quantity the scheduler subtracts from when it places a GPU Pod.</div>
+</div>
+
+<h2>3. Pods, Deployments, and Jobs <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The atom of execution in Kubernetes is the <em>Pod</em>: one or more containers that share a network identity and are always scheduled together onto a single node. A Pod is the smallest thing the scheduler places, and for AI work the mental model is "one Pod is one process on one machine, typically owning some slice of the accelerators on that machine". You rarely create bare Pods, because a bare Pod that dies stays dead. Instead you declare a higher-level controller that owns Pods and continuously drives the cluster's real state toward your declared intent. Two controllers carry almost all AI workloads, and the choice between them is exactly the choice between training and serving.</p>
+<p>A <em>Deployment</em> manages a set of identical, interchangeable, long-lived Pods and keeps a target number of them running. If a Pod or its node dies, the Deployment creates a replacement; if you ask for more replicas, it scales out. This is precisely the shape of an inference service: a horizontally scaled pool of stateless model-server replicas sitting behind a load-balancing Service, which is the deployment pattern that <a href="../../part-5-distributed-inference/module-23-distributed-inference-systems/index.html">Chapter 23</a> develops and that <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a> specializes for large language models. A <em>Job</em>, by contrast, manages Pods that run to completion and then stop, which is the shape of a training run or a batch evaluation: it launches the work, tracks how many Pods finished successfully, and retries failures up to a limit. Figure 33.3.1 shows the control plane translating both kinds of declared intent into placed Pods on worker nodes.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A Kubernetes control plane on the left holding an API server and scheduler, feeding placement decisions to three worker nodes on the right. Two worker nodes hold GPU training Pods belonging to one Job; the third holds replicated inference Pods behind a Service.">
+<defs>
+<marker id="arr333" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.cp333 { fill:#eef2f8; stroke:#14385c; stroke-width:1.6; }
+.nd333 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.gp333 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.sv333 { fill:#eaf5ee; stroke:#2f7d4f; stroke-width:1.6; }
+.t333 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.tg333 { font:600 13px sans-serif; fill:#8a4f12; text-anchor:middle; }
+.s333 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l333 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr333); }
+</style>
+<text class="t333" x="135" y="26">Control plane</text>
+<rect class="cp333" x="40" y="40" width="190" height="150" rx="10"/>
+<rect class="cp333" x="60" y="60" width="150" height="42" rx="6"/>
+<text class="t333" x="135" y="86">API server</text>
+<rect class="cp333" x="60" y="116" width="150" height="42" rx="6"/>
+<text class="t333" x="135" y="138">Scheduler</text>
+<text class="s333" x="135" y="180">declared intent &#8594; placement</text>
+<line x1="230" y1="100" x2="300" y2="100" class="l333"/>
+<line x1="230" y1="130" x2="300" y2="240" class="l333"/>
+<text class="s333" x="600" y="26">Worker nodes (each with GPUs)</text>
+<rect class="nd333" x="320" y="44" width="250" height="120" rx="10"/>
+<text class="t333" x="445" y="64">Node A</text>
+<rect class="gp333" x="338" y="78" width="100" height="68" rx="8"/>
+<text class="tg333" x="388" y="104">Job Pod 0</text>
+<text class="s333" x="388" y="124">gpu: 1</text>
+<rect class="gp333" x="452" y="78" width="100" height="68" rx="8"/>
+<text class="tg333" x="502" y="104">Job Pod 1</text>
+<text class="s333" x="502" y="124">gpu: 1</text>
+<rect class="nd333" x="600" y="44" width="240" height="120" rx="10"/>
+<text class="t333" x="720" y="64">Node B</text>
+<rect class="gp333" x="618" y="78" width="100" height="68" rx="8"/>
+<text class="tg333" x="668" y="104">Job Pod 2</text>
+<text class="s333" x="668" y="124">gpu: 1</text>
+<rect class="gp333" x="732" y="78" width="92" height="68" rx="8"/>
+<text class="tg333" x="778" y="104">Job Pod 3</text>
+<text class="s333" x="778" y="124">gpu: 1</text>
+<text class="s333" x="580" y="186">one training Job = four co-scheduled Pods (must all run together)</text>
+<rect class="nd333" x="320" y="230" width="520" height="120" rx="10"/>
+<text class="t333" x="580" y="250">Node C</text>
+<rect class="sv333" x="338" y="266" width="120" height="60" rx="8"/>
+<text class="t333" x="398" y="292">Infer Pod</text>
+<text class="s333" x="398" y="310">replica</text>
+<rect class="sv333" x="470" y="266" width="120" height="60" rx="8"/>
+<text class="t333" x="530" y="292">Infer Pod</text>
+<text class="s333" x="530" y="310">replica</text>
+<rect class="sv333" x="602" y="266" width="120" height="60" rx="8"/>
+<text class="t333" x="662" y="292">Infer Pod</text>
+<text class="s333" x="662" y="310">replica</text>
+<rect class="sv333" x="734" y="266" width="92" height="60" rx="8"/>
+<text class="t333" x="780" y="292">Service</text>
+<text class="s333" x="780" y="310">LB</text>
+<text class="s333" x="560" y="372">one Deployment = N interchangeable replicas behind a Service</text>
+<line x1="722" y1="296" x2="734" y2="296" class="l333"/>
+<line x1="590" y1="296" x2="602" y2="296" class="l333"/>
+<line x1="458" y1="296" x2="470" y2="296" class="l333"/>
+</svg>
+<figcaption><strong>Figure 33.3.1:</strong> The control plane translates declared intent into placed Pods. A training <em>Job</em> (top) is a set of GPU Pods spread across nodes that, for a distributed run, must all be running at once to make progress. An inference <em>Deployment</em> (bottom) is a set of interchangeable replicas behind a load-balancing Service, where any one replica can serve any request and a missing replica only reduces capacity. The default scheduler places each Pod independently, which is why the top group has a coordination hazard the bottom group does not.</figcaption>
+</figure>
+<p>The distinction in Figure 33.3.1 is the heart of why AI strains Kubernetes. An inference Deployment is embarrassingly tolerant: replicas are independent, the loss of one is a small capacity dip, and Pod restarts driven by the controller map cleanly onto graceful fleet churn. A distributed training Job is the opposite: its Pods are not interchangeable, they are coordinated peers running a collective such as the all-reduce of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>, and a single missing peer stalls the entire group at the next synchronization barrier. The controller abstractions describe both, but they protect only the first.</p>
+
+<h2>4. Requests, Limits, and Bin Packing <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Every container declares two numbers per resource: a <em>request</em>, the amount the scheduler reserves and uses for placement, and a <em>limit</em>, the ceiling the runtime enforces at execution. For CPU and memory the two can differ, allowing oversubscription. For whole GPUs they are effectively the same: an accelerator is an indivisible countable unit, so a Pod that requests one GPU holds that GPU exclusively for its lifetime, and no other Pod can share it. This is why GPU clusters live or die by packing efficiency. If jobs request GPUs in shapes that do not tile cleanly onto the nodes, accelerators sit idle inside partially filled machines while new jobs wait. The scheduler's placement problem is a bin-packing problem, and its quality is measured by utilization,</p>
+$$U = \frac{\sum_{j} g_j}{G_{\text{total}}}, \qquad \text{fragmentation} = 1 - \frac{\sum_{j} g_j}{\sum_{n} \mathbb{1}[\text{node } n \text{ has any GPU in use}] \cdot G_n},$$
+<p>where $g_j$ is the number of GPUs job $j$ holds, $G_{\text{total}}$ is the cluster's total, $G_n$ is node $n$'s GPU count, and the fragmentation term measures how much capacity is stranded inside nodes that are partly but not fully used. A cluster can show high allocation yet poor effective utilization when many nodes each carry one small job and refuse a large one that needs a whole node. Requesting GPUs in node-aligned shapes (a full node of eight, or a clean half) is how large jobs keep fragmentation low; the topology-aware placement of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> adds a second reason to pack a job onto as few nodes as possible, namely that intra-node accelerator links are far faster than the inter-node network.</p>
+<p>When a whole GPU per Pod is wasteful, the hardware offers a middle path. Multi-Instance GPU partitioning splits one physical accelerator into several smaller, hardware-isolated instances, each advertised to the scheduler as its own unit so that several light inference Pods can pack onto one card. We treat that partitioning in detail in the next section as one lever for raising utilization; here it is enough to note that requests and limits are the dial through which a tenant tells the scheduler how much accelerator it intends to hold.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Cluster That Was Full and Idle at the Same Time</div>
+<p><strong>Who:</strong> A platform engineer running a shared 16-node, 128-GPU research cluster for several model teams.</p>
+<p><strong>Situation:</strong> The dashboard showed 96 percent of GPUs allocated, yet a new eight-GPU training Job had been pending for two hours and the teams complained the cluster felt empty.</p>
+<p><strong>Problem:</strong> Many single-GPU notebook Pods had been placed one per node by the default scheduler, leaving seven free GPUs on each of a dozen nodes but no node with eight free at once.</p>
+<p><strong>Dilemma:</strong> Buy more hardware to relieve apparent pressure, or accept that the cluster was fragmented, not full, and change how it packed.</p>
+<p><strong>Decision:</strong> They treated it as a packing problem, not a capacity problem, since effective utilization by the fragmentation measure above was far below the 96 percent allocation figure.</p>
+<p><strong>How:</strong> They moved interactive single-GPU Pods into a dedicated node pool with bin-packing placement, reserved the remaining nodes as whole-node units for multi-GPU Jobs, and enforced it with node affinity and taints (Section 5).</p>
+<p><strong>Result:</strong> The pending eight-GPU Job scheduled in seconds, and measured GPU-hours of useful work rose by roughly a third with no new hardware.</p>
+<p><strong>Lesson:</strong> Allocation is not utilization. A scheduler that places each Pod greedily and independently can strand most of a cluster's capacity inside partly filled nodes, and the fix is shaping requests and placement, not buying GPUs.</p>
+</div>
+
+<h2>5. Placing Work on the Right Accelerator: Selectors, Taints, and Affinity <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A real GPU cluster is heterogeneous: some nodes carry top-tier training accelerators, others carry cheaper inference cards, some are spot or preemptible instances, some sit in a different network rack. Getting the right Pod onto the right node is the job of three placement controls, and AI workloads use all three. A <em>node selector</em> (or its richer cousin, <em>node affinity</em>) is a requirement a Pod attaches to itself: "schedule me only on a node labeled with this accelerator type". It is how a memory-hungry training Pod insists on a high-memory card and how a latency-sensitive inference replica insists on staying off a slow one. A <em>taint</em> works in the opposite direction: it is a mark a node attaches to itself to repel Pods that do not explicitly <em>tolerate</em> it, the mechanism by which a pool of expensive GPU nodes refuses ordinary CPU jobs that would otherwise pack onto it and waste the accelerators. Together, affinity pulls the right Pods toward a node and taints push the wrong ones away.</p>
+<p>The third control, <em>Pod affinity and anti-affinity</em>, expresses relationships between Pods rather than between a Pod and a node. Anti-affinity spreads the replicas of an inference Deployment across distinct nodes and racks so that one machine or rack failure cannot take out the whole service, a direct application of the failure-domain thinking that fault tolerance demands. Affinity does the reverse, packing the peers of a training Job close together to shorten the communication path. These rules shape placement but do not coordinate it: each rule is still evaluated for one Pod at a time, which is the seam this section keeps returning to.</p>
+<pre><code class="language-yaml">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bert-finetune
+spec:
+  backoffLimit: 4                       # retry a failed Pod up to 4 times
+  completions: 1
+  template:
+    spec:
+      restartPolicy: OnFailure
+      nodeSelector:
+        accelerator: a100-80gb          # only land on A100-80GB nodes
+      tolerations:
+      - key: nvidia.com/gpu             # tolerate the GPU-node taint so we may
+        operator: Exists                #   schedule onto the reserved GPU pool
+        effect: NoSchedule
+      containers:
+      - name: trainer
+        image: registry.example.com/ml/bert-train:cuda12.4-torch2.5
+        command: ["torchrun", "--nproc_per_node=1", "finetune.py"]
+        resources:
+          requests:
+            cpu: "8"
+            memory: 64Gi
+            nvidia.com/gpu: 1           # request reserves; for whole GPUs
+          limits:
+            nvidia.com/gpu: 1           #   request and limit must match
+</code></pre>
+<div class="code-caption"><strong>Code 33.3.2:</strong> A single-Pod GPU training Job. The <code>nodeSelector</code> pins it to A100-80GB nodes, the toleration lets it onto the tainted GPU pool, and the matching GPU request and limit reserve exactly one accelerator. The pinned image (<code>cuda12.4-torch2.5</code>) is the frozen stack of Section 1; <code>backoffLimit</code> is the Job-level analogue of the Pod restarts that elastic training exploits.</div>
+<p>Code 33.3.2 is a complete, runnable manifest for the common case of a single-worker fine-tune. Its <code>backoffLimit</code> is worth pausing on: a Job retries a failed Pod automatically, which means a transient node failure during training is recovered by Kubernetes recreating the Pod. That recovery is exactly the Pod-restart mechanism that elastic and fault-tolerant training in <a href="../../part-4-parallel-deep-learning/module-18-elastic-fault-tolerant-training/index.html">Chapter 18</a> builds on, pairing automatic restarts with checkpointing so a multi-hour run survives losing a worker. The manifest scales to one worker cleanly; scaling it to many coordinated workers is where the default scheduler's blind spot appears.</p>
+
+<h2>6. Namespaces and Quotas for Multi-Tenant Clusters <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A cluster shared by several teams needs walls. A <em>namespace</em> is a logical partition of the cluster that scopes names and serves as the unit to which policy attaches, so each team works inside its own namespace without colliding with another team's Pod names or seeing its objects. The teeth come from a <em>ResourceQuota</em> bound to a namespace, a hard cap on the total resources its Pods may collectively request, including the custom GPU resource. A quota of <code>nvidia.com/gpu: 16</code> on a team's namespace means that team can never hold more than sixteen accelerators at once, no matter how many Jobs it submits, which protects the other tenants from a single team monopolizing the cluster. Quotas turn a shared cluster from a free-for-all into a governed commons, and they are the cluster-level expression of the fairness concerns that scheduling policy, in the next section, makes dynamic.</p>
+<p>Quotas interact with the packing story of Section 4 in a way worth flagging. A namespace can be well within its GPU quota yet still unable to schedule a large Job because the cluster is fragmented, and conversely a cluster with free capacity may refuse a Job because its namespace quota is exhausted. The two limits are independent gates, one about fairness across tenants and one about physical fit, and a Pod schedules only when it clears both. Naming this explicitly saves many hours of debugging a Pod that is "pending" for reasons that look contradictory until you check both the quota and the node fit.</p>
+
+<h2>7. The Gang-Scheduling Gap <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Everything so far describes a scheduler that, by design, considers one Pod at a time. It picks a Pod from the queue, finds a node that satisfies that Pod's requests, affinity, taints, and the namespace quota, binds it, and moves on. For an inference Deployment this is exactly right: replicas are independent, so placing them one by one and starting each as soon as it lands is optimal. For a distributed training Job it is a trap. Suppose a Job needs eight GPU Pods that must run together to form a single all-reduce group. The default scheduler may place six of them, exhaust the available GPUs, and leave the last two pending. The six placed Pods are now running, holding six precious GPUs, blocked at the first synchronization barrier waiting for two siblings that cannot be scheduled. They make no progress and they release nothing. Worse, two such half-placed Jobs can each hold half the cluster and each wait for the other to release GPUs, a deadlock that wastes the entire machine.</p>
+<p>The missing property has a name: <em>gang scheduling</em>, the rule that a group of Pods is scheduled all-or-nothing, never partially. Vanilla Kubernetes does not provide it, because its core scheduler has no notion that a set of Pods forms an indivisible unit whose value is zero until every member is placed. This is not a bug; it is a design choice optimized for the independent, long-lived services that Kubernetes was born to run, and AI training is the workload that exposes its limit. The remedy is to extend the scheduler with awareness of the group, which is precisely what gang and batch schedulers add, and the straggler-avoidance benefit of placing all peers together at once was previewed back in the scheduling arc of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Collective Reaches Down Into the Scheduler</div>
+<p>The all-reduce that <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> introduced and <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a> turned into a training step is not only a network operation; it is a scheduling constraint. Because every worker must reach the barrier for the collective to complete, the workers form an indivisible gang, and a scheduler that places them one at a time can stall the whole group. The same primitive that makes data parallelism exact (one synchronized step across all workers) is what makes naive placement fail. Scale-out, in other words, pushes its demands all the way down from the math of the gradient to the policy of the cluster scheduler, and the next two sections answer that demand.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Topology-Aware and Gang Scheduling for Large Jobs (2024 to 2026)</div>
+<p>Because the gap above wastes the most expensive hardware in the building, gang-aware batch scheduling is an active line. Kubernetes-native batch schedulers such as Volcano and the Kueue queueing layer add all-or-nothing placement, fair-share queues, and preemption on top of the default scheduler, and have become the standard way to run training Jobs at scale. A parallel thread makes placement topology-aware so a job's gang lands on GPUs that share fast interconnect: Kubernetes added dynamic resource allocation and structured device topology so the scheduler can reason about which accelerators sit on the same high-bandwidth fabric, and large-cluster operators report that placing a gang onto interconnect-adjacent nodes can change effective training throughput substantially. The frontier question is co-optimizing the three pressures of this section at once, packing for utilization, gang placement for correctness, and topology for communication speed, under live multi-tenant quotas. We take up the schedulers themselves next.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>A six-of-eight training gang holding six idle GPUs at a barrier is the distributed-systems version of holding the entire dinner table hostage because two guests are stuck in traffic. Nobody eats, the food gets cold, and the seats cannot be given to anyone else. Gang scheduling is the maitre d' who simply will not seat the party until everyone has arrived.</p>
+</div>
+
+<p>We now have the substrate. Containers freeze the CUDA stack into a reproducible image; the device plugin and GPU Operator make accelerators schedulable; Pods, Deployments, and Jobs express serving and training; requests, limits, selectors, taints, affinity, namespaces, and quotas govern where work lands and who may hold what. We also have the precise shape of the substrate's limit: it places one Pod at a time and cannot, alone, guarantee a training gang runs all-or-nothing on fast-interconnect nodes. The next section turns to the schedulers and hardware-partitioning techniques that close that gap, and <a href="section-33.4.html">Section 33.4</a> begins with how the cluster scheduler is extended to reason about whole jobs rather than lone Pods.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.3.1: Job or Deployment? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each workload, state whether you would express it as a Kubernetes Job or a Deployment, and say in one sentence why its Pods are or are not interchangeable: (a) a four-node, 32-GPU pretraining run using all-reduce; (b) a stateless image-classification API that must serve 5,000 requests per second; (c) a one-time batch job that computes embeddings for a 100-million-document corpus and then exits; (d) a vector-search service behind a load balancer. For the two training-flavored cases, explain why the default scheduler's one-Pod-at-a-time placement is a hazard that the serving cases do not face.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.3.2: A Multi-Worker Training Manifest <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 33.3.2 from a single-Pod Job into a four-worker distributed training Job. Set <code>parallelism: 4</code> and <code>completions: 4</code>, give each worker one GPU, and add a headless Service plus the environment variables (<code>MASTER_ADDR</code>, <code>WORLD_SIZE=4</code>, a per-Pod <code>RANK</code>) that <code>torchrun</code> needs to form the process group of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>. Then answer in prose: with the default scheduler and only three free GPUs in the cluster, what state are the four Pods in after placement, and what are the three placed Pods doing while the fourth is pending? Name the property the manifest cannot express that would prevent this.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.3.3: Fragmentation Arithmetic <span class="exercise-type analysis">Analysis</span></div>
+<p>A cluster has 16 nodes of 8 GPUs each ($G_{\text{total}} = 128$). Twelve single-GPU interactive Pods are each placed on a distinct node by a greedy scheduler. Using the two formulas in Section 4, compute the raw allocation $U$ and the fragmentation term, then determine the largest single multi-GPU Job (in whole GPUs on one node) that can still be scheduled. Now suppose those twelve Pods had instead been bin-packed onto two nodes; recompute the largest schedulable single-node Job and the number of completely free nodes. Quantify, in GPU-hours over an eight-hour window, how much large-Job capacity the greedy placement stranded.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-33.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 33.2</span><span class="nav-title">Compute: CPUs, GPUs, TPUs, and Accelerator Instances</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 33</span><span class="nav-num">Contents</span><span class="nav-title">Cluster Infrastructure and Scheduling</span></a>
+<a class="next" href="section-33.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 33.4</span><span class="nav-title">Batch Schedulers: Slurm, Kubernetes Batch, and Volcano</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

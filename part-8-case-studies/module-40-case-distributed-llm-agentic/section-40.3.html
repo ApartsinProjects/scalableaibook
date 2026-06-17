@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 40.3: Embedding Pipelines. The production pipeline that turns chunks into versioned vectors: a batched embedding service, offline backfill versus online incremental embedding, idempotency and model-version pinning, and throughput and cost engineering for a continuously synchronized vector index." name="description"/>
+<title>Section 40.3: Embedding Pipelines | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Case Studies and Capstone Projects</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 40: Distributed LLM and Agentic Applications</a></div>
+<h1>Embedding Pipelines</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I was a chunk of text, about to become 1024 numbers forever. Then the model got a new version, and I had to become 1024 different numbers, all over again, by Friday."</p>
+<cite>A Chunk That Has Been Re-Embedded More Than Once</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>An embedding pipeline is a continuously running distributed inference system whose only job is to keep a vector index in agreement with a corpus that never stops changing.</strong> Every chunk produced by the splitter in <a href="section-40.2.html">Section 40.2</a> must be turned into a vector and written to the store that the retrieval layer will query in <a href="section-40.4.html">Section 40.4</a>. Doing this once, for a static corpus, is a batch job. Doing it forever, for a corpus that grows by the hour while the embedding model itself is occasionally replaced, is a pipeline: it has a backfill mode and an incremental mode, it must never produce a duplicate or a stale vector, and its cost is dominated by how many model calls it can avoid. This section treats the embedding step not as a single function call (the mathematics of which <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/index.html">Chapter 8</a> and the distributed-embedding deep dive in <a href="../module-36-case-web-scale-text-rag/section-36.5.html">Section 36.5</a> already covered) but as an operational system that must stay correct, cheap, and synchronized at scale.</p>
+</div>
+<p>In the previous section the corpus was cut into chunks: spans of text small enough to embed and retrieve, each carrying the metadata that ties it back to its source document. Those chunks are the input to this section. The output is a vector store, populated with one record per chunk, every record tagged with the version of the model that produced it, and kept current as documents are added, edited, and deleted. The deep treatment of how a single embedding model is run across many accelerators (sharding the model, batching across the data, the collective that gathers the results) lives in <a href="../module-36-case-web-scale-text-rag/section-36.5.html">Section 36.5</a>; we build directly on it and do not re-derive it. What this section adds is everything that turns that distributed encoder into a production pipeline: the service boundary, the backfill-versus-incremental split, idempotency and versioning, and the throughput and cost engineering that decides whether the whole thing is affordable.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="An embedding pipeline. A corpus feeds two paths: an offline backfill that re-embeds the whole corpus in large batches, and an online incremental stream that embeds only changed chunks. Both flow through a dedup cache into a pool of batched embedding workers, then into a versioned vector store queried by retrieval.">
+<defs>
+<marker id="arr403" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b403 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w403 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g403 { fill:#eef6ee; stroke:#2f7d32; stroke-width:1.6; }
+.t403 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s403 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l403 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr403); }
+.d403 { fill:none; stroke:#b86b1f; stroke-width:1.7; stroke-dasharray:5 4; marker-end:url(#arr403); }
+</style>
+<rect class="b403" x="20" y="170" width="120" height="80" rx="10"/>
+<text class="t403" x="80" y="200">Corpus</text>
+<text class="s403" x="80" y="218">chunks from</text>
+<text class="s403" x="80" y="232">Section 40.2</text>
+<rect class="w403" x="200" y="70" width="180" height="74" rx="10"/>
+<text class="t403" x="290" y="98">Offline backfill</text>
+<text class="s403" x="290" y="116">whole corpus,</text>
+<text class="s403" x="290" y="130">large batches</text>
+<rect class="g403" x="200" y="276" width="180" height="74" rx="10"/>
+<text class="t403" x="290" y="304">Online incremental</text>
+<text class="s403" x="290" y="322">changed chunks,</text>
+<text class="s403" x="290" y="336">streaming (Ch 9)</text>
+<rect class="b403" x="430" y="180" width="120" height="62" rx="10"/>
+<text class="t403" x="490" y="206">Dedup cache</text>
+<text class="s403" x="490" y="224">skip seen ids</text>
+<rect class="w403" x="600" y="150" width="130" height="56" rx="8"/>
+<text class="t403" x="665" y="174">Embed worker 1</text>
+<text class="s403" x="665" y="192">batched GPU</text>
+<rect class="w403" x="600" y="216" width="130" height="56" rx="8"/>
+<text class="t403" x="665" y="240">Embed worker K</text>
+<text class="s403" x="665" y="258">batched GPU</text>
+<rect class="b403" x="770" y="180" width="100" height="80" rx="10"/>
+<text class="t403" x="820" y="208">Vector</text>
+<text class="t403" x="820" y="226">store</text>
+<text class="s403" x="820" y="244">(version-tagged)</text>
+<path class="d403" d="M 140 196 L 200 110"/>
+<path class="l403" d="M 140 224 L 200 308"/>
+<path class="l403" d="M 380 107 L 430 196"/>
+<path class="l403" d="M 380 313 L 430 226"/>
+<path class="l403" d="M 550 205 L 596 185"/>
+<path class="l403" d="M 550 217 L 596 238"/>
+<path class="l403" d="M 730 178 L 766 205"/>
+<path class="l403" d="M 730 244 L 766 222"/>
+<text class="s403" x="820" y="300">queried by retrieval</text>
+<text class="s403" x="820" y="316">(Section 40.4)</text>
+<path class="l403" d="M 820 260 L 820 290"/>
+<text class="s403" x="290" y="404">dashed = one-time / on model bump &#183; solid = continuous</text>
+</svg>
+<figcaption><strong>Figure 40.3.1:</strong> The embedding pipeline. The corpus feeds two paths into the same encoder fleet: an offline backfill (dashed) that re-embeds everything when the model version changes, and an online incremental stream (solid) that embeds only chunks that changed since the last run. Both pass through a dedup cache that suppresses identical chunks before they reach the batched embedding workers of <a href="../module-36-case-web-scale-text-rag/section-36.5.html">Section 36.5</a>, and both write version-tagged records to the vector store that <a href="section-40.4.html">Section 40.4</a> queries.</figcaption>
+</figure>
+
+<h2>1. The Embedding Service: Batched Inference Behind a Boundary <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The first design decision is to make embedding a service rather than a library call scattered through the ingestion code. A service is a process (or a fleet of processes) that accepts a list of texts and returns a list of vectors, and nothing else. Putting a boundary there buys three things at once: the encoder model is loaded once and reused across all callers rather than re-instantiated per job; requests from many producers can be merged into large batches before they touch the accelerator; and the model version is owned in exactly one place, so it cannot drift between the backfill job and the incremental job. This is the same logic that motivates a dedicated inference tier in <a href="../../part-5-distributed-inference/module-23-distributed-inference-systems/index.html">Chapter 23</a>, applied to a model whose output is a vector rather than a token stream.</p>
+<p>Inside the service, the lever that matters is batch size. Embedding a single chunk wastes the accelerator: the kernel launch, the weight load into on-chip memory, and the fixed per-call overhead are amortized over one input. Embedding a batch of chunks amortizes that overhead over the whole batch, so per-chunk cost falls steeply as the batch grows, until the batch saturates the device and throughput plateaus. If the service embeds $B$ chunks per batch with a per-batch wall-clock time $t(B)$, the throughput is</p>
+$$\text{throughput}(B) = \frac{B}{t(B)}, \qquad t(B) \approx t_0 + c\,B,$$
+<p>where $t_0$ is the fixed per-batch overhead and $c$ is the marginal cost of one more chunk. As $B$ grows the overhead $t_0$ is spread thinner, throughput rises toward the ceiling $1/c$, and the right operating point is the smallest batch that gets close to that ceiling without inflating latency or exhausting device memory. The batching machinery itself (continuous batching, padding, request queues) is exactly the machinery of <a href="../../part-5-distributed-inference/module-23-distributed-inference-systems/index.html">Chapter 23</a>; the embedding service is one of its simplest tenants, because each request is a single forward pass with no autoregressive decode.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: An Embedding Pipeline Is a Cost-Minimization Problem Wearing a Correctness Constraint</div>
+<p>The embedding itself is a fixed forward pass; you cannot make the model cheaper without changing the model. Everything the pipeline can control is about how many times that forward pass runs. Batching shrinks the per-call overhead, caching removes calls for chunks you have already embedded, and the incremental path removes calls for chunks that did not change. The correctness constraint, never serve a stale or duplicated vector, is what stops you from cutting calls recklessly; the engineering is finding the cheapest schedule of model calls that still satisfies it.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Batched Encoding in a Few Lines</div>
+<p>You rarely write the batching loop by hand. A local model is one call with <code>sentence-transformers</code>, which batches internally and moves data to the GPU for you; a hosted embedding API takes a list and returns vectors in the same order. Both replace dozens of lines of queueing, padding, and device management:</p>
+<pre><code class="language-python"># Local model: sentence-transformers batches across the GPU internally.
+from sentence_transformers import SentenceTransformer
+model = SentenceTransformer("BAAI/bge-base-en-v1.5", device="cuda")
+vectors = model.encode(chunks, batch_size=256,        # one tuned knob
+                       normalize_embeddings=True,
+                       convert_to_numpy=True)          # shape (len(chunks), dim)
+
+# Hosted API: send a batch, keep the version string with the result.
+# resp = client.embeddings.create(model="text-embedding-3-large", input=chunks)
+# vectors = [d.embedding for d in resp.data]           # same order as input
+</code></pre>
+<div class="code-caption"><strong>Code 40.3.1:</strong> The encoder behind the service of Section 1. The <code>batch_size</code> argument is the $B$ from $\text{throughput}(B)$ above; the library handles padding, device transfer, and the forward pass that <a href="../module-36-case-web-scale-text-rag/section-36.5.html">Section 36.5</a> distributes across accelerators.</div>
+</div>
+
+<h2>2. Backfill and Incremental: Two Modes of One Pipeline <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A corpus is never embedded once. It is embedded in two distinct regimes that share the same encoder but differ in scheduling, scale, and trigger. The offline backfill processes the entire corpus in one large sweep: it runs when the index is first built, and again whenever the embedding model is replaced and every existing vector must be regenerated. It is throughput-bound, embarrassingly parallel, and tolerant of latency, so it runs as a batch job over the whole corpus with the largest batches the hardware allows, exactly the distributed-encoding workload of <a href="../module-36-case-web-scale-text-rag/section-36.5.html">Section 36.5</a>. The online incremental path processes only what changed since the last run: a document was added, edited, or deleted, producing a small set of new or modified chunks that must be embedded and written promptly so retrieval reflects reality within minutes rather than days.</p>
+<p>The incremental path is a stream-processing problem, and it inherits its design from <a href="../../part-2-distributed-data/module-09-stream-processing-online-ai/index.html">Chapter 9</a>. A change-data-capture feed or a message queue carries chunk-level change events; a consumer embeds them in small batches and upserts the results; a deletion event removes the corresponding records so the index does not retain vectors for text that no longer exists. The two modes are not alternatives but two settings of one pipeline: backfill establishes a consistent baseline, incremental keeps it consistent, and a model bump collapses the distinction by forcing a fresh backfill. Keeping them as one codebase, one encoder service, and one record schema is what prevents the index from fragmenting into vectors produced by different code paths that disagree about format or version.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Index That Drifted Three Days Behind the Docs</div>
+<p><strong>Who:</strong> A platform engineer running the retrieval backend for an internal documentation assistant.</p>
+<p><strong>Situation:</strong> Embeddings were produced by a nightly batch job that re-embedded the entire documentation corpus from scratch every run.</p>
+<p><strong>Problem:</strong> As the corpus grew, the nightly job stretched past its window, so freshly edited pages were not searchable until the following night, and on bad days the job did not finish at all.</p>
+<p><strong>Dilemma:</strong> Run the full re-embed more often (linear cost growth, soon unaffordable) or add an incremental path (more moving parts: a change feed, idempotent upserts, deletion handling).</p>
+<p><strong>Decision:</strong> They split the pipeline. The nightly full sweep was demoted to a weekly correctness backstop; an incremental consumer fed by the docs change feed handled edits within minutes.</p>
+<p><strong>How:</strong> Each edited page emitted chunk-change events; the consumer embedded only the changed chunks in small batches and upserted by content-addressed id, while deletes removed stale records.</p>
+<p><strong>Result:</strong> Median time from edit to searchable fell from about eighteen hours to under three minutes, and total embedding cost dropped because the bulk of the corpus stopped being re-embedded every night.</p>
+<p><strong>Lesson:</strong> Re-embedding everything on a schedule does not scale; embed the whole corpus once, then embed only what changed, and keep the full sweep as a rare backstop.</p>
+</div>
+
+<h2>3. Idempotency and Versioning: Never Stale, Never Doubled <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A pipeline that runs forever will retry, replay, and overlap. A worker crashes after embedding a batch but before confirming the write, so the batch is re-processed; a backfill and an incremental update touch the same chunk in the same minute; an at-least-once message queue delivers the same change event twice. None of these may produce a duplicate record or a lost update. The mechanism that makes this safe is a content-addressed identifier: the record id for a chunk is a hash of the chunk's text (and the fields that define its identity), so the same chunk always maps to the same id, and writing it is an upsert keyed by that id. Re-processing the same chunk overwrites its own record with an identical one, which is a no-op; the operation is idempotent, so retries are free of consequence. This is the same content-addressing discipline that pipeline operations and versioning in <a href="../../part-5-distributed-inference/module-26-mlops-distributed-ai/index.html">Chapter 26</a> apply across the MLOps stack.</p>
+<p>Versioning answers a different question: which model produced this vector? Vectors from two different embedding models are not comparable; a query embedded with model $v2$ must be searched against an index of $v2$ vectors, never a mix of $v1$ and $v2$, or the distances are meaningless. Therefore every record carries the embedding-model version, and the model version is pinned to the index. When the model changes, you do not edit vectors in place. You backfill the whole corpus under the new version into a new index (or a new version partition), verify it, and atomically switch retrieval to point at it, so that at every instant queries and stored vectors share one version. The re-embed is the price of a model upgrade, and Section 4 makes that price a number you can put in a budget.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: A Vector Index Is a Distributed System Held Consistent by Idempotent Writes</div>
+<p>The vector store of <a href="section-40.4.html">Section 40.4</a> is not a passive container; it is the convergence point of a distributed pipeline whose backfill and incremental paths, running on different schedules across different machines, must leave it in one coherent state. The tool that makes that possible without a global lock is the content-addressed, version-tagged, idempotent write: any path can write any chunk at any time, and because the id is the content and the write is an upsert, concurrent and repeated writes converge to the same answer. The same property that made the all-reduce of <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a> safe to reorder, that the combined result does not depend on the order of operations, is what makes this pipeline safe to retry.</p>
+</div>
+
+<h2>4. Throughput and Cost Engineering <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The dominant cost of an embedding pipeline is model calls, whether paid as accelerator-hours for a self-hosted encoder or as per-token charges for a hosted API. For a corpus of $C$ chunks averaging $T$ tokens each, embedded at a price $p$ per thousand tokens, the backfill cost is</p>
+$$\text{cost}_{\text{backfill}} = \frac{C \cdot T}{1000} \cdot p,$$
+<p>a number that scales linearly with the corpus and that you pay again, in full, on every model bump. If the index is rebuilt under a new model version $m$ times over its life, the cumulative re-embed cost is $m \cdot \text{cost}_{\text{backfill}}$, which is why a model upgrade is a budget event and not a free improvement. The two largest reductions available are batching, which lowers the per-call overhead as shown in Section 1, and caching, which removes calls entirely for chunks the pipeline has already embedded.</p>
+<p>Caching pays off because real corpora are full of repetition: boilerplate headers and footers, repeated license blocks, the same FAQ answer copied across pages, near-identical templated documents. If a fraction $h$ of incoming chunks are exact duplicates of chunks already embedded, a content-addressed cache turns those into lookups, and the effective number of model calls drops to $(1 - h)$ of the naive count:</p>
+$$\text{calls}_{\text{cached}} = (1 - h)\,C, \qquad \text{saving} = h \cdot \text{cost}_{\text{backfill}}.$$
+<p>The cache key is the same content-addressed id used for idempotency in Section 3, so deduplication and correctness share one mechanism: a chunk seen before is both skipped (a cost win) and written identically (a correctness guarantee). The demonstration below runs a small embedding pipeline end to end, batches a duplicate-heavy chunk stream through a deterministic stand-in encoder, deduplicates identical chunks through this cache, version-tags every record, and reports the model-call reduction and cache hit rate that Code 40.3.1's real encoder would inherit.</p>
+<pre><code class="language-python">import hashlib
+
+# A deterministic, dependency-free "embedding": bag-of-words hashed into a fixed
+# dimension. Stands in for a real model (sentence-transformers, a hosted API) so
+# the pipeline mechanics are visible without GPU or network.
+DIM = 256
+MODEL_VERSION = "demo-bow-v1"   # pinned to the index; bump forces a re-embed
+
+
+def embed(text):
+    vec = [0.0] * DIM
+    for tok in text.lower().split():
+        h = int(hashlib.md5(tok.encode()).hexdigest(), 16)
+        vec[h % DIM] += 1.0
+    norm = sum(v * v for v in vec) ** 0.5 or 1.0
+    return tuple(v / norm for v in vec)
+
+
+def chunk_id(text):
+    # Content-addressed id: identical chunk text -> identical id -> idempotent write.
+    return hashlib.sha1(text.encode()).hexdigest()[:12]
+
+
+# A corpus of chunks (from the chunking stage, 40.2). Note deliberate duplicates:
+# boilerplate headers and a repeated FAQ answer that recur across documents.
+boiler = "All rights reserved. Confidential internal document."
+faq = "To reset your password open settings and choose account recovery."
+corpus = [
+    "The distributed embedding pipeline keeps the vector index synchronized.",
+    boiler,
+    "Batched GPU inference amortizes kernel launch over many chunks at once.",
+    faq,
+    "Idempotent writes use content addressed ids so retries never duplicate.",
+    boiler,
+    "Offline backfill re-embeds the whole corpus when the model version bumps.",
+    faq,
+    "Incremental embedding handles only the chunks that changed since last run.",
+    boiler,
+    faq,
+    "The vector store is queried by the retrieval layer that the agents call.",
+] * 40   # scale the stream up to make throughput and cache effect measurable
+
+
+def run_pipeline(chunks, batch_size=64, use_cache=True):
+    cache = {}                      # chunk_id -> vector, dedups identical chunks
+    records, hits, calls = [], 0, 0
+    for start in range(0, len(chunks), batch_size):
+        batch = chunks[start:start + batch_size]
+        if use_cache:
+            # Dedup against the cache AND within the batch: a unique chunk is
+            # embedded once even if it appears many times in the same batch.
+            seen = set()
+            for text in batch:
+                cid = chunk_id(text)
+                if cid in cache or cid in seen:
+                    hits += 1
+                else:
+                    seen.add(cid)
+                    cache[cid] = embed(text)   # one model call per unique chunk
+                    calls += 1
+                records.append({"id": cid, "vector": cache[cid],
+                                "model_version": MODEL_VERSION})
+        else:
+            # Baseline: every chunk is embedded, duplicates included.
+            for text in batch:
+                cid = chunk_id(text)
+                calls += 1
+                records.append({"id": cid, "vector": embed(text),
+                                "model_version": MODEL_VERSION})
+    return records, hits, calls
+
+
+total = len(corpus)
+
+# Baseline: no dedup cache, every chunk hits the model.
+_, _, calls_nocache = run_pipeline(corpus, use_cache=False)
+
+# Cached: identical chunks embedded once, reused on every later occurrence.
+records, hits, calls_cache = run_pipeline(corpus, use_cache=True)
+
+unique = len({chunk_id(c) for c in corpus})
+hit_rate = hits / total
+
+print(f"model version pinned to index : {MODEL_VERSION}")
+print(f"chunks ingested               : {total:,}")
+print(f"unique chunks                  : {unique:,}")
+print(f"embed calls (no cache)         : {calls_nocache:,}")
+print(f"embed calls (with cache)       : {calls_cache:,}")
+print(f"cache hit rate                 : {hit_rate:.1%}")
+print(f"model calls saved by cache     : {calls_nocache - calls_cache:,} "
+      f"({1 - calls_cache / calls_nocache:.1%})")
+print(f"model-call reduction           : {calls_nocache / calls_cache:.1f}x fewer calls")
+print(f"sample record id / version     : {records[0]['id']} / "
+      f"{records[0]['model_version']}")
+# Idempotency check: the same chunk text always yields the same id and vector.
+a = records[1]                      # first boilerplate occurrence
+dups = [r for r in records if r["id"] == a["id"]]
+same = all(r["vector"] == a["vector"] for r in dups)
+print(f"id {a['id']} written {len(dups):,} times, all identical vector: {same}")
+</code></pre>
+<div class="code-caption"><strong>Code 40.3.2:</strong> A complete embedding pipeline in miniature: batched encoding, a content-addressed dedup cache, version-tagged records, and an idempotency check. The corpus is deliberately duplicate-heavy (twelve distinct chunks repeated to 480), so the cache effect is exaggerated relative to a real corpus; the mechanism, not the headline percentage, is the point.</div>
+<pre><code class="language-text">model version pinned to index : demo-bow-v1
+chunks ingested               : 480
+unique chunks                  : 8
+embed calls (no cache)         : 480
+embed calls (with cache)       : 8
+cache hit rate                 : 98.3%
+model calls saved by cache     : 472 (98.3%)
+model-call reduction           : 60.0x fewer calls
+sample record id / version     : 473980868949 / demo-bow-v1
+id 6234797bfd3b written 120 times, all identical vector: True</code></pre>
+<div class="code-caption"><strong>Output 40.3.2:</strong> Of 480 ingested chunks only 8 are unique, so the dedup cache cuts model calls from 480 to 8, a sixtyfold reduction at a 98.3% hit rate, and the same id is written 120 times to an identical vector, confirming the writes are idempotent. Every record carries <code>demo-bow-v1</code>, the version pinned to the index. A production corpus would show a far lower hit rate, but the saving, model calls avoided in proportion to the duplicate fraction $h$, follows the same $(1-h)\,C$ law from Section 4.</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Avoiding the Re-Embed on Every Model Bump (2024 to 2026)</div>
+<p>The most expensive line item in Section 4 is the full re-embed forced by a new model version, and a research line is attacking it directly. Matryoshka Representation Learning (Kusupati et al., 2022) trains embeddings whose leading coordinates are themselves valid lower-dimensional embeddings, so one backfill yields many dimensionalities and you can shrink the index without re-encoding. Work on backward-compatible and aligned embeddings (in the lineage of Shen et al.'s backward-compatible representation learning, 2020) trains a new model whose vector space is compatible with the old one, so a model upgrade does not invalidate the existing index and the re-embed can be incremental or skipped. The MTEB benchmark (Muennighoff et al., 2022) has made it routine to compare embedding models on retrieval quality, sharpening the question of whether a given upgrade is worth its backfill cost. The frontier treats the re-embed not as an inevitable tax but as a cost to be amortized, deferred, or avoided.</p>
+</div>
+<p>With chunks turned into versioned vectors by a pipeline that stays cheap through batching and caching and stays correct through idempotent, version-pinned writes, the only remaining question is where those vectors land and how they are searched. That is the subject of <a href="section-40.4.html">Section 40.4</a>, which takes the records this pipeline produces and builds the distributed vector store and retrieval path that the agents of this chapter query.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 40.3.1: Backfill or Incremental? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each event, state whether the embedding pipeline should respond with an offline backfill of the whole corpus or an online incremental update of a few chunks, and justify it in one sentence: (a) a single documentation page is edited; (b) the team replaces the embedding model with a newer one of a different dimension; (c) ten thousand new documents are ingested in a bulk import overnight; (d) a chunk's source document is deleted. For (b), explain why the new vectors must go into a separate index version rather than overwriting the old vectors in place.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 40.3.2: Measure the Cache Curve <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 40.3.2 so the corpus is generated with a tunable duplicate fraction $h$ (mix unique chunks with copies of a small repeated set so that a known fraction are exact duplicates). Sweep $h$ from 0.0 to 0.9 and plot, or tabulate, the number of model calls with caching against the prediction $(1 - h)\,C$ from Section 4. Then add a per-call cost in dollars and report the dollar saving at each $h$. Explain why the measured calls match the formula exactly here but would only approximate it on a real corpus where near-duplicates are not exact-duplicates.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 40.3.3: The Cost of a Model Upgrade <span class="exercise-type analysis">Analysis</span></div>
+<p>A corpus has $C = 2 \times 10^8$ chunks averaging $T = 220$ tokens, embedded by a hosted API at $p = \$0.02$ per thousand tokens. Compute the one-time backfill cost from the formula in Section 4. Now suppose the model is upgraded on average twice a year and the index lives for three years; compute the cumulative re-embed cost. If a content-addressed cache removes a duplicate fraction $h = 0.15$, recompute both numbers. Argue from these figures whether an engineering effort to make embeddings backward-compatible (so an upgrade skips the backfill) would pay for itself, and what additional information you would need to decide.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-40.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 40.2</span><span class="nav-title">Distributed Document Processing</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 40</span><span class="nav-num">Contents</span><span class="nav-title">Distributed LLM and Agentic Applications</span></a>
+<a class="next" href="section-40.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 40.4</span><span class="nav-title">Sharded Vector Search</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

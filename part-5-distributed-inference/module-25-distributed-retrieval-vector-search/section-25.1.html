@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 25.1: Retrieval-Augmented Generation as a Distributed System. RAG as a four-stage distributed pipeline (embed, sharded ANN search, rerank, distributed generation) governed by one end-to-end latency budget." name="description"/>
+<title>Section 25.1: Retrieval-Augmented Generation as a Distributed System | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 25: Distributed Retrieval and Vector Search</a></div>
+<h1>Retrieval-Augmented Generation as a Distributed System</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"The model asked me one question. I asked nine billion vectors. We agreed to split the difference inside nine hundred milliseconds, and somehow nobody noticed how many of us it took."</p>
+<cite>A Vector Shard That Answered in Time</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Retrieval-augmented generation looks like a single clever prompt, but it is a pipeline of four distributed systems wired in series under one latency budget: a query is embedded by a replicated encoder, searched against a sharded index of millions to billions of vectors, reranked by a dedicated scorer, and handed as context to a distributed language model.</strong> Each stage outgrows one machine for its own reason, and each is built and scaled separately in the sections that follow. What ties them into a system is not a shared algorithm but a shared deadline: the embed, search, rerank, and generate latencies must sum to less than the service-level objective, or the answer arrives too late to matter. This section frames that pipeline, derives its latency budget, and shows which stage dominates as the corpus grows, so the rest of the chapter can attack each stage knowing exactly how much of the budget it owns.</p>
+</div>
+<p>A language model knows only what was in its training data, frozen at a point in time, and it cannot cite a source it never saw. Retrieval-augmented generation, or RAG, fixes both problems by giving the model fresh, specific text at query time: before the model answers, a retrieval system finds the most relevant passages from a corpus and places them in the prompt. The idea is simple to state and is often demonstrated on a laptop with a few thousand documents. That demonstration hides the engineering. A production RAG system serves a corpus that does not fit on one machine, answers more queries per second than one server can handle, and must do both inside a strict latency budget. The moment any of those three pressures binds, and in a real deployment all three bind at once, RAG stops being a prompt-engineering trick and becomes a distributed system. This chapter is about that system; the quality of the retrieved text matters, but the distribution is the point.</p>
+<p>Those three pressures are the same ones that opened this book in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>: data too big for one machine, model too big for one device, throughput beyond one server. Retrieval makes all three concrete. The corpus and its embeddings are the data; a billion passages at 768 dimensions in 32-bit floats is roughly three terabytes of vectors alone, before any index structure, which is why the index must be sharded across machines. The language model is the model, already distributed across a fleet by <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a>. And every user-facing query competes for the same index and the same model, so every stage must also be replicated for throughput. RAG is therefore not one axis of distribution but several, stacked, which is exactly why it earns its own chapter rather than a paragraph.</p>
+
+<h2>1. The Four Stages, Each Its Own Subsystem <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Trace a single query through the pipeline and four distinct distributed systems light up in turn. Figure 25.1.1 lays them out left to right; we walk them in the same order. The first stage is embedding. The raw query text is meaningless to a vector index, so a transformer encoder maps it to a dense vector in the same space as the corpus embeddings. That encoder is replicated across machines because query volume exceeds one accelerator's throughput, and the corpus side of the same embedding job, encoding billions of passages offline, is a large distributed batch pipeline in its own right, the subject of <a href="section-25.2.html">Section 25.2</a>.</p>
+<p>The second stage is search. The query vector is compared against every corpus vector, in effect, to find the nearest neighbors, except that exact comparison against billions of vectors is far too slow, so the system uses an approximate nearest-neighbor (ANN) index that trades a little recall for orders of magnitude less work. That index does not fit on one machine, so it is partitioned into shards, each holding a slice of the corpus, and a query is scattered to all shards and the partial results gathered back, a pattern <a href="section-25.4.html">Sections 25.4</a> and <a href="section-25.5.html">25.5</a> develop in full. The third stage is reranking. ANN search is fast but coarse; a heavier cross-encoder rescores the top candidates with the query and passage read together, which is more accurate but too expensive to run over the whole corpus, so it runs only over the few dozen candidates that search returned, on its own replicated service (<a href="section-25.7.html">Section 25.7</a>). The fourth stage is generation: the reranked passages are concatenated into the prompt and sent to the distributed language model of <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a>, which produces the answer.</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The distributed RAG pipeline drawn left to right: a query enters a replicated embedding service, then a sharded approximate-nearest-neighbor search that scatters to shards and gathers results, then a replicated reranking service, then a distributed language model that emits the answer. Each stage is labeled as its own subsystem with its own scaling reason.">
+<defs>
+<marker id="arr251" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b251 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w251 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g251 { fill:#eef6ee; stroke:#2e7d32; stroke-width:1.6; }
+.t251 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s251 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l251 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr251); }
+.k251 { font:600 11px sans-serif; fill:#b86b1f; text-anchor:middle; }
+</style>
+<text class="t251" x="55" y="120">Query</text>
+<text class="s251" x="55" y="138">text</text>
+<line x1="92" y1="130" x2="128" y2="130" class="l251"/>
+
+<rect class="b251" x="132" y="92" width="118" height="76" rx="9"/>
+<text class="t251" x="191" y="120">Embed</text>
+<text class="s251" x="191" y="138">replicated</text>
+<text class="s251" x="191" y="153">encoder</text>
+<text class="k251" x="191" y="84">throughput</text>
+<line x1="252" y1="130" x2="288" y2="130" class="l251"/>
+
+<rect class="w251" x="292" y="60" width="150" height="140" rx="9"/>
+<text class="t251" x="367" y="84">Sharded ANN search</text>
+<rect class="w251" x="306" y="98" width="36" height="26" rx="4"/>
+<rect class="w251" x="349" y="98" width="36" height="26" rx="4"/>
+<rect class="w251" x="392" y="98" width="36" height="26" rx="4"/>
+<text class="s251" x="324" y="116">s1</text>
+<text class="s251" x="367" y="116">s2</text>
+<text class="s251" x="410" y="116">sK</text>
+<text class="s251" x="367" y="146">scatter to shards,</text>
+<text class="s251" x="367" y="161">gather top-k</text>
+<text class="s251" x="367" y="183">corpus too big</text>
+<text class="k251" x="367" y="52">data + throughput</text>
+<line x1="444" y1="130" x2="480" y2="130" class="l251"/>
+
+<rect class="g251" x="484" y="92" width="120" height="76" rx="9"/>
+<text class="t251" x="544" y="120">Rerank</text>
+<text class="s251" x="544" y="138">cross-encoder</text>
+<text class="s251" x="544" y="153">top candidates</text>
+<text class="k251" x="544" y="84">accuracy</text>
+<line x1="606" y1="130" x2="642" y2="130" class="l251"/>
+
+<rect class="b251" x="646" y="60" width="150" height="140" rx="9"/>
+<text class="t251" x="721" y="86">Distributed LLM</text>
+<rect class="b251" x="660" y="100" width="36" height="26" rx="4"/>
+<rect class="b251" x="703" y="100" width="36" height="26" rx="4"/>
+<rect class="b251" x="746" y="100" width="36" height="26" rx="4"/>
+<text class="s251" x="678" y="118">gpu</text>
+<text class="s251" x="721" y="118">gpu</text>
+<text class="s251" x="764" y="118">gpu</text>
+<text class="s251" x="721" y="148">prefill context,</text>
+<text class="s251" x="721" y="163">decode answer</text>
+<text class="s251" x="721" y="185">model too big</text>
+<text class="k251" x="721" y="52">model + throughput</text>
+<line x1="798" y1="130" x2="834" y2="130" class="l251"/>
+<text class="t251" x="862" y="126">Answer</text>
+<text class="s251" x="862" y="144">+ sources</text>
+
+<rect x="132" y="248" width="664" height="58" rx="9" fill="none" stroke="#14385c" stroke-width="1.4" stroke-dasharray="5 4"/>
+<text class="t251" x="464" y="272">One latency budget</text>
+<text class="s251" x="464" y="292">t_embed + t_search + t_rerank + t_gen &#8804; SLO</text>
+<path class="l251" d="M 191 168 L 191 248" />
+<path class="l251" d="M 367 200 L 367 248" />
+<path class="l251" d="M 544 168 L 544 248" />
+<path class="l251" d="M 721 200 L 721 248" />
+</svg>
+<figcaption><strong>Figure 25.1.1:</strong> The distributed RAG pipeline. A query flows through four subsystems in series: a replicated embedding encoder, a sharded approximate-nearest-neighbor (ANN) search that scatters to $K$ shards and gathers the top-$k$, a replicated cross-encoder reranker, and the distributed language model of <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a>. The small caption above each box names the pressure that forces it off one machine. The dashed band underneath is the constraint that makes the four into one system: their latencies must sum to less than the service-level objective.</figcaption>
+</figure>
+<p>The crucial observation in Figure 25.1.1 is that the four boxes do not share an algorithm; they share a deadline. The embedding service knows nothing about graph-based indexes; the ANN shards know nothing about transformer decoding. What couples them is that a user is waiting, and the four stages run in series, so their latencies add. That sum, and not any single stage's cleverness, is what the architect must hold under control. The next section makes the sum precise.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: RAG Is a Series Pipeline of Independent Distributed Systems Under One Deadline</div>
+<p>Each stage of RAG scales out for a different reason (the encoder for throughput, the index for corpus size, the reranker for accuracy, the model for parameters and throughput) and is engineered with different machinery. They become a single system only because they run in series under a shared latency budget. Optimize a stage in isolation and you may win nothing; optimize the stage that owns the largest slice of the budget and the whole pipeline speeds up. The budget, not any individual index trick, is the object of design.</p>
+</div>
+
+<h2>2. The End-to-End Latency Budget <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Because the stages run in series, the user-perceived latency of one query is the sum of the per-stage latencies plus the network hops between them. Writing $t_{\text{embed}}$, $t_{\text{search}}$, $t_{\text{rerank}}$, and $t_{\text{gen}}$ for the four stage latencies, the end-to-end time must fit a service-level objective (SLO):</p>
+$$t_{\text{e2e}} \;=\; t_{\text{embed}} + t_{\text{search}} + t_{\text{rerank}} + t_{\text{gen}} \;\le\; \text{SLO}.$$
+<p>This is a budget in the literal sense: a fixed quantity of milliseconds to be allocated across stages, where spending more on one leaves less for the others. The subtlety is that the relevant number is not the average latency of each stage but its tail. A query waits for the slowest of the $K$ ANN shards, not the average shard, so $t_{\text{search}}$ is governed by the tail of the shard-latency distribution, and the more shards a query fans out to, the worse the slowest-of-$K$ tends to be. The same logic applies wherever a stage fans out. The honest budget is therefore written in tail latency, typically the 95th or 99th percentile:</p>
+$$t_{\text{search}}^{p99} \;\approx\; \mathbb{E}\!\left[\max_{1 \le j \le K} t_j\right] \;\ge\; \max_j \, \mathbb{E}[t_j],$$
+<p>and the gap between the expected maximum and the maximum expectation is exactly the tail-amplification effect that <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.3.html">Section 5.3</a> analyzes as the central hazard of fan-out systems. Budgeting RAG in average latency and then being surprised by the p99 is the most common way these pipelines miss their SLO. We allocate the budget at the tail and measure it at the tail.</p>
+<p>To see where the budget actually goes, and how it shifts as the corpus grows, we model the four stages with simple closed-form latencies and sum them across corpus sizes from one million to ten billion vectors. The model is deliberately coarse; its job is to show the shape of the budget, namely which stage dominates and how that stays stable as data scales, not to predict any specific deployment to the millisecond.</p>
+<pre><code class="language-python">import math
+
+# Per-stage latency models (milliseconds), all simple closed forms so the
+# numbers are reproducible and the dominant term is easy to read off.
+
+def embed_ms():
+    # One query embedded on a replicated encoder: fixed forward pass + network
+    # hop to the embedding service. Independent of corpus size.
+    forward = 6.0          # transformer encoder forward pass for one short query
+    network_hop = 1.5      # client -> embedding replica round trip
+    return forward + network_hop
+
+def search_ms(n_vectors, shards):
+    # Sharded ANN index. Each shard searches n_vectors/shards points; graph-based
+    # ANN visits ~ c * log(points_per_shard) nodes, then a scatter-gather merges
+    # the per-shard top-k. Fan-out adds one network round trip plus tail-straggler
+    # slack that grows slowly with shard count.
+    per_shard = n_vectors / shards
+    visit = 0.45 * math.log2(max(per_shard, 2.0))   # ANN node visits per shard
+    fanout = 1.5                                     # scatter to shards round trip
+    straggler = 0.25 * math.log2(max(shards, 2.0))   # slowest-of-S tail slack
+    merge = 0.4                                       # top-k merge of shard results
+    return visit + fanout + straggler + merge
+
+def rerank_ms(candidates):
+    # Cross-encoder reranker scores the candidate passages in a batch on a
+    # dedicated replica; cost is roughly linear in the candidate count.
+    per_candidate = 0.35
+    network_hop = 1.5
+    return per_candidate * candidates + network_hop
+
+def generate_ms(prompt_tokens, output_tokens):
+    # Distributed LLM serving (Chapter 24): prefill over the retrieved context,
+    # then autoregressive decode. Decode dominates and is corpus-independent.
+    prefill = 0.02 * prompt_tokens     # context (query + retrieved passages)
+    decode = 11.0 * output_tokens      # 11 ms per output token, served distributed
+    return prefill + decode
+
+SLO_MS = 900.0          # end-to-end p95 latency budget for the answer
+SHARDS_PER_BILLION = 100  # we add index shards as the corpus grows
+CANDIDATES = 50          # top-k passages handed to the reranker
+PROMPT_TOKENS = 1200     # query + retrieved passages fed to the LLM
+OUTPUT_TOKENS = 64       # generated answer length
+
+corpus_sizes = [1_000_000, 10_000_000, 100_000_000, 1_000_000_000, 10_000_000_000]
+
+print(f"{'corpus':>14} {'shards':>7} {'embed':>7} {'search':>7} "
+      f"{'rerank':>7} {'gen':>7} {'total':>8} {'dominant':>9} {'SLO':>5}")
+print("-" * 86)
+for n in corpus_sizes:
+    shards = max(1, round(n / 1_000_000_000 * SHARDS_PER_BILLION))
+    e = embed_ms()
+    s = search_ms(n, shards)
+    r = rerank_ms(CANDIDATES)
+    g = generate_ms(PROMPT_TOKENS, OUTPUT_TOKENS)
+    total = e + s + r + g
+    stages = {"embed": e, "search": s, "rerank": r, "generate": g}
+    dominant = max(stages, key=stages.get)
+    ok = "ok" if total &lt;= SLO_MS else "OVER"
+    print(f"{n:>14,} {shards:>7} {e:>7.1f} {s:>7.1f} "
+          f"{r:>7.1f} {g:>7.1f} {total:>8.1f} {dominant:>9} {ok:>5}")
+</code></pre>
+<div class="code-caption"><strong>Code 25.1.1:</strong> An end-to-end RAG latency budget built by summing four distributed stages. The search model adds one index shard per ten million vectors so the points searched per shard stay bounded; every other stage is corpus-independent. The dominant stage is the one consuming the largest slice of the budget at each corpus size.</div>
+<pre><code class="language-text">        corpus  shards   embed  search  rerank     gen    total  dominant   SLO
+--------------------------------------------------------------------------------------
+     1,000,000       1     7.5    11.1    19.0   728.0    765.6  generate    ok
+    10,000,000       1     7.5    12.6    19.0   728.0    767.1  generate    ok
+   100,000,000      10     7.5    13.2    19.0   728.0    767.7  generate    ok
+ 1,000,000,000     100     7.5    14.0    19.0   728.0    768.5  generate    ok
+10,000,000,000    1000     7.5    14.9    19.0   728.0    769.4  generate    ok</code></pre>
+<div class="code-caption"><strong>Output 25.1.1:</strong> The corpus grows by a factor of ten thousand, yet the total latency moves by under four milliseconds. Search rises only from 11.1 to 14.9 ms because sharding keeps the per-shard work logarithmic, and generation sits at a fixed 728 ms floor that no amount of corpus growth touches. The pipeline stays comfortably inside the 900 ms budget throughout.</div>
+<p>Output 25.1.1 carries the chapter's central practical lesson. As the corpus grows ten-thousand-fold, from one million to ten billion vectors, the total latency barely moves, because the search stage grows only logarithmically once the shard count tracks the corpus size, exactly the property that <a href="section-25.5.html">Section 25.5</a> engineers on purpose. The stage that dominates the budget is generation, the distributed language model from <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a>, and it is corpus-independent. This is liberating: it means the retrieval half of RAG, the part this chapter is about, can scale to web-sized corpora without eating the latency budget, provided the index is sharded well. The danger is not that search gets slow as data grows; it is that an unsharded index makes search grow linearly, at which point a few hundred million vectors blow the budget on their own. The whole point of distributing the index is to convert that linear growth into the flat line you see above.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Tyranny of the Slowest Friend</div>
+<p>A fan-out query is a group of friends leaving a restaurant: you cannot go home until the slowest one finishes their coffee. With two friends, the wait is usually fine. With a thousand friends, one of them is always, at this very moment, ordering a second espresso. That is why the search row in Output 25.1.1 creeps upward even though each shard does less work: more shards means a higher chance that one of them is having a slow millisecond. The cure is not to make every friend faster, it is to stop waiting for the very last one, which is what hedged requests and tail-cutting do in <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.3.html">Section 5.3</a>.</p>
+</div>
+
+<h2>3. Why Retrieval Must Scale Out at All <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>It is worth pausing on why retrieval cannot simply live on one large machine, because the answer determines the shape of the whole chapter. Two ceilings force it out, and they are the same data and throughput ceilings from <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>, now wearing retrieval's clothes. The first ceiling is the corpus and its embeddings. A web-scale text corpus runs to billions of passages, and each passage becomes a dense vector. At 768 dimensions and four bytes per number, a billion vectors is about three terabytes before the index adds its own overhead, and a graph or quantized index can multiply that. No single machine holds that in memory at search speed, so the index is partitioned: shard $j$ holds a disjoint slice of the corpus, and a query is searched against all shards in parallel and their results merged. This is the same partitioning-and-sharding arc the book has followed from <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a>'s sharded embedding tables onward, now applied to a search index.</p>
+<p>The second ceiling is query throughput. A single index replica can sustain only so many searches per second; a service answering thousands of user queries per second must therefore replicate the index, running several copies behind a load balancer so that capacity scales with traffic. Sharding and replication are orthogonal: sharding splits one logical index across machines so it fits and so each query does less work, while replication duplicates the sharded index so more queries can run at once. A production index is laid out as a grid, sharded one way and replicated the other, which is precisely the design space <a href="section-25.5.html">Section 25.5</a> opens up. The classical foundations for the search inside each shard, locality-sensitive hashing and approximate nearest neighbors, were built in <a href="../../part-3-distributed-ml/module-12-distributed-classical-ml/section-12.7.html">Section 12.7</a>, and the distributed top-$k$ gather that merges shard results is the same reduce pattern as the MapReduce aggregation of <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/section-6.7.html">Section 6.7</a>; this chapter scales those ideas to the index and binds them to a latency budget.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Support Bot That Missed Its Budget on the Reranker</div>
+<p><strong>Who:</strong> A platform engineer running a customer-support RAG assistant over a 40-million-document knowledge base.</p>
+<p><strong>Situation:</strong> The assistant answered well in testing but its p99 latency drifted past the 1.2-second SLO under real traffic, and product threatened to cut the retrieval step entirely.</p>
+<p><strong>Problem:</strong> The team's instinct was to blame the vector search and buy a faster ANN index, the stage they had spent the most time tuning.</p>
+<p><strong>Dilemma:</strong> Spend the quarter optimizing search, which felt like the hard distributed-systems problem, or first measure where the budget actually went, which risked finding that their pride-and-joy index was not the culprit.</p>
+<p><strong>Decision:</strong> They instrumented every stage separately, exactly as Code 25.1.1 sums them, and read off the dominant term before touching any code.</p>
+<p><strong>How:</strong> Per-stage traces showed sharded search at 22 ms p99, embedding at 9 ms, generation at 700 ms, and a cross-encoder reranker scoring 200 candidates at 380 ms p99, the reranker, not search, was eating the slack.</p>
+<p><strong>Result:</strong> Cutting the reranker's candidate set from 200 to 40 and batching it cut its p99 to 70 ms with no measurable drop in answer quality, and the pipeline came in under SLO with room to spare.</p>
+<p><strong>Lesson:</strong> Distribute and optimize the stage that owns the budget, not the stage you find most interesting. The budget in Section 2 is a diagnostic instrument before it is a design constraint.</p>
+</div>
+
+<h2>4. The Map of the Chapter <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Each stage of the pipeline in Figure 25.1.1 expands into its own section, and a few cross-cutting concerns get sections of their own. The embedding stage, including the offline pipeline that encodes the whole corpus into vectors, is <a href="section-25.2.html">Section 25.2</a>. The store that holds those vectors and answers searches, the vector database, is <a href="section-25.3.html">Section 25.3</a>. The approximate-nearest-neighbor algorithms that make search fast inside one shard, HNSW graphs, inverted files (IVF), and product quantization (PQ), are <a href="section-25.4.html">Section 25.4</a>, and the way those indexes are sharded and replicated across machines is <a href="section-25.5.html">Section 25.5</a>, the structural heart of the chapter.</p>
+<p>Beyond pure vector search, <a href="section-25.6.html">Section 25.6</a> covers distributed hybrid search, combining dense vectors with classical keyword retrieval so the two signals reinforce each other. The reranking stage and its distributed, multi-stage refinement is <a href="section-25.7.html">Section 25.7</a>. Because the same queries and the same hot passages recur, <a href="section-25.8.html">Section 25.8</a> treats distributed caching for retrieval, the layer that lets a system skip work it has already done. Finally, <a href="section-25.9.html">Section 25.9</a> closes the loop with evaluation, how to measure recall, latency, and freshness across a sharded, replicated retrieval fleet, building directly on the evaluation methodology of <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/index.html">Chapter 5</a>. Once the pieces are in place, the web-scale and agentic case studies of <a href="../../part-8-case-studies/module-36-case-web-scale-text-rag/index.html">Chapter 36</a> and Chapter 40 assemble them into complete systems serving real traffic.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Retrieval Is the Six Axes, Stacked</div>
+<p>RAG is the clearest example in the book of the six axes of distribution from <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a> meeting in one system. It distributes data (the sharded corpus and its embeddings), distributes inference (the replicated encoder, reranker, and language model), distributes the model (the LLM's parameters across <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a>'s fleet), and coordinates the cluster (the scatter-gather across index shards and the latency budget that governs them). Reading retrieval as a single subsystem misses the lesson; the engineering payoff is in seeing four distributed systems composed under one deadline, and in knowing which axis to scale when the budget tightens. That is the thesis of this book applied to one of its most demanding workloads.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: LangChain and LlamaIndex Wire the Pipeline in a Few Lines</div>
+<p>The four stages of Figure 25.1.1 are real services you operate, but orchestration frameworks let you express the wiring declaratively while you point each stage at a distributed backend. In LlamaIndex, an embedding model, a sharded vector store, a reranker, and an LLM are four components composed into a query engine; the framework handles the embed-search-rerank-generate flow and lets each component be a remote, replicated service rather than an in-process object:</p>
+<pre><code class="language-python"># Each component is a handle to a distributed service, not a local object.
+from llama_index.core import VectorStoreIndex
+from llama_index.core.postprocessor import SentenceTransformerRerank
+
+index = VectorStoreIndex.from_vector_store(sharded_vector_store)  # 25.3-25.5
+reranker = SentenceTransformerRerank(top_n=40, model="BAAI/bge-reranker-base")  # 25.7
+
+query_engine = index.as_query_engine(
+    similarity_top_k=200,          # ANN search breadth, fanned out to shards
+    node_postprocessors=[reranker],# rerank stage trims 200 -> 40 candidates
+    llm=distributed_llm,           # Chapter 24's served model
+)
+answer = query_engine.query("How do index shards bound search latency?")
+</code></pre>
+<div class="code-caption"><strong>Code 25.1.2:</strong> The embed-search-rerank-generate pipeline of Figure 25.1.1 expressed in LlamaIndex; LangChain and Haystack offer equivalent retriever-reranker-generator compositions. The framework supplies the orchestration that the case studies in <a href="../../part-8-case-studies/module-36-case-web-scale-text-rag/index.html">Chapter 36</a> run at scale, but it does not relieve you of owning the latency budget: each handle points at a service you must shard, replicate, and keep inside its slice of the SLO.</div>
+</div>
+
+<h2>5. A Frontier in Motion: Retrieve, or Just Read Everything? <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The premise of RAG, that you retrieve a small relevant slice rather than feed the model the whole corpus, is under active pressure from two directions at once, and the resolution is shaping how these systems are built right now. It is worth knowing where the argument stands before committing a design to it.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Long-Context Models, Agentic Retrieval, and the Future of the Pipeline (2024 to 2026)</div>
+<p>One direction questions retrieval itself. Models with context windows of hundreds of thousands to millions of tokens (Gemini 1.5, 2024, and its successors; Anthropic's and OpenAI's long-context releases) raised the question of whether you can skip retrieval and simply read the relevant documents into the prompt. The empirical answer so far is no, not at corpus scale: studies of the "lost in the middle" effect (Liu et al., 2024) show models attend unevenly across a long context, and stuffing a million tokens into every prompt is ruinous for both latency and cost, since the generation stage that already dominates Output 25.1.1 grows with context length. Retrieval survives as the way to keep the prompt small and relevant, and long context becomes a larger candidate budget for the reranker rather than a replacement for search.</p>
+<p>The other direction makes retrieval more active. Agentic and iterative retrieval (the Self-RAG line of Asai et al., 2024, and the broader move to retrieval-using agents) turns the single embed-search-rerank-generate pass of Figure 25.1.1 into a loop: the model decides whether to retrieve, issues several queries, reads results, and retrieves again before answering. This multiplies the number of search round trips per user request, which tightens the per-search latency budget rather than relaxing it, and turns the index into a shared memory that many agent steps hit concurrently, the pattern <a href="../../part-6-multi-agent-systems/module-32-distributed-agent-orchestration/index.html">Chapter 32</a> develops. Both frontiers leave the distributed retrieval substrate of this chapter not just intact but more heavily loaded, which is the strongest argument for building it well.</p>
+</div>
+<p>Whichever way these debates settle, the distributed machinery is the durable part. A longer context window still needs a fast way to choose what goes in it; an agent that retrieves ten times per task needs each retrieval to cost a tenth of the budget. The sections that follow build that machinery stage by stage, starting with the pipeline that turns a corpus into the vectors everything else searches. We have the pipeline, the budget that governs it, and the map; <a href="section-25.2.html">Section 25.2</a> opens the first stage, the distributed embedding pipeline.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.1.1: Allocate the Budget <span class="exercise-type conceptual">Conceptual</span></div>
+<p>You are given a 600 ms p99 SLO for a RAG answer and the following measured stage tails: embed 10 ms, search 25 ms, rerank 60 ms, generate 540 ms. State whether the pipeline meets its SLO, and by how much it misses if not. Then, using Output 25.1.1's lesson about which stage dominates, name the single most effective change to bring it under budget, and explain why shrinking the search stage (the one most associated with "distributed retrieval") would be the wrong first move here.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.1.2: Make Search the Bottleneck <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 25.1.1 so the index is <em>not</em> sharded: fix <code>shards = 1</code> for every corpus size and change <code>search_ms</code> so that visiting cost grows linearly in the points per shard (replace the <code>log2</code> term with a small constant times <code>per_shard</code>). Re-run across the same corpus sizes and report the first corpus size at which the total exceeds the 900 ms SLO. Explain, in terms of the difference between linear and logarithmic growth, why sharding is what converts the flat search line in Output 25.1.1 into a budget-busting one when removed, and what this implies for the layout choices of <a href="section-25.5.html">Section 25.5</a>.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.1.3: Tail Amplification Across Shards <span class="exercise-type analysis">Analysis</span></div>
+<p>Suppose each ANN shard's search latency is independent and uniformly distributed between 5 and 15 ms. A query fans out to $K$ shards and waits for the slowest. Using the fact that for $K$ independent uniforms on $[a,b]$ the expected maximum is $a + (b-a)\frac{K}{K+1}$, compute the expected fan-out latency for $K = 1, 10, 100, 1000$. Compare each to the single-shard mean of 10 ms, and relate your numbers to the slow upward creep of the search column in Output 25.1.1 and to the tail-latency treatment of <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.3.html">Section 5.3</a>. What does this say about the cost of adding shards purely to fit a larger corpus?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html"><span class="nav-label">Chapter Overview</span><span class="nav-num">Chapter 25</span><span class="nav-title">Distributed Retrieval and Vector Search</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 25</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Retrieval and Vector Search</span></a>
+<a class="next" href="section-25.2.html"><span class="nav-label">Next</span><span class="nav-num">Section 25.2</span><span class="nav-title">Distributed Embedding Pipelines</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

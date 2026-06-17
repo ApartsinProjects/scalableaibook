@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 16.3: Pipeline Parallelism. Splitting a model by layers across devices, the pipeline bubble, and how micro-batching and 1F1B schedules keep every stage busy." name="description"/>
+<title>Section 16.3: Pipeline Parallelism | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 16: Model, Pipeline, and Sharded Parallelism</a></div>
+<h1>Pipeline Parallelism</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I hold layers nine through sixteen. Most of the time I am simply waiting for layers one through eight to finish having opinions."</p>
+<cite>A Pipeline Stage Between Forward and Backward</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Pipeline parallelism splits a model along its depth: consecutive layers become stages that live on different devices, and a batch flows forward through the stages and backward again like work moving down an assembly line.</strong> Where tensor parallelism (the previous section) cuts each layer crosswise and pays an all-reduce inside every layer, pipeline parallelism cuts between layers and pays only a cheap point-to-point handoff at each stage boundary. That cheap communication is what lets a pipeline stretch across separate nodes. The price is a new failure mode all its own: if you feed the pipeline one batch at a time, only one stage works while the rest stand idle, an inefficiency called the bubble. This section shows where the bubble comes from, derives the formula that predicts it, and shows how micro-batching and smarter schedules shrink it until the assembly line runs nearly full.</p>
+</div>
+<p>A model too large for one device must be cut somewhere. Tensor parallelism, developed in <a href="section-16.2.html">Section 16.2</a>, cuts each layer's weight matrices across devices and stitches the pieces back together with an all-reduce on every forward and backward pass. That all-reduce is frequent and bandwidth-hungry, so tensor parallelism wants the fattest interconnect you have and rarely crosses a node boundary. Pipeline parallelism makes the opposite cut. Instead of splitting a layer, it keeps each layer whole and assigns a contiguous block of layers to each device. The devices form stages in sequence: stage one holds the first block of layers, stage two the next block, and so on, with the last stage producing the loss. A device only ever talks to its immediate neighbor, handing forward the activations it computed and receiving back the gradients that flow the other way. Figure 16.3.1 lays out this depth-ordered relay across four devices.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A model with sixteen layers split into four pipeline stages on four devices; activations flow forward to the right through point-to-point links and gradients flow backward to the left.">
+<defs>
+<marker id="arrF" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arrB" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.dev16 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.lay16 { fill:#dde8f4; stroke:#14385c; stroke-width:1.1; }
+.tt16 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.ss16 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.lf16 { fill:none; stroke:#14385c; stroke-width:2; marker-end:url(#arrF); }
+.lb16 { fill:none; stroke:#b86b1f; stroke-width:2; marker-end:url(#arrB); }
+.fwd16 { font:600 12px sans-serif; fill:#14385c; text-anchor:middle; }
+.bwd16 { font:600 12px sans-serif; fill:#b86b1f; text-anchor:middle; }
+</style>
+<text class="tt16" x="440" y="26">One model, sixteen layers, cut into four pipeline stages</text>
+<!-- four device boxes -->
+<rect class="dev16" x="40" y="60" width="180" height="120" rx="10"/>
+<rect class="dev16" x="240" y="60" width="180" height="120" rx="10"/>
+<rect class="dev16" x="460" y="60" width="180" height="120" rx="10"/>
+<rect class="dev16" x="660" y="60" width="180" height="120" rx="10"/>
+<text class="tt16" x="130" y="82">Device 1 (Stage 1)</text>
+<text class="tt16" x="330" y="82">Device 2 (Stage 2)</text>
+<text class="tt16" x="550" y="82">Device 3 (Stage 3)</text>
+<text class="tt16" x="750" y="82">Device 4 (Stage 4)</text>
+<!-- layer chips per stage -->
+<rect class="lay16" x="56" y="100" width="36" height="60" rx="4"/><text class="ss16" x="74" y="135">L1</text>
+<rect class="lay16" x="96" y="100" width="36" height="60" rx="4"/><text class="ss16" x="114" y="135">L2</text>
+<rect class="lay16" x="136" y="100" width="36" height="60" rx="4"/><text class="ss16" x="154" y="135">L3</text>
+<rect class="lay16" x="176" y="100" width="36" height="60" rx="4"/><text class="ss16" x="194" y="135">L4</text>
+<rect class="lay16" x="256" y="100" width="36" height="60" rx="4"/><text class="ss16" x="274" y="135">L5</text>
+<rect class="lay16" x="296" y="100" width="36" height="60" rx="4"/><text class="ss16" x="314" y="135">L6</text>
+<rect class="lay16" x="336" y="100" width="36" height="60" rx="4"/><text class="ss16" x="354" y="135">L7</text>
+<rect class="lay16" x="376" y="100" width="36" height="60" rx="4"/><text class="ss16" x="394" y="135">L8</text>
+<rect class="lay16" x="476" y="100" width="36" height="60" rx="4"/><text class="ss16" x="494" y="135">L9</text>
+<rect class="lay16" x="516" y="100" width="36" height="60" rx="4"/><text class="ss16" x="534" y="135">L10</text>
+<rect class="lay16" x="556" y="100" width="36" height="60" rx="4"/><text class="ss16" x="574" y="135">L11</text>
+<rect class="lay16" x="596" y="100" width="36" height="60" rx="4"/><text class="ss16" x="614" y="135">L12</text>
+<rect class="lay16" x="676" y="100" width="36" height="60" rx="4"/><text class="ss16" x="694" y="135">L13</text>
+<rect class="lay16" x="716" y="100" width="36" height="60" rx="4"/><text class="ss16" x="734" y="135">L14</text>
+<rect class="lay16" x="756" y="100" width="36" height="60" rx="4"/><text class="ss16" x="774" y="135">L15</text>
+<rect class="lay16" x="796" y="100" width="36" height="60" rx="4"/><text class="ss16" x="814" y="135">L16</text>
+<!-- forward links -->
+<line class="lf16" x1="220" y1="108" x2="240" y2="108"/>
+<line class="lf16" x1="420" y1="108" x2="460" y2="108"/>
+<line class="lf16" x1="640" y1="108" x2="660" y2="108"/>
+<text class="fwd16" x="440" y="218">forward: activations flow right (point-to-point send)</text>
+<!-- backward links -->
+<line class="lb16" x1="660" y1="152" x2="640" y2="152"/>
+<line class="lb16" x1="460" y1="152" x2="420" y2="152"/>
+<line class="lb16" x1="240" y1="152" x2="220" y2="152"/>
+<text class="bwd16" x="440" y="244">backward: gradients flow left (point-to-point send)</text>
+<text class="ss16" x="440" y="290">Each device talks only to its neighbor: a single tensor per handoff, no all-reduce.</text>
+<text class="ss16" x="440" y="312">Total parameters now span four devices, so a model 4x too large to fit can train.</text>
+</svg>
+<figcaption><strong>Figure 16.3.1:</strong> Inter-layer (pipeline) parallelism. A sixteen-layer model is split into four contiguous stages, one per device. Activations are sent forward to the next stage and gradients are sent backward to the previous stage over point-to-point links (the navy and amber arrows). Unlike tensor parallelism, no collective all-reduce sits inside the layers; each stage boundary moves a single activation or gradient tensor, which is why a pipeline can span separate nodes.</figcaption>
+</figure>
+
+<h2>1. Splitting a Model by Depth <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The idea is mechanical. Number the layers of a network from input to output, choose $S$ cut points so the layers fall into $S$ contiguous groups, and place group $s$ on device $s$. A forward pass now runs as a relay: device one computes the activations of its layers and sends the final activation tensor to device two, which continues, and so on until the last device computes the loss. The backward pass runs the relay in reverse: the last device computes the gradient of the loss with respect to its inputs and sends that gradient back to the previous device, which continues backpropagation through its own layers, and so on to the first device. Each device holds only the parameters, optimizer state, and activations of its own stage, so a model whose parameters are $S$ times too large for one device now fits, $1/S$ of it per device.</p>
+<p>The communication between stages is the cheapest in this chapter. At each boundary a stage sends exactly one activation tensor forward (during the forward pass) and one gradient tensor backward (during the backward pass). These are point-to-point transfers, a <code>send</code> from one device matched by a <code>recv</code> on its neighbor, not a collective that touches every device. The volume is the size of one activation tensor, independent of how many parameters the stage holds. This is the structural reason pipeline parallelism, unlike tensor parallelism, tolerates a slower link and is the standard tool for crossing node boundaries, a trade-off we make precise in Section 5.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Pipeline Parallelism Trades a Cheap Cut for an Idle Tax</div>
+<p>Cutting a model between layers means each device exchanges only a single activation or gradient tensor with one neighbor, the lightest communication of any model-parallel method. But a strictly sequential dependency comes with that cut: stage $s$ cannot start until stage $s-1$ has handed it something to work on. Run one batch at a time and most stages sit idle most of the time. The entire craft of pipeline parallelism is keeping that cheap-to-communicate structure while filling the idle time, and the lever for doing so is feeding many small micro-batches through the pipeline at once.</p>
+</div>
+
+<h2>2. The Bubble Problem <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Push a single batch through a four-stage pipeline and watch the timeline. At the first time step only stage one is busy; the other three have nothing to do because the data has not reached them yet. At the second step stages one and two might both work, and only by the fourth step is the whole pipeline lit up, just in time for the forward pass to end and the backward pass to begin draining it the other way. That fill-and-drain idle time, where some stages wait with no work, is the pipeline bubble. With one batch and $S$ stages, the pipeline is full for only a sliver of its runtime, and utilization is roughly $1/S$: four stages running at one-quarter efficiency is a poor return on four devices.</p>
+<p>The fix that defines modern pipeline parallelism is micro-batching, introduced by the GPipe system. Instead of pushing one batch of $B$ examples through the pipeline as a single indivisible unit, split it into $M$ micro-batches of $B/M$ examples each and feed them in one after another. While stage two works on micro-batch one, stage one can already start micro-batch two; while stage three handles micro-batch one, stage two handles micro-batch two and stage one micro-batch three. After a short fill, every stage is busy on a different micro-batch at once, and the bubble shrinks to the fill-and-drain at the very start and end. The gradients from all $M$ micro-batches are accumulated and applied as one optimizer step, so micro-batching changes the schedule, not the math: the update is identical to processing the full batch at once. Figure 16.3.2 contrasts the two schedules on a four-stage pipeline.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two pipeline schedules compared. The top schedule pushes one batch through four stages and leaves large idle bubbles. The bottom schedule splits the batch into eight micro-batches so the stages overlap and the bubble shrinks to a thin band at the start and end.">
+<defs>
+<marker id="ax16" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L7,4 L0,8 z" fill="#5a626c"/></marker>
+</defs>
+<style>
+.axl16 { font:11px sans-serif; fill:#5a626c; }
+.hd16 { font:600 13px sans-serif; fill:#14385c; }
+.fwc16 { fill:#cfe0f1; stroke:#14385c; stroke-width:0.8; }
+.bwc16 { fill:#f6ddbe; stroke:#b86b1f; stroke-width:0.8; }
+.bub16 { fill:#f0f0f2; stroke:#c8ccd2; stroke-width:0.7; }
+.cap16 { font:600 11px sans-serif; text-anchor:middle; }
+.rowl16 { font:11px sans-serif; fill:#14385c; text-anchor:end; }
+</style>
+<!-- TOP: one batch -->
+<text class="hd16" x="40" y="28">One batch, no micro-batching: large idle bubbles, utilization about 1/S</text>
+<!-- 4 stage rows, each 8 cells wide; time axis -->
+<!-- helper grid: x start 90, cell 70 wide, 22 tall, rows at y 44,70,96,122 -->
+<!-- row labels -->
+<text class="rowl16" x="82" y="59">Stage 1</text>
+<text class="rowl16" x="82" y="85">Stage 2</text>
+<text class="rowl16" x="82" y="111">Stage 3</text>
+<text class="rowl16" x="82" y="137">Stage 4</text>
+<!-- Stage1: F at t0, idle, ... B at t7 -->
+<rect class="fwc16" x="90"  y="46" width="68" height="20"/><text class="cap16" x="124" y="60" fill="#14385c">F</text>
+<rect class="bub16" x="158" y="46" width="408" height="20"/>
+<rect class="bwc16" x="566" y="46" width="68" height="20"/><text class="cap16" x="600" y="60" fill="#b86b1f">B</text>
+<rect class="bub16" x="634" y="46" width="136" height="20"/>
+<!-- Stage2 -->
+<rect class="bub16" x="90"  y="72" width="68" height="20"/>
+<rect class="fwc16" x="158" y="72" width="68" height="20"/><text class="cap16" x="192" y="86" fill="#14385c">F</text>
+<rect class="bub16" x="226" y="72" width="272" height="20"/>
+<rect class="bwc16" x="498" y="72" width="68" height="20"/><text class="cap16" x="532" y="86" fill="#b86b1f">B</text>
+<rect class="bub16" x="566" y="72" width="204" height="20"/>
+<!-- Stage3 -->
+<rect class="bub16" x="90"  y="98" width="136" height="20"/>
+<rect class="fwc16" x="226" y="98" width="68" height="20"/><text class="cap16" x="260" y="112" fill="#14385c">F</text>
+<rect class="bub16" x="294" y="98" width="136" height="20"/>
+<rect class="bwc16" x="430" y="98" width="68" height="20"/><text class="cap16" x="464" y="112" fill="#b86b1f">B</text>
+<rect class="bub16" x="498" y="98" width="272" height="20"/>
+<!-- Stage4 -->
+<rect class="bub16" x="90"  y="124" width="204" height="20"/>
+<rect class="fwc16" x="294" y="124" width="68" height="20"/><text class="cap16" x="328" y="138" fill="#14385c">F</text>
+<rect class="bwc16" x="362" y="124" width="68" height="20"/><text class="cap16" x="396" y="138" fill="#b86b1f">B</text>
+<rect class="bub16" x="430" y="124" width="340" height="20"/>
+<line x1="90" y1="152" x2="770" y2="152" stroke="#5a626c" stroke-width="1" marker-end="url(#ax16)"/>
+<text class="axl16" x="760" y="166" text-anchor="end">time</text>
+
+<!-- BOTTOM: eight micro-batches -->
+<text class="hd16" x="40" y="216">Eight micro-batches (GPipe): stages overlap, bubble is just the thin fill and drain</text>
+<text class="rowl16" x="82" y="247">Stage 1</text>
+<text class="rowl16" x="82" y="271">Stage 2</text>
+<text class="rowl16" x="82" y="295">Stage 3</text>
+<text class="rowl16" x="82" y="319">Stage 4</text>
+<!-- cell width 19, start x 90; forwards 8 then backwards 8, staggered by stage -->
+<!-- Stage1: F0..F7 at cols 0..7, idle, B7..B0 at cols 15..22 (offset 7 for fill, drain back) -->
+<!-- We render: forwards filled navy, backwards amber, bubbles grey. cell w=19 h=18 -->
+<!-- Stage 1 -->
+<g>
+<rect class="fwc16" x="90"  y="238" width="19" height="18"/><rect class="fwc16" x="109" y="238" width="19" height="18"/><rect class="fwc16" x="128" y="238" width="19" height="18"/><rect class="fwc16" x="147" y="238" width="19" height="18"/><rect class="fwc16" x="166" y="238" width="19" height="18"/><rect class="fwc16" x="185" y="238" width="19" height="18"/><rect class="fwc16" x="204" y="238" width="19" height="18"/><rect class="fwc16" x="223" y="238" width="19" height="18"/>
+<rect class="bub16" x="242" y="238" width="114" height="18"/>
+<rect class="bwc16" x="356" y="238" width="19" height="18"/><rect class="bwc16" x="375" y="238" width="19" height="18"/><rect class="bwc16" x="394" y="238" width="19" height="18"/><rect class="bwc16" x="413" y="238" width="19" height="18"/><rect class="bwc16" x="432" y="238" width="19" height="18"/><rect class="bwc16" x="451" y="238" width="19" height="18"/><rect class="bwc16" x="470" y="238" width="19" height="18"/><rect class="bwc16" x="489" y="238" width="19" height="18"/>
+</g>
+<!-- Stage 2 (offset +1) -->
+<g>
+<rect class="bub16" x="90" y="262" width="19" height="18"/>
+<rect class="fwc16" x="109" y="262" width="19" height="18"/><rect class="fwc16" x="128" y="262" width="19" height="18"/><rect class="fwc16" x="147" y="262" width="19" height="18"/><rect class="fwc16" x="166" y="262" width="19" height="18"/><rect class="fwc16" x="185" y="262" width="19" height="18"/><rect class="fwc16" x="204" y="262" width="19" height="18"/><rect class="fwc16" x="223" y="262" width="19" height="18"/><rect class="fwc16" x="242" y="262" width="19" height="18"/>
+<rect class="bub16" x="261" y="262" width="76" height="18"/>
+<rect class="bwc16" x="337" y="262" width="19" height="18"/><rect class="bwc16" x="356" y="262" width="19" height="18"/><rect class="bwc16" x="375" y="262" width="19" height="18"/><rect class="bwc16" x="394" y="262" width="19" height="18"/><rect class="bwc16" x="413" y="262" width="19" height="18"/><rect class="bwc16" x="432" y="262" width="19" height="18"/><rect class="bwc16" x="451" y="262" width="19" height="18"/><rect class="bwc16" x="470" y="262" width="19" height="18"/>
+<rect class="bub16" x="489" y="262" width="19" height="18"/>
+</g>
+<!-- Stage 3 (offset +2) -->
+<g>
+<rect class="bub16" x="90" y="286" width="38" height="18"/>
+<rect class="fwc16" x="128" y="286" width="19" height="18"/><rect class="fwc16" x="147" y="286" width="19" height="18"/><rect class="fwc16" x="166" y="286" width="19" height="18"/><rect class="fwc16" x="185" y="286" width="19" height="18"/><rect class="fwc16" x="204" y="286" width="19" height="18"/><rect class="fwc16" x="223" y="286" width="19" height="18"/><rect class="fwc16" x="242" y="286" width="19" height="18"/><rect class="fwc16" x="261" y="286" width="19" height="18"/>
+<rect class="bub16" x="280" y="286" width="38" height="18"/>
+<rect class="bwc16" x="318" y="286" width="19" height="18"/><rect class="bwc16" x="337" y="286" width="19" height="18"/><rect class="bwc16" x="356" y="286" width="19" height="18"/><rect class="bwc16" x="375" y="286" width="19" height="18"/><rect class="bwc16" x="394" y="286" width="19" height="18"/><rect class="bwc16" x="413" y="286" width="19" height="18"/><rect class="bwc16" x="432" y="286" width="19" height="18"/><rect class="bwc16" x="451" y="286" width="19" height="18"/>
+<rect class="bub16" x="470" y="286" width="38" height="18"/>
+</g>
+<!-- Stage 4 (offset +3) -->
+<g>
+<rect class="bub16" x="90" y="310" width="57" height="18"/>
+<rect class="fwc16" x="147" y="310" width="19" height="18"/><rect class="fwc16" x="166" y="310" width="19" height="18"/><rect class="fwc16" x="185" y="310" width="19" height="18"/><rect class="fwc16" x="204" y="310" width="19" height="18"/><rect class="fwc16" x="223" y="310" width="19" height="18"/><rect class="fwc16" x="242" y="310" width="19" height="18"/><rect class="fwc16" x="261" y="310" width="19" height="18"/><rect class="fwc16" x="280" y="310" width="19" height="18"/>
+<rect class="bwc16" x="299" y="310" width="19" height="18"/><rect class="bwc16" x="318" y="310" width="19" height="18"/><rect class="bwc16" x="337" y="310" width="19" height="18"/><rect class="bwc16" x="356" y="310" width="19" height="18"/><rect class="bwc16" x="375" y="310" width="19" height="18"/><rect class="bwc16" x="394" y="310" width="19" height="18"/><rect class="bwc16" x="413" y="310" width="19" height="18"/><rect class="bwc16" x="432" y="310" width="19" height="18"/>
+<rect class="bub16" x="451" y="310" width="57" height="18"/>
+</g>
+<line x1="90" y1="336" x2="560" y2="336" stroke="#5a626c" stroke-width="1" marker-end="url(#ax16)"/>
+<text class="axl16" x="550" y="350" text-anchor="end">time</text>
+<!-- legend -->
+<rect class="fwc16" x="90" y="372" width="16" height="12"/><text class="axl16" x="112" y="382">forward micro-batch</text>
+<rect class="bwc16" x="252" y="372" width="16" height="12"/><text class="axl16" x="274" y="382">backward micro-batch</text>
+<rect class="bub16" x="430" y="372" width="16" height="12"/><text class="axl16" x="452" y="382">idle (bubble)</text>
+</svg>
+<figcaption><strong>Figure 16.3.2:</strong> The bubble shrinks with micro-batching. Top: one batch through four stages leaves each device idle (grey) for most of the run. Bottom: the same batch split into eight micro-batches keeps all four stages working on different micro-batches at once, so the idle band collapses to the thin fill-and-drain at the start and end. Both schedules accumulate gradients across all micro-batches into one identical optimizer step; only the device utilization differs.</figcaption>
+</figure>
+
+<h2>3. The Bubble Fraction, Exactly <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>How much idle time remains, and how fast does it vanish as we add micro-batches? Count in units of one micro-batch's work on one stage. With $S$ stages and $M$ micro-batches, the forward pass needs $M$ units of useful work per stage, and the fill-and-drain that surrounds it costs $S-1$ extra units (the time for the first micro-batch to travel from the first stage to the last, and symmetrically at the end). The backward pass mirrors this exactly. The useful work is therefore proportional to $M$ and the wasted bubble to $S-1$, giving the bubble fraction</p>
+$$\text{bubble fraction} = \frac{S - 1}{M + S - 1}, \qquad \text{utilization} = 1 - \frac{S - 1}{M + S - 1} = \frac{M}{M + S - 1}.$$
+<p>Read off the two limits that matter. When $M = 1$ (one batch, no micro-batching) the fraction is $(S-1)/S$, so a four-stage pipeline wastes three quarters of its devices, exactly the $1/S$ utilization of Section 2. As $M$ grows, the $S-1$ in the numerator stays fixed while the denominator grows, so the bubble fraction falls toward zero like $1/M$. The practical rule that follows is direct: choose the number of micro-batches $M$ to be several times the number of stages $S$. At $M = 4S$ the bubble is already under a fifth; at $M = 8S$ it is under a tenth. The formula also exposes the cost of adding stages: more stages let you fit a larger model but enlarge the $S-1$ bubble, so depth and efficiency pull against each other, and $M$ is the knob that buys back the efficiency.</p>
+<p>The code below simulates a GPipe schedule directly, counting busy device-slots against total device-slots to measure utilization, and checks the measurement against the formula above. It then sweeps $M$ to show the bubble collapsing, and sweeps $S$ to show it growing.</p>
+<pre><code class="language-python">def gpipe_schedule(S, M):
+    """Busy and total device-slots for a synchronous GPipe schedule.
+    Each (stage, micro-batch) pair costs one forward unit and one backward
+    unit of work, so the useful work is 2*S*M slot-units. The per-device
+    timeline runs for the forward fill-drain plus the backward fill-drain,
+    each of length M+S-1, so the makespan is 2*(M+S-1) units."""
+    work_units = 2 * S * M                 # one F and one B per stage per micro-batch
+    makespan   = 2 * (M + S - 1)           # length of each device's timeline
+    total_slots = S * makespan             # device-slots offered over the whole run
+    return work_units, total_slots          # busy, total
+
+def bubble_fraction(S, M):
+    return (S - 1) / (M + S - 1)
+
+print(f"{'S':>3} {'M':>4} {'util_measured':>14} {'util_formula':>13} {'bubble':>9}")
+S = 4
+for M in (1, 2, 4, 8, 16, 32, 64):
+    busy, total = gpipe_schedule(S, M)
+    util = busy / total                                  # measured from the schedule
+    bub  = bubble_fraction(S, M)
+    print(f"{S:>3} {M:>4} {util:>14.4f} {1.0 - bub:>13.4f} {bub:>9.4f}")
+</code></pre>
+<div class="code-caption"><strong>Code 16.3.1:</strong> A pure-Python pipeline-schedule simulator. It derives utilization by counting busy versus total device-slots, with no reference to the formula, then prints the formula's prediction alongside so the two can be compared number by number.</div>
+<pre><code class="language-text">  S    M  util_measured  util_formula    bubble
+  4    1         0.2500        0.2500    0.7500
+  4    2         0.4000        0.4000    0.6000
+  4    4         0.5714        0.5714    0.4286
+  4    8         0.7273        0.7273    0.2727
+  4   16         0.8421        0.8421    0.1579
+  4   32         0.9143        0.9143    0.0857
+  4   64         0.9552        0.9552    0.0448
+</code></pre>
+<div class="code-caption"><strong>Output 16.3.1:</strong> Measured utilization matches the formula $M/(M+S-1)$ to every printed digit. With one batch the four-stage pipeline runs at 25 percent; at $M=16$ micro-batches it clears 84 percent, and at $M=64$ it passes 95 percent. The bubble falls like $1/M$, exactly as predicted.</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Assembly Line Henry Ford Would Recognize</div>
+<p>The bubble is the same problem a factory faces when it starts a new product line. Before the line fills, the workers downstream stand around waiting for the first piece to reach them; after the last piece passes, the upstream workers have nothing left to do. The cure is identical too: keep many items in flight so every station always has something on the belt. Pipeline parallelism is a 1913 idea wearing a 2019 paper's clothes, and the bubble fraction $(S-1)/(M+S-1)$ is just the ratio of ramp-up-and-down time to the length of the production run.</p>
+</div>
+
+<h2>4. Better Schedules: 1F1B and Interleaving <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>GPipe shrinks the bubble but pays for it in memory. Because it runs all $M$ forward passes before any backward pass begins, every stage must keep the activations of all $M$ in-flight micro-batches alive until their gradients are computed, and peak activation memory grows with $M$, the very knob you wanted to turn up. The one-forward-one-backward schedule, known as 1F1B and used by PipeDream and Megatron-LM, breaks this tension. After a short warm-up that fills the pipeline, each stage alternates: do one forward for a new micro-batch, then immediately do one backward for the oldest micro-batch whose gradient is ready. A micro-batch's activations are freed as soon as its backward pass runs, so at steady state a stage holds activations for only about $S$ micro-batches, not all $M$. The bubble fraction is the same $(S-1)/(M+S-1)$, but the peak memory no longer scales with $M$, which is what lets you raise $M$ high enough to make the bubble negligible.</p>
+<p>Interleaved (virtual-stage) scheduling, also from the Megatron-LM line, attacks the $S-1$ in the numerator. Instead of giving each device one contiguous block of layers, give it several smaller, non-contiguous chunks, called virtual stages, scattered through the model's depth. With $v$ virtual stages per device the fill-and-drain shrinks by a factor of $v$, so the bubble fraction becomes roughly $\frac{1}{v} \cdot \frac{S-1}{M+S-1}$. The cost is more frequent, smaller point-to-point transfers, since a micro-batch now visits each device $v$ times per pass instead of once. Modern large-model training stacks combine 1F1B for memory with interleaving for a smaller bubble, and then compose the whole pipeline with data and tensor parallelism, the subject of <a href="index.html">this chapter</a>'s later sections on 3D parallelism.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: PyTorch Builds the Schedule for You</div>
+<p>Code 16.3.1 only simulates the timeline; writing a correct 1F1B schedule by hand, with its send and recv ordering, warm-up, and gradient accumulation, is hundreds of lines and a notorious source of deadlocks. PyTorch's <code>torch.distributed.pipelining</code> package takes a model split into stages and a chosen schedule and runs it for you:</p>
+<pre><code class="language-python"># Run with: torchrun --nproc_per_node=4 thisfile.py
+from torch.distributed.pipelining import PipelineStage, ScheduleGPipe, Schedule1F1B
+
+stage = PipelineStage(stage_module, stage_index=rank, num_stages=4, device=dev)
+schedule = Schedule1F1B(stage, n_microbatches=32, loss_fn=loss_fn)  # or ScheduleGPipe
+
+# One call runs warm-up, steady-state 1F1B, drain, and gradient accumulation:
+if rank == 0:
+    schedule.step(x)                 # first stage feeds the input micro-batches
+else:
+    losses = []
+    schedule.step(target=y, losses=losses)   # last stage gets targets, returns losses
+</code></pre>
+<div class="code-caption"><strong>Code 16.3.2:</strong> Swapping <code>ScheduleGPipe</code> for <code>Schedule1F1B</code> changes the entire execution plan, memory profile and all, with no other edits. The library handles micro-batch splitting, the send/recv choreography, and accumulation that Code 16.3.1 only counts, collapsing hundreds of lines of scheduling logic into two.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Fitting a 30-Billion-Parameter Model Across Two Nodes</div>
+<p><strong>Who:</strong> An ML systems engineer at a startup training a 30-billion-parameter language model.</p>
+<p><strong>Situation:</strong> The model needed roughly 480 GB for parameters, gradients, and optimizer state, far beyond the 8 GPUs (640 GB total) of a single node once activations were counted, and the team had two such nodes connected by a 100 Gb/s Ethernet link.</p>
+<p><strong>Problem:</strong> Tensor parallelism alone could not span the two nodes; its per-layer all-reduce over the slow inter-node link would have dominated the step time and crushed throughput.</p>
+<p><strong>Dilemma:</strong> Keep everything on one node and shrink the model to fit, accepting a weaker result, or span both nodes with a parallelism whose communication survives a 100 Gb/s link.</p>
+<p><strong>Decision:</strong> They used tensor parallelism within each node (over the fast NVLink) and pipeline parallelism across the two nodes, so the only inter-node traffic was the single activation tensor at the one pipeline stage boundary that crossed nodes.</p>
+<p><strong>How:</strong> Two pipeline stages, one per node; inside each stage, 8-way tensor parallelism; micro-batches set to $M = 16$ so the bubble fraction $(2-1)/(16+2-1) \approx 0.059$ stayed under six percent, and a 1F1B schedule kept activation memory flat.</p>
+<p><strong>Result:</strong> The model trained at about 94 percent pipeline utilization, the slow Ethernet link carried only activations and never a per-layer all-reduce, and the run fit comfortably across the two nodes.</p>
+<p><strong>Lesson:</strong> Use the cheap-to-communicate cut where the link is slow. Pipeline parallelism crosses the node boundary; tensor parallelism stays inside it where bandwidth is plentiful.</p>
+</div>
+
+<h2>5. Pipeline versus Tensor Parallelism <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The two model-parallel methods of this chapter cut the model along different axes and therefore communicate very differently, and the practical example above already hints at how they compose. Table 16.3.1 lays the trade-offs side by side. The governing idea is simple: tensor parallelism communicates a lot but only over the fastest links, so it belongs inside a node; pipeline parallelism communicates little but introduces a bubble, so it belongs across nodes where bandwidth is scarce. The communication-cost reasoning behind this split is the alpha-beta model from <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>, and the collectives that tensor parallelism leans on are the all-reduce family built in <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>.</p>
+<div class="table-caption"><strong>Table 16.3.1:</strong> Pipeline (inter-layer) parallelism versus tensor (intra-layer) parallelism. The choice is driven by which links are fast and how the two compose into a larger plan.</div>
+<table>
+<thead>
+<tr><th scope="col">Property</th><th scope="col">Pipeline (inter-layer)</th><th scope="col">Tensor (intra-layer)</th></tr>
+</thead>
+<tbody>
+<tr><td>What is cut</td><td>The model's depth, into contiguous layer stages</td><td>Each layer's weight matrices, crosswise</td></tr>
+<tr><td>Communication</td><td>One point-to-point send/recv per stage boundary</td><td>An all-reduce inside every layer, each pass</td></tr>
+<tr><td>Volume per step</td><td>One activation tensor per boundary</td><td>Grows with hidden size, every layer</td></tr>
+<tr><td>Tolerates slow links</td><td>Yes; standard for crossing nodes</td><td>No; wants NVLink-class bandwidth, stays in a node</td></tr>
+<tr><td>Main inefficiency</td><td>The pipeline bubble (fixable with large $M$)</td><td>All-reduce latency on the critical path</td></tr>
+<tr><td>Memory note</td><td>1F1B keeps activation memory flat in $M$</td><td>Splits parameter and activation memory per layer</td></tr>
+</tbody>
+</table>
+<p>Neither method replaces data parallelism, the subject of <a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a>; they extend it. A real large-model run typically wraps data parallelism around the outside (replicating the whole pipeline-and-tensor group across more devices and all-reducing gradients between replicas), giving the three-dimensional parallelism that the rest of this chapter assembles. Pipeline parallelism contributes the dimension that scales across the cheap links, and the bubble fraction you derived here is the number that tells you how many micro-batches that dimension needs to stay efficient. The next section turns to a different way of fitting a model that is too large, sharding the optimizer state and parameters of a data-parallel job rather than partitioning the model graph, in <a href="section-16.4.html">Section 16.4</a>.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Shrinking the Bubble to Almost Nothing (2024 to 2026)</div>
+<p>The bubble fraction $(S-1)/(M+S-1)$ has driven a steady stream of schedule innovations. Zero-bubble pipeline parallelism (Qi et al., 2024) splits the backward pass into its input-gradient and weight-gradient halves and reorders the weight-gradient work to fill the drain, reaching a near-zero bubble without raising $M$, and its successor work pushes peak activation memory down further still. DeepSeek-V3's training stack (2024 to 2025) introduced the DualPipe schedule, which runs forward and backward computation streams in both directions at once and overlaps the inter-stage communication so completely that the pipeline bubble nearly vanishes on its hardware. A parallel line studies how pipeline depth interacts with the optimizer when micro-batches grow very large, since the bubble-shrinking trick of raising $M$ eventually collides with the large-batch generalization limits studied in <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>. The throughline: the schedule, not just the cut, is now a first-class design surface.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.3.1: Reading the Bubble Formula <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A team runs an 8-stage pipeline. (a) Using the bubble fraction $(S-1)/(M+S-1)$, how many micro-batches $M$ are needed to push the bubble below 10 percent? (b) They later split the model into 16 stages to fit a larger version. Holding the same $M$ you found in (a), what is the new bubble fraction, and what value of $M$ restores the 10 percent target? (c) Explain in one or two sentences why doubling the stage count more than doubles the micro-batches needed to hold a fixed efficiency.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.3.2: Extend the Simulator to 1F1B Memory <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 16.3.1 so it also reports peak activation memory in units of "micro-batches held alive at once." For the GPipe schedule, this peak is $M$ (all forwards precede all backwards). For a 1F1B schedule, model it as approximately $S$ at steady state. Print both alongside utilization for $S = 4$ and $M \in \{4, 8, 16, 32\}$, and confirm that GPipe's memory grows with $M$ while 1F1B's stays flat. Explain in a comment why 1F1B can therefore use a much larger $M$ than GPipe on the same device.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.3.3: Pipeline or Tensor Across a Slow Link <span class="exercise-type analysis">Analysis</span></div>
+<p>You have two nodes joined by a 100 Gb/s link; inside each node the GPUs share a 600 GB/s NVLink fabric. A transformer layer's per-pass tensor-parallel all-reduce moves about 200 MB, while one pipeline stage boundary hands off a single activation tensor of about 8 MB. Estimate the inter-node transfer time for each option using only bandwidth (ignore latency). Argue from these two numbers which method should cross the node boundary and which should stay inside a node, and connect your answer to the alpha-beta cost model of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-16.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 16.2</span><span class="nav-title">Tensor Parallelism</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 16</span><span class="nav-num">Contents</span><span class="nav-title">Model, Pipeline, and Sharded Parallelism</span></a>
+<a class="next" href="section-16.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 16.4</span><span class="nav-title">Sharded Data Parallelism: ZeRO Stages 1-3</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 22.3: Pruning and Sparsity. Removing weights to shrink and speed up one model: unstructured vs structured vs 2:4 semi-structured sparsity, the lottery-ticket intuition, and one-shot LLM pruning with SparseGPT and Wanda." name="description"/>
+<title>Section 22.3: Pruning and Sparsity | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 22: Per-Node Inference Efficiency: A Prerequisite</a></div>
+<h1>Pruning and Sparsity</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They told me half my weights were redundant. I took it personally, until I noticed I ran twice as fast without them."</p>
+<cite>A Weight Matrix, Two Quarters Lighter</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A trained network carries weights it does not need, and removing them shrinks the model and can speed it up, but a saving in stored numbers becomes a saving in latency only when the hardware is able to skip the zeros.</strong> This is a single-node, scale-up technique: it makes one accelerator hold a model in less memory and finish a forward pass in fewer operations. That distinction matters for the rest of Part V, because every byte and every microsecond you remove from one node is removed again on each of the hundreds of replicas a serving fleet runs, so a modest per-node win multiplies into a large fleet-level saving. The section's job is to separate the three kinds of sparsity, unstructured, structured, and the 2:4 semi-structured middle ground, by the one question that decides whether they help: can the silicon actually avoid the work you deleted?</p>
+</div>
+<p>The previous section made each surviving weight cheaper to store and multiply by lowering its precision. Pruning attacks the other half of the cost equation: it reduces how many weights there are at all. The two compose, a pruned model can also be quantized, but they answer different questions. Quantization asks how few bits a weight needs; pruning asks whether the weight needs to exist. The appeal is obvious from the cost side. A linear layer that multiplies a $d$-dimensional input by an $m \times d$ weight matrix performs roughly $2md$ floating-point operations and reads $md$ weights from memory; if a fraction $s$ of those weights are zero, both the arithmetic and the memory traffic could in principle fall to $(1 - s)$ of their dense value. The catch hides in "in principle," and it is the whole story of this section.</p>
+<p>We must first separate this idea sharply from a different use of the word sparse. In a Mixture-of-Experts model the network is sparse because each token activates only a few of many expert subnetworks; the weights are all present and all needed, the sparsity is in which ones run for a given input. That is conditional computation, developed as a distribution strategy in <a href="../../part-4-parallel-deep-learning/module-17-expert-parallelism-moe/section-17.1.html">Chapter 17</a>, and it is not what this section is about. Here, sparsity means weights that have been permanently removed and will never participate in any forward pass again.</p>
+
+<h2>1. Unstructured Pruning: High Sparsity the Hardware Cannot Use <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The simplest and most aggressive form of pruning is unstructured: examine every individual weight, and set the smallest-magnitude ones to zero. The intuition is that a weight close to zero contributes little to any output, so removing it perturbs the function least. Magnitude pruning, ranking weights by $|w|$ and zeroing the bottom fraction, is the workhorse here, and it is remarkably effective at preserving accuracy: many networks tolerate 80 or 90 percent of their individual weights set to zero with only a small quality drop, especially if the surviving weights are then fine-tuned.</p>
+<p>The problem is that the zeros land in arbitrary positions. The matrix is now mostly zero, but each row has a different, irregular pattern of surviving weights. A dense matrix multiply is fast because the hardware streams contiguous blocks of memory through wide vector units that assume every element is present. To skip scattered zeros, the processor would have to check each weight, gather the survivors, and track their column indices, work that on a GPU's regular, lockstep arithmetic units costs more than just multiplying by the zero. So a 90 percent unstructured-sparse matrix, stored densely, runs at exactly the dense speed; stored in a sparse format, it usually runs slower, because the indexing overhead swamps the saved multiplies until sparsity is extreme (well above 95 percent) and even then only on hardware with dedicated sparse support. Unstructured pruning reliably saves memory if you store only the nonzeros, but it rarely saves latency on commodity accelerators.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Sparsity Is Free Storage but Not Free Speed</div>
+<p>Zeroing weights always reduces the number of parameters, and if you store the model in a compressed sparse format it reduces memory footprint. It reduces <em>latency</em> only when the hardware can locate and skip the zeros faster than it can multiply by them. Dense vector units cannot, so unstructured sparsity, however high, typically buys no speedup. The forms of pruning that accelerate real serving are the ones whose zero pattern is regular enough for the silicon to exploit, which is why structured and 2:4 sparsity, not raw unstructured sparsity, dominate production inference.</p>
+</div>
+
+<h2>2. Structured Pruning: A Smaller Dense Model <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Structured pruning removes whole units rather than individual weights: an entire neuron (a row of the weight matrix), a convolutional channel, an attention head, or even a whole transformer layer. When you delete a neuron, every weight feeding into and out of it disappears together, and the matrix that remains is smaller but still fully dense. A layer pruned from 4096 to 3072 neurons is just a dense $3072 \times d$ matrix, and it runs faster on any hardware, no special sparse kernels, no index bookkeeping, because it is simply a smaller version of the same dense operation the accelerator already does best.</p>
+<p>That universality is the appeal, and the cost is paid in accuracy. Removing a whole neuron discards its useful weights along with its useless ones, so structured pruning perturbs the function more than unstructured pruning at the same parameter-reduction level. The practical recipe is to prune in modest increments and fine-tune between increments, letting the surviving units absorb the role of the removed ones. For transformer serving the highest-value structured targets are attention heads (many heads turn out to be redundant) and entire layers (depth pruning), both of which shrink the model into a form that needs no special runtime at all. When the goal is a guaranteed latency reduction on whatever GPU the fleet happens to own, structured pruning is the safe choice precisely because the speedup does not depend on the hardware cooperating.</p>
+
+<h2>3. The Sparsity Spectrum, in One Picture <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Between the two extremes sits a constrained pattern that modern GPUs accelerate directly. Figure 22.3.1 places all three side by side, because the difference between them is entirely about the geometry of where the zeros fall, and that geometry, not the raw zero count, is what decides the speedup.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three weight-matrix patterns side by side: unstructured sparsity with scattered zeros, structured sparsity with whole rows removed, and 2:4 semi-structured sparsity with exactly two of every four cells kept.">
+<defs>
+<style>
+.kept223 { fill:#14385c; }
+.zero223 { fill:#e7ecf2; stroke:#c2ccd8; stroke-width:0.8; }
+.t223 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s223 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+</style>
+</defs>
+<!-- Panel A: unstructured -->
+<text class="t223" x="140" y="30">Unstructured</text>
+<text class="s223" x="140" y="48">scattered zeros</text>
+<g transform="translate(80,62)">
+<rect class="zero223" x="0" y="0" width="24" height="24"/><rect class="kept223" x="26" y="0" width="24" height="24"/><rect class="zero223" x="52" y="0" width="24" height="24"/><rect class="kept223" x="78" y="0" width="24" height="24"/><rect class="kept223" x="104" y="0" width="24" height="24"/>
+<rect class="kept223" x="0" y="26" width="24" height="24"/><rect class="zero223" x="26" y="26" width="24" height="24"/><rect class="zero223" x="52" y="26" width="24" height="24"/><rect class="kept223" x="78" y="26" width="24" height="24"/><rect class="zero223" x="104" y="26" width="24" height="24"/>
+<rect class="zero223" x="0" y="52" width="24" height="24"/><rect class="kept223" x="26" y="52" width="24" height="24"/><rect class="kept223" x="52" y="52" width="24" height="24"/><rect class="zero223" x="78" y="52" width="24" height="24"/><rect class="kept223" x="104" y="52" width="24" height="24"/>
+<rect class="kept223" x="0" y="78" width="24" height="24"/><rect class="zero223" x="26" y="78" width="24" height="24"/><rect class="kept223" x="52" y="78" width="24" height="24"/><rect class="zero223" x="78" y="78" width="24" height="24"/><rect class="zero223" x="104" y="78" width="24" height="24"/>
+</g>
+<text class="s223" x="140" y="200">high sparsity, but irregular:</text>
+<text class="s223" x="140" y="216">dense hardware cannot skip it</text>
+<!-- Panel B: structured -->
+<text class="t223" x="430" y="30">Structured</text>
+<text class="s223" x="430" y="48">whole rows removed</text>
+<g transform="translate(370,62)">
+<rect class="kept223" x="0" y="0" width="24" height="24"/><rect class="kept223" x="26" y="0" width="24" height="24"/><rect class="kept223" x="52" y="0" width="24" height="24"/><rect class="kept223" x="78" y="0" width="24" height="24"/><rect class="kept223" x="104" y="0" width="24" height="24"/>
+<rect class="zero223" x="0" y="26" width="24" height="24"/><rect class="zero223" x="26" y="26" width="24" height="24"/><rect class="zero223" x="52" y="26" width="24" height="24"/><rect class="zero223" x="78" y="26" width="24" height="24"/><rect class="zero223" x="104" y="26" width="24" height="24"/>
+<rect class="kept223" x="0" y="52" width="24" height="24"/><rect class="kept223" x="26" y="52" width="24" height="24"/><rect class="kept223" x="52" y="52" width="24" height="24"/><rect class="kept223" x="78" y="52" width="24" height="24"/><rect class="kept223" x="104" y="52" width="24" height="24"/>
+<rect class="zero223" x="0" y="78" width="24" height="24"/><rect class="zero223" x="26" y="78" width="24" height="24"/><rect class="zero223" x="52" y="78" width="24" height="24"/><rect class="zero223" x="78" y="78" width="24" height="24"/><rect class="zero223" x="104" y="78" width="24" height="24"/>
+</g>
+<text class="s223" x="430" y="200">smaller DENSE matrix:</text>
+<text class="s223" x="430" y="216">runs faster on any hardware</text>
+<!-- Panel C: 2:4 -->
+<text class="t223" x="720" y="30">2:4 semi-structured</text>
+<text class="s223" x="720" y="48">2 of every 4 kept</text>
+<g transform="translate(660,62)">
+<rect class="kept223" x="0" y="0" width="24" height="24"/><rect class="zero223" x="26" y="0" width="24" height="24"/><rect class="kept223" x="52" y="0" width="24" height="24"/><rect class="zero223" x="78" y="0" width="24" height="24"/>
+<rect class="zero223" x="0" y="26" width="24" height="24"/><rect class="kept223" x="26" y="26" width="24" height="24"/><rect class="zero223" x="52" y="26" width="24" height="24"/><rect class="kept223" x="78" y="26" width="24" height="24"/>
+<rect class="kept223" x="0" y="52" width="24" height="24"/><rect class="kept223" x="26" y="52" width="24" height="24"/><rect class="zero223" x="52" y="52" width="24" height="24"/><rect class="zero223" x="78" y="52" width="24" height="24"/>
+<rect class="zero223" x="0" y="78" width="24" height="24"/><rect class="kept223" x="26" y="78" width="24" height="24"/><rect class="kept223" x="52" y="78" width="24" height="24"/><rect class="zero223" x="78" y="78" width="24" height="24"/>
+</g>
+<text class="s223" x="720" y="200">fixed 50% pattern the GPU</text>
+<text class="s223" x="720" y="216">Tensor Core decodes natively</text>
+</svg>
+<figcaption><strong>Figure 22.3.1:</strong> Three sparsity patterns on the same weight matrix (filled cells kept, pale cells zeroed). Unstructured (left) can reach very high sparsity but scatters its zeros, so dense vector units cannot skip them. Structured (center) deletes whole rows, leaving a smaller dense matrix that is fast everywhere. 2:4 semi-structured (right) keeps exactly two of every four entries, a regular 50 percent pattern that a modern GPU's sparse Tensor Cores read directly, giving a real speedup without leaving the dense-kernel world.</figcaption>
+</figure>
+<p>The right-hand panel is the 2:4 pattern: in every contiguous group of four weights, exactly two are kept and two are zeroed. This fixes the sparsity at 50 percent, lower than unstructured pruning can reach, but the payoff is that the position of the zeros is now constrained enough to encode compactly (two survivors plus a 2-bit index per group) and to feed a hardware unit built for exactly this layout. NVIDIA's Ampere and later GPUs include sparse Tensor Cores that multiply a 2:4-compressed matrix at up to twice the dense rate, so here the zeros translate into genuine latency reduction. It is the engineering sweet spot of the section: enough structure for the silicon to exploit, enough freedom (the survivors can be any two of the four) to keep accuracy close to unstructured pruning at the same ratio.</p>
+
+<h2>4. Measuring What the Zeros Cost <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The claims above are quantitative, so we measure them directly. The code below takes one dense weight matrix and prunes it three ways at 50 percent sparsity: magnitude unstructured (keep the largest weights anywhere), random unstructured (keep a random half), and 2:4 semi-structured (keep the larger two of every four). It then reports a reconstruction error, how far the pruned layer's outputs drift from the dense layer's outputs on a batch of inputs, which is a clean accuracy proxy that needs no training. We use it both to confirm that magnitude beats random and to locate 2:4 on the spectrum between them.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+m, n = 256, 256
+W = rng.standard_normal((m, n)) / np.sqrt(n)   # a dense weight matrix
+X = rng.standard_normal((4096, n))             # a batch of input activations
+Y = X @ W.T                                     # the reference outputs we want to preserve
+ref_energy = np.linalg.norm(Y)
+
+def rel_error(Wp):                              # output drift after pruning, an accuracy proxy
+    return np.linalg.norm(X @ Wp.T - Y) / ref_energy
+
+def unstructured(W, sparsity):                  # zero the globally smallest-magnitude weights
+    k = int(round(sparsity * W.size))
+    thresh = np.sort(np.abs(W).ravel())[k] if k > 0 else -1.0
+    return W * (np.abs(W) &gt; thresh)
+
+def random_unstructured(W, sparsity):           # zero a random fraction, ignoring magnitude
+    return W * (rng.random(W.shape) &gt; sparsity)
+
+def two_four(W):                                # keep the 2 largest of every group of 4
+    Wp = W.copy().reshape(-1, 4)
+    idx = np.argsort(-np.abs(Wp), axis=1)
+    keep = np.zeros_like(Wp, dtype=bool)
+    keep[np.arange(Wp.shape[0])[:, None], idx[:, :2]] = True
+    return (Wp * keep).reshape(W.shape)
+
+print("sparsity  magnitude-unstructured  random-unstructured")
+for s in [0.25, 0.50, 0.75, 0.90]:
+    print(f"  {s:4.2f}        {rel_error(unstructured(W, s)):8.4f}"
+          f"              {rel_error(random_unstructured(W, s)):8.4f}")
+
+print()
+print(f"2:4 structured (exactly 50% zeros) : {rel_error(two_four(W)):.4f}")
+print(f"magnitude unstructured  at 50%     : {rel_error(unstructured(W, 0.50)):.4f}")
+print(f"random   unstructured   at 50%     : {rel_error(random_unstructured(W, 0.50)):.4f}")
+</code></pre>
+<div class="code-caption"><strong>Code 22.3.1:</strong> Magnitude, random, and 2:4 pruning applied to one weight matrix, scored by how far each pruned layer's outputs drift from the dense outputs. The 2:4 mask keeps the larger two entries of every contiguous group of four, the same constraint a sparse Tensor Core expects.</div>
+<pre><code class="language-text">sparsity  magnitude-unstructured  random-unstructured
+  0.25          0.0921                0.5008
+  0.50          0.2687                0.7030
+  0.75          0.5270                0.8668
+  0.90          0.7475                0.9484
+
+2:4 structured (exactly 50% zeros) : 0.3648
+magnitude unstructured  at 50%     : 0.2687
+random   unstructured   at 50%     : 0.7069
+</code></pre>
+<div class="code-caption"><strong>Output 22.3.1:</strong> Magnitude pruning preserves far more output energy than random at every sparsity (0.27 versus 0.70 drift at 50 percent), confirming that <em>which</em> weights you remove matters more than how many. The 2:4 pattern at 0.36 sits between magnitude-unstructured (0.27) and random (0.71): its per-group constraint costs a little accuracy against free-form magnitude pruning, yet it stays far closer to the dense layer than random removal, and unlike either it maps onto hardware that actually skips the zeros.</div>
+<p>Two readings matter here. First, the gap between the magnitude and random columns is the entire justification for principled pruning: choosing the smallest weights to delete, rather than deleting at random, changes the 50 percent drift from 0.70 to 0.27. Second, 2:4 at 0.36 confirms its sweet-spot status numerically. It cannot match free-form magnitude pruning, because forcing exactly two survivors per group occasionally discards a large weight to keep the quota, but it stays far below random, and it is the only one of the three whose 50 percent sparsity a GPU can turn into a 50 percent reduction in multiply-accumulate work. The FLOPs argument is simple arithmetic: a dense layer costs $C_{\text{dense}} = 2md$ operations, and removing a fraction $s$ of the weights drops the useful work to $C_{\text{sparse}} = 2md\,(1 - s)$, a reduction realized in wall-clock time only when the kernel can avoid the zeroed terms, which for $s = 0.5$ is exactly what 2:4 hardware delivers.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Quota Tax</div>
+<p>Notice that 2:4 scored slightly worse than free-form magnitude pruning even though both keep half the weights. The reason is a small bureaucratic tax: 2:4 must keep exactly two per group of four, so when a group happens to hold three genuinely important weights, one of them is evicted to satisfy the quota, while in a group of four small weights, two are kept that magnitude pruning would have happily dropped. The hardware demands a tidy ledger, and tidiness costs a little accuracy. The trade is almost always worth it, because the alternative tidy-but-slow option is no speedup at all.</p>
+</div>
+
+<h2>5. Why Pruning Works at All: Lottery Tickets and Iteration <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>It can seem surprising that a trained network has so many disposable weights. The lottery-ticket hypothesis offers an intuition: a large randomly-initialized network contains, by sheer combinatorial luck, a small subnetwork (a "winning ticket") whose initial weights are already positioned to train well, and the bulk of training is in effect discovering and amplifying that subnetwork while the rest stays near its small initial values. If that picture is even approximately right, then the small-magnitude weights pruning removes were never doing much work, and a sparse subnetwork can match the dense one's accuracy.</p>
+<p>This motivates iterative magnitude pruning, the standard high-quality recipe: rather than zeroing half the weights in one violent step, prune a modest fraction, fine-tune the survivors to recover, prune a bit more, fine-tune again, and repeat. Each round removes weights the network has had a chance to compensate for, so the cumulative accuracy loss at a given final sparsity is far smaller than one-shot pruning to the same level. The cost is many train-prune cycles, which for a small model is cheap and for a foundation model is prohibitive, a tension that the next two methods exist to resolve.</p>
+
+<h2>6. One-Shot Pruning for Large Language Models <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>For a model with tens or hundreds of billions of parameters, the iterate-and-fine-tune loop is off the table: a single fine-tuning pass costs more than most teams can spend, and the training data may not even be available. The breakthrough of the 2023 to 2024 wave is one-shot pruning that needs no gradient updates at all, only a few hundred forward passes over a small calibration set. The insight is that you should not rank weights by raw magnitude alone, because a small weight that multiplies a large, frequently-active input matters more than a large weight that multiplies a near-dead input. The pruning decision should account for the activations the weight actually sees.</p>
+<p>SparseGPT (Frantar and Alistarh, 2023) frames pruning as a layer-wise reconstruction problem: for each layer, choose which weights to zero and adjust the survivors so the layer's output on the calibration data changes as little as possible, solving it with an efficient approximation of the second-order (Hessian) information. Wanda (Sun et al., 2023) reaches nearly the same quality with a strikingly simpler rule: score each weight by the product of its magnitude and the norm of the corresponding input activation, $|w_{ij}| \cdot \lVert x_j \rVert_2$, and prune the lowest scores per output, with no weight updates and no Hessian at all. Both reach 50 percent sparsity, including the 2:4 pattern, on large language models with modest perplexity loss and zero retraining, and that is what makes pruning practical for models nobody can afford to fine-tune.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Retraining-Free Sparsity for Trillion-Parameter Serving (2023 to 2026)</div>
+<p>One-shot pruning is the most active strand of model sparsity. SparseGPT (Frantar and Alistarh, 2023) and Wanda (Sun et al., 2023) established that 50 percent and 2:4 sparsity are reachable on large language models without any gradient step, using only calibration forward passes; follow-up work combines them with the quantization of <a href="section-22.2.html">Section 22.2</a> so a single model is both pruned and low-bit. The 2:4 path is the one with hardware behind it: NVIDIA's sparse Tensor Cores (Ampere onward) accelerate exactly this layout, and serving stacks increasingly ship 2:4 paths, so the pattern is moving from research curiosity to a default option for latency-bound deployments. A parallel line revisits structured pruning for transformers, removing heads, channels, and whole layers under a target-latency budget (for example the LLM-Pruner and Sheared-LLaMA lineage of 2023 to 2024), because a guaranteed dense speedup on any GPU is sometimes worth more than a larger but hardware-contingent unstructured saving. The open question the frontier circles is the accuracy-versus-realizable-speedup frontier: high unstructured sparsity that no kernel exploits is a number on a slide, whereas a 2:4 or structured model that actually halves the layer cost is money saved on every replica.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: torch.nn.utils.prune and SparseML</div>
+<p>The hand-written masks in Code 22.3.1 exist so you can see the mechanism; in practice you call a library. PyTorch ships pruning utilities that apply and manage masks for you, and Neural Magic's SparseML applies recipe-driven structured and 2:4 pruning (often jointly with quantization) for deployment. The from-scratch loop collapses to a few lines:</p>
+<pre><code class="language-python">import torch
+import torch.nn.utils.prune as prune
+
+layer = torch.nn.Linear(256, 256)
+
+# Unstructured magnitude pruning: zero the smallest 50% of this layer's weights.
+prune.l1_unstructured(layer, name="weight", amount=0.5)
+
+# Structured pruning: remove whole output neurons (rows) by their L2 norm.
+prune.ln_structured(layer, name="weight", amount=0.25, n=2, dim=0)
+
+prune.remove(layer, "weight")   # bake the mask into the weights, drop the bookkeeping
+# For 2:4 semi-structured sparsity that the GPU accelerates, SparseML recipes or
+# torch.sparse.to_sparse_semi_structured produce the hardware-ready layout.
+</code></pre>
+<div class="code-caption"><strong>Code 22.3.2:</strong> The same magnitude and structured pruning as Code 22.3.1, now in three library calls. PyTorch's <code>prune</code> module handles mask creation and storage; SparseML and <code>to_sparse_semi_structured</code> handle the 2:4 layout that maps onto sparse Tensor Cores, which the manual NumPy version cannot exercise.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Choosing the Sparsity That the Fleet Could Actually Use</div>
+<p><strong>Who:</strong> An inference platform engineer responsible for the serving cost of a 13-billion-parameter chat model.</p>
+<p><strong>Situation:</strong> The model ran on a fleet of several hundred Ampere-generation GPUs, and a quarterly cost review demanded a 20 to 30 percent reduction in GPUs without a visible quality regression.</p>
+<p><strong>Problem:</strong> A research notebook had achieved 80 percent unstructured magnitude sparsity with almost no perplexity loss, and the obvious move was to ship it.</p>
+<p><strong>Dilemma:</strong> Ship the headline 80 percent unstructured model, whose zeros the serving GPUs could not skip, so the latency and the GPU count would not move at all, or accept a more modest 2:4 (50 percent) model that the sparse Tensor Cores would actually accelerate.</p>
+<p><strong>Decision:</strong> They pruned to 2:4 with Wanda-style calibration scoring, because only that pattern turned deleted weights into fewer GPUs on this hardware.</p>
+<p><strong>How:</strong> A few hundred calibration prompts produced per-weight scores; the 2:4 mask was applied layer by layer, the model was re-evaluated for perplexity and on a task suite, and the sparse Tensor Core path was enabled in the serving runtime.</p>
+<p><strong>Result:</strong> The per-GPU throughput rose enough to retire roughly a quarter of the fleet, with a perplexity change small enough to pass the quality gate, while the 80 percent unstructured model was shown in a benchmark to deliver zero latency improvement on the same GPUs.</p>
+<p><strong>Lesson:</strong> The sparsity that lowers cost is the sparsity the deployed hardware can exploit, not the one with the largest zero count. A realizable 50 percent beats an unrealizable 80 percent every time the kernel cannot skip scattered zeros.</p>
+</div>
+
+<h2>7. Where Pruning Fits in the Per-Node Toolkit <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Pruning is one lever in the single-node efficiency set this chapter assembles, and it composes with the others. A model can be pruned to 2:4 and then quantized so each surviving weight is also low-bit (<a href="section-22.2.html">Section 22.2</a>), and the smaller, sparser network is a better starting point for the distillation of <a href="section-22.4.html">Section 22.4</a>, which trains a compact student to imitate a large teacher. The thread tying them together is the chapter's reason for existing: every per-node byte and microsecond you remove is removed on each replica, so the unit economics established here set the slope of the fleet-cost curve that the distributed serving stacks of <a href="../module-23-distributed-inference-systems/index.html">Chapter 23</a> and <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a> have to pay.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: One Node's Sparsity, Multiplied Across the Fleet</div>
+<p>Pruning is a scale-up technique: it changes what happens inside one accelerator. The book leads with scale-out, and this section earns its place by feeding that larger story. A 2:4 model that doubles one GPU's effective matrix-multiply throughput does not merely speed up one box; it changes how many boxes the serving fleet needs, because distributed inference replicates the per-node cost across hundreds of machines. The per-node sparsity numbers measured here become fleet-sizing inputs when <a href="../module-23-distributed-inference-systems/index.html">Chapter 23</a> turns per-node throughput into a replica count and <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a> multiplies it across the serving fleet, exactly as the cross-reference arc promises: per-node efficiency, multiplied. Keep the distinction clean, sparsity here means removing weights, not the conditional expert routing of <a href="../../part-4-parallel-deep-learning/module-17-expert-parallelism-moe/index.html">Chapter 17</a>, and the per-node saving stays a multiplier on the distributed cost rather than a replacement for distribution.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.3.1: Storage Versus Speed <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A colleague prunes a linear layer to 95 percent unstructured sparsity and reports a 20x reduction in the number of stored nonzero weights, then is surprised that inference latency on the team's GPU is unchanged. Explain precisely why the memory footprint fell but the latency did not, what would have to be true of the hardware or the zero pattern for the latency to fall, and why a 2:4 pattern at only 50 percent sparsity could beat the 95 percent model on wall-clock time. Reference the dense-kernel argument from Section 1.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.3.2: Iterative Versus One-Shot <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 22.3.1 into a tiny iterative-pruning experiment. Starting from the dense matrix $W$, reach 75 percent unstructured magnitude sparsity two ways: (a) one shot, zeroing the smallest 75 percent at once; (b) in three rounds of 25, 50, then 75 percent cumulative, where between rounds you "fine-tune" by a simple least-squares re-fit of the surviving weights to reproduce $Y = XW^\top$ on the held inputs (solve for the nonzeros that minimize $\lVert XW_p^\top - Y \rVert$). Compare the final reconstruction error of (a) and (b), and explain how this toy result mirrors why iterative magnitude pruning beats one-shot on real networks, and why one-shot methods like Wanda must work harder to compensate.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.3.3: The Realizable-Speedup Frontier <span class="exercise-type analysis">Analysis</span></div>
+<p>Consider a transformer layer whose dense matrix multiply costs $C_{\text{dense}} = 2md$ operations. You are offered three pruned variants: 90 percent unstructured (no sparse kernel available on your GPU), 2:4 semi-structured (sparse Tensor Cores available, up to 2x on the matmul), and structured pruning that removes 30 percent of the neurons. For each, write the realizable FLOPs as a fraction of $C_{\text{dense}}$ given the hardware described, not the nominal fraction. Rank the three by expected wall-clock speedup, state the accuracy ordering you would expect from Output 22.3.1's evidence, and explain to a cost-conscious manager why the variant with the most zeros is not the one you would deploy. Tie your answer to the fleet-multiplier argument from Section 7.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-22.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 22.2</span><span class="nav-title">Quantization</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 22</span><span class="nav-num">Contents</span><span class="nav-title">Per-Node Inference Efficiency: A Prerequisite</span></a>
+<a class="next" href="section-22.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 22.4</span><span class="nav-title">Knowledge Distillation</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

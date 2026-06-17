@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 25.8: Distributed Caching for Retrieval. Caching at every layer of the RAG pipeline (query-embedding, retrieval-result, semantic, and generation prefix caches) to cut latency and cost, the shared distributed cache across the fleet, and the hit-rate versus staleness trade-off." name="description"/>
+<title>Section 25.8: Distributed Caching for Retrieval | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 25: Distributed Retrieval and Vector Search</a></div>
+<h1>Distributed Caching for Retrieval</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They asked me the same question ten thousand times. The first time I thought hard. The other nine thousand nine hundred and ninety-nine, I just smiled and handed back the receipt."</p>
+<cite>A Cache Layer With Very Little Left to Prove</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A retrieval-augmented generation pipeline repeats itself far more than it admits, and caching is how you stop paying for the same work twice across an entire serving fleet.</strong> Every request that flows through a RAG system touches an embedding model, a vector index, and a generation model, and each of those steps is expensive in either dollars or milliseconds. Yet real query traffic is heavily skewed: a small set of questions, and a slightly larger set of near-duplicates of those questions, accounts for most of the volume. A cache placed at each layer of the pipeline captures that repetition and turns a costly recomputation into a lookup. The hard part is not the lookup; it is making the cache shared and consistent across many serving replicas, deciding how loosely "the same query" may be defined before a fast wrong answer slips through, and keeping cached results fresh as the underlying documents change. This section walks the cacheable layers, models the cost they save under a realistic skewed workload, and confronts the staleness and false-hit risks that separate a cache that helps from one that quietly lies.</p>
+</div>
+<p>By this point in the chapter the retrieval path is fully distributed: the index is sharded across machines (<a href="section-25.5.html">Section 25.5</a>), queries fan out to every shard, and a multi-stage reranker refines the candidates that come back (<a href="section-25.7.html">Section 25.7</a>). That path is correct, and it is also the most expensive thing the serving system does on a per-request basis. A single user question may trigger an embedding-model forward pass, a scatter-gather over dozens of index shards, a rerank pass, and finally a generation step that reads thousands of retrieved tokens. Doing all of that once is unavoidable. Doing it again for a question the fleet answered a second ago, on another replica, for another user, is pure waste. Caching is the discipline of recognizing that waste and eliminating it, and in production RAG it is one of the highest-leverage levers on both latency and cost.</p>
+<p>The reason caching pays off so dramatically is structural, not incidental. Query distributions over real services are skewed in the same heavy-tailed way as word frequencies, web-page popularity, and the keys in a MapReduce shuffle. A handful of "heavy hitter" queries dominate, exactly the regime where the sketches and approximate-counting methods of <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/section-6.8.html">Chapter 6</a> shine, and that same skew means a cache holding only the popular entries intercepts a large fraction of all traffic. A cache that fits in memory and tracks the top few thousand questions can absorb most of the requests a service ever sees.</p>
+
+<h2>1. The Cacheable Layers of a RAG Pipeline <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A RAG request is a small assembly line, and caching can be inserted between any two stations. It helps to name the layers explicitly, because each one caches a different object, keyed in a different way, with a different consistency concern. Figure 25.8.1 lays out the four layers as they sit in the request path, all of them backed by a single cache tier shared across the serving fleet.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A horizontal RAG request pipeline showing four cache layers (embedding cache, retrieval-result and semantic cache, and generation prefix cache) sitting in front of the embedding model, vector index, and generation model. Below the pipeline a shared distributed cache tier spans the full width and connects upward to all four cache layers, indicating that every serving replica reads and writes the same cache.">
+<defs>
+<marker id="arr258" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.box258 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.cache258 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.shared258 { fill:#eef6ef; stroke:#2f7d46; stroke-width:1.8; }
+.t258 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.tc258 { font:600 12.5px sans-serif; fill:#8a4d12; text-anchor:middle; }
+.tg258 { font:600 13px sans-serif; fill:#235c33; text-anchor:middle; }
+.s258 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l258 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr258); }
+.lg258 { fill:none; stroke:#2f7d46; stroke-width:1.4; stroke-dasharray:4 3; }
+</style>
+<text class="t258" x="60" y="40">Query</text>
+<line x1="60" y1="52" x2="60" y2="92" class="l258"/>
+
+<rect class="cache258" x="10" y="92" width="150" height="48" rx="8"/>
+<text class="tc258" x="85" y="112">Embedding cache</text>
+<text class="s258" x="85" y="130">key: query text -&gt; vector</text>
+<rect class="box258" x="10" y="160" width="150" height="44" rx="8"/>
+<text class="t258" x="85" y="186">Embedding model</text>
+<line x1="85" y1="140" x2="85" y2="158" class="l258"/>
+<line x1="160" y1="182" x2="232" y2="182" class="l258"/>
+
+<rect class="cache258" x="232" y="92" width="180" height="48" rx="8"/>
+<text class="tc258" x="322" y="110">Result + semantic cache</text>
+<text class="s258" x="322" y="130">key: query / embedding -&gt; passages</text>
+<rect class="box258" x="247" y="160" width="150" height="44" rx="8"/>
+<text class="t258" x="322" y="180">Vector index</text>
+<text class="s258" x="322" y="196">(sharded, reranked)</text>
+<line x1="322" y1="140" x2="322" y2="158" class="l258"/>
+<line x1="412" y1="182" x2="488" y2="182" class="l258"/>
+
+<rect class="cache258" x="488" y="92" width="180" height="48" rx="8"/>
+<text class="tc258" x="578" y="110">Generation prefix cache</text>
+<text class="s258" x="578" y="130">key: passage set -&gt; KV state</text>
+<rect class="box258" x="503" y="160" width="150" height="44" rx="8"/>
+<text class="t258" x="578" y="180">Generation model</text>
+<text class="s258" x="578" y="196">(LLM)</text>
+<line x1="578" y1="140" x2="578" y2="158" class="l258"/>
+<line x1="653" y1="182" x2="740" y2="182" class="l258"/>
+
+<rect class="box258" x="740" y="160" width="120" height="44" rx="8"/>
+<text class="t258" x="800" y="186">Answer</text>
+
+<rect class="shared258" x="10" y="300" width="850" height="86" rx="12"/>
+<text class="tg258" x="435" y="330">Shared distributed cache tier (Redis-style), spread across the fleet</text>
+<text class="s258" x="435" y="352">every serving replica reads and writes the same entries; one replica's miss warms the cache for all</text>
+<text class="s258" x="435" y="372">invalidation on document update keeps cached passages and answers fresh</text>
+<line x1="85" y1="298" x2="85" y2="142" class="lg258"/>
+<line x1="322" y1="298" x2="322" y2="142" class="lg258"/>
+<line x1="578" y1="298" x2="578" y2="142" class="lg258"/>
+</svg>
+<figcaption><strong>Figure 25.8.1:</strong> The four cache layers of a RAG pipeline. The embedding cache skips the embedding model when a query's text has been seen before; the result and semantic cache returns stored passages for an identical or near-identical query; the generation prefix cache reuses the KV state of passages shared across requests. All four sit on a single distributed cache tier (green) shared across the serving fleet, so a miss served by one replica warms the entry for every other replica, and document updates invalidate stale entries everywhere at once.</figcaption>
+</figure>
+<p>The <strong>query-embedding cache</strong> is the simplest. Embedding the query text into a vector is deterministic for a fixed model, so an exact-text key maps to a stored vector and a repeated query skips the embedding forward pass entirely. The <strong>retrieval-result cache</strong> goes one step further: it keys on the query and stores the passages that retrieval returned, so an identical query skips both embedding and the fan-out search across shards. The <strong>semantic cache</strong> relaxes the key from exact text to embedding similarity, so a paraphrase or a typo of a previous question can hit the same stored answer, which is powerful and, as we will see, dangerous. Finally, the <strong>generation prefix cache</strong> lives inside the generation step: when two requests retrieve an overlapping set of passages, the attention key-value state computed over those shared tokens can be reused rather than recomputed, the prefix-caching mechanism developed for the serving fleet in <a href="../module-24-distributed-llm-serving/section-24.7.html">Section 24.7</a>.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Each Layer Caches a Different Object, So Cache All of Them</div>
+<p>The four caches are not alternatives; they are complementary, because each one short-circuits a different and increasingly expensive stage. An embedding-cache hit saves one model forward pass. A result-cache hit additionally saves the distributed index search. A prefix-cache hit saves recomputing attention over passages the generator already read. The cheapest hit (embedding) is the most common; the most valuable hit (avoiding generation) is rarer but saves the dominant cost. A production RAG system layers all four and treats them as a hierarchy: try the most complete cache first, fall through to the cheaper partial caches, and only run the full pipeline on a genuine miss.</p>
+</div>
+
+<h2>2. A Cost Model for the Skewed Workload <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>To reason about caching quantitatively, attach a cost to each stage and a probability that a request hits the cache. Let a full pipeline cost $c_{\text{full}} = c_{\text{embed}} + c_{\text{retr}} + c_{\text{gen}}$, dominated in practice by $c_{\text{gen}}$. If a fraction $h$ of requests hit the cache and a hit costs only $c_{\text{hit}}$ (a lookup plus, for a semantic cache, an embedding call), the expected cost per request is</p>
+$$\mathbb{E}[c] = h \, c_{\text{hit}} + (1 - h)\, c_{\text{full}}, \qquad \text{cost saved} = \frac{(1-h)\,c_{\text{full}} + h\,c_{\text{hit}}}{c_{\text{full}}} \text{ below } 1.$$
+<p>The leverage of caching is entirely in the hit rate $h$, and this is where the skew of the workload does the heavy lifting. If queries follow a Zipf law, the probability of the query of rank $r$ (the $r$-th most popular) is $p(r) \propto r^{-s}$ for an exponent $s$ near $1$. The first time each distinct query appears it misses and is cached; thereafter it hits. With $M$ distinct queries over $N$ requests, the steady-state hit rate approaches $1 - M_{\text{eff}}/N$, where $M_{\text{eff}}$ is the number of distinct queries actually seen, and under heavy skew $M_{\text{eff}}$ grows far more slowly than $N$. A small cache therefore captures a large fraction of traffic, the same heavy-hitter phenomenon that makes the sketches of <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/section-6.8.html">Chapter 6</a> so effective.</p>
+<p>The demonstration below makes this concrete. It simulates a stream of RAG requests drawn from a Zipf distribution, where each canonical query also appears as slightly jittered paraphrases (to model typos and rephrasings on a similarity ring). It then measures three regimes: no cache, an exact result cache, and a semantic cache at four similarity thresholds, reporting for each the hit rate, the false-hit rate (a semantic hit that returned a different question's answer), the total cost, and the average latency.</p>
+<pre><code class="language-python">import random, bisect
+
+random.seed(7)
+
+# ---- Workload: a stream of queries drawn from a Zipf (skewed) distribution ----
+V = 5000                       # distinct canonical queries ("heavy hitters" dominate)
+s = 1.1                        # Zipf exponent: bigger => more skew
+N = 100_000                    # incoming requests to simulate
+weights = [1.0 / (r ** s) for r in range(1, V + 1)]
+Z = sum(weights)
+cum = []                       # cumulative distribution for fast inverse sampling
+acc = 0.0
+for w in weights:
+    acc += w / Z
+    cum.append(acc)
+
+angle = [random.random() for _ in range(V)]   # canonical query positions on a ring [0,1)
+
+def sample_query():
+    q = bisect.bisect_left(cum, random.random())   # Zipf draw via inverse CDF, O(log V)
+    jitter = random.gauss(0, 0.004)                # small angular paraphrase noise
+    return q, (angle[q] + jitter) % 1.0
+
+def sim(a, b):
+    d = abs(a - b); d = min(d, 1 - d)              # circular distance
+    return 1.0 - 2.0 * d                            # cosine-like score in [-1, 1]
+
+# ---- Cost model (USD per request component), order-of-magnitude realistic ----
+C_EMBED, C_RETR, C_GEN = 0.00002, 0.00015, 0.00400   # generation dominates
+L_EMBED, L_RETR, L_GEN = 8.0, 25.0, 900.0            # latency (ms) per component
+
+def run(mode, thresh=None):
+    exact = set()        # canonical-query ids already answered (exact result cache)
+    keys = []            # sorted ring positions of semantically cached queries
+    ids = []             # parallel: canonical id stored at each position
+    cost = lat = 0.0
+    hits_exact = hits_sem = false_hits = 0
+    for _ in range(N):
+        q, e = sample_query()
+        if q in exact:                              # 1) exact result-cache hit
+            hits_exact += 1; lat += 1.0; continue
+        if mode == "semantic" and keys:             # 2) semantic (similarity) cache
+            i = bisect.bisect_left(keys, e)         # nearest cached embedding on the ring
+            best_s, best_id = -2.0, None
+            for j in (i - 1, i % len(keys), i):     # check immediate ring neighbours
+                if 0 &lt;= j &lt; len(keys):
+                    ssim = sim(e, keys[j])
+                    if ssim &gt; best_s: best_s, best_id = ssim, ids[j]
+            if best_id is not None and best_s &gt;= thresh:
+                hits_sem += 1; lat += 2.0; cost += C_EMBED   # still embed to compare
+                if best_id != q: false_hits += 1             # wrong-but-similar answer
+                continue
+        cost += C_EMBED + C_RETR + C_GEN            # 3) miss: full RAG pipeline
+        lat  += L_EMBED + L_RETR + L_GEN
+        exact.add(q)
+        if mode == "semantic":
+            p = bisect.bisect_left(keys, e)
+            keys.insert(p, e); ids.insert(p, q)
+    total = hits_exact + hits_sem
+    return {"hit_rate": total / N,
+            "false_hit_rate": false_hits / max(total, 1),
+            "cost": cost, "avg_lat": lat / N}
+
+base_cost = N * (C_EMBED + C_RETR + C_GEN)
+base_lat = L_EMBED + L_RETR + L_GEN
+print(f"no cache              : cost=${base_cost:8.2f}   avg_latency={base_lat:7.1f} ms")
+
+r = run("exact")
+print(f"exact result cache    : hit={r['hit_rate']*100:5.1f}%  false= 0.0%  "
+      f"cost=${r['cost']:8.2f}  ({(1-r['cost']/base_cost)*100:4.1f}% saved)  "
+      f"avg_latency={r['avg_lat']:6.1f} ms")
+
+for th in (0.9990, 0.9970, 0.9940, 0.9900):
+    r = run("semantic", th)
+    print(f"semantic cache t={th:6.4f}: hit={r['hit_rate']*100:5.1f}%  "
+          f"false={r['false_hit_rate']*100:4.1f}%  "
+          f"cost=${r['cost']:8.2f}  ({(1-r['cost']/base_cost)*100:4.1f}% saved)  "
+          f"avg_latency={r['avg_lat']:6.1f} ms")
+</code></pre>
+<div class="code-caption"><strong>Code 25.8.1:</strong> A pure-Python RAG cache simulator. Queries are drawn from a Zipf distribution with paraphrase jitter on a similarity ring; the exact result cache keys on the canonical query id, while the semantic cache accepts any cached neighbour above a similarity threshold. The false-hit counter records semantic hits that returned a different question's stored answer.</div>
+<pre><code class="language-text">no cache              : cost=$  417.00   avg_latency=  933.0 ms
+exact result cache    : hit= 95.4%  false= 0.0%  cost=$   19.14  (95.4% saved)  avg_latency=  43.8 ms
+semantic cache t=0.9990: hit= 98.6%  false=14.0%  cost=$    6.09  (98.5% saved)  avg_latency=  14.1 ms
+semantic cache t=0.9970: hit= 99.5%  false=25.9%  cost=$    2.55  (99.4% saved)  avg_latency=   5.8 ms
+semantic cache t=0.9940: hit= 99.8%  false=33.0%  cost=$    1.69  (99.6% saved)  avg_latency=   3.6 ms
+semantic cache t=0.9900: hit= 99.8%  false=39.1%  cost=$    1.41  (99.7% saved)  avg_latency=   2.8 ms
+</code></pre>
+<div class="code-caption"><strong>Output 25.8.1:</strong> The exact result cache alone removes 95.4% of the cost with zero false hits, because the skewed workload sends most traffic to a small set of repeated queries. Loosening the semantic threshold buys a few more points of hit rate and further cost savings, but the false-hit rate climbs from 14% to 39%: each relaxation lets a near-duplicate match the wrong stored answer more often.</div>
+<p>Read the numbers as a trade-off curve, not a leaderboard. The exact cache is the safe, large win: it captured better than nineteen of every twenty requests purely from repetition, with no risk of returning the wrong passages, because an exact key match means the query genuinely was the same. The semantic cache extends the hit rate toward 100% and drives the average latency down to single-digit milliseconds, but every step looser on the threshold trades correctness for coverage. At $t = 0.99$ nearly four in ten "hits" answered from a different question's stored result. That false-hit rate is the price of treating "similar" as "same", and choosing the threshold is the central engineering decision of semantic caching.</p>
+
+<h2>3. The Distributed Cache: One Shared Tier Across the Fleet <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A cache local to each serving replica wastes most of its potential. If ten replicas each keep their own cache, a popular query must miss ten times, once per replica, before it is warm everywhere, and a replica restart throws away everything it learned. The fix is to put the cache in a shared tier that every replica reads and writes, the green band along the bottom of Figure 25.8.1. A miss served by any one replica immediately warms the entry for all the others, so the fleet behaves as though it had a single large cache rather than many small disjoint ones. This is the same shared-state pattern that the distributed log and replicated key-value store of <a href="../../part-1-foundations/module-02-distributed-systems-concepts/index.html">Chapter 2</a> were built to provide: many readers and writers agreeing on one authoritative copy of mutable state.</p>
+<p>In practice the shared tier is an in-memory key-value store, and Redis is the default choice because its data model fits cache entries exactly and its latency is low enough that a network round trip to the cache is still vastly cheaper than recomputing the pipeline. The keys are query hashes (for the exact caches) or vector-index lookups (for the semantic cache, which needs a small approximate-nearest-neighbour search over the cached embeddings, a miniature version of the index from earlier in this chapter). The values are serialized passage lists, embedding vectors, or answer strings, each carrying a time-to-live so that nothing lives in the cache forever.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Redis and GPTCache Run the Shared Tier for You</div>
+<p>The simulator in Code 25.8.1 implemented its own dictionaries and ring search. In production you do not hand-roll the shared cache; a managed store and a semantic-cache library handle the distribution, eviction, and similarity search. Redis provides the distributed key-value tier with built-in TTL eviction, and GPTCache layers semantic matching on top of it in a few lines:</p>
+<pre><code class="language-python"># pip install redis gptcache
+import redis
+from gptcache import Cache
+from gptcache.manager import manager_factory
+from gptcache.embedding import Onnx
+from gptcache.similarity_evaluation import SearchDistanceEvaluation
+
+r = redis.Redis(host="cache.internal", port=6379)   # shared tier across the fleet
+
+# Exact result cache: every replica reads/writes the same Redis keys.
+def cached_retrieve(query, ttl=3600):
+    key = "retr:" + query
+    hit = r.get(key)
+    if hit is not None:                       # warm for the whole fleet, not just here
+        return deserialize(hit)
+    passages = distributed_retrieve(query)    # full fan-out search on a miss
+    r.setex(key, ttl, serialize(passages))    # TTL caps staleness automatically
+    return passages
+
+# Semantic cache: similarity match with an explicit distance threshold.
+embed = Onnx()
+sem_cache = Cache()
+sem_cache.init(
+    embedding_func=embed.to_embeddings,
+    data_manager=manager_factory("redis,faiss", vector_params={"dimension": embed.dimension}),
+    similarity_evaluation=SearchDistanceEvaluation(max_distance=0.05),  # the false-hit knob
+)
+</code></pre>
+<div class="code-caption"><strong>Code 25.8.2:</strong> The exact and semantic caches of Code 25.8.1, now backed by Redis and GPTCache. The roughly forty lines of hand-written dictionary, ring search, and TTL logic collapse to a managed store plus a configured similarity evaluator; Redis handles distribution and eviction across the fleet, and GPTCache owns the embedding, the vector search, and the <code>max_distance</code> threshold that sets the false-hit rate.</div>
+</div>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Cache Is Shared State, Scaled Out</div>
+<p>A single-machine program would cache results in a local dictionary and never think about it again. Scaling out turns that dictionary into a distributed systems problem: the cache must be visible to every replica, consistent when documents change, and resilient to the loss of any one node. The remedy is the shared, replicated key-value store of <a href="../../part-1-foundations/module-02-distributed-systems-concepts/index.html">Chapter 2</a>, the same primitive that holds cluster membership and configuration, now holding retrieval results. And the prefix cache of <a href="../module-24-distributed-llm-serving/section-24.7.html">Section 24.7</a> is the same idea pushed inside the generation model: shared KV state reused across requests on the serving fleet. Caching is not a single-node optimization bolted onto a distributed system; it is itself a distributed-state problem, and it is solved with the distributed-state machinery the book has already built.</p>
+</div>
+
+<h2>4. Consistency, Staleness, and the False-Hit Risk <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Two failure modes turn a helpful cache into a harmful one, and both come from the gap between what the cache stored and what the truth now is. The first is <strong>staleness from document updates</strong>. A retrieval-result cache stores the passages a query returned; if the corpus then changes (a document is edited, added, or deleted), the cached passages may no longer be what retrieval would return, so the system serves an answer grounded in an out-of-date document. The remedy is invalidation: when a document changes, every cached entry whose passages came from that document must be evicted. Exact invalidation requires tracking which cache entries depend on which documents, which is itself distributed bookkeeping; the cheaper approximation is a time-to-live, which caps the staleness window at the TTL without tracking dependencies at all. The choice is the hit-rate-versus-staleness trade-off in its clearest form: a long TTL keeps the cache warm and the hit rate high but lets stale answers persist; a short TTL bounds staleness but forces more misses and more recomputation.</p>
+<p>The second failure mode is the <strong>semantic false hit</strong>, which Output 25.8.1 quantified. A semantic cache returns the stored answer for the most similar previous query, and "most similar" is not "the same". Two questions can be close in embedding space yet have genuinely different answers: "What is the capital of Australia?" and "What is the largest city in Australia?" sit near each other but resolve to Canberra and Sydney respectively. A loose threshold answers the second with the first's cached result, fast and wrong. Unlike a stale hit, which was once correct, a false hit may never have been correct for this query, and it is invisible to the user because the answer is fluent and plausible. This is why the threshold is not a tuning convenience but a correctness boundary, and why high-stakes RAG systems keep it conservative, accepting a lower hit rate to drive the false-hit rate toward zero.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Cache That Was Confidently Almost Right</div>
+<p>A semantic cache set too loosely is the system equivalent of the colleague who half-listens to your question, recognizes three of its words, and answers a different question with total confidence. It is not lying; it genuinely found something similar. The trouble is that fluency hides the mismatch: a wrong-but-similar RAG answer reads exactly as smoothly as a right one, so nobody notices until a user does. The cure is the boring one. Make the threshold strict, log the near-misses, and let a human look at what the cache nearly returned before you loosen it.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Support Bot That Cached Its Way Out of a Budget Crisis</div>
+<p><strong>Who:</strong> An ML platform engineer running a customer-support RAG assistant for a software-as-a-service company.</p>
+<p><strong>Situation:</strong> The assistant answered product questions over a documentation corpus, fanning out to a sharded vector index and then generating an answer with a large model. Traffic had tripled in a quarter.</p>
+<p><strong>Problem:</strong> The monthly generation bill had tripled with the traffic, and tail latency during peak hours was pushing past the four-second budget that made the assistant feel responsive.</p>
+<p><strong>Dilemma:</strong> Provision more generation capacity (linear cost growth with traffic) or cache aggressively (cheap, but a loose semantic cache risked returning the wrong documentation page to a paying customer, which support leadership would not accept).</p>
+<p><strong>Decision:</strong> They deployed a shared Redis cache tier with two layers: an exact result cache with a one-hour TTL, and a semantic cache set to a strict similarity threshold, tuned so the offline-measured false-hit rate stayed under one percent on a labeled query set.</p>
+<p><strong>How:</strong> Every replica read and wrote the same Redis tier, so a question answered once stayed warm fleet-wide. Document-publish events fired targeted invalidations for the affected pages, and the one-hour TTL bounded staleness for everything else.</p>
+<p><strong>Result:</strong> The exact cache alone absorbed the bulk of repeated questions, generation cost fell back below its pre-growth level, and peak-hour median latency dropped into the tens of milliseconds for cached questions. The strict semantic threshold added a few more points of hit rate without a single escalated wrong-answer ticket.</p>
+<p><strong>Lesson:</strong> Take the large, safe win first (the exact cache on a shared tier) and treat the semantic cache as a tuned, monitored extension, not a free upgrade. The skew of real support traffic did most of the work; the threshold discipline kept it honest.</p>
+</div>
+
+<h2>5. The Generation Prefix Cache as the Final Layer <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The three caches discussed so far sit in front of the generation model. The fourth lives inside it. When the generator reads the retrieved passages, it computes attention key-value (KV) state over every one of their tokens, and that computation is a large share of the per-request cost when the retrieved context runs to thousands of tokens. The crucial observation is that retrieved passage sets overlap heavily across requests: the same popular document chunk is retrieved for many different but related queries. The prefix cache, developed for the LLM serving fleet in <a href="../module-24-distributed-llm-serving/section-24.7.html">Section 24.7</a>, stores the KV state of a shared token prefix so that the second request reusing those passages skips recomputing attention over them and resumes generation from the cached state.</p>
+<p>This layer composes naturally with the others and tightens the case for a shared fleet-wide cache. A result-cache miss still goes to the generator, but if its retrieved passages overlap a previously served set, the prefix cache turns part of an expensive generation into a cheap resumption. Because the heavy-hitter queries retrieve heavy-hitter passages, the same skew that makes the result cache effective also concentrates prefix reuse on a small set of popular passage prefixes, so a modest prefix-cache budget intercepts a disproportionate share of the generation work. Ordering the passages so that the most-shared chunks sit at the front of the context maximizes the reusable prefix, a placement detail that matters precisely because the cache keys on a contiguous prefix.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Semantic Caching and Beyond (2024 to 2026)</div>
+<p>Semantic caching for LLM and RAG pipelines moved from idea to infrastructure in this period. GPTCache (Bang, 2023, and its subsequent releases) popularized the embedding-keyed semantic cache and is now a common building block, while managed offerings and Redis-based semantic caches brought it into production stacks. The active research question is the false-hit problem this section emphasizes: a fixed cosine threshold is a blunt instrument, and recent work explores learned or query-dependent acceptance criteria, verification of a candidate cached answer before serving it, and uncertainty-aware caching that abstains when the similarity is ambiguous. On the generation side, prefix and KV-cache reuse has grown beyond a single node into cross-request and cross-node sharing on the serving fleet, with systems in the lineage of vLLM's automatic prefix caching and disaggregated KV stores treating cached attention state as a first-class distributed resource. The common thread is that caching in RAG is increasingly treated as a correctness-constrained optimization, not a best-effort speedup, with the false-hit rate measured and bounded rather than ignored.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.8.1: Reading the Trade-Off Curve <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using Output 25.8.1, explain why the exact result cache reaches a 95.4% hit rate with a zero false-hit rate, while every semantic threshold has a nonzero false-hit rate. Then argue which configuration you would deploy for (a) a customer-support assistant where a wrong-but-fluent answer is a serious failure, and (b) an internal brainstorming tool where speed matters more than precision. State the threshold you would pick for each and what false-hit rate you are accepting in exchange for the cost savings.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.8.2: Add a TTL and Measure Staleness <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 25.8.1 so that cached entries expire after a fixed number of requests (a proxy for a TTL), and so that a small fraction of the canonical queries have their "correct answer" change partway through the stream (a document update). Add a counter for stale hits: a cache hit whose stored answer predates the change for a query that has since updated. Plot the hit rate and the stale-hit rate as you vary the TTL from very short to effectively infinite, and identify the TTL that, for your update rate, keeps stale hits under one percent while preserving most of the hit-rate benefit.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.8.3: Where Does the Saving Come From? <span class="exercise-type analysis">Analysis</span></div>
+<p>The cost model in Section 2 has generation dominate at $c_{\text{gen}} = 0.004$ against $c_{\text{embed}} = 0.00002$ and $c_{\text{retr}} = 0.00015$. Derive the expected cost per request as a function of three independent hit rates: $h_e$ for the embedding cache, $h_r$ for the result cache (which subsumes embedding), and $h_p$ for the prefix cache on the residual generation. Show analytically that improving the result-cache hit rate by one point saves far more than improving the embedding-cache hit rate by one point, and use this to justify the layering order in the Key Insight of Section 1. Where would adding the prefix cache change your conclusion?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-25.7.html"><span class="nav-label">Previous</span><span class="nav-num">Section 25.7</span><span class="nav-title">Multi-Stage Retrieval and Distributed Reranking</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 25</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Retrieval and Vector Search</span></a>
+<a class="next" href="section-25.9.html"><span class="nav-label">Next</span><span class="nav-num">Section 25.9</span><span class="nav-title">Evaluating Distributed Retrieval</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

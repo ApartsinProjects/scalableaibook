@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 2.5: Consistency Models: From Parameter Staleness to the CAP Trade-off. How asynchronous SGD reads slightly old parameters, what bounded staleness buys, and why training tolerates weak consistency while the control plane demands strong consistency." name="description"/>
+<title>Section 2.5: Consistency Models: From Parameter Staleness to the CAP Trade-off | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Distributed AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 2: Distributed Systems Concepts for AI</a></div>
+<h1>Consistency Models: From Parameter Staleness to the CAP Trade-off</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I read the weights, I computed an honest gradient, and by the time I sent it back the weights had moved on without me. We agreed it was close enough."</p>
+<cite>A Parameter Server Under Mild Staleness</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Consistency is the rule that decides what value a read returns when many machines hold copies of the same thing, and distributed AI deliberately picks a different rule for its training data plane than for its control plane.</strong> When a worker reads the current model parameters from a shared store, computes a gradient, and sends it back, the parameters may have changed in the meantime; the worker acted on a slightly old copy. Training mostly shrugs at this and keeps going, because a stochastic gradient is already noisy and a little extra staleness rarely hurts convergence. The control plane that records which model is in production, what the configuration is, or who holds a lock cannot shrug: a stale read there can route traffic to a deleted model or let two schedulers both believe they are the leader. This section starts from the concrete staleness of asynchronous SGD, generalizes to the strong-versus-eventual consistency spectrum, and lands on the CAP trade-off that forces the choice under a network partition.</p>
+</div>
+<p>In the previous section we treated a node that fails by stopping, and we recovered from it with checkpoints and re-execution. Now we treat a subtler problem that exists even when nothing fails: the moment a piece of state is copied onto more than one machine, those copies can disagree, and the system must declare a rule for what a reader is allowed to see. That rule is the consistency model. We approach it the way this book approaches every borrowed distributed-systems idea, through the AI operation that uses it first. The most instructive case is the one that distributed training runs millions of times per job: a worker reads parameters that are already a little out of date.</p>
+
+<h2>1. The Worker That Read Stale Parameters <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Picture the parameter-server style of distributed training, which we develop fully in <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a>. One or more server machines hold the authoritative copy of the model weights $w$. Many worker machines repeat a loop: pull the current $w$ from the server, compute a gradient on a local mini-batch, and push that gradient back so the server can apply it. If every worker waited for every other worker at every step, this would be synchronous SGD, and the read would always return the freshest weights. The price of that freshness is that the whole system runs at the speed of its slowest worker, the straggler problem we meet again in <a href="section-2.7.html">Section 2.7</a>.</p>
+<p>Asynchronous SGD removes the barrier: a worker pulls $w$, works, and pushes its gradient whenever it is ready, without waiting. The benefit is that fast workers never idle behind slow ones. The cost is staleness. Between the instant a worker reads $w$ and the instant its gradient is applied, other workers have pushed their own gradients, so the server's weights have moved. The gradient this worker computed was correct for the weights it read, but it is applied to newer weights. We say the gradient has a staleness of $s$ if the parameters advanced by $s$ updates between the read and the apply. Synchronous SGD is exactly the special case $s = 0$. The asynchronous and synchronous variants are compared as optimization methods in <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a>; here we care only about what staleness means for consistency.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Stale Read Is a Consistency Choice, Not a Bug</div>
+<p>When an asynchronous worker computes a gradient on parameters that are $s$ updates old, it is not malfunctioning. The system has chosen a weak consistency model on purpose, trading the freshness of every read for the throughput of never waiting. The design question is never "how do we eliminate staleness" but "how much staleness can the learning algorithm absorb before convergence suffers, and how do we bound it." That reframing, from correctness to a tunable trade-off, is what separates the data plane of distributed AI from a bank ledger that must never see a stale balance.</p>
+</div>
+
+<h2>2. Bounded Staleness and Stale-Synchronous Parallel <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Fully asynchronous training has no limit on $s$: a worker that pauses for a garbage collection or a slow disk read can come back and push a gradient that is hundreds of updates out of date, and a gradient that stale points in a direction that may no longer descend the loss at all. The fix is not to forbid staleness but to <em>bound</em> it. The stale-synchronous parallel (SSP) model, introduced for distributed machine learning by Ho and colleagues, sets a staleness threshold $s_{\max}$: a worker is allowed to run ahead using slightly old parameters, but if it gets more than $s_{\max}$ updates ahead of the slowest worker, it must stop and wait for the laggard to catch up. SSP interpolates between the two extremes: $s_{\max} = 0$ recovers strict synchronous SGD, and $s_{\max} = \infty$ recovers fully asynchronous SGD. A small positive bound captures most of the speed of asynchrony while keeping the convergence guarantees that fully unbounded staleness throws away. This bounded-staleness machinery returns in detail in <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a>, where it becomes a parameter-server feature.</p>
+<p>Why does a bound rescue convergence? Intuitively, a stochastic gradient is already a noisy estimate of the true gradient; bounded staleness adds another bounded source of error, and stochastic optimization is robust to bounded perturbations as long as they do not systematically point the wrong way. The convergence theory of SSP shows the optimality gap degrades gracefully with $s_{\max}$ rather than exploding, which is exactly the behavior we want from a tunable knob. Figure 2.5.1 places these regimes on a single spectrum so the vocabulary stays straight before we generalize beyond training.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A horizontal spectrum of consistency. The far left is strong consistency and synchronous SGD with staleness zero. The middle is bounded staleness and stale-synchronous parallel. The far right is eventual consistency and fully asynchronous SGD with unbounded staleness. An arrow underneath shows freshness decreasing and throughput increasing from left to right.">
+<defs>
+<marker id="arr25" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#14385c"/></marker>
+<linearGradient id="grad25" x1="0" y1="0" x2="1" y2="0">
+<stop offset="0%" stop-color="#cfe0f0"/>
+<stop offset="100%" stop-color="#fbe6cf"/>
+</linearGradient>
+</defs>
+<style>
+.t25 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s25 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.m25 { font:600 12px sans-serif; fill:#b86b1f; text-anchor:middle; }
+.l25 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr25); }
+</style>
+<rect x="60" y="50" width="740" height="40" rx="8" fill="url(#grad25)" stroke="#14385c" stroke-width="1.4"/>
+<line x1="310" y1="50" x2="310" y2="90" stroke="#14385c" stroke-width="1" stroke-dasharray="4 3"/>
+<line x1="560" y1="50" x2="560" y2="90" stroke="#14385c" stroke-width="1" stroke-dasharray="4 3"/>
+<text class="t25" x="185" y="38">Strong consistency</text>
+<text class="s25" x="185" y="75">every read sees the latest write</text>
+<text class="t25" x="435" y="38">Bounded staleness</text>
+<text class="s25" x="435" y="75">reads at most s_max behind</text>
+<text class="t25" x="680" y="38">Eventual consistency</text>
+<text class="s25" x="680" y="75">copies converge, eventually</text>
+<text class="m25" x="185" y="118">synchronous SGD (s = 0)</text>
+<text class="m25" x="435" y="118">stale-synchronous parallel</text>
+<text class="m25" x="680" y="118">async SGD (s = &#8734;)</text>
+<line x1="80" y1="165" x2="780" y2="165" class="l25"/>
+<text class="s25" x="200" y="158">more freshness, more waiting</text>
+<text class="s25" x="650" y="158">more throughput, more staleness</text>
+<text class="t25" x="430" y="205">The training data plane lives here, toward the right</text>
+<text class="s25" x="430" y="225">the control plane (registry, config, locks) is pinned to the far left</text>
+</svg>
+<figcaption><strong>Figure 2.5.1:</strong> The consistency spectrum, read through distributed training. Moving left to right relaxes the rule for what a read may return, trading freshness for throughput. Synchronous SGD ($s = 0$) sits at the strong-consistency end, bounded-staleness stale-synchronous parallel in the middle, and fully asynchronous SGD ($s = \infty$) at the eventual-consistency end. Section 4 explains why training deliberately operates on the right while the control plane is pinned to the left.</figcaption>
+</figure>
+<p>The demo below makes the bounded-staleness claim measurable on a convex least-squares loss, where the final loss is a clean convergence signal. It simulates stale-synchronous SGD: the gradient applied at step $t$ is evaluated at the parameters from $s$ steps earlier, exactly modelling a worker that read an old copy before the server moved on. We run staleness $0$, $4$, and $16$ at a fixed learning rate and report the final loss.</p>
+<pre><code class="language-python">import numpy as np
+
+# A convex least-squares objective: minimize (1/N) sum (x_i . w - y_i)^2.
+# Convexity lets us read the final loss as a clean convergence signal.
+rng = np.random.default_rng(7)
+N, d = 4000, 30
+X = rng.standard_normal((N, d))
+w_star = rng.standard_normal(d)
+y = X @ w_star + 0.05 * rng.standard_normal(N)
+
+def loss(w):
+    r = X @ w - y
+    return float(r @ r) / N
+
+def grad(w, idx):
+    Xi, yi = X[idx], y[idx]
+    return (2.0 / len(idx)) * (Xi.T @ (Xi @ w - yi))
+
+def run(staleness, steps=3000, batch=32, lr=0.03, seed=0):
+    # Stale-synchronous SGD: the gradient applied at step t is evaluated at the
+    # parameters from 'staleness' steps ago, modelling a worker that read an old
+    # copy of w before the server moved on. staleness=0 is exact synchronous SGD.
+    g = np.random.default_rng(seed)
+    w = np.zeros(d)
+    past = []                          # ring of recent parameter snapshots
+    for t in range(steps):
+        idx = g.integers(0, N, size=batch)
+        w_read = past[0] if (staleness > 0 and len(past) == staleness) else w
+        gt = grad(w_read, idx)         # gradient computed on the stale read
+        past.append(w.copy())
+        if len(past) > staleness:
+            past.pop(0)
+        w = w - lr * gt                # applied to the current (newer) w
+    return loss(w)
+
+base = run(0)
+print(f"{'staleness s':>12} | {'final loss':>12} | {'vs s=0':>9}")
+print("-" * 40)
+for s in (0, 4, 16):
+    L = run(s)
+    ratio = "diverged" if L > 1e3 else f"{L / base:6.2f}x"
+    shown = f"{L:12.5f}" if L < 1e3 else f"{L:12.2e}"
+    print(f"{s:>12} | {shown} | {ratio:>9}")
+</code></pre>
+<div class="code-caption"><strong>Code 2.5.1:</strong> A single-process simulation of stale-synchronous SGD. The ring buffer <code>past</code> holds recent parameter snapshots so each step can compute its gradient on the copy from $s$ updates ago, reproducing the delayed read of an asynchronous worker without needing a real cluster.</div>
+<pre><code class="language-text"> staleness s |   final loss |    vs s=0
+----------------------------------------
+           0 |      0.00270 |     1.00x
+           4 |      0.00273 |     1.01x
+          16 |      0.00283 |     1.05x
+</code></pre>
+<div class="code-caption"><strong>Output 2.5.1:</strong> Final loss degrades gracefully with the staleness bound: staleness $4$ costs one percent over the synchronous baseline, staleness $16$ about five percent. The penalty grows with $s$ but stays small and predictable, which is precisely why bounded staleness is a knob worth turning for throughput rather than a failure to avoid.</div>
+<p>The result is the honest one. More staleness does cost something; the loss at $s = 16$ is measurably worse than at $s = 0$. The point is that the cost is small and grows gradually, so a training system can spend a little convergence to buy a lot of throughput, and a staleness bound keeps that trade inside a regime where it stays a good deal. Push $s$ far enough at an aggressive learning rate and the method diverges; that cliff, and the learning-rate scaling that moves it, belongs to <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a>.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Real Parameter Server Enforces the Bound for You</div>
+<p>Code 2.5.1 simulated staleness with a ring buffer in one process. In a real system the staleness bound is a server-side policy, and frameworks expose it as a configuration value rather than something you implement. A parameter-server library such as the classic <code>ps-lite</code> backend, or a Ray-based parameter server, tracks each worker's clock and blocks a push that would exceed the bound:</p>
+<pre><code class="language-python"># Sketch of the server-side contract a parameter server enforces.
+# You configure the bound; the server does the clock-tracking and blocking.
+server = ParameterServer(weights=w0, max_staleness=4)   # SSP bound s_max = 4
+
+# Each worker, in its own process, simply pulls and pushes:
+w = server.pull()                 # returns weights at most s_max updates old
+grad = compute_gradient(w, local_batch)
+server.push(grad)                 # server blocks this worker if it runs too far ahead
+</code></pre>
+<div class="code-caption"><strong>Code 2.5.2:</strong> The bounded-staleness logic of Code 2.5.1 as a one-line <code>max_staleness</code> policy. The library tracks per-worker clocks, decides when a read is too stale, and blocks the offending worker, replacing the manual ring buffer with a server-side guarantee that <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a> unpacks.</div>
+</div>
+
+<h2>3. Strong and Eventual Consistency, Generalized <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Staleness in SGD is one instance of a question every replicated system must answer: when state is copied onto multiple machines, what is a reader guaranteed to see? The two anchor points of the spectrum in Figure 2.5.1 have standard names. Under <strong>strong consistency</strong>, every read returns the result of the most recent write, as if there were a single copy that all operations pass through in one agreed order. A reader can never observe a value that has been superseded. This is the model a bank balance, a model registry, or a configuration store needs, and it is the model synchronous SGD provides for the weights, at the cost of a global barrier.</p>
+<p>Under <strong>eventual consistency</strong>, writes propagate to replicas over time, and a read may return an old value, but if writes stop, all replicas eventually converge to the same final value. There is no guarantee about <em>when</em> a given read sees a given write, only that the system does not diverge forever. Fully asynchronous SGD is an eventual-consistency system for the weights: at any instant different workers may hold different snapshots, yet the training process still converges toward a shared solution. Between the two anchors sit many intermediate models, including the bounded staleness of the previous section, which promises a read is never more than $s_{\max}$ writes behind, a quantitative middle ground that pure strong or eventual consistency does not offer.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Match the Consistency Model to What a Stale Read Costs</div>
+<p>The right consistency model is decided by the consequence of reading a stale value. If a stale read merely adds bounded noise to an already-noisy computation, as in training, choose a relaxed model and reap the throughput. If a stale read can corrupt a decision that must be made exactly once, such as which model serves production traffic or which node holds a lock, pay for strong consistency. A single AI system almost always runs both: a relaxed data plane for the heavy numerical work, and a strongly consistent control plane for the small amount of metadata that coordinates it.</p>
+</div>
+
+<h2>4. The CAP Trade-off Under a Partition <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Strong consistency is not free, and the reason is failure, not just speed. Consider a store replicated across two machines for availability, and suppose the network link between them drops so neither can talk to the other. This is a <em>network partition</em>: each side is up and serving, but they cannot synchronize. A write arrives at one side. The system now faces a forced choice. It can refuse to serve until the partition heals, guaranteeing that no one reads a value that disagrees with the other side; that preserves consistency but sacrifices availability. Or it can accept reads and writes on both sides and reconcile later, staying available but allowing the two sides to disagree; that preserves availability but sacrifices consistency. There is no third option that keeps both, because the two sides physically cannot agree while they cannot communicate.</p>
+<p>This is the CAP trade-off, stated by Brewer and proved by Gilbert and Lynch: a distributed store cannot simultaneously guarantee consistency, availability, and partition tolerance. Since real networks partition, partition tolerance is not optional, so the genuine engineering choice is the one CAP forces during a partition: consistency or availability. The choice is not made once for a whole company; it is made per piece of state, according to what a stale or unavailable read costs. Table 2.5.1 makes the per-state nature of that decision concrete for the components of a typical distributed AI stack.</p>
+<div class="table-caption"><strong>Table 2.5.1:</strong> The same system makes opposite CAP choices for different state. The deciding question is always the cost of a stale or refused read.</div>
+<table>
+<thead>
+<tr><th scope="col">State</th><th scope="col">What a stale read would cost</th><th scope="col">CAP choice under partition</th></tr>
+</thead>
+<tbody>
+<tr><td>Training weights (data plane)</td><td>A slightly worse gradient; bounded extra noise</td><td>Availability (relaxed consistency)</td></tr>
+<tr><td>Model registry (which model is live)</td><td>Routing traffic to a wrong or deleted model</td><td>Consistency</td></tr>
+<tr><td>Cluster configuration / feature flags</td><td>Nodes acting on conflicting settings</td><td>Consistency</td></tr>
+<tr><td>Scheduler leader election / locks</td><td>Two leaders, double-scheduled jobs</td><td>Consistency</td></tr>
+<tr><td>Inference request cache</td><td>A slightly old cached answer</td><td>Availability</td></tr>
+</tbody>
+</table>
+<p>The pattern in Table 2.5.1 is the honest summary of where distributed AI sits on the consistency spectrum. The heavy numerical work, training and much of inference, leans toward availability and relaxed consistency, because its reads are robust to bounded staleness and its throughput is precious. The small but critical metadata that coordinates the cluster leans toward strong consistency, because a single wrong answer there can corrupt the whole system. Implementing that strongly consistent control plane is its own problem, solved by consensus protocols that keep a replicated log in agreement even through partitions and failures, and that is exactly where <a href="section-2.6.html">Section 2.6</a> goes next.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Async Speedup That Came Back to Bite the Registry</div>
+<p><strong>Who:</strong> A platform engineer running a recommendation-model training and serving stack on a shared cluster.</p>
+<p><strong>Situation:</strong> The training job used an asynchronous parameter server, and a model registry recorded which checkpoint each serving replica should load.</p>
+<p><strong>Problem:</strong> Encouraged by how well the relaxed-consistency training scaled, the team put the registry behind the same eventually consistent key-value store to "keep the architecture simple."</p>
+<p><strong>Dilemma:</strong> Keep one relaxed store everywhere, simple and uniform but risking stale registry reads, or run a separate strongly consistent store for the registry, more moving parts but correct routing.</p>
+<p><strong>Decision:</strong> A brief network partition exposed the mistake: two serving replicas read different "latest" model versions from the eventual store and served inconsistent recommendations for several minutes, so the team split the registry onto a strongly consistent store.</p>
+<p><strong>How:</strong> Training kept its bounded-staleness parameter server unchanged, while the registry and serving configuration moved to a consensus-backed store with linearizable reads.</p>
+<p><strong>Result:</strong> Routing became exact again with no measurable hit to training throughput, because the strongly consistent store handled only kilobytes of metadata, not the gradient traffic.</p>
+<p><strong>Lesson:</strong> Relaxed consistency that is a feature for the data plane is a liability for the control plane. Choose the model per state, not per system.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Eventual Consistency Is Just a Promise With No Deadline</div>
+<p>"Eventually consistent" has the same energy as a roommate who promises the dishes will get done eventually. The guarantee is real: in a quiet system, with no new writes, every replica truly does converge to the same value. The catch is that the system is rarely quiet, so "eventually" can mean milliseconds or, on a bad day behind a partition, distinctly longer. Training tolerates this cheerfully because its dishes are gradients and a few old ones in the sink do not spoil dinner.</p>
+</div>
+
+<h2>5. Reading the Spectrum as a Design Tool <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The consistency spectrum is not trivia to memorize; it is a design tool you apply component by component. For each piece of replicated state in a system you are building, ask three questions in order. First, what does a reader actually do with the value, and how much does a stale value degrade that action? Second, if the answer is "a little, and bounded," can you name the bound and enforce it, the way stale-synchronous parallel names $s_{\max}$? Third, when a partition forces the CAP choice, which do you need on this state, the availability to keep serving or the consistency to never be wrong? Working through those three questions turns "what consistency model should I use" from a philosophical debate into a short checklist with a defensible answer per component.</p>
+<p>This per-component discipline is why the same engineers who happily run fully asynchronous training will insist on a consensus-backed store for the five hundred bytes that say which model is in production. It is not inconsistency in their thinking; it is consistency applied to the right places. The partitioning and replication mechanics that put state on multiple machines in the first place were the subject of <a href="section-2.3.html">Section 2.3</a>, and the consensus machinery that makes a strongly consistent control plane possible is the subject of the next section. We now have the vocabulary, strong versus eventual, bounded staleness, and the CAP trade-off, to read any distributed AI design and say where on the spectrum each part of it lives and why.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Relaxed Consistency Pushed to Internet Scale (2024 to 2026)</div>
+<p>The frontier is testing how far the relaxed-consistency end of training can be pushed when machines are not in one data center. Local-update schemes in the DiLoCo lineage (Douillard et al., 2024) let workers take many local steps between rare synchronizations, deliberately accepting large, structured staleness to train over slow or intermittent links; follow-on work has run such training across continents and over the public internet, and streaming-DiLoCo variants overlap the rare synchronization with computation to hide it almost entirely. The honest reading is that these methods deepen the lesson of this section rather than overturn it: they move the training data plane even further toward eventual consistency, and they pair it with an unchanged, strongly consistent control plane that decides when a synchronization round commits. We return to these communication-efficient methods with the tools to evaluate them in <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.5.1: Place the State on the Spectrum <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each of the following, state where on the consistency spectrum of Figure 2.5.1 it should sit (strong, bounded staleness, or eventual) and justify the placement by the cost of a stale read: (a) the gradient of an asynchronous worker in a fraud-detection model retrained hourly; (b) the record of which model checkpoint is currently authorized to serve payments; (c) a distributed counter tracking total inference requests for a dashboard; (d) the lock that ensures only one scheduler promotes a new model at a time. For each, name what goes wrong if you pick the model one notch too relaxed.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.5.2: Find the Staleness Cliff <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 2.5.1 to sweep the staleness bound $s$ over $\{0, 2, 4, 8, 16, 32, 64\}$ and, separately, the learning rate over $\{0.01, 0.03, 0.06\}$. Produce a small table of final loss for each $(s, \text{lr})$ pair, marking any cell that diverged. Identify, for each learning rate, the largest staleness that still converges to within ten percent of the synchronous baseline. Explain in two sentences why a larger learning rate lowers the staleness that the method can tolerate, connecting your numbers to the learning-rate scaling that <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a> formalizes.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.5.3: Reason Through a Partition <span class="exercise-type analysis">Analysis</span></div>
+<p>A two-replica model registry is split by a network partition for ninety seconds. During the split, a deployment pipeline on one side promotes model $v$2 to production while the other side still believes $v$1 is live, and serving replicas on each side read their local registry. Walk through what an availability-favoring (eventual) store and a consistency-favoring (refuse-to-serve) store each do during and after the partition. State the concrete user-visible failure in each case, and argue which choice you would make for a registry versus for the inference request cache from Table 2.5.1. Tie your answer to the Gilbert-Lynch statement that you cannot have both under a partition.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-2.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 2.4</span><span class="nav-title">Fault Tolerance and Recovery</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 2</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Systems Concepts for AI</span></a>
+<a class="next" href="section-2.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 2.6</span><span class="nav-title">Coordination and Consensus in the Control Plane</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

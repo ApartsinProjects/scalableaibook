@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 25.9: Evaluating Distributed Retrieval. Measuring a sharded retrieval system on both quality (recall@k, nDCG, RAG faithfulness) and systems axes (QPS, p99, cost), why recall and latency must be reported jointly, plus the Chapter 25 summary and project ideas." name="description"/>
+<title>Section 25.9: Evaluating Distributed Retrieval | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 25: Distributed Retrieval and Vector Search</a></div>
+<h1>Evaluating Distributed Retrieval</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They told the dashboard I answered in two milliseconds. They forgot to mention I found the wrong document."</p>
+<cite>An ANN Index Tuned a Little Too Aggressively</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A distributed retrieval system has two scoreboards that you must read at the same time: did it find the right items (quality), and did it do so fast and cheaply enough to serve (systems)?</strong> Every preceding section of this chapter added a knob that trades one against the other. Approximate nearest-neighbor search trades recall for speed; sharding trades a single latency for a scatter-gather whose tail is set by the slowest shard; caching trades freshness for throughput. Because these knobs couple, no single number describes the system. The discipline this section teaches, the same construct-matched evaluation discipline of <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/index.html">Chapter 5</a>, is to report quality and cost as a joint frontier rather than as separate headlines, so that "this retriever is fast" can never hide "at a recall nobody would accept".</p>
+</div>
+<p>Across this chapter we built a retrieval pipeline out of distributed parts: embeddings computed on a fleet of encoders, vectors stored in a sharded database, an approximate index that answers nearest-neighbor queries in sublinear time, replicas that absorb load, a scatter-gather that fans a query across shards, a reranker that sharpens the top results, and caches that short-circuit the repeats. Each part has a dial, and turning a dial moves both quality and cost. The final engineering question is therefore not "is it correct?" but "where on the trade-off surface does it sit, and is that the point we want?" Answering it requires measuring the system along two axes that most teams are tempted to measure separately, and that is exactly the temptation this section exists to break.</p>
+
+<h2>1. Two Scoreboards: Quality and Systems <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The first axis is retrieval quality: of the items the system returned, how many were the ones it should have returned, and were the best ones near the top? The second axis is systems behavior: how many queries per second can the fleet sustain, what is the tail latency of a query, how long does the index take to build, how much memory does it occupy, and what does a single query cost. A retrieval system is healthy only when both scoreboards are healthy at once, and the central lesson of distributed retrieval is that the two are linked by the very approximations that make scale-out possible. You cannot tune one in isolation without silently moving the other.</p>
+<p>This is the construct-matching point from <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/index.html">Chapter 5</a> in its sharpest form. A metric is only meaningful next to the configuration that produced it. Recall measured at one approximate-search setting and latency measured at another describe two different systems and cannot be compared; they must be co-measured in one pass on one configuration. The rest of this section names the metrics on each scoreboard, then shows how to bind them together.</p>
+
+<h2>2. Retrieval-Quality Metrics <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The headline quality metric for distributed retrieval is <strong>recall@k</strong>, because approximate search exists precisely to trade recall for speed. Let $R_q$ be the set of truly relevant (or, for ANN, the exact-nearest) items for query $q$, and let $\hat{R}_q^{(k)}$ be the top $k$ the system returned. Recall@k averages, over a query set $Q$, the fraction of the true items that were recovered,</p>
+$$\text{recall@}k = \frac{1}{|Q|} \sum_{q \in Q} \frac{|\,\hat{R}_q^{(k)} \cap R_q\,|}{\min(k, |R_q|)}.$$
+<p>For an ANN index the natural ground truth is the exact brute-force top-$k$, so recall@k measures how much of the exact answer the approximation kept; a recall of $0.9$ at $k=10$ means the index recovered nine of the ten exact neighbors on average. Precision@k, the complementary fraction of returned items that are relevant, matters more when retrieval feeds a downstream consumer with a fixed budget of slots. When the order within the top $k$ matters, as it does when a reranker or a generator reads the list top-down, ranking-aware metrics take over: <strong>nDCG</strong> discounts a relevant item by the logarithm of its rank so that a correct answer at position one counts more than the same answer at position ten, and <strong>MRR</strong> rewards getting the single first relevant item as high as possible. These are the same ranking metrics that govern reranking quality in <a href="section-25.7.html">Section 25.7</a>, now read as evaluation rather than as a training objective.</p>
+<p>Recall, precision, and nDCG measure the retriever in isolation. When retrieval feeds a generator, as it does in retrieval-augmented generation, the metric that ultimately matters is the quality of the generated answer, which depends on retrieval only through the context it supplies. Two end-to-end measures dominate here: <strong>groundedness</strong> (is every claim in the answer supported by a retrieved passage?) and <strong>faithfulness</strong> (does the answer avoid asserting anything the retrieved context does not support?). Both are commonly scored with an LLM-as-judge that reads the answer, the context, and the question and rates support, a technique we treat with its calibration caveats in <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/index.html">Chapter 5</a>. The crucial structural fact is that a retrieval change can lift recall yet leave answer quality flat (the generator already had enough context) or, worse, raise recall of near-duplicates that crowd out the one passage the answer needed. Quality must therefore be measured at the layer the user actually experiences, not only at the retriever's own output.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Recall Is a Knob, Not a Property</div>
+<p>In an exact index, recall is fixed at one. In an approximate index it is a dial you set with <code>nprobe</code> (IVF) or <code>efSearch</code> (HNSW), the same dials introduced in <a href="section-25.4.html">Section 25.4</a>. Turning the dial up recovers more of the exact neighbors and costs more compute and latency; turning it down is faster and recovers fewer. Because recall is a chosen operating point rather than a property of the system, a recall number is meaningless without the latency it was bought at. Report the pair, never the single number.</p>
+</div>
+
+<h2>3. Systems Metrics <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The systems scoreboard begins with <strong>query throughput</strong> (QPS), the sustained rate the fleet serves under a fixed latency ceiling, and <strong>tail latency</strong>, reported at the p99 rather than the mean because a user feels the slow queries, not the average ones. Tail latency is where the distributed structure of the system shows itself most plainly: a query fanned across $S$ shards in the scatter-gather of <a href="section-25.5.html">Section 25.5</a> is only as fast as its slowest shard, so the p99 of the merged query is governed by the p99 of the worst replica, not the typical one. This is the fan-out tail-amplification effect, and it is why adding shards to raise capacity can quietly raise tail latency even as it lowers mean latency.</p>
+<p>Two offline systems metrics round out the picture. <strong>Index build time and memory</strong> bound how often you can rebuild the index as the corpus grows and how many vectors fit per node; a graph index such as HNSW is fast to query but heavy to build and to hold in memory, while a quantized IVF-PQ index is lighter in memory but recovers less recall, the same construction trade-offs catalogued in <a href="section-25.4.html">Section 25.4</a>. Finally, <strong>cost-per-query</strong> ties the systems scoreboard to money: it folds the accelerator and memory time a query consumes into a single figure that, tracked over the fleet, is the number a budget owner cares about. Cost-per-query is the retrieval instance of the cost analysis of <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.5.html">Section 5.5</a>, and it is the third axis of the frontier this section is building toward.</p>
+
+<h2>4. The Coupling: Report Recall and Latency Together <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The two scoreboards are not independent dashboards to be read side by side; they are a single surface. The cleanest way to see this is to sweep the recall dial and watch latency and cost move with it. The demonstration below builds a small IVF index in pure Python, computes exact brute-force ground truth, and then for each <code>nprobe</code> setting measures recall@10, the p99 latency of the scatter-gather query, and a derived cost-per-query, all co-measured in one pass on one configuration so the numbers are construct-matched by construction. The joint operating point we care about is the cheapest configuration that meets a recall target,</p>
+$$\text{operating point} = \arg\min_{c \,\in\, \mathcal{C}} \; \text{cost}(c) \quad \text{subject to} \quad \text{recall@}k(c) \ge \tau,$$
+<p>where $\mathcal{C}$ is the set of configurations (here, the <code>nprobe</code> values) and $\tau$ is the recall floor the application demands. Reporting only $\min_c \text{latency}(c)$ would select the fastest configuration regardless of whether it found anything useful, which is exactly the misleading headline this section warns against.</p>
+<pre><code class="language-python">import math, random
+random.seed(7)
+
+DIM, N, NQ, NLIST, K = 16, 4000, 200, 64, 10        # dims, corpus, queries, IVF cells, recall@K
+
+def rand_vec(): return [random.gauss(0, 1) for _ in range(DIM)]
+def dist2(a, b): return sum((x - y) ** 2 for x, y in zip(a, b))
+
+corpus  = [rand_vec() for _ in range(N)]
+queries = [rand_vec() for _ in range(NQ)]
+centroids = random.sample(corpus, NLIST)             # coarse quantizer
+
+def nearest_cell(v): return min(range(NLIST), key=lambda i: dist2(v, centroids[i]))
+cells = [[] for _ in range(NLIST)]
+for idx, v in enumerate(corpus): cells[nearest_cell(v)].append(idx)
+
+# exact ground truth: brute-force top-K neighbours per query
+ground_truth = [set(sorted(range(N), key=lambda j: dist2(q, corpus[j]))[:K]) for q in queries]
+
+def ivf_search(q, nprobe):                           # search nprobe nearest cells
+    probed = sorted(range(NLIST), key=lambda i: dist2(q, centroids[i]))[:nprobe]
+    cand = [j for ci in probed for j in cells[ci]]
+    work = NLIST + len(cand)                          # distance evals ~ compute ~ cost
+    return set(sorted(cand, key=lambda j: dist2(q, corpus[j]))[:K]), work
+
+BASE_MS, PER_EVAL_US, TAIL, COST_PER_MS = 1.2, 0.9, 1.35, 0.00004
+print(f"{'nprobe':>6} {'recall@10':>10} {'p99_ms':>8} {'$/query':>10}")
+rows = []
+for nprobe in [1, 2, 4, 8, 16, 32, 64]:
+    hits, lat = 0, []
+    for q, gt in zip(queries, ground_truth):
+        found, work = ivf_search(q, nprobe)
+        hits += len(found &amp; gt)
+        lat.append((BASE_MS + work * PER_EVAL_US / 1000.0) * TAIL)   # p99 straggler inflation
+    recall = hits / (NQ * K); lat.sort()
+    p99 = lat[int(0.99 * (len(lat) - 1))]; cost = p99 * COST_PER_MS
+    rows.append((nprobe, recall, p99, cost))
+    print(f"{nprobe:>6} {recall:>10.3f} {p99:>8.2f} {cost:>10.5f}")
+
+TARGET = 0.90
+knee = min([r for r in rows if r[1] &gt;= TARGET], key=lambda r: r[2])
+fast = min(rows, key=lambda r: r[2])
+print(f"cheapest at recall&gt;={TARGET}: nprobe={knee[0]} (recall={knee[1]:.3f}, p99={knee[2]:.2f} ms)")
+print(f"fastest overall:          nprobe={fast[0]} (recall={fast[1]:.3f}): misleading alone")
+</code></pre>
+<div class="code-caption"><strong>Code 25.9.1:</strong> A construct-matched retrieval evaluation. For every <code>nprobe</code> the same loop produces recall@10, p99 latency, and cost-per-query together, so no number can be quoted at a configuration other than the one it was measured on.</div>
+<pre><code class="language-text">nprobe  recall@10   p99_ms    $/query
+     1      0.266     2.04    0.00008
+     2      0.408     2.28    0.00009
+     4      0.583     2.55    0.00010
+     8      0.771     3.10    0.00012
+    16      0.930     4.01    0.00016
+    32      0.997     5.28    0.00021
+    64      1.000     6.56    0.00026
+cheapest at recall>=0.9: nprobe=16 (recall=0.930, p99=4.01 ms)
+fastest overall:          nprobe=1 (recall=0.266): misleading alone</code></pre>
+<div class="code-caption"><strong>Output 25.9.1:</strong> The recall-latency-cost frontier. The fastest configuration (nprobe 1, p99 2.04 ms) recovers barely a quarter of the true neighbors; the operating point the application actually wants is the knee at nprobe 16, where 93% recall costs twice the latency and twice the dollars of the misleading headline.</div>
+<p>The numbers tell the whole story of the section. Read the p99 column alone and nprobe 1 looks like a triumph at two milliseconds; read recall@10 beside it and that triumph collapses to a system that misses three of every four exact neighbors. The honest summary of this index is not a number but a curve: the frontier traced by the rows of Output 25.9.1, on which every team must choose a point. Figure 25.9.1 draws that frontier so the shape of the trade-off is visible at a glance.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A two-axis plot with p99 latency on the horizontal axis and recall at ten on the vertical axis. A curve rises from a fast low-recall point at the lower left to a slow high-recall point at the upper right, with marker sizes growing to indicate rising cost per query. A target recall line and the chosen knee operating point are highlighted.">
+<defs>
+<marker id="arr259" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.ax259 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr259); }
+.gl259 { fill:none; stroke:#d6deea; stroke-width:1; }
+.cv259 { fill:none; stroke:#b86b1f; stroke-width:2.4; }
+.pt259 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.8; }
+.knee259 { fill:#14385c; stroke:#0b223a; stroke-width:1.8; }
+.tt259 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.lb259 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.tg259 { fill:none; stroke:#2e7d4f; stroke-width:1.6; stroke-dasharray:6 5; }
+</style>
+<text class="tt259" x="430" y="26">The recall-latency-cost frontier you must report jointly</text>
+<!-- axes -->
+<line class="ax259" x1="110" y1="350" x2="780" y2="350"/>
+<line class="ax259" x1="110" y1="350" x2="110" y2="60"/>
+<text class="tt259" x="445" y="392">p99 latency of the scatter-gather query (ms)  &#8594;</text>
+<text class="tt259" x="34" y="210" transform="rotate(-90 34 210)">recall@10  &#8594;</text>
+<!-- gridlines -->
+<line class="gl259" x1="110" y1="290" x2="780" y2="290"/>
+<line class="gl259" x1="110" y1="210" x2="780" y2="210"/>
+<line class="gl259" x1="110" y1="130" x2="780" y2="130"/>
+<text class="lb259" x="92" y="294" text-anchor="end">0.4</text>
+<text class="lb259" x="92" y="214" text-anchor="end">0.7</text>
+<text class="lb259" x="92" y="134" text-anchor="end">0.9</text>
+<!-- target recall line at 0.90 -->
+<line class="tg259" x1="110" y1="130" x2="780" y2="130"/>
+<text class="lb259" x="715" y="122" fill="#2e7d4f">recall target &#964; = 0.90</text>
+<!-- frontier curve through the seven operating points -->
+<path class="cv259" d="M 150 318 C 230 300, 280 270, 330 240 C 390 205, 470 150, 560 130 C 640 116, 710 108, 760 104"/>
+<!-- operating points, marker radius grows with cost-per-query -->
+<circle class="pt259" cx="150" cy="318" r="5"/>
+<text class="lb259" x="150" y="338">nprobe 1</text>
+<circle class="pt259" cx="245" cy="298" r="6"/>
+<circle class="pt259" cx="330" cy="240" r="7"/>
+<circle class="pt259" cx="430" cy="186" r="9"/>
+<text class="lb259" x="430" y="172">nprobe 8</text>
+<!-- the knee: cheapest config meeting the target -->
+<circle class="knee259" cx="560" cy="130" r="11"/>
+<text class="lb259" x="588" y="126" text-anchor="start" fill="#14385c">knee: nprobe 16</text>
+<text class="lb259" x="588" y="142" text-anchor="start">93% recall, 4.0 ms</text>
+<circle class="pt259" cx="665" cy="112" r="13"/>
+<circle class="pt259" cx="760" cy="104" r="15"/>
+<text class="lb259" x="760" y="86">nprobe 64</text>
+<!-- cost legend -->
+<circle class="pt259" cx="150" cy="80" r="5"/>
+<circle class="pt259" cx="190" cy="80" r="13"/>
+<text class="lb259" x="300" y="84" text-anchor="start">marker size &#8733; cost-per-query</text>
+</svg>
+<figcaption><strong>Figure 25.9.1:</strong> The frontier from Output 25.9.1, drawn so the three coupled metrics appear at once. Latency runs along the horizontal axis, recall up the vertical axis, and cost-per-query grows with marker size. The fast low-recall point at the lower left (nprobe 1) sits far below the target line; the knee (dark marker, nprobe 16) is the cheapest point that clears the recall target, and the upper-right points buy the last few percent of recall at steeply rising latency and cost. Reporting any single axis hides this shape.</figcaption>
+</figure>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Evaluation Is Where the Distribution Becomes Visible</div>
+<p>Every metric on the systems scoreboard is a distributed-systems quantity, not a single-machine one. The p99 latency is high because a query fans across shards and waits for the slowest (<a href="section-25.5.html">Section 25.5</a>); throughput scales because replicas absorb load in parallel; cost-per-query aggregates accelerator time across the fleet; index build time is the cost of partitioning the corpus across nodes. Evaluating a retriever well is therefore evaluating a distributed system well, the discipline of <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/index.html">Chapter 5</a> applied to the specific machine this chapter built. The recall-latency frontier is the place where scale-out stops being an implementation detail and becomes a number on a dashboard.</p>
+</div>
+
+<h2>5. Online Evaluation, A/B Testing, and Embedding Drift <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Offline metrics on a fixed query set tell you how a change behaves on yesterday's data; they cannot tell you how real users respond to it. For that you need online evaluation: route a fraction of live traffic to the new retriever in an A/B test and compare downstream outcomes (click-through, answer acceptance, task success) against the control, with the experiment infrastructure and shadow-deployment machinery that <a href="../module-26-mlops-distributed-ai/index.html">Chapter 26</a> develops for the whole fleet. A retrieval change that improves offline recall but degrades the live acceptance rate is a real and common outcome, usually because the offline relevance labels and the live objective measure different things, the construct mismatch of <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/index.html">Chapter 5</a> reappearing online.</p>
+<p>The harder, slower failure is drift. Embeddings are trained on a snapshot of the world; as the corpus and the queries evolve, the geometry the index was built on stops matching the geometry the queries now inhabit, and recall decays even though no code changed. Detecting this requires monitoring the distribution of query and document embeddings over time and alerting when it shifts, the same drift-detection problem posed for streaming features in <a href="../../part-2-distributed-data/module-09-stream-processing-online-ai/section-9.9.html">Section 9.9</a>, now applied to the embedding space rather than to raw features. The remedy, re-embedding the corpus and rebuilding the index with a refreshed model, is expensive (it is the index-build cost from Section 3 paid in full), which is exactly why drift must be measured continuously: you rebuild when the evidence says recall has decayed, not on a fixed calendar that either wastes compute or lets quality rot.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Retriever That Got Faster and Worse</div>
+<p><strong>Who:</strong> A platform engineer running the retrieval tier for a support-assistant RAG product.</p>
+<p><strong>Situation:</strong> Latency dashboards were red during peak hours, and the on-call goal for the quarter was to cut p99 retrieval latency below five milliseconds.</p>
+<p><strong>Problem:</strong> Lowering the HNSW <code>efSearch</code> dial took p99 from nine milliseconds to three and closed the latency ticket immediately.</p>
+<p><strong>Dilemma:</strong> Ship the fast configuration on the strength of the green latency dashboard, or hold it because recall was never measured at the new setting and the latency dashboard had no quality axis beside it.</p>
+<p><strong>Decision:</strong> They held it and ran the construct-matched sweep of Code 25.9.1 on their own index, co-measuring recall@10 and p99 at every <code>efSearch</code> value in one pass.</p>
+<p><strong>How:</strong> The sweep showed the three-millisecond setting sat at 0.71 recall, far below the 0.92 the answer-faithfulness judge needed; the knee that met the recall floor landed at four milliseconds, still inside the budget.</p>
+<p><strong>Result:</strong> They shipped the four-millisecond knee, met the latency goal, and held answer quality flat; a later A/B test confirmed live acceptance was unchanged, where the three-millisecond setting would have dropped it.</p>
+<p><strong>Lesson:</strong> A latency dashboard without a quality axis beside it is an invitation to ship a fast wrong answer. Co-measure, then choose the knee.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Benchmarking Retrieval and RAG (2024 to 2026)</div>
+<p>Retrieval evaluation has consolidated around shared benchmarks. <strong>BEIR</strong> (Thakur et al.) made zero-shot retrieval comparable across eighteen heterogeneous tasks, and <strong>MTEB</strong> (Muennighoff et al.) extended this into a broad embedding leaderboard whose 2024 to 2025 multilingual and long-context editions (MMTEB) now drive most public embedding-model choices. For the generation side, <strong>RAGAS</strong> (Es et al., 2024) popularized reference-free LLM-as-judge metrics for faithfulness, answer relevance, and context precision, and frameworks such as ARES and the 2024 to 2026 wave of RAG-evaluation surveys probe how well these automated judges track human ratings, since a miscalibrated judge silently corrupts the quality scoreboard. The open frontier is jointly benchmarking retrieval quality and serving cost: most leaderboards still report recall and nDCG with no latency or dollar axis, exactly the single-number trap this section argues against, and recall-latency-cost frontier reporting (in the spirit of the ann-benchmarks project) is only beginning to reach RAG evaluation.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: BEIR, MTEB, and RAGAS Compute These Metrics for You</div>
+<p>Code 25.9.1 computed recall by hand to expose its definition. In practice you do not hand-roll retrieval metrics: <code>beir</code> evaluates a retriever against standard corpora and emits recall, nDCG, and MAP in a few lines; <code>mteb</code> benchmarks an embedding model across dozens of tasks with one <code>evaluate</code> call; and <code>ragas</code> scores end-to-end RAG faithfulness and context precision with LLM-judges. What you must still supply yourself is the systems axis, because these libraries report quality only:</p>
+<pre><code class="language-python"># pip install beir ragas
+from beir.retrieval.evaluation import EvaluateRetrieval
+# results[qid][doc_id] = score, from YOUR sharded retriever, measured WITH its p99
+ndcg, _map, recall, precision = EvaluateRetrieval.evaluate(qrels, results, k_values=[10])
+print(recall["Recall@10"])          # quality axis from the library
+
+from ragas import evaluate
+from ragas.metrics import faithfulness, context_precision
+rag_scores = evaluate(dataset, metrics=[faithfulness, context_precision])   # answer-quality axis
+# the latency / cost-per-query axis you still measure yourself, in the same run
+</code></pre>
+<div class="code-caption"><strong>Code 25.9.2:</strong> The dozen lines of metric arithmetic in Code 25.9.1 collapse to one <code>EvaluateRetrieval.evaluate</code> call, and RAGAS adds the answer-quality axis; the library handles the metric definitions, but you must still co-record latency and cost in the same run to keep the frontier construct-matched.</div>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Benchmark That Forgot to Bring a Clock</div>
+<p>A retrieval leaderboard once crowned an index that reached state-of-the-art recall. The fine print revealed the winning configuration searched every shard exhaustively and took half a second per query, which is to say it had quietly turned the approximate index back into a brute-force scan and then claimed the speed trophy was irrelevant. The lesson the field keeps relearning: a recall column with no latency column beside it is a high-score table for a game nobody is actually playing.</p>
+</div>
+
+<h2>6. Chapter Summary <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>This chapter built retrieval-augmented generation as a distributed pipeline and then taught you to evaluate it as one. The arc ran from the embeddings produced on a fleet of encoders (<a href="section-25.2.html">Section 25.2</a>), through the vector databases that store them (<a href="section-25.3.html">Section 25.3</a>) and the approximate-nearest-neighbor index families that search them in sublinear time (<a href="section-25.4.html">Section 25.4</a>), to the sharding and replication that let the index scale and the scatter-gather that fans a query across shards with its tail-latency cost (<a href="section-25.5.html">Section 25.5</a>). On top of that base we layered hybrid search that fuses lexical and dense signals (<a href="section-25.6.html">Section 25.6</a>), retrieve-then-rerank cascades that sharpen the top results (<a href="section-25.7.html">Section 25.7</a>), and the layered caches that absorb the repeats (<a href="section-25.8.html">Section 25.8</a>). This final section closed the loop: a retrieval system is evaluated on recall and latency jointly, never on either alone, because the approximations that buy scale-out also set the recall, and a fast retriever at low recall is a fast wrong answer.</p>
+<div class="callout key-takeaway">
+<div class="callout-title">Key Takeaway: RAG Is a Distributed Pipeline, Evaluated on a Frontier</div>
+<p>Retrieval-augmented generation is not a model, it is a distributed system: distributed embedding, vector databases, ANN index families (HNSW, IVF, PQ), sharding and replication with scatter-gather and its tail latency, hybrid lexical-plus-dense search, retrieve-then-rerank cascades, and layered caching. Each stage adds a knob that trades quality against cost. The discipline that holds the whole pipeline honest is to evaluate it on recall <em>and</em> latency <em>and</em> cost together, as a single frontier, and to choose the knee that meets your recall floor at the lowest cost, never the fastest point on a dashboard that forgot to plot recall.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.9.1: Why the Single Number Lies <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using only Output 25.9.1, explain to a manager who wants "the fastest retriever" why shipping the nprobe-1 configuration would be a mistake, in terms a non-specialist understands. Then state the one additional number you would put on the latency dashboard so the mistake becomes impossible to make, and explain why a mean latency would be the wrong systems number to pair it with instead of the p99.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.9.2: Move the Knee <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 25.9.1 to also report nDCG@10 against the exact-neighbor ground truth (rank-discount the recovered neighbors by $1/\log_2(\text{rank}+1)$). Then sweep the recall target $\tau$ over $\{0.80, 0.90, 0.95, 0.99\}$ and print the knee (cheapest configuration meeting each target). Describe how the chosen nprobe and the cost-per-query change as $\tau$ rises, and identify the value of $\tau$ beyond which the last percent of recall more than doubles the cost.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.9.3: Budget the Tail <span class="exercise-type analysis">Analysis</span></div>
+<p>A query fans across $S = 16$ shards in a scatter-gather. Suppose each shard's latency is independent with a p99 of $4$ ms, and the query waits for the slowest shard. Argue qualitatively why the p99 of the merged query is larger than $4$ ms, and explain how this fan-out tail amplification interacts with the nprobe knob from Output 25.9.1: if raising nprobe to hit a recall target also raises each shard's per-query work, what happens to the merged p99, and what does that imply for choosing the operating point on a sharded index versus a single-node one? Tie your answer to the scatter-gather of <a href="section-25.5.html">Section 25.5</a>.</p>
+</div>
+
+<div class="callout project-ideas">
+<div class="callout-title">Project Ideas</div>
+<p>Three projects to carry the chapter from reading into building. Each one ends in a frontier or a dashboard, not a single number.</p>
+<p><strong>1. The recall-latency-cost frontier of a real sharded ANN service.</strong> Stand up a small FAISS or HNSWlib index over a public corpus (for example a BEIR dataset), shard it across two or more processes with a scatter-gather merge, and sweep the recall dial (<code>nprobe</code> or <code>efSearch</code>). For each setting co-measure recall@10, p99 latency, and an estimated cost-per-query in one pass, then plot the three-axis frontier of Figure 25.9.1 from your own numbers. Mark the knee for a recall target you justify, and write one paragraph defending why that point, not the fastest one, is what you would ship.</p>
+<p><strong>2. An end-to-end RAG evaluation harness.</strong> Wire a retriever to a generator and score the pipeline with RAGAS (faithfulness, context precision) on a question set, while simultaneously logging retrieval recall@10 and the end-to-end p99. Then deliberately lower the recall dial and chart how answer faithfulness degrades as recall falls, finding the recall floor below which the generator can no longer ground its answers. The deliverable is the recall-versus-faithfulness curve that tells you how much retrieval quality the generator actually needs.</p>
+<p><strong>3. An embedding-drift monitor.</strong> Embed a corpus, build an index, then synthesize drift by shifting the query distribution over time (new topics, new vocabulary). Track an embedding-distribution distance over the stream in the spirit of <a href="../../part-2-distributed-data/module-09-stream-processing-online-ai/section-9.9.html">Section 9.9</a>, alert when it crosses a threshold, and measure how recall@10 against fresh ground truth decays before and after a rebuild. The deliverable is a drift signal that fires early enough to trigger a re-index before users feel the recall loss.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-25.8.html"><span class="nav-label">Previous</span><span class="nav-num">Section 25.8</span><span class="nav-title">Distributed Caching for Retrieval</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 25</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Retrieval and Vector Search</span></a>
+<a class="next" href="../module-26-mlops-distributed-ai/index.html"><span class="nav-label">Next</span><span class="nav-num">Chapter 26</span><span class="nav-title">MLOps for Distributed AI</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

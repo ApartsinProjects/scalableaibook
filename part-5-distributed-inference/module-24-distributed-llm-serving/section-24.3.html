@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 24.3: Pipeline-Parallel and Multi-Node Inference. When tensor parallelism caps out at one node, stage the model's layers across nodes and pass activations between them, filling the decode pipeline by batching concurrent requests." name="description"/>
+<title>Section 24.3: Pipeline-Parallel and Multi-Node Inference | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 24: Distributed LLM Serving</a></div>
+<h1>Pipeline-Parallel and Multi-Node Inference</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I hold layers forty through sixty. I do not know what the prompt was, I do not know what the answer will be, and I refuse to start until the node before me sends my activations. We call this teamwork."</p>
+<cite>A Pipeline Stage Waiting on Its Upstream</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>When a model is too large for even one node's worth of GPUs, you cut it into layer-stages and place each stage on a different node, streaming activations from one stage to the next as a token flows through the network.</strong> Tensor parallelism (the subject of <a href="section-24.2.html">Section 24.2</a>) splits each layer across the GPUs inside a single node, where fast NVLink makes its chatty all-reduces affordable; but a node has only so many GPUs, and once that ceiling is hit the model still may not fit. Pipeline parallelism adds a second axis: instead of splitting every layer, it assigns whole blocks of layers to whole nodes, connected by a single cheap point-to-point hop per boundary. The cost is a pipeline bubble, idle time while the stages fill, and at inference that bubble behaves differently than it does in training. This section shows how to hide it by batching many concurrent requests, why crossing nodes is a tax you pay only when forced, and how this stacks on top of the replication and routing from <a href="../module-23-distributed-inference-systems/index.html">Chapter 23</a>.</p>
+</div>
+<p>In the previous section the model was split so that every matrix multiply inside every transformer layer ran across several GPUs at once, with the partial results stitched together by an all-reduce on each layer. That tensor-parallel scheme is wonderful inside one node, where the GPUs share an NVLink fabric that moves activations at hundreds of gigabytes per second. It stops being wonderful the moment the all-reduce has to cross a slower network link between nodes, because tensor parallelism communicates on every layer, twice, and a single forward pass through a large model has dozens of layers. So in practice you cap tensor parallelism at the GPUs of one node and ask a different question: if eight GPUs in one box still cannot hold the model, how do you spill it onto a second box without paying the tensor-parallel communication tax across the network?</p>
+<p>The answer is to communicate far less often. A transformer is a stack of identical layers, and the only thing layer $i$ needs from layer $i-1$ is that layer's output activations, a single tensor. If you put layers $1$ through $L/S$ on node one, layers $L/S+1$ through $2L/S$ on node two, and so on across $S$ stages, then the entire inter-node traffic for one token is $S-1$ small activation tensors, one per stage boundary, instead of the dozens of all-reduces tensor parallelism would demand. This is pipeline parallelism, and it is the same construction the training chapters built; <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/section-16.3.html">Section 16.3</a> developed it for the backward pass of training. Here we re-derive its economics for the forward-only, one-token-at-a-time world of inference, where the bubble has a different shape.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two nodes connected by a slow network link. Inside each node, four GPUs run tensor-parallel with a fast NVLink all-reduce. Node 1 holds the early layer stage, node 2 holds the late layer stage, and an activation tensor is passed across the network link from stage 1 to stage 2.">
+<defs>
+<marker id="arr243" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr243b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.n243 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.8; }
+.g243 { fill:#eaf2fb; stroke:#14385c; stroke-width:1.3; }
+.t243 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s243 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.nv243 { fill:none; stroke:#2f6b3a; stroke-width:1.6; }
+.lk243 { fill:none; stroke:#b86b1f; stroke-width:2.4; marker-end:url(#arr243b); stroke-dasharray:7 4; }
+.in243 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr243); }
+.lbl243 { font:600 12px sans-serif; fill:#2f6b3a; text-anchor:middle; }
+.lbl243b { font:600 12px sans-serif; fill:#b86b1f; text-anchor:middle; }
+</style>
+<text class="t243" x="200" y="26">Node 1 (stage 1: layers 1 .. L/2)</text>
+<rect class="n243" x="40" y="40" width="320" height="150" rx="12"/>
+<rect class="g243" x="62" y="70" width="62" height="44" rx="6"/><text class="s243" x="93" y="97">GPU 0</text>
+<rect class="g243" x="134" y="70" width="62" height="44" rx="6"/><text class="s243" x="165" y="97">GPU 1</text>
+<rect class="g243" x="206" y="70" width="62" height="44" rx="6"/><text class="s243" x="237" y="97">GPU 2</text>
+<rect class="g243" x="278" y="70" width="62" height="44" rx="6"/><text class="s243" x="309" y="97">GPU 3</text>
+<path class="nv243" d="M93 114 L93 140 L309 140 L309 114"/>
+<path class="nv243" d="M165 114 L165 130 L237 130 L237 114"/>
+<text class="lbl243" x="200" y="160">tensor-parallel all-reduce over NVLink</text>
+<text class="s243" x="200" y="178">(fast, intra-node, every layer)</text>
+<text class="t243" x="680" y="26">Node 2 (stage 2: layers L/2+1 .. L)</text>
+<rect class="n243" x="520" y="40" width="320" height="150" rx="12"/>
+<rect class="g243" x="542" y="70" width="62" height="44" rx="6"/><text class="s243" x="573" y="97">GPU 0</text>
+<rect class="g243" x="614" y="70" width="62" height="44" rx="6"/><text class="s243" x="645" y="97">GPU 1</text>
+<rect class="g243" x="686" y="70" width="62" height="44" rx="6"/><text class="s243" x="717" y="97">GPU 2</text>
+<rect class="g243" x="758" y="70" width="62" height="44" rx="6"/><text class="s243" x="789" y="97">GPU 3</text>
+<path class="nv243" d="M573 114 L573 140 L789 140 L789 114"/>
+<path class="nv243" d="M645 114 L645 130 L717 130 L717 114"/>
+<text class="lbl243" x="680" y="160">tensor-parallel all-reduce over NVLink</text>
+<text class="s243" x="680" y="178">(fast, intra-node, every layer)</text>
+<path class="lk243" d="M362 115 L518 115"/>
+<text class="lbl243b" x="440" y="104">activations</text>
+<text class="s243" x="440" y="135">slow network link,</text>
+<text class="s243" x="440" y="151">once per stage boundary</text>
+<path class="in243" d="M10 115 L36 115"/>
+<text class="s243" x="20" y="106">token</text>
+<path class="in243" d="M844 115 L872 115"/>
+<text class="s243" x="858" y="106">logits</text>
+<text class="s243" x="440" y="230">Pipeline-parallel ACROSS nodes (cheap point-to-point) ;  tensor-parallel WITHIN each node (chatty, fast)</text>
+<rect class="n243" x="40" y="262" width="800" height="86" rx="10" fill="#fdf3e7" stroke="#b86b1f" stroke-width="1.4"/>
+<text class="t243" x="440" y="288" fill="#b86b1f">Add data-parallel replicas on top: the 3D layout</text>
+<text class="s243" x="440" y="310">Chapter 23's router fans requests across replicas of this whole two-node group;</text>
+<text class="s243" x="440" y="328">each replica is one tensor-parallel-by-pipeline-parallel serving unit (the 3D layout of Chapter 16, applied to serving).</text>
+</svg>
+<figcaption><strong>Figure 24.3.1:</strong> The common production layout for a model too big for one node. Inside each node, four GPUs run tensor-parallel (Section 24.2) over fast NVLink, paying an all-reduce on every layer. Across nodes, the model is split into pipeline stages: node 1 holds the early layers, node 2 the late layers, and a single activation tensor crosses the slow network link once per stage boundary. The router of <a href="../module-23-distributed-inference-systems/index.html">Chapter 23</a> then replicates this whole group for throughput, giving the three-dimensional tensor-by-pipeline-by-data layout shown along the bottom band.</figcaption>
+</figure>
+
+<h2>1. Staging Layers Across Nodes <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Pipeline parallelism rests on a structural fact about transformers: they are a deep stack of layers applied in sequence, where each layer consumes only the previous layer's output. That sequential dependency is exactly what lets you cut the stack at any layer boundary and place the two halves on different machines. Cut the $L$-layer model into $S$ contiguous stages, give stage $s$ to node $s$, and a forward pass becomes a relay: node one runs its layers, hands the resulting activation tensor to node two, node two runs its layers, and so on until the final stage produces the output logits. The only thing that ever travels between nodes is that activation tensor, whose size is the hidden dimension times the number of tokens in flight, typically a few megabytes, sent once per boundary rather than the dozens of collective operations tensor parallelism performs.</p>
+<p>This is why the two parallelism axes pair so naturally. Tensor parallelism is communication-heavy but the communication is fast inside a node; pipeline parallelism is communication-light, so its communication survives the slow trip between nodes. The standard recipe, visible in Figure 24.3.1, is tensor-parallel within a node and pipeline-parallel across nodes. You scale tensor parallelism up to the GPU count of one box, where NVLink keeps the per-layer all-reduce cheap, and only then reach for pipeline parallelism to span boxes, because its sparse activation passing is the only kind of inter-node traffic that does not strangle throughput.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Match the Parallelism Axis to the Interconnect</div>
+<p>Tensor parallelism and pipeline parallelism are not competitors; they live on different network tiers. Tensor parallelism communicates a lot but tolerates only fast links, so it belongs inside a node on NVLink. Pipeline parallelism communicates little, so it tolerates slow links and belongs across nodes on the data-center network. The production rule follows directly: fill a node with tensor parallelism first, then add pipeline stages across nodes, and never run tensor parallelism over the inter-node network unless you have measured that you can afford it.</p>
+</div>
+
+<h2>2. The Inference Bubble Is Not the Training Bubble <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Splitting layers across stages creates idle time. When the very first token enters the pipeline, only stage one is busy; stages two through $S$ sit idle waiting for activations to reach them. Symmetrically, as the work drains out, the early stages go idle. This idle region is the pipeline bubble, and in training it is fought with micro-batching: a large training batch is chopped into many micro-batches that march through the stages one after another, so that once the pipeline is full every stage is working on a different micro-batch at once. That same trick was the subject of <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/section-16.3.html">Section 16.3</a>, where micro-batches existed naturally because a training step processes a big batch of examples.</p>
+<p>Inference decoding is different, and the difference is the whole point of this section. Autoregressive decoding produces one token at a time: the model must emit token $t$ before it can begin token $t+1$, because token $t+1$ depends on it. A single request therefore offers no micro-batches to fill the pipeline; it is one token walking the relay alone, leaving $S-1$ stages idle at every moment. The bubble does not shrink with longer generation, because the dependency is along the sequence, not across it. The only way to fill the stages is to put <em>different requests</em> in flight at once: while stage two works on request A's token, stage one starts request B's token. The micro-batches of inference are concurrent requests, and the pipeline fills exactly when the serving system has enough simultaneous traffic to keep every stage busy.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: A Conveyor Belt That Only Pays Off When Busy</div>
+<p>Think of the $S$ stages as cooks on an assembly line making sandwiches, each cook adding one ingredient. One customer's single sandwich keeps only one cook busy at a time while the other $S-1$ watch; the line looks absurd. Hand the line a hundred orders and every cook is buttering, layering, and wrapping a different sandwich at once. The kitchen did not get faster per sandwich, it got busy, and busy is what a pipeline rewards.</p>
+</div>
+<p>Let us make the economics quantitative. Suppose each stage takes $t_{\text{stage}}$ milliseconds to run its layers for one micro-batch, and passing activations across a boundary costs $t_{\text{link}}$ milliseconds. Filling the pipeline costs a one-time bubble of $(S-1)(t_{\text{stage}} + t_{\text{link}})$. After that, the pipeline emits one finished micro-batch every $t_{\text{stage}} + t_{\text{link}}$, so processing $m$ concurrent requests in one decode step takes</p>
+$$T(m) = \underbrace{(S-1)\,(t_{\text{stage}} + t_{\text{link}})}_{\text{fill bubble, paid once}} + \; m\,(t_{\text{stage}} + t_{\text{link}}),$$
+<p>and the throughput in tokens per second is $\text{thr}(m) = 1000\, m / T(m)$. As $m$ grows, the fixed bubble is amortized over more requests and throughput climbs toward the ceiling $1000 / (t_{\text{stage}} + t_{\text{link}})$. Crucially, the per-request latency does not improve with $m$: a single token still has to cross all $S$ stages, so its latency is roughly $S\,(t_{\text{stage}} + t_{\text{link}})$ no matter how full the pipe is. Batching buys throughput, never latency, which is the central trade-off of multi-node serving.</p>
+
+<h2>3. A Runnable Model of the Filling Pipeline <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The code below turns the formula above into a small simulator. It sweeps the number of concurrent requests $m$ from one to sixty-four and reports, for a four-stage pipeline, how long each decode step takes, the resulting throughput, and the stage utilization (the fraction of stage-time actually doing work rather than waiting in the bubble). It then isolates the cross-node penalty by recomputing throughput with the link cost set to zero, the single-node fantasy, and comparing it to the real networked number.</p>
+<pre><code class="language-python">t_stage = 6.0     # ms: one stage runs its layers for one micro-batch
+t_link  = 2.0     # ms: cross-node activation transfer between adjacent stages
+S = 4             # pipeline stages, one per node
+warmup = (S - 1) * (t_stage + t_link)   # bubble: time to fill the pipeline
+
+def decode_step(m):                      # m = concurrent requests (micro-batches)
+    period   = t_stage + t_link          # a stage emits one micro-batch per period
+    total_ms = warmup + m * period       # fill the pipe, then stream m results
+    throughput = m / total_ms * 1000.0   # tokens/sec across the whole step
+    util = (m * t_stage) / total_ms      # fraction of stage-time doing real work
+    return total_ms, throughput, util
+
+print(f"S={S} stages  t_stage={t_stage}ms  t_link={t_link}ms  fill bubble={warmup:.1f}ms")
+print(f"{'requests m':&gt;10} {'step ms':&gt;9} {'tok/s':&gt;8} {'util %':&gt;7}")
+for m in [1, 2, 4, 8, 16, 32, 64]:
+    total_ms, thr, util = decode_step(m)
+    print(f"{m:&gt;10} {total_ms:&gt;9.1f} {thr:&gt;8.1f} {util*100:&gt;6.1f}")
+
+# Cross-node penalty: same work with links free (one node) vs the real network.
+def thr_at(m, link):
+    bubble = (S - 1) * (t_stage + link)
+    return m / (bubble + m * (t_stage + link)) * 1000.0
+m = 32
+print(f"\nat m={m}: links=0ms -&gt; {thr_at(m,0.0):.1f} tok/s, "
+      f"links={t_link}ms -&gt; {thr_at(m,t_link):.1f} tok/s, "
+      f"penalty {100*(1-thr_at(m,t_link)/thr_at(m,0.0)):.1f}%")
+</code></pre>
+<div class="code-caption"><strong>Code 24.3.1:</strong> A pure-Python model of pipeline-parallel decode. <code>decode_step</code> implements the throughput formula $\text{thr}(m) = 1000\,m / T(m)$; the final block holds the work fixed and toggles only the inter-node link cost to expose the multi-node tax.</div>
+<pre><code class="language-text">S=4 stages  t_stage=6.0ms  t_link=2.0ms  fill bubble=24.0ms
+requests m   step ms    tok/s  util %
+         1      32.0     31.2   18.8
+         2      40.0     50.0   30.0
+         4      56.0     71.4   42.9
+         8      88.0     90.9   54.5
+        16     152.0    105.3   63.2
+        32     280.0    114.3   68.6
+        64     536.0    119.4   71.6
+
+at m=32: links=0ms -> 152.4 tok/s, links=2.0ms -> 114.3 tok/s, penalty 25.0%</code></pre>
+<div class="code-caption"><strong>Output 24.3.1:</strong> One request keeps the four-stage pipeline only 18.8% utilized; the throughput climbs toward the $1000/(t_{\text{stage}}+t_{\text{link}}) = 125$ tok/s ceiling as concurrency rises, and the bottom line shows the activation hop alone costing 25% of throughput at thirty-two concurrent requests.</div>
+<p>Three readings repay attention. First, at one concurrent request the pipeline is barely a fifth utilized, and the only cure is more simultaneous traffic; this is the inference bubble made of empty stages. Second, throughput rises steeply at first and then flattens as it approaches the ceiling, so the marginal benefit of yet more concurrency falls off, and there is a sweet spot past which you are buying latency (longer steps) for very little throughput. Third, the cross-node penalty is real and quantified: at thirty-two requests the activation hops shave a quarter off the throughput that an imaginary single-node version would reach. That penalty is the price of admission for serving a model that simply does not fit in one box, and it is why you reach for pipeline parallelism only when forced, never for elegance.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Same Cut, Now Forward-Only and Replicated</div>
+<p>The layer-staging you just simulated is the identical construction that trained large models in <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/section-16.3.html">Section 16.3</a>, re-derived for the forward-only world of serving, where the micro-batches are concurrent requests rather than slices of a training batch. And the production layout in Figure 24.3.1, tensor-parallel within a node, pipeline-parallel across nodes, data-parallel replicas on top, is precisely the three-dimensional parallelism of <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/section-16.9.html">Section 16.9</a> turned from a training plan into a serving plan. Each axis you met while learning to train a model returns here, scaled out one more time, to serve it.</p>
+</div>
+
+<h2>4. Composing With Replication and Routing <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A single pipeline-by-tensor parallel group can serve only so many requests per second, and it cannot survive a node failure on its own; lose one stage's node and the whole relay breaks, because every request must traverse every stage. Both limits are answered by the layer above, the replication and routing of <a href="../module-23-distributed-inference-systems/index.html">Chapter 23</a>. You stand up several identical copies of the whole multi-node group, each a complete serving unit, and put a router in front that fans incoming requests across the replicas. This is the data-parallel axis of Figure 24.3.1, stacked on top of the tensor and pipeline axes, and it is what carries the three-dimensional layout from a single oversized model into a fault-tolerant fleet.</p>
+<p>The composition is clean because the axes answer different questions. Tensor and pipeline parallelism exist to make one copy of the model fit and run; they are about capacity. Data-parallel replication exists to multiply throughput and to provide spares when a node dies; it is about scale and reliability. The router does not care that each replica is internally a four-node pipeline, it sees an opaque endpoint that accepts a request and returns tokens. Continuous batching, the policy of admitting new requests into a running batch as old ones finish, then operates inside each replica to keep its pipeline filled toward the high-utilization end of Output 24.3.1, and we develop that scheduling in <a href="section-24.6.html">Section 24.6</a>.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: vLLM Builds the 3D Layout From Two Numbers</div>
+<p>Everything in this section, the layer staging, the activation passing, the cross-node coordination, and the bubble-filling micro-batching, is exposed by vLLM as two integers. You set <code>tensor_parallel_size</code> to the GPUs in one node and <code>pipeline_parallel_size</code> to the number of nodes; vLLM partitions the layers into stages, wires up the point-to-point sends, and runs continuous batching to keep the stages busy:</p>
+<pre><code class="language-python">from vllm import LLM   # launched across nodes via Ray; vLLM discovers the cluster
+
+llm = LLM(
+    model="meta-llama/Llama-3.1-70B-Instruct",
+    tensor_parallel_size=8,     # split each layer across the 8 GPUs in ONE node
+    pipeline_parallel_size=2,   # stage the layers across 2 nodes (a 16-GPU group)
+)
+# One serving unit = 2 nodes; replicate this unit behind a router (Chapter 23)
+# to scale throughput and tolerate node failure.
+out = llm.generate(["Explain pipeline parallelism in one sentence."])
+print(out[0].outputs[0].text)
+</code></pre>
+<div class="code-caption"><strong>Code 24.3.2:</strong> The hundreds of lines of stage partitioning, activation transport, and micro-batch scheduling sketched in Code 24.3.1 collapse to <code>tensor_parallel_size</code> and <code>pipeline_parallel_size</code>; vLLM handles the layer cut, the inter-node sends over Ray, and the continuous batching that fills the bubble.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Spilling a 70B Model Onto a Second Node</div>
+<p><strong>Who:</strong> An inference platform engineer at a company rolling out an internal coding assistant.</p>
+<p><strong>Situation:</strong> The chosen model was a 70-billion-parameter model in 16-bit precision, whose weights plus KV cache and activation headroom needed roughly 180 GB, while each serving node carried eight 24 GB GPUs, about 192 GB before any KV-cache budget.</p>
+<p><strong>Problem:</strong> Tensor parallelism over all eight GPUs in one node fit the weights but left almost no room for the KV cache, so concurrency collapsed to a handful of requests and throughput cratered.</p>
+<p><strong>Dilemma:</strong> Buy bigger 80 GB GPUs (a costly scale-up that one box still might not satisfy as context lengths grew), or spill the model across a second node and accept the inter-node activation tax measured in Output 24.3.1.</p>
+<p><strong>Decision:</strong> They kept tensor parallelism at eight within each node and set <code>pipeline_parallel_size=2</code>, spreading the layers across two nodes so each node held half the weights and had ample memory for a large KV cache.</p>
+<p><strong>How:</strong> They launched vLLM as in Code 24.3.2 across a two-node Ray cluster, then placed three such two-node replicas behind the Chapter 23 router with continuous batching enabled.</p>
+<p><strong>Result:</strong> Per-request latency rose by the modest cross-node hop, but the freed KV-cache memory raised sustainable concurrency by roughly an order of magnitude, lifting fleet throughput far past the single-node ceiling while one replica could now fail without dropping the service.</p>
+<p><strong>Lesson:</strong> Pipeline parallelism is often chosen not because the weights cannot fit one node, but because making them barely fit starves the KV cache; spreading the layers buys the memory that concurrency needs.</p>
+</div>
+
+<h2>5. When to Cross a Node, and When to Refuse <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The discipline this section teaches is restraint. Every node boundary a token must cross adds a network hop to its latency and a slice off its throughput, as Output 24.3.1 made concrete with its 25% penalty. So the rule is to add pipeline stages only when a hard ceiling forces it: the weights plus a usable KV cache do not fit in one node even after tensor parallelism has used every GPU in the box. If the model does fit one node, a pure tensor-parallel single-node deployment replicated by the router will almost always beat a multi-node pipeline on latency, because it pays no inter-node activation tax at all. Multi-node serving is the remedy for a capacity ceiling, not a default.</p>
+<p>When you are forced across nodes, two levers control the damage. The first is keeping the pipeline full: the bubble is fixed overhead, so high concurrency (the right end of Output 24.3.1) is what makes the multi-node cost worthwhile, and a multi-node pipeline run at low traffic is the worst of both worlds, idle stages and a network tax. The second is balancing the stages: if one stage is slower than the others, it becomes the bottleneck that sets the whole pipeline's period, so you split the layers to equalize per-stage time rather than simply by layer count, accounting for the fact that the first stage also does the prefill and the last stage computes the output projection.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Disaggregated and Asynchronous Pipelines (2024 to 2026)</div>
+<p>The fixed shape of the inference bubble has become a research target. Prefill and decode have very different pipeline profiles, prefill is compute-bound and naturally batched, decode is latency-bound and starved of micro-batches, so a 2024 line of work disaggregates them onto separate node pools, a design DistServe (Zhong et al., 2024) and Splitwise (Patel et al., 2024) push hard and which we treat in <a href="section-24.5.html">Section 24.5</a>. Inside the decode pipeline, schemes that overlap the activation send with the next stage's compute, and asynchronous pipeline schedules that tolerate stages of unequal speed, aim to drive the cross-node penalty of Output 24.3.1 toward zero. Production engines reflect the momentum: vLLM and SGLang gained robust multi-node <code>pipeline_parallel_size</code> support over Ray during 2024 to 2025, and TensorRT-LLM pairs pipeline parallelism with prefill/decode disaggregation, turning what was once a training-only technique into a standard serving knob.</p>
+</div>
+<p>With the model now spread across nodes by tensor and pipeline parallelism and replicated by the router, one shared resource has been quietly growing in the background of every example: the KV cache, which stores the attention keys and values for every token of every in-flight request. At the high concurrency that makes a multi-node pipeline pay off, that cache becomes the dominant consumer of GPU memory and the true limit on how many requests a serving unit can hold. The next section takes it up directly.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.3.1: Which Axis, and Why <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each deployment, state whether you would add pipeline parallelism across nodes, keep a single-node tensor-parallel deployment and replicate it, or neither, and justify it from the ceilings discussed in Section 5: (a) a 13-billion-parameter model that fits in three of a node's eight GPUs with room to spare; (b) a 70-billion-parameter model whose weights fit one node but leave no KV-cache headroom at the target context length; (c) a 405-billion-parameter model whose weights alone exceed one node's total GPU memory. Explain why running tensor parallelism across the node boundary would be the wrong fix in case (c).</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.3.2: Find the Concurrency Sweet Spot <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 24.3.1 to also report per-request latency, $S\,(t_{\text{stage}} + t_{\text{link}})$, and the per-step latency $T(m)$ alongside throughput. Sweep $m$ finely and find the smallest $m$ that reaches 90% of the theoretical throughput ceiling $1000/(t_{\text{stage}}+t_{\text{link}})$. Then re-run with $S = 8$ stages and explain why the same throughput target now demands more concurrency, connecting your answer to the size of the fill bubble.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.3.3: The Cost of an Unbalanced Stage <span class="exercise-type analysis">Analysis</span></div>
+<p>Suppose your four-stage pipeline is imbalanced: stages take 6, 6, 6, and 10 milliseconds respectively (the last stage also computes the output projection over a large vocabulary). The steady-state period is set by the slowest stage. Estimate the throughput ceiling for this imbalanced pipeline and compare it to the balanced 6-millisecond case from Output 24.3.1. Then argue, in terms of equalizing per-stage time rather than per-stage layer count, how you would re-partition the layers, and what this implies about placing the prefill-heavy first stage and projection-heavy last stage.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-24.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 24.2</span><span class="nav-title">Tensor-Parallel Inference</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 24</span><span class="nav-num">Contents</span><span class="nav-title">Distributed LLM Serving</span></a>
+<a class="next" href="section-24.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 24.4</span><span class="nav-title">Distributed and Paged KV Cache</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

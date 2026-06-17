@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 38.5: Feature Stores. The distributed infrastructure that computes features once and serves them consistently to training and serving, and why point-in-time correctness is what keeps the recommender trustworthy." name="description"/>
+<title>Section 38.5: Feature Stores | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Case Studies and Capstone Projects</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 38: Distributed Recommendation at Scale</a></div>
+<h1>Feature Stores</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"A feature, computed once offline, served a million times online. The day the two copies disagreed, the model started predicting a world that never existed."</p>
+<cite>A Feature Value That Time-Traveled by Accident</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A feature store is the distributed system that computes a feature once, stores it, and serves the same value to both training and serving, so that the model learns from exactly the numbers it will later be scored on.</strong> The ranker of <a href="section-38.4.html">Section 38.4</a> is only as trustworthy as the features feeding it, and those features are produced far from the model: by batch jobs that grind over months of history and by streaming jobs that update counters as clicks arrive. Two stores hold the results, an offline store sized for training scans and an online store tuned for millisecond lookups, and the central engineering problem is keeping them consistent across time. This section builds the feature store as a distributed data system, names the failure it exists to prevent (train/serve skew), and proves with a tiny as-of join why point-in-time correctness, not raw freshness, is the property that makes the recommender honest.</p>
+</div>
+<p>Every section of this chapter so far has treated features as if they simply arrived: the candidate generator of Section 38.3 read user and item embeddings, and the ranker of <a href="section-38.4.html">Section 38.4</a> consumed dozens of numerical signals per candidate. In a real recommender those numbers do not appear by magic. A user's "average dwell time over the last seven days", an item's "click-through rate this hour", a cross feature like "times this user bought from this category" are each the output of a distributed computation over event logs that can run to petabytes. The feature store is the system that owns those computations and their results. It exists because the alternative, letting the training pipeline and the serving pipeline each compute features their own way, produces two subtly different definitions of the same number and a model that fails silently in production.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A feature store: batch and streaming pipelines write feature values into both an offline store used for training and an online store used for serving, with a point-in-time join connecting historical events to as-of feature values.">
+<defs>
+<marker id="arr385" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b385 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w385 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g385 { fill:#eef6ee; stroke:#2e6b34; stroke-width:1.6; }
+.t385 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s385 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l385 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr385); }
+.d385 { fill:none; stroke:#b86b1f; stroke-width:1.6; stroke-dasharray:5 4; marker-end:url(#arr385); }
+</style>
+<text class="t385" x="120" y="26">Sources</text>
+<rect class="b385" x="40" y="42" width="160" height="46" rx="8"/>
+<text class="t385" x="120" y="63">Event logs (history)</text>
+<text class="s385" x="120" y="79">months of clicks, buys</text>
+<rect class="b385" x="40" y="104" width="160" height="46" rx="8"/>
+<text class="t385" x="120" y="125">Event stream (live)</text>
+<text class="s385" x="120" y="141">clicks arriving now</text>
+<text class="t385" x="400" y="26">Feature pipelines</text>
+<rect class="g385" x="300" y="42" width="200" height="46" rx="8"/>
+<text class="t385" x="400" y="63">Batch job (Spark)</text>
+<text class="s385" x="400" y="79">Ch 7: scan-and-aggregate</text>
+<rect class="g385" x="300" y="104" width="200" height="46" rx="8"/>
+<text class="t385" x="400" y="125">Streaming job</text>
+<text class="s385" x="400" y="141">Ch 9: event-time windows</text>
+<line x1="200" y1="65" x2="296" y2="65" class="l385"/>
+<line x1="200" y1="127" x2="296" y2="127" class="l385"/>
+<text class="t385" x="700" y="26">Two stores, one definition</text>
+<rect class="b385" x="600" y="42" width="200" height="84" rx="8"/>
+<text class="t385" x="700" y="68">Offline store</text>
+<text class="s385" x="700" y="86">full history, columnar</text>
+<text class="s385" x="700" y="102">scanned for training</text>
+<text class="s385" x="700" y="118">(Ch 8 storage)</text>
+<rect class="w385" x="600" y="146" width="200" height="84" rx="8"/>
+<text class="t385" x="700" y="172">Online store</text>
+<text class="s385" x="700" y="190">latest value per key</text>
+<text class="s385" x="700" y="206">Redis / Cassandra</text>
+<text class="s385" x="700" y="222">millisecond lookup</text>
+<path class="l385" d="M 500 65 L 560 65 L 560 70 L 596 70"/>
+<path class="l385" d="M 500 127 L 540 127 L 540 188 L 596 188"/>
+<path class="d385" d="M 500 78 L 560 78 L 560 175 L 596 175"/>
+<path class="d385" d="M 500 140 L 525 140 L 525 96 L 596 96"/>
+<rect class="b385" x="600" y="262" width="200" height="46" rx="8"/>
+<text class="t385" x="700" y="283">Training set</text>
+<text class="s385" x="700" y="299">labels + as-of features</text>
+<rect class="w385" x="600" y="324" width="200" height="46" rx="8"/>
+<text class="t385" x="700" y="345">Ranker (Section 38.4)</text>
+<text class="s385" x="700" y="361">scores live requests</text>
+<path class="l385" d="M 700 126 L 700 258"/>
+<path class="l385" d="M 700 230 L 700 320"/>
+<rect class="b385" x="300" y="262" width="240" height="108" rx="8"/>
+<text class="t385" x="420" y="286">Point-in-time join</text>
+<text class="s385" x="420" y="306">for each label at event</text>
+<text class="s385" x="420" y="322">time t, attach the feature</text>
+<text class="s385" x="420" y="338">value as-of t, never a</text>
+<text class="s385" x="420" y="354">value computed after t</text>
+<path class="l385" d="M 596 285 L 544 285"/>
+<text class="s385" x="420" y="392">offline store + label timestamps -&gt; leakage-free training rows</text>
+</svg>
+<figcaption><strong>Figure 38.5.1:</strong> The feature store as a distributed data system. The same feature definition is computed by a batch job (over history, <a href="../../part-2-distributed-data/module-07-spark-dataframes/index.html">Chapter 7</a>) and a streaming job (over live events, <a href="../../part-2-distributed-data/module-09-stream-processing-online-ai/index.html">Chapter 9</a>), then materialized into an offline store scanned for training and an online store queried at serving. The point-in-time join (lower middle) is what links historical labels to the feature values that were actually knowable at each label's event time; it is the subject of Code 38.5.1.</figcaption>
+</figure>
+
+<h2>1. One Definition, Two Stores <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A feature store separates a feature's <em>definition</em> from its <em>storage</em>, and that separation is the whole idea. The definition is a piece of code, "count this user's clicks in the trailing hour", written once. The storage is split in two because training and serving have opposite access patterns. Training reads enormous slices of history: every example for every user over months, scanned sequentially, where throughput per byte matters and a query taking minutes is fine. Serving reads one row at a time under a hard deadline: given a user id, return that user's current feature vector in single-digit milliseconds, where latency per lookup is everything and a full scan is unthinkable. No single storage engine is good at both, so the feature store keeps two materializations of the same feature, an offline store and an online store, and the engineering discipline is ensuring they encode the identical definition.</p>
+<p>The offline store holds the complete history of every feature value, typically as columnar files (Parquet on object storage, the layout of <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/index.html">Chapter 8</a>) partitioned by date so that a training job reads only the slice it needs. The online store holds only the latest value per entity key, in a low-latency key-value system such as Redis or Cassandra, where a lookup by user id or item id is a single hash probe. The batch and streaming pipelines write to both: the batch job backfills history into the offline store and refreshes the online store on a schedule, while the streaming job updates the online store continuously so that a click from one second ago is already reflected when the same user makes their next request. Figure 38.5.1 traces all four of these write paths.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Feature Store Exists to Make Training and Serving Agree</div>
+<p>The reason to centralize features is not convenience; it is correctness. If the training pipeline computes "clicks in the last hour" with a Spark job and the serving pipeline computes it with a separate streaming counter, the two definitions drift, often in ways no test catches, and the model is trained on numbers it will never actually see at inference. A feature store forces one definition to feed both stores, turning a class of silent production failures into an architectural impossibility. Everything else the system does, the dual stores, the pipelines, the point-in-time joins, is in service of that single guarantee.</p>
+</div>
+
+<h2>2. Train/Serve Skew and Point-in-Time Correctness <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The failure a feature store is built to prevent has a name: <em>train/serve skew</em>, the gap between the feature value a model trains on and the value it is served at inference. Skew has two sources. The first, definitional skew, is two pieces of code computing the same feature differently; the single-definition discipline of Section 1 closes it. The second is subtler and is the heart of this section: <em>temporal</em> skew, where the training value reflects information that was not yet available when the prediction would have been made. This is label leakage, and it makes offline metrics look spectacular while production performance collapses, because the model has learned to lean on numbers it can never have in time.</p>
+<p>The cure is <em>point-in-time correctness</em>. Each training label is an event with a timestamp $t$: a recommendation shown, a click that did or did not follow. The feature vector attached to that label must contain, for each feature, the value that was knowable strictly as-of $t$, never a value computed afterward. Formally, let a feature have a log of $(\tau_j, v_j)$ pairs, each a value $v_j$ that became valid at time $\tau_j$. The point-in-time correct value for a label at event time $t$ is</p>
+$$\phi(t) = v_{j^\star}, \qquad j^\star = \arg\max_{j \,:\, \tau_j \le t} \tau_j,$$
+<p>the most recent value whose validity time does not exceed $t$. This is exactly the as-of join, or backward $\texttt{merge\_asof}$, and it ties directly to the event-time semantics and watermarks of <a href="../../part-2-distributed-data/module-09-stream-processing-online-ai/index.html">Chapter 9</a>: the timestamp $\tau_j$ is the feature's event time, not the wall-clock time the pipeline happened to process it. A naive join that simply attaches each entity's latest feature value ignores $t$ entirely and sets $\phi(t) = v_{\text{last}}$, leaking every value with $\tau_j > t$ into the training row.</p>
+<p>The code below makes the leak concrete on a six-row event log. It performs both joins, the naive "latest value" join and the point-in-time as-of join, against two labels stamped at 10:30, and reports the skew between what each join would train on and what the model could actually see at serving time.</p>
+<pre><code class="language-python">import numpy as np
+import pandas as pd
+
+# Per user, a feature ("clicks in last hour") evolves over time. The value is
+# only KNOWN as-of the time it was computed. A label is stamped at its own event
+# time; attaching a value computed AFTER that time leaks the future.
+feature_log = pd.DataFrame({
+    "user": ["u1", "u1", "u1", "u2", "u2", "u2"],
+    "feature_time": pd.to_datetime([
+        "2026-01-01 09:00", "2026-01-01 10:00", "2026-01-01 11:00",
+        "2026-01-01 09:00", "2026-01-01 10:00", "2026-01-01 11:00"]),
+    "clicks_last_hour": [1, 2, 9, 0, 1, 8]})   # both spike late, after the label
+
+labels = pd.DataFrame({
+    "user": ["u1", "u2"],
+    "event_time": pd.to_datetime(["2026-01-01 10:30", "2026-01-01 10:30"]),
+    "bought": [1, 0]})
+
+# NAIVE join: attach each user's LATEST feature, ignoring time. Both labels get
+# the 11:00 value (9, 8), computed AFTER the 10:30 event. This is the leak.
+latest = feature_log.sort_values("feature_time").groupby("user").tail(1)
+naive = labels.merge(latest[["user", "clicks_last_hour"]], on="user", how="left")
+
+# POINT-IN-TIME (as-of) join: most recent feature with feature_time <= event_time.
+pit = pd.merge_asof(
+    labels.sort_values("event_time"), feature_log.sort_values("feature_time"),
+    by="user", left_on="event_time", right_on="feature_time", direction="backward")
+
+# At serving the model only ever sees as-of values like the PIT column. Training
+# on the NAIVE column teaches it from numbers it can never have in time.
+print("NAIVE join (latest feature, leaks the post-event spike):")
+print(naive.to_string(index=False))
+print("\nPOINT-IN-TIME as-of join (feature_time <= event_time):")
+print(pit[["user", "event_time", "bought", "feature_time", "clicks_last_hour"]].to_string(index=False))
+
+print("\nfeature the model trains on vs the value available at serving (as-of 10:30):")
+naive_seen = dict(zip(naive["user"], naive["clicks_last_hour"]))
+pit_seen = dict(zip(pit["user"], pit["clicks_last_hour"]))
+for u in ["u1", "u2"]:
+    print(f"  {u}: NAIVE trains on {naive_seen[u]:>2}  |  PIT trains on {pit_seen[u]:>2}"
+          f"  |  available at serving = {pit_seen[u]:>2}"
+          f"   skew = {naive_seen[u] - pit_seen[u]:+d}")
+</code></pre>
+<div class="code-caption"><strong>Code 38.5.1:</strong> A point-in-time correct as-of join (<code>merge_asof</code>, <code>direction="backward"</code>) compared against a naive latest-value join on the same six-row event log. The naive join attaches a feature computed after the label's event time; the as-of join attaches only what was knowable as-of that time.</div>
+<pre><code class="language-text">NAIVE join (latest feature, leaks the post-event spike):
+user          event_time  bought  clicks_last_hour
+  u1 2026-01-01 10:30:00       1                 9
+  u2 2026-01-01 10:30:00       0                 8
+
+POINT-IN-TIME as-of join (feature_time &lt;= event_time):
+user          event_time  bought        feature_time  clicks_last_hour
+  u1 2026-01-01 10:30:00       1 2026-01-01 10:00:00                 2
+  u2 2026-01-01 10:30:00       0 2026-01-01 10:00:00                 1
+
+feature the model trains on vs the value available at serving (as-of 10:30):
+  u1: NAIVE trains on  9  |  PIT trains on  2  |  available at serving =  2   skew = +7
+  u2: NAIVE trains on  8  |  PIT trains on  1  |  available at serving =  1   skew = +7</code></pre>
+<div class="code-caption"><strong>Output 38.5.1:</strong> The naive join trains the model on feature value 9 for a user who, at the 10:30 decision moment, had a clicks count of only 2; the as-of join keeps training and serving aligned at 2. The constant +7 skew is the leaked post-event spike, and a model fit on the naive column would learn a relationship that evaporates the instant it is deployed.</div>
+<p>The skew of $+7$ in Output 38.5.1 is not a rounding artifact; it is the entire post-event spike leaking backward into the past. A model trained on the naive column would discover that "high clicks predicts a buy" and score beautifully offline, because in the training data the click spike and the buy co-occur. In production the spike has not happened yet at decision time, so the feature reads 2, not 9, and the learned relationship is worthless. This is why point-in-time correctness, not freshness, is the property that makes the recommender honest: a stale-but-as-of feature trains a model that works; a fresh-but-leaked feature trains a model that lies.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Event Time, Scaled Across Two Stores</div>
+<p>The as-of join in Code 38.5.1 ran on six rows in one process. At recommendation scale the offline store holds billions of label rows and trillions of feature events, and the same join becomes a distributed temporal shuffle: feature events and labels are partitioned by entity key across the cluster, sorted by event time within each partition, and merged as-of, the very event-time discipline of <a href="../../part-2-distributed-data/module-09-stream-processing-online-ai/index.html">Chapter 9</a> applied to training-set construction rather than to a live stream. The watermark that bounds lateness in a streaming job becomes the cutoff that bounds how far the offline backfill must wait for late feature events before it can stamp a row as point-in-time complete. The single primitive, "the value as-of event time", is what scales out into a correct training set.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Feast Does the Point-in-Time Join Across Both Stores</div>
+<p>Code 38.5.1 implemented the as-of join by hand for one feature. A production feature store such as Feast (the open-source standard) does it across many features and both stores from a single declarative definition. You register a feature view once, then ask for a training set by passing an entity dataframe of (key, event_timestamp) rows; Feast issues the point-in-time join against the offline store, and the same definition serves the online store at inference:</p>
+<pre><code class="language-python"># Define once; Feast keeps offline and online materializations consistent.
+from feast import FeatureStore
+store = FeatureStore(repo_path=".")
+
+# TRAINING: leakage-free join, the distributed version of Code 38.5.1.
+training_df = store.get_historical_features(
+    entity_df=labels,                      # columns: user, event_timestamp
+    features=["user_stats:clicks_last_hour", "user_stats:dwell_7d"],
+).to_df()                                  # each row's features are as-of its event_timestamp
+
+# SERVING: same definitions, online store, millisecond lookup by key.
+vec = store.get_online_features(
+    features=["user_stats:clicks_last_hour", "user_stats:dwell_7d"],
+    entity_rows=[{"user": "u1"}],
+).to_dict()
+</code></pre>
+<div class="code-caption"><strong>Code 38.5.2:</strong> The same point-in-time guarantee as Output 38.5.1, now declarative. The dozen lines of manual <code>merge_asof</code> collapse to one <code>get_historical_features</code> call; Feast handles the per-entity temporal join across a distributed offline store and routes the identical feature definition to the online store via <code>get_online_features</code>, removing the chance of definitional skew between training and serving.</div>
+</div>
+
+<h2>3. Freshness, the Latency Budget, and the Pipelines That Fill the Store <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Point-in-time correctness governs the offline store and training; two other quantities govern the online store and serving. The first is the <em>latency budget</em>. The ranker of <a href="section-38.4.html">Section 38.4</a> sits inside a request that must return in tens of milliseconds, and every online feature lookup spends part of that budget. If the ranker scores $C$ candidates and the request allows $T_{\text{budget}}$ for feature retrieval, then with feature lookups of latency $\ell$ issued with batching factor $B$ (keys per round trip), the retrieval must satisfy</p>
+$$\left\lceil \frac{C}{B} \right\rceil \cdot \ell \;\le\; T_{\text{budget}}.$$
+<p>This inequality is why online feature stores live or die on tail latency and on batching: a $p99$ lookup of a few milliseconds, multiplied across hundreds of candidates, is the difference between a request that meets its deadline and one that times out. It is also why the online store is a key-value system and not a relational database; the access pattern is a batch of point lookups by entity key, exactly what <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a> built sharded embedding tables to serve, and the same sharding-by-key logic places online feature rows across the cluster.</p>
+<p>The second quantity is <em>freshness</em>, the lag between an event happening and its effect appearing in the online store. Define the freshness lag of a feature as</p>
+$$\Delta_{\text{fresh}} = t_{\text{available}} - t_{\text{event}},$$
+<p>the time from when an event occurs to when the feature reflecting it can be read at serving. A feature populated only by a nightly batch job has a freshness lag of up to a day; a feature populated by a streaming job has a lag of seconds. Freshness trades off against cost and complexity: streaming pipelines are harder to operate than batch jobs and consume resources continuously, so a recommender computes slowly-changing features (a user's 30-day purchase history) in batch and fast-changing ones (clicks in the current session) in a streaming job. This batch-plus-streaming split is the classic two-pipeline pattern, and Section 38.6 takes up the streaming side in full, where freshness lag is the dominant design constraint.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Feature That Was Fresh and Wrong</div>
+<p><strong>Who:</strong> An ML platform engineer at a marketplace running a click-through-rate ranker.</p>
+<p><strong>Situation:</strong> A new "items viewed in this session" feature was added to lift relevance for browsing users, computed in the training pipeline with a Spark window over the full session log.</p>
+<p><strong>Problem:</strong> Offline AUC jumped by four points, the team shipped it, and online click-through fell. The model had become measurably worse in production while looking better in evaluation.</p>
+<p><strong>Dilemma:</strong> Trust the strong offline number and assume a serving bug, or distrust the offline number and suspect leakage, with no obvious tooling to tell which.</p>
+<p><strong>Decision:</strong> They audited the feature with a point-in-time join, recomputing the training set so each label saw only the session views knowable as-of its own event time, exactly the as-of join of Code 38.5.1.</p>
+<p><strong>How:</strong> The Spark window had counted views across the <em>entire</em> session, including views that occurred after the impression being scored; the offline value leaked the future, while the online streaming counter (correctly) only had past views.</p>
+<p><strong>Result:</strong> After switching the offline computation to a point-in-time window, offline AUC dropped back to a believable level and matched online behavior; the apparent four-point gain had been pure leakage. The feature, recomputed correctly, gave a small real lift.</p>
+<p><strong>Lesson:</strong> A fresh online feature and a leaky offline feature produce train/serve skew that masquerades as a great model. Point-in-time correctness in the offline store is the only thing that makes an offline number worth believing.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Streaming-First Feature Platforms and On-Demand Features (2024 to 2026)</div>
+<p>The batch-plus-streaming split is being collapsed from two pipelines toward one. Streaming-first feature platforms in the lineage of Chronon (open-sourced by Airbnb in 2024) and Tecton let a single declarative feature definition compile to both a backfill over history and a streaming aggregation, generating the point-in-time offline join and the online update from the same source, which structurally removes definitional skew rather than testing for it. A parallel thread targets <em>on-demand</em> (request-time) features, transformations computed from the live request itself (a query string, a current location) that have no precomputed value to store; the open question is how to express and test these so they remain point-in-time consistent with stored features. A third direction applies feature stores to retrieval-augmented and embedding-heavy systems, treating a vector index (<a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a>) as another online store with its own freshness lag. The unifying research goal is a single definition whose offline and online forms are correct by construction.</p>
+</div>
+<p>The feature store closes the loop the chapter opened: candidate generation and ranking consume features, and the feature store is where those features are defined, computed by distributed batch and streaming pipelines, and served from a distributed low-latency store, with point-in-time correctness as the contract that lets the model trust its own training data. What remains is the fast edge of this picture, the streaming pipelines that drive freshness lag down to seconds so the recommender can react within a single session. That is the subject of <a href="section-38.6.html">Section 38.6</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 38.5.1: Why Two Stores, Not One? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A teammate proposes serving features at inference by querying the offline columnar store (Parquet on object storage) directly, eliminating the online store and its synchronization. Using the access patterns of Section 1 and the latency-budget inequality of Section 3, explain concretely why this fails for a ranker that must score 300 candidates within a 20-millisecond feature-retrieval budget. Then describe the one situation in which serving directly from the offline store would be acceptable.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 38.5.2: Break and Repair the As-Of Join <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 38.5.1 so that some feature events arrive <em>late</em>: add a feature row for <code>u1</code> with <code>feature_time</code> 10:15 but imagine it was actually written to the log at 10:45 (after the 10:30 label was already scored offline). First show that a backward <code>merge_asof</code> on <code>feature_time</code> alone still picks it up, leaking a value the serving system did not yet have. Then add a second timestamp, the time the value landed in the store, and modify the join so a label only sees values that were both valid and <em>landed</em> by its event time. Relate your two-timestamp fix to event time versus processing time and watermarks in <a href="../../part-2-distributed-data/module-09-stream-processing-online-ai/index.html">Chapter 9</a>.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 38.5.3: Sizing the Online Store <span class="exercise-type analysis">Analysis</span></div>
+<p>A recommender serves 50,000 requests per second; each request scores 200 candidates and reads 30 item features plus 30 user features. The online store batches lookups at $B = 100$ keys per round trip with a $p99$ latency of $\ell = 2$ milliseconds, and the per-request feature-retrieval budget is $T_{\text{budget}} = 15$ milliseconds. Using the inequality of Section 3, determine whether a single round-trip-per-request design meets the budget, and compute the aggregate lookup throughput (keys per second) the online store cluster must sustain. Then argue, referencing the sharded key-value design of <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a>, how many shards you would need if one node sustains 2 million key lookups per second.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-38.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 38.4</span><span class="nav-title">Distributed Ranking Models</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 38</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Recommendation at Scale</span></a>
+<a class="next" href="section-38.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 38.6</span><span class="nav-title">Real-Time Personalization</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

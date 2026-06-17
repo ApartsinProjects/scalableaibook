@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 11.4: Synchronous and Asynchronous Updates. How a parameter server applies worker pushes: a synchronous barrier that averages all gradients versus an asynchronous immediate apply, with update queues, atomic apply, read-your-writes, and the throughput-versus-staleness trade-off." name="description"/>
+<title>Section 11.4: Synchronous and Asynchronous Updates | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Distributed Machine Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 11: Parameter Servers and Distributed Embeddings</a></div>
+<h1>Synchronous and Asynchronous Updates</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They told me to wait for everyone before I moved. So I waited. The fast ones napped, the slow one apologized, and the clock just kept billing."</p>
+<cite>A Parameter Server Tired of Barriers</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A parameter server has exactly one decision to make about every gradient a worker pushes: apply it now, or hold it until the others arrive.</strong> That single choice splits the design space in two. In <em>synchronous</em> mode the server waits for all workers, averages their gradients, and applies one update per round, so the math is identical to synchronous SGD but the workers stall behind the slowest one. In <em>asynchronous</em> mode the server applies each push the instant it lands, so no worker ever waits, but every gradient is computed against a slightly out-of-date copy of the parameters. This is the parameter server's signature trade-off: throughput bought with staleness. This section shows the exact server-side mechanics that implement each mode (the update queue, the atomic apply, read-your-writes) and measures the trade-off on a running demo, setting up the bounded-staleness compromise of <a href="section-11.5.html">Section 11.5</a>.</p>
+</div>
+<p>In <a href="section-11.2.html">Section 11.2</a> we built the push-pull interface, and in <a href="section-11.3.html">Section 11.3</a> we sharded the parameters across many server machines. Both sections were silent on one question: when a worker's push arrives at the server, what does the server actually do with it? The answer is the subject of this section, and it is the same dichotomy that organized distributed optimization in Chapter 10. There, synchronous distributed SGD (<a href="../module-10-distributed-optimization/section-10.3.html">Section 10.3</a>) and asynchronous distributed SGD (<a href="../module-10-distributed-optimization/section-10.4.html">Section 10.4</a>) were presented as two ways to drive a training loop. Here we look at the same fork from inside the server, where it becomes a question of queueing, locking, and ordering rather than of optimization theory.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two parameter-server update schemes side by side. On the left, synchronous mode: three workers push gradients that meet at a barrier, the server averages them, and applies one update. On the right, asynchronous mode: three workers push at different times and the server applies each push immediately as it arrives.">
+<defs>
+<marker id="arr114" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr114o" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.s114 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.wk114 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.bar114 { fill:#e9eef5; stroke:#14385c; stroke-width:1.6; stroke-dasharray:5 4; }
+.t114 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.tw114 { font:600 13px sans-serif; fill:#8a4d12; text-anchor:middle; }
+.c114 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l114 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr114); }
+.lo114 { fill:none; stroke:#b86b1f; stroke-width:1.7; marker-end:url(#arr114o); }
+</style>
+<text class="t114" x="225" y="24">Synchronous: wait at the barrier, apply the average</text>
+<rect class="wk114" x="40" y="56" width="100" height="40" rx="7"/><text class="tw114" x="90" y="81">Worker 1</text>
+<rect class="wk114" x="40" y="116" width="100" height="40" rx="7"/><text class="tw114" x="90" y="141">Worker 2</text>
+<rect class="wk114" x="40" y="176" width="100" height="40" rx="7"/><text class="tw114" x="90" y="201">Worker 3</text>
+<rect class="bar114" x="210" y="46" width="36" height="180" rx="6"/>
+<text class="c114" x="228" y="240">barrier</text>
+<path class="lo114" d="M 140 76 L 206 96"/>
+<path class="lo114" d="M 140 136 L 206 136"/>
+<path class="lo114" d="M 140 196 L 206 176"/>
+<rect class="s114" x="300" y="96" width="120" height="80" rx="9"/>
+<text class="t114" x="360" y="128">Server</text>
+<text class="c114" x="360" y="148">average K</text>
+<text class="c114" x="360" y="163">then apply once</text>
+<path class="l114" d="M 246 136 L 296 136"/>
+<text class="c114" x="225" y="280">fast workers idle until the slowest arrives</text>
+<line x1="455" y1="40" x2="455" y2="300" stroke="#c4ccd6" stroke-width="1.4"/>
+<text class="t114" x="675" y="24">Asynchronous: apply each push the instant it lands</text>
+<rect class="wk114" x="490" y="56" width="100" height="40" rx="7"/><text class="tw114" x="540" y="81">Worker 1</text>
+<rect class="wk114" x="490" y="116" width="100" height="40" rx="7"/><text class="tw114" x="540" y="141">Worker 2</text>
+<rect class="wk114" x="490" y="176" width="100" height="40" rx="7"/><text class="tw114" x="540" y="201">Worker 3</text>
+<rect class="s114" x="700" y="86" width="130" height="100" rx="9"/>
+<text class="t114" x="765" y="116">Server</text>
+<text class="c114" x="765" y="136">FIFO queue</text>
+<text class="c114" x="765" y="152">atomic apply</text>
+<text class="c114" x="765" y="168">no waiting</text>
+<path class="lo114" d="M 590 76 L 696 110"/>
+<path class="lo114" d="M 590 136 L 696 136"/>
+<path class="lo114" d="M 590 196 L 696 162"/>
+<text class="c114" x="675" y="280">each gradient read a slightly older w (staleness)</text>
+</svg>
+<figcaption><strong>Figure 11.4.1:</strong> The single decision that divides parameter-server design. On the left (synchronous), pushes meet at a barrier; the server averages the $K$ gradients and applies one update, so fast workers idle behind the slowest. On the right (asynchronous), pushes enter a queue and the server applies each one atomically the moment it arrives, so no worker waits but every gradient was computed against an older copy of the weights. The demo in Output 11.4.1 puts numbers on both halves.</figcaption>
+</figure>
+
+<h2>1. The Synchronous Server: One Barrier, One Averaged Update <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The synchronous server is the disciplined one. It holds the current parameters $w$ and a counter of how many of the $K$ workers have pushed their gradient for the current round. As each push $g_k$ arrives, the server accumulates it into a running sum and increments the counter. Nothing is applied yet. Only when the counter reaches $K$, meaning every worker has reported, does the server perform a single update,</p>
+$$w \leftarrow w - \eta \cdot \frac{1}{K} \sum_{k=1}^{K} g_k,$$
+<p>then resets the counter and lets the next round begin. The averaged gradient is exactly the gradient that one machine holding all $K$ shards would have computed, which is why this mode is mathematically identical to the synchronous distributed SGD of <a href="../module-10-distributed-optimization/section-10.3.html">Section 10.3</a>. The only difference is architectural: instead of the workers combining their gradients among themselves with an all-reduce, a central server does the summation. The barrier is implicit in the rule "apply only when the counter hits $K$"; a worker that pulls the new $w$ must wait until that update has happened, so every worker proceeds in lockstep.</p>
+<p>This lockstep is the cost. The round cannot finish until the slowest worker's push arrives, so the wall-clock time of every round equals the time of the slowest worker, and every faster worker sits idle for the difference. A single straggler, a machine on a congested link or sharing a host with a noisy neighbor, sets the pace for the whole cluster. This is the same straggler problem flagged in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/index.html">Chapter 2</a> and quantified by Amdahl-style reasoning in <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>; the synchronous parameter server inherits it in full.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Synchronous Server Is an All-Reduce With a Boss</div>
+<p>Synchronous parameter-server training and all-reduce data-parallel training compute the <em>identical</em> averaged gradient; they differ only in who does the summing. All-reduce spreads the combine across the workers themselves as a peer-to-peer collective (the arc that runs from <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> to <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>). A synchronous server centralizes it. The math is the same, the optimizer trajectory is the same, and so is the straggler tax: both must wait for the slowest worker before the step completes. Choosing one over the other is a question of topology and fault model, not of convergence.</p>
+</div>
+
+<h2>2. The Asynchronous Server: An Update Queue and an Atomic Apply <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The asynchronous server discards the barrier entirely. It keeps an update queue, and each worker's push is simply an enqueued message: "here is gradient $g$, computed by worker $k$ against the version of $w$ I last pulled." A server thread pulls messages from the queue in arrival order and, for each one, performs a single atomic update $w \leftarrow w - \eta \, g$. There is no counter, no round, and no waiting. A fast worker can push, pull the fresh $w$, and push again several times before a straggler has finished a single gradient. Throughput is now bounded by the server's apply rate and the workers' aggregate push rate, not by the slowest worker.</p>
+<p>Two mechanics make this correct rather than chaotic. The first is the <strong>atomic apply</strong>. Because many workers push concurrently, two updates must never interleave on the same parameter; a half-applied gradient would corrupt the value. The server therefore applies each gradient under a lock (or a lock-free compare-and-swap, or per-key locking when parameters are sharded as in <a href="section-11.3.html">Section 11.3</a>), so that every apply is all-or-nothing and the updates form a clean serial order even though the pushes arrived concurrently. The second is <strong>read-your-writes</strong>: when a worker pulls after pushing, it must see at least its own most recent contribution reflected in $w$, never an older value. A server that returned a stale snapshot to the very worker that just updated it would make progress invisible and confuse the optimizer; honoring read-your-writes keeps each worker's local view monotone even as other workers' updates stream in between its pulls.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Gradient That Arrived Late to Its Own Party</div>
+<p>Picture a gradient computed at 12:00 against weights $w_{100}$. By the time it crosses the network and reaches the server, it is 12:02 and the weights are already at $w_{105}$, five updates later. The server applies it anyway, as a correction to a world that has moved on. It is the optimization equivalent of replying to an email five threads too late: not wrong, exactly, just addressed to a slightly different reality. Staleness is the polite name for the size of that gap, and keeping it small is the whole point of <a href="section-11.5.html">Section 11.5</a>.</p>
+</div>
+<p>The price of removing the barrier is exactly this gap. Every asynchronous gradient is computed against a $w$ that may be several updates behind the live parameters, because other workers pushed in the interim. We call the number of intervening updates the <em>staleness</em> of that gradient. A staleness of zero is the synchronous case; the larger it grows, the more each gradient points in a slightly wrong direction, because it answers a question about an older model. The optimizer still converges under mild conditions, but it can need more steps, and with too much staleness it can slow badly or diverge. This is precisely the throughput-versus-staleness trade-off, restated in parameter-server terms: synchronous mode pays in idle time to keep staleness at zero; asynchronous mode pays in staleness to keep idle time at zero.</p>
+
+<h2>3. Measuring the Trade-Off: Sync vs Async on One Problem <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The code below simulates a parameter server in a single process so both modes can be compared on identical data with an identical compute budget. Six workers each own a shard of a linear-regression problem, and worker 3 is a four-times straggler. In synchronous mode the server averages all six gradients per round, and the round is paced by that straggler. In asynchronous mode the server applies each push the instant it arrives in a global arrival order, and each gradient is computed against the worker's last pulled copy of $w$ (a stale read), with read-your-writes restored after every apply. We give both modes the same total number of gradient applies so the comparison is about scheduling, not budget.</p>
+<pre><code class="language-python">import numpy as np
+
+# A tiny parameter server simulated in one process. Workers compute gradients on
+# their shard; the server applies them either SYNCHRONOUSLY (wait for all K, then
+# apply the average) or ASYNCHRONOUSLY (apply each push the instant it arrives).
+# Both modes get the SAME compute budget; only the scheduling differs.
+
+rng = np.random.default_rng(0)
+N, d, K = 60_000, 30, 6
+X = rng.standard_normal((N, d))
+w_true = rng.standard_normal(d)
+y = X @ w_true + 0.1 * rng.standard_normal(N)
+shards = np.array_split(np.arange(N), K)
+
+# Heterogeneous worker speeds: worker 3 is a 4x straggler, the rest are fast.
+step_time = np.array([1.0, 1.0, 1.0, 4.0, 1.0, 1.0])   # time per local gradient
+lr = 0.05                                               # step small enough to stay stable
+PUSHES = 600                                            # total gradient applies, both modes
+
+def grad(w, idx):
+    Xs, ys = X[idx], y[idx]
+    return (2.0 / len(idx)) * (Xs.T @ (Xs @ w - ys))
+
+def loss(w):
+    r = X @ w - y
+    return float(r @ r / N)
+
+# ---- SYNCHRONOUS: server waits for ALL K workers, then applies the average ----
+# Each round costs K pushes and is gated by the slowest worker (a barrier).
+w = np.zeros(d)
+sync_idle = 0.0
+sync_wall = 0.0
+applies = 0
+sync_mid = None
+for _ in range(PUSHES // K):
+    g = np.mean([grad(w, s) for s in shards], axis=0)   # one averaged update per round
+    w -= lr * g
+    applies += K
+    if sync_mid is None and applies >= PUSHES // 4:     # progress at 1/4 of the budget
+        sync_mid = loss(w)
+    round_time = step_time.max()                        # bottleneck = slowest worker
+    sync_wall += round_time
+    sync_idle += float(np.sum(round_time - step_time))  # fast workers wait at the barrier
+sync_loss = loss(w)
+
+# ---- ASYNCHRONOUS: server applies each push the instant it arrives, no barrier ----
+# Build the arrival timeline; fast workers push far more often than the straggler.
+events = []
+for k in range(K):
+    t = 0.0
+    for _ in range(PUSHES):
+        t += step_time[k]
+        events.append((t, k))
+events.sort()                                           # global arrival order
+events = events[:PUSHES]
+w = np.zeros(d)
+cached = [np.zeros(d) for _ in range(K)]                # each worker's last pulled w
+last_seen_ver = [0] * K
+version = 0
+stale_sum = 0
+async_mid = None
+for (t, k) in events:
+    g = grad(cached[k], shards[k])                      # gradient on a STALE read of w
+    stale_sum += version - last_seen_ver[k]             # applies that landed meanwhile
+    w -= lr * g                                         # atomic apply at the server
+    version += 1
+    if async_mid is None and version >= PUSHES // 4:    # progress at 1/4 of the budget
+        async_mid = loss(w)
+    cached[k] = w.copy()                                # read-your-writes: pull fresh w
+    last_seen_ver[k] = version
+async_loss = loss(w)
+async_wall = events[-1][0]                              # finish time of the last push
+async_idle = 0.0                                        # workers never block on a barrier
+avg_stale = stale_sum / PUSHES
+
+print(f"problem: N={N} d={d} workers K={K}, straggler {step_time.max():.0f}x slower")
+print(f"compute budget: {PUSHES} gradient applies in BOTH modes")
+print()
+print(f"{'mode':&lt;14}{'loss@150':&gt;12}{'final loss':&gt;13}{'wall-clock':&gt;12}{'worker idle':&gt;13}{'avg staleness':&gt;15}")
+print(f"{'synchronous':&lt;14}{sync_mid:&gt;12.5f}{sync_loss:&gt;13.5f}{sync_wall:&gt;12.1f}{sync_idle:&gt;13.1f}{0.0:&gt;15.2f}")
+print(f"{'asynchronous':&lt;14}{async_mid:&gt;12.5f}{async_loss:&gt;13.5f}{async_wall:&gt;12.1f}{async_idle:&gt;13.1f}{avg_stale:&gt;15.2f}")
+print()
+print(f"async cut wall-clock by {100*(1-async_wall/sync_wall):.0f}% "
+      f"({async_wall:.0f} vs {sync_wall:.0f} time units)")
+print(f"async removed all {sync_idle:.0f} units of barrier idle "
+      f"({100*sync_idle/(sync_wall*K):.0f}% of sync worker-time was waiting)")
+print(f"cost of speed: async carries avg staleness {avg_stale:.1f} versions; here the "
+      f"convex problem absorbs it and both reach loss {async_loss:.4f}")
+</code></pre>
+<div class="code-caption"><strong>Code 11.4.1:</strong> One process, two server scheduling policies. The synchronous loop applies one averaged update per round and charges the slowest worker's time as idle for the rest; the asynchronous loop replays a global arrival timeline, applying each push atomically against the pushing worker's stale read and restoring read-your-writes immediately after.</div>
+<pre><code class="language-text">problem: N=60000 d=30 workers K=6, straggler 4x slower
+compute budget: 600 gradient applies in BOTH modes
+
+mode              loss@150   final loss  wall-clock  worker idle  avg staleness
+synchronous        0.16295      0.01002       400.0       1500.0           0.00
+asynchronous       0.01002      0.01002       115.0          0.0           4.96
+
+async cut wall-clock by 71% (115 vs 400 time units)
+async removed all 1500 units of barrier idle (62% of sync worker-time was waiting)
+cost of speed: async carries avg staleness 5.0 versions; here the convex problem absorbs it and both reach loss 0.0100
+</code></pre>
+<div class="code-caption"><strong>Output 11.4.1:</strong> Asynchronous scheduling cut wall-clock by 71% and eliminated all 1500 units of barrier idle (62% of synchronous worker-time was spent waiting on the straggler), while every async gradient carried an average staleness of about five versions. On this well-conditioned convex problem the optimizer absorbed that staleness and both modes reached loss $0.01002$; on harder problems the staleness column is exactly the quantity that <a href="section-11.5.html">Section 11.5</a> learns to cap.</div>
+<p>The numbers tell the whole story of this section. The synchronous server kept staleness at exactly zero, the textbook-clean trajectory, but spent 1500 units of worker time idle, fully 62% of the cluster's capacity wasted waiting at the barrier behind one straggler. The asynchronous server wasted nothing, finishing in less than a third of the wall-clock, but every gradient it applied was on average five versions out of date. Here the convex problem tolerated that staleness and both reached the same loss; the warning in the final line is the bridge to <a href="section-11.5.html">Section 11.5</a>, where staleness on harder, non-convex objectives stops being free and must be bounded.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Same Fork, Three Times in This Book</div>
+<p>Synchronous-versus-asynchronous is one of the book's signature arcs. It is introduced as a coordination choice in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/index.html">Chapter 2</a>, deepened as sync and async SGD in <a href="../module-10-distributed-optimization/index.html">Chapter 10</a>, given its parameter-server mechanics here (and bounded in <a href="section-11.5.html">Section 11.5</a>), and returns one more time as synchronous versus asynchronous actor-learner architectures in distributed reinforcement learning (<a href="../../part-4-parallel-deep-learning/module-20-distributed-rl-infrastructure/index.html">Chapter 20</a>). Each appearance trades the same two currencies, throughput and staleness, on a different workload. Recognizing the fork lets you carry the intuition from one chapter straight into the next.</p>
+</div>
+
+<h2>4. Why Async Fits Sparse Embedding Workloads <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>So far the trade-off has looked symmetric: async buys speed, sync buys clean gradients, and you pick your poison. For one enormous and important class of workload, sparse models with embedding tables, the trade-off tilts hard toward async, and understanding why is the reason parameter servers and asynchrony grew up together. In a recommendation or ranking model (the terabyte-scale embeddings of <a href="section-11.7.html">Section 11.7</a>), the parameters are mostly a giant embedding table with one row per user, item, or feature value, often hundreds of millions of rows. Any single training example touches only a handful of those rows: the user it concerns, the items in that user's session, a few categorical features. The dense part of the model is tiny; the action is in which sparse rows light up.</p>
+<p>Now consider two workers training such a model at the same time. Worker A is processing a request about user 7 and movies 12 and 99. Worker B is processing a request about user 5,000,003 and movies 4,012 and 88,765. The gradients they push update <em>completely disjoint sets of embedding rows</em>. When the server applies them asynchronously, there is no conflict at all: A's update to row 7 and B's update to row 5,000,003 commute, because they touch different memory. The staleness that hurt the dense problem in Output 11.4.1 barely arises, because two workers rarely compute gradients against the same row between one's pull and its push. Asynchrony is nearly free precisely when the parameter access is sparse and the conflict rate is low.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Low Conflict Makes Async Nearly Free</div>
+<p>The cost of asynchronous updates is staleness, and staleness only bites when two workers touch the <em>same</em> parameter between a pull and a push. In a dense model every gradient touches every parameter, so conflict is total and staleness is maximal. In a sparse embedding model each gradient touches a few rows out of hundreds of millions, so two random workers almost never collide, and per-key staleness stays near zero even at high worker counts. This is why the classic strength of the parameter server, asynchronous training without the barrier, is most fully realized on the sparse, high-cardinality workloads it was designed for. The arc continues into terabyte-scale embeddings in <a href="section-11.7.html">Section 11.7</a> and distributed recommendation in <a href="../../part-8-case-studies/module-38-case-distributed-recommendation/index.html">Chapter 38</a>.</p>
+</div>
+
+<h2>5. Hybrids: Living Between the Two Extremes <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Pure synchronous and pure asynchronous are the endpoints of a spectrum, and most production systems sit somewhere in between. The most common middle ground is <em>bounded staleness</em>, the subject of the next section: the server lets workers run ahead asynchronously but refuses to let any worker fall more than $s$ updates behind the fastest, blocking only the worst stragglers and only when they cross the bound. At $s = 0$ this is exactly synchronous; at $s = \infty$ it is fully asynchronous; in between it captures most of the throughput of async while capping the staleness that hurts convergence. A second hybrid is the <em>hybrid-parallel</em> split common in recommendation systems: the dense parameters are trained synchronously with all-reduce among the workers (low conflict tolerance, small size), while the sparse embedding table lives on asynchronous parameter servers (high conflict tolerance, enormous size). Each part of the model gets the scheme that suits its access pattern, which is the practical synthesis of everything in this section.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A One-Line Switch Between Sync and Async</div>
+<p>Code 11.4.1 spelled out both server loops by hand. In TensorFlow's parameter-server training, the same fork is a configuration choice: a single coordinator class drives workers against a cluster of parameter servers, and whether updates are applied synchronously or asynchronously is set by how the optimizer is wrapped, not by rewriting the training loop. The framework supplies the update queue, the per-variable locking that gives you the atomic apply, the read-your-writes consistency on pulls, and the placement of variables across the parameter-server shards from <a href="section-11.3.html">Section 11.3</a>.</p>
+<pre><code class="language-python"># TensorFlow parameter-server training: the cluster and the apply policy are config,
+# not a hand-written loop. (Sketch; a full cluster spec and dataset fn are omitted.)
+import tensorflow as tf
+
+strategy = tf.distribute.ParameterServerStrategy(cluster_resolver)
+
+with strategy.scope():
+    model = build_model()                  # variables auto-sharded across PS tasks
+    optimizer = tf.keras.optimizers.Adam(1e-3)
+
+# Synchronous apply: wrap the optimizer so the coordinator averages worker gradients
+# before applying. Drop the wrapper (apply per worker) to get asynchronous updates.
+# The atomic apply, the update queue, and read-your-writes are handled internally.
+coordinator = tf.distribute.coordinator.ClusterCoordinator(strategy)
+</code></pre>
+<div class="code-caption"><strong>Code 11.4.2:</strong> The roughly forty lines of dual server loops in Code 11.4.1 collapse to a strategy object plus a coordinator; the queue, the per-variable atomic apply, the read-your-writes pulls, and the sharded placement are all framework-internal.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Recommendation Team That Stopped Waiting</div>
+<p><strong>Who:</strong> A machine learning platform engineer at a video streaming service, owner of the candidate-ranking model.</p>
+<p><strong>Situation:</strong> The model was a small dense tower on top of a 300-million-row embedding table, trained on 64 workers against a sharded parameter server.</p>
+<p><strong>Problem:</strong> The job ran in fully synchronous mode, and a handful of preemptible workers on shared hosts routinely lagged, so the whole cluster waited at the barrier and GPU utilization hovered near 40%.</p>
+<p><strong>Dilemma:</strong> Switch the entire model to asynchronous updates, risking staleness on the small dense tower where workers <em>do</em> conflict, or keep paying the barrier tax to protect convergence.</p>
+<p><strong>Decision:</strong> They split the model. The 300-million-row embedding table moved to asynchronous parameter servers, where two workers almost never touch the same row, while the tiny dense tower stayed synchronous with all-reduce among the workers.</p>
+<p><strong>How:</strong> Embedding lookups and their gradient pushes went through the async push-pull path of <a href="section-11.2.html">Section 11.2</a>; the dense parameters used a synchronous collective, with a small bounded-staleness cap on the sparse side as insurance.</p>
+<p><strong>Result:</strong> Worker idle time fell from roughly 60% to under 10%, throughput more than doubled, and offline accuracy was within noise of the fully synchronous baseline, because the sparse updates that went async almost never conflicted.</p>
+<p><strong>Lesson:</strong> Match the apply policy to the access pattern. Sparse, low-conflict parameters thrive on asynchrony; dense, high-conflict parameters keep their barrier. The hybrid is usually better than either pure extreme.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Async Reconsidered for Large-Model Training (2024 to 2026)</div>
+<p>For a decade the field largely abandoned asynchronous parameter servers for dense deep learning, because synchronous all-reduce gave cleaner convergence and faster interconnects made the barrier cheap. Recent work has reopened the question for settings where the barrier is expensive again: geo-distributed and over-the-internet training, where workers are far apart and synchronizing every step is prohibitive. Local-update and delayed-synchronization schemes in the lineage of DiLoCo (Douillard et al., 2024) and its asynchronous descendants let workers run many steps before exchanging parameters, reviving the throughput-versus-staleness trade-off of this section at the scale of foundation models. In parallel, asynchronous actor-learner designs remain standard in distributed reinforcement learning (<a href="../../part-4-parallel-deep-learning/module-20-distributed-rl-infrastructure/index.html">Chapter 20</a>), where the data-generating actors must never block on the learner. The pattern is clear: whenever communication is the binding cost, the asynchronous parameter server returns, and bounding its staleness (the next section) is what makes it safe.</p>
+</div>
+<p>We now have the two endpoints, sync with its barrier and async with its queue and atomic apply, and the read-your-writes contract that keeps each worker's view coherent. We have seen async eliminate idle time at the cost of measurable staleness, and seen why sparse embedding workloads make that cost nearly vanish. The remaining question is how to keep staleness controlled when it does <em>not</em> vanish, so that asynchrony's speed comes without async's risk. That controlled middle ground, bounded staleness and the stale-synchronous-parallel model, is the subject of <a href="section-11.5.html">Section 11.5</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.4.1: Where the Barrier Tax Goes <span class="exercise-type conceptual">Conceptual</span></div>
+<p>In Output 11.4.1 the synchronous server wasted 1500 units of worker time idle, with one worker four times slower than the rest. Without running code, derive a formula for the fraction of cluster worker-time spent idle in synchronous mode as a function of the per-worker step times. Then argue what happens to that fraction as you add more <em>fast</em> workers while keeping the one straggler, and explain why this makes the synchronous straggler problem worse, not better, at larger scale.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.4.2: Make Staleness Bite <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 11.4.1 so that staleness actually degrades the asynchronous run. Increase the learning rate (try $\eta = 0.2$) and ill-condition the data by scaling each feature column by a different factor, then compare the final losses of the two modes at equal budget. Report the learning rate at which async first diverges while sync still converges. Explain the result in terms of the average-staleness column: why does a larger effective step size turn a tolerable staleness into an intolerable one?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.4.3: Conflict Rate on a Sparse Table <span class="exercise-type analysis">Analysis</span></div>
+<p>Consider an embedding table with $R$ rows, $W$ workers each holding one in-flight gradient, and each gradient touching $m$ rows drawn uniformly at random. Estimate the probability that two given in-flight gradients share at least one row (the conflict probability), and from it the expected number of conflicting worker pairs. Plug in $R = 3 \times 10^{8}$, $W = 64$, $m = 50$ from the practical example above and report the expected conflict count. Use your number to justify, quantitatively, the claim in Section 4 that asynchronous updates are nearly free on this workload, and state what would have to change about $R$, $W$, or $m$ to make conflict matter.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-11.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 11.3</span><span class="nav-title">Centralized and Sharded Parameter Servers</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 11</span><span class="nav-num">Contents</span><span class="nav-title">Parameter Servers and Distributed Embeddings</span></a>
+<a class="next" href="section-11.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 11.5</span><span class="nav-title">Bounded Staleness</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

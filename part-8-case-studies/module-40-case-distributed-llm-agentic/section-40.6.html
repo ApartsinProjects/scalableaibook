@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 40.6: Distributed Agent Orchestration. Turning a single LLM call into a fleet of cooperating agents and tool services: the ReAct loop, tool calls as distributed RPCs, supervisor fan-out to parallel workers, durable execution, shared memory, and the MCP/A2A protocols that let agents interoperate." name="description"/>
+<title>Section 40.6: Distributed Agent Orchestration | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Case Studies and Capstone Projects</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 40: Distributed LLM and Agentic Applications</a></div>
+<h1>Distributed Agent Orchestration</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I am an Orchestrator, holding the plan while five workers run ahead. Two have already finished, one is retrying a flaky tool, one is blocked on a lock, and one has wandered off to call an API I never approved. This is, somehow, the calm part of my job."</p>
+<cite>An Orchestrator, Holding the Plan While Five Workers Run Ahead</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A production agentic application is not one model answering one prompt; it is a fleet of cooperating agents and tool services coordinated like a distributed workflow, where the unit of work is a reasoning step and the unit of communication is a tool call.</strong> A single language model can plan, but it cannot retrieve a billion documents, run untrusted code in isolation, query a payments API, and do all three at once without help. The moment the work exceeds what one model call can do alone, the application splits into a planner that decides what to do, executors that act, tool services that the executors call as remote procedures, and an orchestration engine that keeps the whole thing durable, retryable, and consistent. This section takes the orchestration machinery built in <a href="../../part-6-multi-agent-systems/module-32-distributed-agent-orchestration/index.html">Chapter 32</a> and applies it to a real agentic product, showing how distributing intelligence across many agents follows the same split-move-recombine discipline as distributing a gradient.</p>
+</div>
+<p>In the previous section we built the retrieval layer that an agent reaches into when it needs grounded facts. Now we step up a level and ask how the agent uses that retrieval, alongside code execution and external APIs, inside a multi-step reasoning loop, and how that loop becomes a distributed system once one agent is no longer enough. The progression mirrors the rest of the book. A single language model call is the scale-up baseline: capable, self-contained, and bounded by what fits in one context window and one forward pass. Once a task needs many steps, many tools, and work that can proceed in parallel, the application scales out into a coordinated set of agents and services. The discipline for doing that well is distributed agent orchestration, and it is the sixth axis of distribution from <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Chapter 1</a>: distributing intelligence itself.</p>
+
+<h2>1. The Agent Loop: Plan, Act, Observe, Repeat <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The smallest unit of agentic behavior is a loop, not a single call. A language model is given a goal and a set of available tools; it reasons about what to do next, emits an action (a tool call with arguments), receives the tool's result as an observation, and feeds that observation back into its context to decide the next action. This reason, act, observe cycle, popularized as the ReAct pattern, repeats until the model decides the goal is met and emits a final answer. The loop is what turns a static predictor into something that can gather information it did not start with, correct course when a tool returns an error, and chain several operations toward a goal no single call could reach.</p>
+<p>Each turn of the loop is cheap to describe and expensive to run. The reasoning step is one LLM forward pass, served from the fleet of <a href="section-40.7.html">Section 40.7</a>. The action step blocks on an external service whose latency the agent does not control: a vector search over the index of <a href="section-40.4.html">Section 40.4</a>, a sandboxed code execution, or a third-party API. Because the model must see each observation before choosing the next action, the turns of a single agent's loop are inherently sequential, and the wall-clock time of the loop is the sum of its per-turn latencies. That sequential spine is exactly the part that orchestration tries to keep short, and the independent work hanging off it is exactly the part that orchestration tries to run in parallel.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The agent loop drawn as a cycle: a Reason node leads to an Act node that calls one of three tools, the tool returns an Observe result, which feeds back into Reason, until a Done branch exits to a final answer.">
+<defs>
+<marker id="arr406a" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b406 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w406 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g406 { fill:#eef6ef; stroke:#2f7a3f; stroke-width:1.6; }
+.t406 { font:600 13.5px sans-serif; fill:#14385c; text-anchor:middle; }
+.s406 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l406 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr406a); }
+</style>
+<rect class="b406" x="60" y="110" width="130" height="64" rx="10"/>
+<text class="t406" x="125" y="138">Reason</text>
+<text class="s406" x="125" y="156">LLM forward pass</text>
+<rect class="b406" x="280" y="110" width="130" height="64" rx="10"/>
+<text class="t406" x="345" y="138">Act</text>
+<text class="s406" x="345" y="156">emit tool call</text>
+<rect class="w406" x="500" y="40" width="190" height="46" rx="8"/>
+<text class="t406" x="595" y="62">Retrieval (40.4)</text>
+<text class="s406" x="595" y="78">vector search</text>
+<rect class="w406" x="500" y="118" width="190" height="46" rx="8"/>
+<text class="t406" x="595" y="140">Code sandbox</text>
+<text class="s406" x="595" y="156">isolated exec</text>
+<rect class="w406" x="500" y="196" width="190" height="46" rx="8"/>
+<text class="t406" x="595" y="218">External API</text>
+<text class="s406" x="595" y="234">RPC over network</text>
+<rect class="b406" x="280" y="220" width="130" height="56" rx="10"/>
+<text class="t406" x="345" y="244">Observe</text>
+<text class="s406" x="345" y="262">tool result</text>
+<line class="l406" x1="190" y1="142" x2="276" y2="142"/>
+<line class="l406" x1="410" y1="132" x2="496" y2="64"/>
+<line class="l406" x1="410" y1="142" x2="496" y2="141"/>
+<line class="l406" x1="410" y1="152" x2="496" y2="218"/>
+<path class="l406" d="M 500 230 L 420 248"/>
+<path class="l406" d="M 280 248 L 125 248 L 125 178"/>
+<rect class="g406" x="60" y="40" width="130" height="46" rx="8"/>
+<text class="t406" x="125" y="62">Done?</text>
+<text class="s406" x="125" y="78">final answer</text>
+<path class="l406" d="M 125 110 L 125 90"/>
+</svg>
+<figcaption><strong>Figure 40.6.1:</strong> One agent's ReAct loop. The Reason step is an LLM forward pass; the Act step emits a tool call dispatched to retrieval, a code sandbox, or an external API; the Observe step feeds the result back. The cycle repeats until the model judges the goal met and exits with a final answer. The turns are sequential because each Reason needs the previous Observe.</figcaption>
+</figure>
+<p>We can put a number on how long such a loop runs. If the agent takes a random number of turns $T$ to reach its goal, and each turn that has not yet finished succeeds with probability $q$, then $T$ is geometric and the expected number of turns to completion is</p>
+$$\mathbb{E}[T] = \frac{1}{q}, \qquad \text{critical-path latency} \approx \mathbb{E}[T]\,\big(\ell_{\text{reason}} + \ell_{\text{act}}\big),$$
+<p>where $\ell_{\text{reason}}$ is the LLM latency per turn and $\ell_{\text{act}}$ is the tool latency per turn. The formula is deliberately blunt, but it captures the operational truth: a loop that needs ten turns at half a second each is a five-second user wait, and the only ways to shrink it are to reduce the number of turns (better planning) or to reduce per-turn latency (faster tools and a faster model). When the per-turn tool work is itself splittable across machines, a third lever appears, and that lever is the subject of the rest of this section.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Tool Call Is a Distributed RPC With a Natural-Language Caller</div>
+<p>The action step of the agent loop is a remote procedure call. The arguments happen to be chosen by a language model rather than hand-written code, but everything downstream is ordinary distributed-systems engineering: the call crosses a network boundary, it can time out, it can fail and need a retry, it can run concurrently with other calls, and its result must be marshaled back into the caller's state. Treating tool calls as RPCs, with the timeouts, idempotency keys, and circuit breakers that RPCs have always needed, is what separates a demo agent from a production one. The model picks the calls; the orchestration engine makes them survivable.</p>
+</div>
+
+<h2>2. Tools as Distributed Services <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Function calling, the mechanism by which a model emits a structured request to invoke a named tool with typed arguments, is the interface through which an agent reaches the rest of the system. Each tool is a service with its own latency, failure profile, and scaling story. The retrieval tool of <a href="section-40.4.html">Section 40.4</a> is a sharded vector index that answers in tens of milliseconds and scales by adding index replicas. A code-execution tool is a pool of sandboxed workers, each an isolated container that runs untrusted model-written code and is torn down afterward; it scales by adding sandbox capacity and is the slowest and riskiest tool in the kit. An external API, a weather service or a payments gateway, is a tool the application does not own at all, with rate limits and an availability budget set by someone else.</p>
+<p>Because the tools are independent services, they fail and scale independently, and the orchestration layer must hold each to its own contract. A retrieval timeout should not abort a plan that could proceed with a cached result; a payments call must never be retried blindly, because a duplicate charge is worse than a failure; a code sandbox that hangs must be killed and its turn re-planned rather than waited on forever. These are the coordination and failure concerns of <a href="../../part-1-foundations/module-02-distributed-systems-concepts/index.html">Chapter 2</a>, now wearing the costume of an agent's toolbox. The agent chooses which tool to call; the engineering choice is how each tool behaves when it is slow, absent, or returns garbage.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Tool-Calling Loop in a Dozen Lines</div>
+<p>Writing the parse-the-tool-call, dispatch, append-the-observation machinery by hand is tedious and error-prone. Modern SDKs expose function calling as a typed loop: you declare the tools, hand the model the goal, and the SDK surfaces each requested call for you to execute and return. The skeleton below is the entire ReAct spine of Figure 40.6.1.</p>
+<pre><code class="language-python">tools = [retrieve_tool, run_code_tool, call_api_tool]   # each a typed schema
+
+messages = [{"role": "user", "content": goal}]
+while True:
+    reply = model.run(messages, tools=tools)            # the Reason step
+    if reply.stop_reason != "tool_use":                 # model judged it Done
+        break
+    for call in reply.tool_calls:                       # the Act step (may be many)
+        result = dispatch(call.name, call.arguments)    # an RPC to a tool service
+        messages.append(tool_result(call.id, result))   # the Observe step
+</code></pre>
+<div class="code-caption"><strong>Code 40.6.1:</strong> The agent loop as exposed by a function-calling SDK. The roughly forty lines of hand-rolled parsing and state threading collapse to this loop; the SDK handles the schema validation, the tool-call extraction, and the message bookkeeping. When <code>reply.tool_calls</code> holds several calls at once, the dispatch can run them in parallel, which Section 4 turns into the supervisor fan-out.</div>
+</div>
+
+<h2>3. Planner and Executor: Fanning Work Out to Role-Specialized Agents <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>One agent looping over tools handles a surprising amount, but it serializes everything, and many goals decompose into independent pieces. A research request might need five sources summarized, a coding task might touch four files, a data pipeline might validate six tables. The production pattern, built in depth in <a href="../../part-6-multi-agent-systems/module-32-distributed-agent-orchestration/index.html">Chapter 32</a>, splits the single agent into roles: a planner (or supervisor) decomposes the goal into sub-tasks and decides their dependencies, and a set of executor agents, each possibly specialized for a role such as researcher, coder, or critic, carry out the sub-tasks. The supervisor then gathers the executors' results and either finishes or plans another round. This is a map-then-reduce over reasoning, with the supervisor playing coordinator and the executors playing workers, the same shape as the all-reduce of <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Chapter 1</a> but with intelligence rather than gradients as the payload.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A supervisor agent at top fans out to four parallel worker agents, each calling its own tool service, then their results gather back into a reduce node that returns to the supervisor.">
+<defs>
+<marker id="arr406b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.sb406 { fill:#e8eef7; stroke:#14385c; stroke-width:1.8; }
+.ww406 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.tt406 { fill:#eef6ef; stroke:#2f7a3f; stroke-width:1.5; }
+.r406  { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.tl406 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sl406 { font:10.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.ln406 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr406b); }
+</style>
+<rect class="sb406" x="300" y="20" width="180" height="54" rx="10"/>
+<text class="tl406" x="390" y="42">Supervisor / Planner</text>
+<text class="sl406" x="390" y="60">decompose, dispatch, gather</text>
+<rect class="ww406" x="40" y="130" width="140" height="50" rx="8"/>
+<text class="tl406" x="110" y="150">Worker: Researcher</text>
+<text class="sl406" x="110" y="167">sub-task A</text>
+<rect class="ww406" x="210" y="130" width="140" height="50" rx="8"/>
+<text class="tl406" x="280" y="150">Worker: Coder</text>
+<text class="sl406" x="280" y="167">sub-task B</text>
+<rect class="ww406" x="380" y="130" width="140" height="50" rx="8"/>
+<text class="tl406" x="450" y="150">Worker: Analyst</text>
+<text class="sl406" x="450" y="167">sub-task C</text>
+<rect class="ww406" x="550" y="130" width="140" height="50" rx="8"/>
+<text class="tl406" x="620" y="150">Worker: Critic</text>
+<text class="sl406" x="620" y="167">sub-task D</text>
+<rect class="tt406" x="40" y="220" width="140" height="38" rx="6"/>
+<text class="sl406" x="110" y="243">retrieval</text>
+<rect class="tt406" x="210" y="220" width="140" height="38" rx="6"/>
+<text class="sl406" x="280" y="243">code sandbox</text>
+<rect class="tt406" x="380" y="220" width="140" height="38" rx="6"/>
+<text class="sl406" x="450" y="243">data API</text>
+<rect class="tt406" x="550" y="220" width="140" height="38" rx="6"/>
+<text class="sl406" x="620" y="243">retrieval</text>
+<rect class="r406" x="300" y="280" width="180" height="32" rx="8"/>
+<text class="tl406" x="390" y="301">Gather / Reduce</text>
+<path class="ln406" d="M 320 74 L 110 126"/>
+<path class="ln406" d="M 360 74 L 280 126"/>
+<path class="ln406" d="M 420 74 L 450 126"/>
+<path class="ln406" d="M 460 74 L 620 126"/>
+<line class="ln406" x1="110" y1="180" x2="110" y2="216"/>
+<line class="ln406" x1="280" y1="180" x2="280" y2="216"/>
+<line class="ln406" x1="450" y1="180" x2="450" y2="216"/>
+<line class="ln406" x1="620" y1="180" x2="620" y2="216"/>
+<path class="ln406" d="M 130 258 L 305 282"/>
+<path class="ln406" d="M 640 258 L 475 282"/>
+<path class="ln406" d="M 470 280 L 470 78"/>
+</svg>
+<figcaption><strong>Figure 40.6.2:</strong> Supervisor fan-out. The planner decomposes the goal into independent sub-tasks A through D, dispatches each to a role-specialized worker agent, and each worker runs its own ReAct loop calling its own tool services. Results gather into a reduce step that returns to the supervisor, which decides whether to finish or plan another round. The fan-out is where parallelism lives.</figcaption>
+</figure>
+<p>Whether this fan-out actually saves time depends on how much of the plan is genuinely independent. If a fraction $p$ of the total work can run in parallel across $W$ worker agents and the remaining fraction $1-p$ is the irreducibly sequential planning spine, the speedup is bounded by Amdahl's law from <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>,</p>
+$$S(W) = \frac{1}{(1-p) + \dfrac{p}{W}}, \qquad \lim_{W \to \infty} S(W) = \frac{1}{1-p}.$$
+<p>The ceiling is sobering: even with infinitely many workers, a plan that is $15\%$ sequential can never run more than about $6.7$ times faster than serial execution. The lesson for agent design is the same as for parallel training: the win comes from making the parallel fraction large (decompose aggressively into independent sub-tasks) and the sequential spine short (fewer supervisor rounds), not from throwing more workers at a plan that is mostly serial. For independent sub-tasks with per-task latencies $\ell_1, \dots, \ell_n$, sequential execution costs $\sum_i \ell_i$ while parallel execution costs only $\max_i \ell_i$, so the speedup is the sum-over-max ratio, and a single slow sub-task (a hung sandbox) caps the gain exactly as a straggler caps a synchronous training step.</p>
+
+<h2>4. The Orchestration Engine: Durable Execution, Retries, and State <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Fan-out is easy to draw and hard to run reliably, because the moment work is spread across many agents and tool calls, partial failure becomes the normal case. A worker crashes mid-plan, a tool times out, the process serving the supervisor is preempted. A toy script loses everything; a production orchestration engine does not, because it treats the plan as durable state. Each completed sub-task is checkpointed, so a restart resumes from the last good step rather than re-running the whole plan; each tool call carries a retry policy and an idempotency guarantee, so a transient failure is retried without duplicating side effects; and the engine tracks which sub-tasks are ready (dependencies satisfied), running, or done, scheduling the ready ones onto available workers. These are precisely the fault-tolerance and coordination primitives of <a href="../../part-1-foundations/module-02-distributed-systems-concepts/index.html">Chapter 2</a>, applied to a workflow whose steps happen to be acts of reasoning.</p>
+<p>The runtime substrate underneath is a distributed-execution framework. <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/index.html">Chapter 33</a> develops Ray as exactly this kind of substrate: it places each agent and tool worker as a task or actor across the cluster, moves the results between them, and restarts the ones that die, so that the orchestration logic can speak in terms of sub-tasks and dependencies while the framework handles process placement, fault recovery, and state transport. The agentic application thus inherits the cluster-scheduling story of the rest of the book: agents are scheduled work, tool services are scaled pools, and the engine is the coordinator that keeps a fleet of cooperating reasoners behaving like one coherent system.</p>
+<p>The demonstration below makes the fan-out payoff concrete. It models a plan of independent sub-tasks, each a tool call with its own latency, and compares the plan two ways: run sequentially through one worker, its critical path is the sum of the latencies; fanned out to a pool of workers as a supervisor would dispatch them, its critical path is the slowest single sub-task. It reports the ideal fan-out speedup against the Amdahl ceiling, so the gap between independent-task ideal and the ceiling a partly-serial plan can reach is visible.</p>
+<pre><code class="language-python">import random
+
+random.seed(7)
+
+# A plan of N independent subtasks the planner discovered. Latencies vary
+# because tools differ (a vector search is fast, a code sandbox is slow).
+# Each subtask is a tool call (retrieval, code exec, or an external API),
+# and `secs` is its wall-clock latency, blocking on I/O rather than on CPU.
+N = 8
+plan = [(f"tool_{i}", round(random.uniform(0.05, 0.30), 3)) for i in range(N)]
+W = N                                          # one worker per independent subtask
+
+# Sequential execution runs one subtask after another, so its critical path is
+# the SUM of the latencies. Fanning the independent subtasks out to W workers
+# runs them at once, so the parallel critical path is the MAX (the straggler).
+serial_path   = sum(secs for _, secs in plan)
+parallel_path = max(secs for _, secs in plan)
+ideal_speedup = serial_path / parallel_path    # sum-over-max for independent work
+
+# Amdahl-style ceiling: a real plan is part parallelizable (the fan-out) and
+# part serial (the planner's reason->act->observe spine that cannot be skipped).
+p = 0.85                                        # parallelizable fraction
+amdahl_speedup = 1.0 / ((1.0 - p) + p / W)      # theoretical ceiling at W workers
+
+print(f"subtasks N              : {N}")
+print(f"workers  W              : {W}")
+print(f"sum of subtask latency  : {serial_path:.3f} s  (critical path if serial)")
+print(f"slowest single subtask  : {parallel_path:.3f} s  (critical path if parallel)")
+print(f"ideal fan-out speedup    : {ideal_speedup:.2f}x  (independent sub-tasks)")
+print(f"Amdahl ceiling (p={p})  : {amdahl_speedup:.2f}x  at W={W} workers")
+</code></pre>
+<div class="code-caption"><strong>Code 40.6.2:</strong> A planner fanning $N$ independent sub-tasks out to $W$ parallel workers versus running them sequentially. The two critical paths follow from the latency model directly: the serial path is the sum of the sub-task latencies, the parallel path is the slowest single sub-task, and their ratio is the ideal fan-out speedup.</div>
+<pre><code class="language-text">subtasks N              : 8
+workers  W              : 8
+sum of subtask latency  : 1.066 s  (critical path if serial)
+slowest single subtask  : 0.213 s  (critical path if parallel)
+ideal fan-out speedup    : 5.00x  (independent sub-tasks)
+Amdahl ceiling (p=0.85)  : 3.90x  at W=8 workers</code></pre>
+<div class="code-caption"><strong>Output 40.6.2:</strong> The fully parallel plan finishes in the time of its slowest sub-task ($0.213$ s) rather than the sum of all eight ($1.066$ s), an ideal $5.00\times$ speedup. Because these sub-tasks are fully independent the ratio exceeds the $3.90\times$ Amdahl ceiling computed for a plan that is only $85\%$ parallelizable: the gap is exactly the cost of the sequential planning spine that a real supervisor cannot avoid.</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Research Assistant That Stopped Timing Out</div>
+<p><strong>Who:</strong> A platform engineer at a company shipping an LLM research assistant that answers analyst questions over internal documents and live data feeds.</p>
+<p><strong>Situation:</strong> A single ReAct agent answered each question by looping through retrieval, code execution, and API calls one tool at a time, often taking eight to twelve turns.</p>
+<p><strong>Problem:</strong> Median latency was forty seconds and the worst cases timed out, because the agent serialized sub-tasks that did not depend on each other, and any single tool failure restarted the whole loop.</p>
+<p><strong>Dilemma:</strong> Keep the simple single-agent loop and accept the latency, or move to a planner-executor design that runs independent sub-tasks in parallel but introduces a supervisor, a durable state store, and per-tool retry policies.</p>
+<p><strong>Decision:</strong> They adopted the planner-executor pattern on a durable orchestration engine, because profiling showed most questions decomposed into three to six independent retrieval and analysis sub-tasks.</p>
+<p><strong>How:</strong> A supervisor agent decomposed each question and fanned the independent sub-tasks out to a pool of worker agents on a Ray cluster; each tool call got a timeout, a bounded retry, and an idempotency key, and completed sub-tasks were checkpointed.</p>
+<p><strong>Result:</strong> Median latency fell from forty seconds to twelve, the timeout rate dropped by an order of magnitude because a single failed tool now retried in place instead of restarting the plan, and throughput rose because workers no longer idled waiting on each other.</p>
+<p><strong>Lesson:</strong> The win came from decomposing aggressively (raising the parallel fraction) and making each tool call independently survivable, not from a smarter model. Orchestration, not the LLM, was the bottleneck.</p>
+</div>
+
+<h2>5. Shared Memory and Interoperation Protocols <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Parallel workers are only useful if they can share what they learn. A researcher worker that finds a key fact must make it visible to the critic worker that checks the final answer, and the supervisor must see every worker's result to plan the next round. Agentic systems therefore need shared memory: a state store the agents read from and write to, ranging from a simple shared scratchpad in the supervisor's context, to a blackboard that workers post intermediate findings on, to a persistent vector store of accumulated knowledge that is itself the retrieval index of <a href="section-40.4.html">Section 40.4</a>. This is the shared-state coordination of <a href="../../part-6-multi-agent-systems/module-32-distributed-agent-orchestration/index.html">Chapter 32</a>, and it carries the same hazards as any distributed shared state: concurrent writes need ordering, stale reads mislead, and unbounded growth of the shared context blows the token budget. The engine that owns the shared memory must enforce consistency exactly as the coordination layer of <a href="../../part-1-foundations/module-02-distributed-systems-concepts/index.html">Chapter 2</a> demands.</p>
+<p>For agents and tools to interoperate at all, they must agree on protocols. Two are consolidating the field. The Model Context Protocol (MCP) standardizes how an agent connects to tools and data sources: a tool server advertises its functions and resources over a uniform interface, and any MCP-speaking agent can call them without bespoke glue, turning the tool layer of Section 2 into a pluggable, discoverable ecosystem. Agent-to-Agent (A2A) protocols standardize the complementary direction: how one agent delegates a task to another, exchanges intermediate state, and reports results, so that a supervisor can fan work out to workers that may run in different processes, on different machines, or even at different organizations. Together MCP and A2A do for agentic systems what the communication primitives of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> did for parallel training: they define the interfaces over which distributed intelligence is exchanged, so that the orchestration engine can treat agents and tools as interchangeable, network-addressable participants.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Sixth Axis, Made Concrete</div>
+<p>Chapter 1 named six axes of distribution and put "distribute intelligence" last, as the most speculative. This section is that axis built as a shipping product. The supervisor fanning sub-tasks out to workers is the same split-move-recombine move as the gradient all-reduce of <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Chapter 1</a>; the durable engine is the fault tolerance of <a href="../../part-1-foundations/module-02-distributed-systems-concepts/index.html">Chapter 2</a>; the Amdahl ceiling on fan-out is the performance model of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>; MCP and A2A are the communication primitives of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>. An agentic application is a distributed system whose payload is reasoning, and every tool the book built for distributing computation applies, unchanged in spirit, to distributing intelligence.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Standardizing Agent Interoperation (2024 to 2026)</div>
+<p>The protocols that let agents and tools interoperate are crystallizing in real time. The Model Context Protocol, introduced by Anthropic in late 2024, has been adopted across multiple vendors as the de facto standard for connecting agents to tools and data, and a growing registry of MCP servers turns external services into plug-in tools. In parallel, agent-to-agent specifications (Google's A2A, proposed in 2025, among others) target cross-agent delegation and are converging on shared notions of agent cards, task lifecycles, and streaming results. On the orchestration side, durable-execution engines (Temporal-style workflows, and agent frameworks such as LangGraph that compile an agent graph onto a checkpointed runtime) are bringing decades of workflow-reliability engineering to multi-agent systems. The open research questions are sharp: how to bound the cost of ever-larger shared context, how to verify that a fanned-out plan's sub-results compose correctly, and how to secure a fleet in which agents call tools and other agents they did not write. We meet the orchestration internals in full in <a href="../../part-6-multi-agent-systems/module-32-distributed-agent-orchestration/index.html">Chapter 32</a>.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Straggler Has a New Costume</div>
+<p>The slow worker that caps a synchronous all-reduce in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Chapter 1</a> reappears here as the hung code sandbox that a supervisor waits on while three other workers sit idle, finished, twiddling their tokens. Same villain, new hat. The fix is the same too: bound its wait, speculate a replacement, and never let one slow participant set the pace for the whole fleet.</p>
+</div>
+<p>We have now turned a single language-model call into a fleet of cooperating agents and tool services: a loop that reasons and acts, tool calls dispatched as distributed RPCs, a supervisor that fans independent work out to parallel workers, a durable engine that keeps the plan alive through failure, shared memory that lets the workers learn from each other, and protocols that let any agent call any tool. Every one of those agents and tool calls ultimately bottoms out in a language-model forward pass, served from a distributed inference fleet. That fleet, the engine every agent in this section depends on, is the subject of <a href="section-40.7.html">Section 40.7</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 40.6.1: Sequential Spine or Parallel Fan-Out? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each goal, decide whether the work is mostly a sequential agent loop (Section 1) or mostly a parallel supervisor fan-out (Section 3), and estimate the parallelizable fraction $p$ you would assume: (a) "summarize these twelve uploaded PDFs into one brief"; (b) "debug this failing test by reading the stack trace, then the implicated file, then proposing a fix"; (c) "for each of our forty product pages, fetch its current price from the live API and flag mispricings". For the one you judge most parallel, use Amdahl's law to give the speedup ceiling as $W \to \infty$, and explain what part of the plan keeps it from being infinite.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 40.6.2: Add a Straggler and a Retry <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 40.6.2 so that one sub-task is a straggler (latency ten times the others) and one sub-task fails on its first attempt and must be retried once before succeeding (model the retry as adding that sub-task's latency a second time to its own path). Recompute the parallel critical path now and compare it to the no-straggler baseline. Then add a per-task timeout that abandons any sub-task exceeding a threshold and re-plans it as a fresh task, and report how the timeout changes the worst-case parallel path. Explain which line of the orchestration engine in Section 4 each of your additions corresponds to.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 40.6.3: Cost of a Round Versus a Fan-Out <span class="exercise-type analysis">Analysis</span></div>
+<p>A supervisor can either run $n$ sub-tasks as one parallel fan-out, or run them as $n$ sequential turns of its own loop. Each fan-out adds a fixed supervisor overhead of $c$ seconds (decompose plus gather) on top of the parallel sub-task latency $\max_i \ell_i$, while the sequential path pays $\sum_i \ell_i$ with no fan-out overhead. Using $\mathbb{E}[T] = 1/q$ from Section 1 for the number of supervisor rounds, derive the condition on $c$, $n$, and the latency distribution under which fanning out is faster than sequential execution. State the regime (small $n$, similar latencies, large overhead) in which a planner is right to keep the work sequential, and connect your answer to the communication-versus-computation trade-off of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-40.5.html"><span class="nav-label">Previous</span><span class="nav-num">Section 40.5</span><span class="nav-title">RAG at Scale</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 40</span><span class="nav-num">Contents</span><span class="nav-title">Distributed LLM and Agentic Applications</span></a>
+<a class="next" href="section-40.7.html"><span class="nav-label">Next</span><span class="nav-num">Section 40.7</span><span class="nav-title">Distributed Model Serving with vLLM</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

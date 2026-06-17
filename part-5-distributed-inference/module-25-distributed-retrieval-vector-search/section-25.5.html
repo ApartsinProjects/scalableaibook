@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 25.5: Index Sharding and Replication. Splitting a billion-vector index across machines with scatter-gather, the tail-latency cost of more shards, and replication for throughput and availability." name="description"/>
+<title>Section 25.5: Index Sharding and Replication | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 25: Distributed Retrieval and Vector Search</a></div>
+<h1>Index Sharding and Replication</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I hold one sixteenth of all human knowledge and not a vector more. When a query arrives, fifteen siblings and I each shout our best ten guesses at the coordinator, and we are only ever as fast as the slowest of us."</p>
+<cite>A Shard That Believes It Is the Whole Model</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>When a vector index outgrows one machine's memory, you split it into shards and search them all in parallel, then merge their partial answers; the index becomes a distributed system whose correctness is a merge and whose latency is a maximum.</strong> A billion 768-dimensional vectors in float32 occupy roughly three terabytes, far beyond any single server's memory, so the index must be partitioned across many machines. A query then scatters to every shard, each returns its local top-$k$, and a coordinator gathers and merges those into the global top-$k$. That pattern is exactly the broadcast-then-gather collective you met in Chapter 4, now carrying nearest-neighbor candidates instead of gradients. This section shows how shard count trades per-machine work against tail latency, how the choice of sharding strategy trades work against recall, and how replication buys throughput and availability on top of a sharded index.</p>
+</div>
+<p>The previous section built the per-machine search engine: HNSW, IVF, and PQ turn an exact nearest-neighbor scan into an approximate one that runs in milliseconds on a single node. That machinery assumes the whole index fits in one machine's memory. It usually does not. A production retrieval corpus for a large-scale RAG system or a recommendation candidate generator runs from hundreds of millions to tens of billions of vectors, and the index plus its graph or inverted-list overhead overflows even a high-memory server. The remedy is the same one the rest of this book applies to data, to parameters, and to models: partition the structure across machines and coordinate them. For a vector index, that partitioning is called sharding, and it is the core distributed-systems content of this chapter. Partitioning as a general technique was introduced in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.3.html">Section 2.3</a>; here we specialize it to an index that every query must consult. Figure 25.5.1 draws the scatter-gather that results, and the sections below quantify each of its three knobs in turn.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 860 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A query is scattered from a coordinator to four index shards, each holding part of the vectors and backed by replicas; every shard returns its local top-k, and the coordinator merges them into a global top-k.">
+<defs>
+<marker id="arr255" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr255b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.b255 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.s255box { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.r255 { fill:#fbfdf4; stroke:#5a8f3c; stroke-width:1.3; }
+.t255 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.u255 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.scatter255 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr255); }
+.gather255 { fill:none; stroke:#b86b1f; stroke-width:1.7; stroke-dasharray:5 3; marker-end:url(#arr255b); }
+</style>
+<rect class="b255" x="350" y="20" width="160" height="54" rx="9"/>
+<text class="t255" x="430" y="42">Coordinator</text>
+<text class="u255" x="430" y="60">scatter query, gather top-k</text>
+<text class="t255" x="100" y="148">Shard 1</text>
+<text class="t255" x="320" y="148">Shard 2</text>
+<text class="t255" x="540" y="148">Shard 3</text>
+<text class="t255" x="760" y="148">Shard 4</text>
+<rect class="s255box" x="40" y="158" width="120" height="50" rx="8"/>
+<text class="u255" x="100" y="188">vectors 0..M</text>
+<rect class="s255box" x="260" y="158" width="120" height="50" rx="8"/>
+<text class="u255" x="320" y="188">vectors M..2M</text>
+<rect class="s255box" x="480" y="158" width="120" height="50" rx="8"/>
+<text class="u255" x="540" y="188">vectors 2M..3M</text>
+<rect class="s255box" x="700" y="158" width="120" height="50" rx="8"/>
+<text class="u255" x="760" y="188">vectors 3M..N</text>
+<rect class="r255" x="48" y="228" width="104" height="30" rx="6"/>
+<text class="u255" x="100" y="248">replica A / B</text>
+<rect class="r255" x="268" y="228" width="104" height="30" rx="6"/>
+<text class="u255" x="320" y="248">replica A / B</text>
+<rect class="r255" x="488" y="228" width="104" height="30" rx="6"/>
+<text class="u255" x="540" y="248">replica A / B</text>
+<rect class="r255" x="708" y="228" width="104" height="30" rx="6"/>
+<text class="u255" x="760" y="248">replica A / B</text>
+<path class="scatter255" d="M 360 74 L 110 156"/>
+<path class="scatter255" d="M 400 74 L 322 156"/>
+<path class="scatter255" d="M 460 74 L 538 156"/>
+<path class="scatter255" d="M 500 74 L 750 156"/>
+<path class="gather255" d="M 120 226 L 365 80"/>
+<path class="gather255" d="M 330 210 L 405 80"/>
+<path class="gather255" d="M 530 210 L 455 80"/>
+<path class="gather255" d="M 740 226 L 495 80"/>
+<rect class="b255" x="300" y="320" width="260" height="64" rx="9"/>
+<text class="t255" x="430" y="346">Merge: global top-k</text>
+<text class="u255" x="430" y="366">k from each of 4 shards = 4k candidates</text>
+<text class="u255" x="430" y="380">keep the best k overall</text>
+<path class="scatter255" d="M 430 74 L 430 318"/>
+<text class="u255" x="232" y="110">scatter (solid)</text>
+<text class="u255" x="618" y="110">gather (dashed)</text>
+</svg>
+<figcaption><strong>Figure 25.5.1:</strong> Scatter-gather over a sharded vector index. The coordinator broadcasts the query to all four shards (solid arrows); each shard searches only its slice of the $N$ vectors and returns its local top-$k$ (dashed arrows); the coordinator merges the $4k$ candidates into the global top-$k$. Each shard sits behind replicas (green) that hold identical copies for throughput and availability. The pattern is the broadcast-and-gather collective of <a href="../../part-1-foundations/module-04-communication-primitives/section-4.7.html">Section 4.7</a> carrying neighbor candidates.</figcaption>
+</figure>
+
+<h2>1. Sharding: One Query, Every Shard <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>To shard an index is to partition its $N$ vectors into $S$ disjoint subsets, one per machine, so that each shard holds about $N/S$ vectors and fits in one machine's memory. The arithmetic that forces this is blunt: a billion 768-dimensional float32 vectors need about 3 TB for the raw vectors alone, more once an HNSW graph or IVF lists are added, while a large server holds a few hundred gigabytes. Splitting across sixteen or thirty-two shards brings each piece within reach. This is the same partitioning move that data shards (<a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.3.html">Section 2.3</a>) and sharded parameters (<a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>) make; the twist for retrieval is that a nearest-neighbor query has no idea in advance which shard holds its answer.</p>
+<p>Because the nearest neighbors of an arbitrary query vector can land in any shard, a correct search must consult every shard. The coordinator broadcasts the query to all $S$ shards, each runs its local approximate search and returns its own top-$k$ candidates, and the coordinator gathers the $S \times k$ candidates and keeps the best $k$ overall. This is scatter-gather, and it is the broadcast-then-gather collective from <a href="../../part-1-foundations/module-04-communication-primitives/section-4.7.html">Section 4.7</a> with nearest-neighbor candidates as the payload. The merge is correct because nearest-neighbor ranking is decomposable: the global top-$k$ by similarity is always contained in the union of the per-shard top-$k$ sets, so merging local winners never misses a global winner that a shard actually found.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Sharding Makes Search a Scatter-Gather, So Its Latency Is a Maximum</div>
+<p>A sharded query is not faster because the shards are smaller; it is parallel because the shards run at once. The coordinator cannot return until the <em>last</em> shard replies, so the query's latency is the maximum over shard latencies, not the average. Per-shard work shrinks as $1/S$, which is why sharding lets the index grow, but the end-to-end latency is governed by the slowest of $S$ independent searches. Adding shards to fit a bigger index therefore quietly raises the tail, and managing that tail is the central engineering tension of a sharded index.</p>
+</div>
+
+<h2>2. Random Versus Clustered Sharding <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>How you assign vectors to shards decides how much work each query does. The two ends of the spectrum trade balance against selectivity. Random or round-robin sharding hashes each vector to a shard independently of its content, giving every shard nearly equal size and an equal share of every query's neighbors. Load is balanced and recall is high, but the query must probe all $S$ shards, so total work does not fall as you add shards; only the per-shard slice shrinks. Clustered or semantic sharding instead groups similar vectors together, for example by the IVF coarse centroid a vector falls under, so that a query's likely neighbors concentrate in a few shards. A router then sends the query to only those shards, cutting total work sharply, at the risk of missing true neighbors that sit just across a shard boundary.</p>
+<p>The boundary risk is real and quantifiable. If a query's true neighbors straddle the edge between two clusters and the router probes only the single nearest cluster's shard, the neighbors on the far side are simply never seen, and recall drops. The standard fix is to probe the few nearest shards rather than one, the same $n_{\text{probe}}$ dial that IVF exposes within a single machine (<a href="section-25.4.html">Section 25.4</a>), now lifted to the cluster level. Probing more shards recovers recall and converges to the all-shards behavior of random sharding, at the cost of more work. Clustered sharding is therefore most attractive when the embedding space has strong cluster structure and the router can be trusted, and least attractive when queries are adversarial or the data is near-uniform.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Shard That Cried "Found It"</div>
+<p>Clustered sharding has a failure mode with a human flavor. Route every query to the one shard the router is most confident about, and that shard becomes a hotspot: it answers nearly every request while its fifteen siblings idle, like an over-eager intern who volunteers for everything and then drowns. Random sharding has the opposite personality, sixteen equally busy workers who never specialize. Most production systems sit between the two, clustering loosely and probing a handful of shards, so that no single shard believes it is the whole index.</p>
+</div>
+
+<h2>3. The Tail-Latency Problem <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Because a scatter-gather query waits for its slowest shard, the number of shards directly controls the tail of the latency distribution. Suppose each shard's search time is a random variable with cumulative distribution $F$, independent across shards. The query latency is the maximum of $S$ such variables, and its distribution is</p>
+$$P(\text{latency} \le t) = F(t)^S, \qquad \text{so} \qquad P(\text{latency} > t) = 1 - F(t)^S.$$
+<p>The probability that <em>some</em> shard exceeds a threshold $t$ grows with $S$: even if each shard is slow only one time in a hundred, with $S = 100$ shards the chance that at least one is slow on a given query is $1 - 0.99^{100} \approx 0.63$. This is the tail-latency amplification that <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.3.html">Section 5.3</a> introduced for distributed serving in general, and it is the same straggler effect that <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.7.html">Section 2.7</a> analyzed for any fan-out computation. More shards make each search cheaper but make a slow query more likely, so the median latency falls while the 99th-percentile latency can rise. A retrieval service is judged on its tail, not its median, so the shard count is bounded from above by the latency budget, not only from below by the memory budget.</p>
+<p>Mitigations are exactly the straggler remedies of <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.7.html">Section 2.7</a>, specialized to retrieval. Hedged requests send a duplicate query to a second replica of any shard that has not answered within a short delay and take whichever returns first, trimming the tail at the cost of extra load. A coordinator may also return early once it has heard from enough shards to be confident the global top-$k$ is settled, accepting a small recall loss for a bounded latency. Both are throughput-for-latency trades, and both depend on replication, which is the subject of Section 5.</p>
+
+<h2>4. A Sharded Index You Can Run <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The code below builds a 200,000-vector index, shards it, and runs scatter-gather queries, measuring three quantities at once: the per-query work (vectors searched), the recall against the exact top-$k$, and the tail latency (the maximum over shard latencies under a simple cost model). It first sweeps the shard count under random sharding, then switches to clustered sharding and sweeps how many shards each query probes, then reports how replicas multiply throughput. Everything is pure NumPy so the scatter-gather logic is visible rather than hidden inside a library.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+N, d, k = 200_000, 64, 10            # vectors in the index, dimensions, neighbors wanted
+data = rng.standard_normal((N, d)).astype(np.float32)
+queries = rng.standard_normal((300, d)).astype(np.float32)
+
+def topk(scores, k):                  # indices of the k largest scores, sorted high-first
+    idx = np.argpartition(scores, -k)[-k:]
+    return idx[np.argsort(scores[idx])[::-1]]
+
+# Exact top-k over the WHOLE index, the answer a sharded search is graded against.
+truth = [set(topk(data @ q, k).tolist()) for q in queries]
+
+# Per-shard latency model: fixed scatter overhead + per-vector work x straggler skew.
+def shard_latency(n, skew):
+    return 0.05 + n * 2.0e-6 * skew    # milliseconds (illustrative)
+
+def build(S, strategy):
+    if strategy == "random":           # round-robin-like: balanced, every shard probed
+        assign = rng.integers(0, S, size=N)
+    else:                              # clustered: group by sign bits (semantic-ish)
+        bits = int(np.log2(S))
+        code = np.zeros(N, dtype=np.int64)
+        for b in range(bits):
+            code = code * 2 + (data[:, b] > 0)
+        assign = code % S
+    return [np.where(assign == s)[0] for s in range(S)]
+
+def scatter_gather(shards, q, targets):
+    cand_idx, cand_score, lat = [], [], []
+    for s in targets:                  # scatter: each shard returns its LOCAL top-k
+        m = shards[s]
+        if m.size == 0:
+            continue
+        sc = data[m] @ q
+        loc = topk(sc, min(k, m.size))
+        cand_idx.append(m[loc]); cand_score.append(sc[loc])
+        lat.append(shard_latency(m.size, 1.0 + 0.6 * rng.random()))
+    ci = np.concatenate(cand_idx); cs = np.concatenate(cand_score)
+    merged = ci[topk(cs, k)]           # gather: coordinator merges into global top-k
+    work = sum(shards[s].size for s in targets)
+    return set(merged.tolist()), work, max(lat), sum(lat)   # tail = slowest shard
+
+print(f"{'shards':&gt;6} {'strategy':&gt;10} {'work/q':&gt;8} {'recall@10':&gt;10} {'tail ms':&gt;8} {'sum ms':&gt;8}")
+for S in [1, 4, 16, 64]:
+    sh = build(S, "random")
+    rec = wk = tail = tot = 0.0
+    for q, gt in zip(queries, truth):
+        got, work, t, sm = scatter_gather(sh, q, range(S))
+        rec += len(got &amp; gt) / k; wk += work; tail += t; tot += sm
+    n = len(queries)
+    print(f"{S:&gt;6} {'random':&gt;10} {wk/n:&gt;8.0f} {rec/n:&gt;10.3f} {tail/n:&gt;8.3f} {tot/n:&gt;8.2f}")
+
+S = 16; shc = build(S, "clustered"); bits = int(np.log2(S))
+def route(q, n_probe):                 # route to the matching shard, plus its neighbors
+    base = 0
+    for b in range(bits):
+        base = base * 2 + (1 if q[b] &gt; 0 else 0)
+    return [(base + j) % S for j in range(n_probe)]
+for n_probe in [1, 2, 4, 16]:
+    rec = wk = 0.0
+    for q, gt in zip(queries, truth):
+        got, work, t, _ = scatter_gather(shc, q, route(q, n_probe))
+        rec += len(got &amp; gt) / k; wk += work
+    n = len(queries)
+    print(f"clustered S=16, probe {n_probe:&gt;2}: work/q={wk/n:&gt;6.0f}  recall@10={rec/n:.3f}")
+
+for R in [1, 2, 4]:                    # replicas share load: throughput scales, tail unchanged
+    qps = R * 1000.0 / shard_latency(N // 16, 1.3)
+    print(f"replicas R={R}: serving throughput ~= {qps:&gt;8.0f} queries/sec (16 shards)")
+</code></pre>
+<div class="code-caption"><strong>Code 25.5.1:</strong> A sharded vector index with explicit scatter-gather. The <code>scatter_gather</code> function searches each target shard locally, merges the per-shard top-$k$ into a global top-$k$, and reports tail latency as the maximum over shard latencies. The three sweeps isolate shard count, sharding strategy, and replication.</div>
+<pre><code class="language-text">shards   strategy   work/q  recall@10  tail ms   sum ms
+     1     random   200000      1.000    0.571     0.57
+     4     random   200000      1.000    0.197     0.72
+    16     random   200000      1.000    0.089     1.32
+    64     random   200000      1.000    0.060     3.72
+
+clustered S=16, probe  1: work/q= 12490  recall@10=0.167
+clustered S=16, probe  2: work/q= 24999  recall@10=0.238
+clustered S=16, probe  4: work/q= 49985  recall@10=0.339
+clustered S=16, probe 16: work/q=200000  recall@10=1.000
+
+replicas R=1: serving throughput ~=    12121 queries/sec (16 shards)
+replicas R=2: serving throughput ~=    24242 queries/sec (16 shards)
+replicas R=4: serving throughput ~=    48485 queries/sec (16 shards)</code></pre>
+<div class="code-caption"><strong>Output 25.5.1:</strong> Random sharding holds recall at 1.000 because every shard is probed, and the tail latency per shard falls from 0.571 ms at $S=1$ to 0.060 ms at $S=64$ as each shard shrinks; the rising <code>sum ms</code> column shows total work climbing with fixed per-shard overheads. Clustered sharding cuts work from 200,000 to 12,490 vectors per query when probing one shard, but recall collapses to 0.167 because neighbors across shard boundaries are missed; probing more shards trades work back for recall until it matches random sharding at probe 16. Replicas scale throughput linearly while leaving per-query latency untouched.</div>
+<p>The output makes the three trades concrete. Shard count lowers the per-shard slice and so the per-shard tail, but the climbing <code>sum ms</code> warns that more shards mean more fixed overheads and, in a real network, more chances for a straggler. Clustered sharding's first row is the headline: a 16-fold reduction in work for a steep recall cost, recovered only by probing more shards. And replication is the clean win, multiplying throughput with no latency penalty. The catch that the cost model cannot show is the one Section 5 addresses next: keeping replicas consistent as the index is updated.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Scatter-Gather and Tail Latency Return, Carrying Vectors</div>
+<p>The all-reduce of <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a> was the book's first collective; scatter-gather is its retrieval cousin, broadcasting a query and gathering candidates instead of summing gradients. The tail-latency amplification you just measured is the same maximum-over-workers cost that bounds every fan-out computation in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.7.html">Section 2.7</a> and that <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.3.html">Section 5.3</a> taught you to measure. A sharded vector index is a clean, self-contained instance of the book's recurring lesson: partition for capacity, pay in communication and tail latency, and replicate to recover throughput. The same three-way balance reappears for sharded recommendation embeddings in <a href="../../part-8-case-studies/module-38-case-distributed-recommendation/index.html">Chapter 38</a>.</p>
+</div>
+
+<h2>5. Replication: Throughput, Availability, and Consistency <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Sharding lets the index grow but does nothing for query throughput or availability: each shard is a single point of failure, and a shard saturates once its query rate exceeds what one machine can serve. Replication answers both. Each shard is copied to $R$ machines that hold identical vectors, and the coordinator routes each query to one replica of every shard, balancing load across replicas. Throughput then scales with $R$, as Output 25.5.1 shows, because $R$ copies of a shard serve $R$ times the queries, while per-query latency is unchanged because a query still touches exactly one replica of each shard. Availability improves for the same reason: if one replica of a shard fails, the coordinator routes to another, and the index stays fully searchable as long as one replica of every shard survives.</p>
+<p>Replication's hard part is not reads but writes. A vector index is rarely static; documents are added, deleted, and re-embedded, and every update must reach all $R$ replicas of the affected shard. The system therefore faces the consistency choice of <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.3.html">Section 2.3</a>. Strong consistency makes an update visible on all replicas before acknowledging it, so every replica answers identically, at the cost of slower writes and reduced availability during a partition. Eventual consistency lets replicas apply updates asynchronously, so a freshly inserted vector may appear on one replica before another, which means two identical queries routed to different replicas can briefly return slightly different neighbors. Most vector databases choose eventual consistency for the index and accept this transient divergence, because retrieval is approximate already and a few seconds of staleness rarely changes which documents a RAG pipeline retrieves. Where freshness is critical, a common pattern keeps a small, strongly consistent buffer of very recent vectors that every query also scans, merging its results with the large eventually-consistent main index.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Sharding a RAG Index That Outgrew Its Box</div>
+<p><strong>Who:</strong> A platform engineer running the retrieval tier for an enterprise RAG assistant over internal documents.</p>
+<p><strong>Situation:</strong> The corpus grew from 40 million to 600 million chunks as more departments onboarded, and the single-node vector index began swapping to disk, pushing p99 retrieval latency past two seconds.</p>
+<p><strong>Problem:</strong> The 600-million-vector HNSW index needed roughly 1.8 TB of memory, well beyond the 512 GB on the serving box, so it could not stay on one machine.</p>
+<p><strong>Dilemma:</strong> Shard into many small pieces to fit memory comfortably and minimize per-shard search time, which raises the tail because the query waits for the slowest of many shards, or use a few large shards that keep the fan-out small but leave each shard's search slower and its memory tight.</p>
+<p><strong>Decision:</strong> They chose 12 shards with random assignment for balanced load and added 2 replicas per shard, sizing the shard count from the p99 latency budget rather than packing each machine to its memory limit.</p>
+<p><strong>How:</strong> They deployed the index in Milvus, which handles shard placement and the scatter-gather merge internally, set the replica count to 2, and enabled hedged requests so a slow shard's query was retried against its second replica after a short delay.</p>
+<p><strong>Result:</strong> p99 retrieval latency fell from 2.1 s to 95 ms, the index served three times the previous query rate from the added replicas, and a single node failure no longer took retrieval down because every shard had a live replica.</p>
+<p><strong>Lesson:</strong> Let the latency budget pick the shard count and the throughput target pick the replica count; do not pack machines to their memory ceiling and then discover the tail.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Milvus and Vespa Shard and Replicate for You</div>
+<p>Code 25.5.1 spells out scatter-gather, shard assignment, and the merge in about forty lines. Production vector databases reduce that to a few configuration values and run the scatter-gather, the global-top-$k$ merge, replica routing, and update propagation internally. In Milvus, sharding and replication are collection-level settings:</p>
+<pre><code class="language-python">from pymilvus import Collection
+
+# Milvus partitions the collection into shards at creation and serves queries
+# with an internal scatter-gather; replicas are loaded for throughput + HA.
+col = Collection("docs", shards_num=12)        # 12 index shards (set at create time)
+col.load(replica_number=2)                     # 2 replicas per shard, query-load balanced
+
+# A single search call fans out to all shards, merges the per-shard top-k, and
+# returns the global top-k. The scatter-gather of Code 25.5.1 is one line here.
+hits = col.search(query_vectors, "embedding",
+                  param={"metric_type": "IP", "params": {"nprobe": 16}},
+                  limit=10)
+</code></pre>
+<div class="code-caption"><strong>Code 25.5.2:</strong> The same sharded, replicated search as Output 25.5.1, expressed in Milvus. Roughly forty lines of explicit scatter-gather collapse to <code>shards_num</code>, <code>replica_number</code>, and one <code>search</code> call; the engine owns shard placement, the global-top-$k$ merge, replica routing, and update propagation. Vespa exposes the same controls through its <code>distribution</code> and content-group settings, and both let you tune shard count against the latency budget without touching application code.</div>
+</div>
+
+<h2>6. Balancing Throughput, Latency, Recall, and Cost <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>A sharded, replicated index is governed by four quantities that cannot all be maximized at once. Shard count $S$ sets memory headroom and per-shard search time but raises the tail; replica count $R$ sets throughput and availability but multiplies hardware cost; the sharding strategy and probe count set the work-recall trade; and the total machine count $S \times R$ sets the bill. A useful way to hold these together is to read each design choice as moving along one axis while pinning the others, exactly as Output 25.5.1 isolated shard count, then strategy, then replicas. Table 25.5.1 summarizes which knob moves which quantity, and in which direction the cost lands.</p>
+<div class="table-caption"><strong>Table 25.5.1:</strong> The four knobs of a sharded, replicated vector index and what each one trades. No single setting optimizes all four quantities, so the design is chosen against an explicit latency and cost budget.</div>
+<table>
+<thead>
+<tr><th scope="col">Knob</th><th scope="col">Raising it improves</th><th scope="col">Raising it costs</th><th scope="col">Bounded by</th></tr>
+</thead>
+<tbody>
+<tr><td>Shard count $S$</td><td>Memory headroom, per-shard search time</td><td>Higher tail latency, more fixed overhead</td><td>The p99 latency budget</td></tr>
+<tr><td>Replica count $R$</td><td>Throughput, availability</td><td>Hardware cost ($S \times R$ machines)</td><td>The query-rate target and budget</td></tr>
+<tr><td>Probe count (clustered)</td><td>Recall</td><td>More work per query, higher latency</td><td>The recall target</td></tr>
+<tr><td>Clustering strength</td><td>Selectivity (less work per query)</td><td>Recall risk at shard boundaries</td><td>Embedding cluster structure</td></tr>
+</tbody>
+</table>
+<p>The discipline this section teaches is to fix the budgets first and let them choose the knobs, not the reverse. The latency budget caps $S$, the throughput target sets $R$, the recall target sets the probe count, and the remaining freedom is spent minimizing $S \times R$. That is the same budget-first reasoning the chapter applies to retrieval as a whole, and it carries directly into the distributed hybrid search of the next section, where a second index (sparse lexical) is sharded and queried alongside the dense one and the two result sets must be merged.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Disaggregated and Out-of-Core Vector Indexes (2024 to 2026)</div>
+<p>The memory cost that forces sharding is itself under attack. Disk-based and out-of-core graph indexes in the DiskANN lineage keep most of the index on NVMe SSD and only a compressed summary in memory, so a single machine can host billions of vectors and the shard count needed for a given corpus drops sharply; recent work pushes these designs toward streaming updates and filtered search. A parallel line disaggregates storage from compute, as in systems such as Milvus 2.x and the research around serverless vector search, so that shards, replicas, and query nodes scale independently and the index can be re-sharded without re-ingesting data. On the algorithm side, learned routing and partition assignment (for example SOAR and related learned-partition methods, 2023 to 2025) aim to make clustered sharding hit higher recall at lower probe counts by partitioning vectors so that each query's neighbors concentrate in fewer shards. The common thread is loosening the memory-per-machine constraint and the work-recall trade that this section framed, so that future sharded indexes scatter to fewer shards and pay a smaller tail for the same capacity. We revisit web-scale instances of these systems in <a href="../../part-8-case-studies/module-36-case-web-scale-text-rag/index.html">Chapter 36</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.5.1: Tail Latency From Shard Count <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Assume each shard answers within its latency target with probability $p = 0.99$ on any given query, independently across shards. Using $P(\text{all fast}) = p^{S}$, compute the probability that a query is fast (no slow shard) for $S = 1, 4, 16, 64, 256$. At which shard count does more than half of all queries hit at least one slow shard? Explain in one sentence why this makes the p99 latency budget, not the memory budget, the binding constraint on shard count for a large index, and connect your answer to the maximum-over-workers cost of <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.7.html">Section 2.7</a>.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.5.2: Measure the Boundary Recall Loss <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 25.5.1 so that clustered sharding uses true $k$-means cluster assignment instead of the sign-bit code: fit $S$ centroids on the data with any simple $k$-means, assign each vector to its nearest centroid's shard, and route each query to the shards of its <code>n_probe</code> nearest centroids. Sweep <code>n_probe</code> from 1 to $S$ and plot recall against work per query. Compare the recall-versus-work curve to the sign-bit version in Output 25.5.1 and explain why a content-aware partition reaches a given recall at lower work than the crude sign-bit partition.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.5.3: Size a Sharded, Replicated Index <span class="exercise-type analysis">Analysis</span></div>
+<p>You must serve a 2-billion-vector index of 1024-dimensional float32 vectors. Each machine has 256 GB of usable memory, an HNSW index adds 40 percent overhead over the raw vectors, you must answer 8,000 queries per second, one replica of a shard sustains 1,500 queries per second, and you require at least 2 replicas of every shard for availability. Compute the minimum shard count from memory, the minimum replica count from the throughput target, the total machine count $S \times R$, and the resulting fan-out per query. Then argue, using the tail-latency model of Section 3, whether you would deploy exactly that shard count or fewer larger shards, and what you would measure first to decide.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-25.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 25.4</span><span class="nav-title">Approximate Nearest Neighbor Search</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 25</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Retrieval and Vector Search</span></a>
+<a class="next" href="section-25.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 25.6</span><span class="nav-title">Distributed Hybrid Search</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

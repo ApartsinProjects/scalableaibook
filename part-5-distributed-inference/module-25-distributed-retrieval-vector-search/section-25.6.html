@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 25.6: Distributed Hybrid Search. Why dense vector retrieval and sparse keyword retrieval miss different things, how to fuse two sharded indexes with reciprocal rank fusion, and the score-normalization and metadata-filtering trade-offs of running both at once." name="description"/>
+<title>Section 25.6: Distributed Hybrid Search | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 25: Distributed Retrieval and Vector Search</a></div>
+<h1>Distributed Hybrid Search</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"The vector index swore the answer was about meaning. The inverted index swore it was about the exact spelling of a product code. They were both right, which is why I now run both and let a referee settle it."</p>
+<cite>A Query Planner With Two Opinions</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Dense vector search and classic keyword search fail in opposite directions, so the strongest distributed retrievers run both as separate sharded systems and fuse their ranked lists into one.</strong> Embedding retrieval (Section 25.4) captures meaning, matching a paraphrase to a passage that shares no words, but it blurs the rare exact tokens (part numbers, error codes, proper names) that a user sometimes needs verbatim. A sparse inverted index, the BM25 machinery built in <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/section-6.3.html">Chapter 6</a>, nails those exact tokens but is blind to a query that means the same thing in different words. Hybrid search keeps both, which turns a single distributed retrieval problem into two distributed retrieval problems plus a fusion step: you now query a sharded vector index and a sharded inverted index in parallel, then merge two ranked lists whose scores are not on the same scale. This section is about that merge, the score-normalization headache it creates, and how metadata filtering rides along on top.</p>
+</div>
+<p>By this point in the chapter you can build a sharded approximate-nearest-neighbor index (Section 25.4) and replicate it for throughput and availability (<a href="section-25.5.html">Section 25.5</a>). That index answers "what is semantically close to this query?" extremely well, and for a great deal of retrieval-augmented generation it is enough. The trouble starts at the edges of meaning. A support agent searches for the literal string <code>E2401</code> and wants the one runbook that mentions that code; an embedding model, having never seen that token often enough to place it meaningfully, returns five passages that are vaguely about errors and none of them the right one. The same model, asked "how does the system grasp a sentence's gist?", confidently retrieves a passage that never uses the words "grasp", "sentence", or "gist", which is exactly what you wanted and exactly what a keyword index cannot do. Neither system is broken; they are tuned for different questions, and real query streams contain both.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A query fans out in parallel to a sharded dense vector index and a sharded sparse inverted index; each returns its own ranked list, and a reciprocal rank fusion step merges the two lists into one final ranked result.">
+<defs>
+<marker id="arr256" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b256 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.d256 { fill:#eaf2fb; stroke:#1f5fa6; stroke-width:1.6; }
+.s256 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.f256 { fill:#eef6ee; stroke:#2e7d4f; stroke-width:1.6; }
+.t256 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.u256 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l256 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr256); }
+</style>
+<rect class="b256" x="370" y="14" width="140" height="44" rx="10"/>
+<text class="t256" x="440" y="34">Query</text>
+<text class="u256" x="440" y="50">"E2401" or a paraphrase</text>
+<path class="l256" d="M 410 58 L 250 96"/>
+<path class="l256" d="M 470 58 L 630 96"/>
+<rect class="d256" x="70" y="100" width="360" height="120" rx="10"/>
+<text class="t256" x="250" y="122">Dense vector index (sharded)</text>
+<rect class="d256" x="92" y="138" width="96" height="62" rx="7"/>
+<text class="u256" x="140" y="166">shard 1</text><text class="u256" x="140" y="182">embeddings</text>
+<rect class="d256" x="202" y="138" width="96" height="62" rx="7"/>
+<text class="u256" x="250" y="166">shard 2</text><text class="u256" x="250" y="182">embeddings</text>
+<rect class="d256" x="312" y="138" width="96" height="62" rx="7"/>
+<text class="u256" x="360" y="166">shard S</text><text class="u256" x="360" y="182">embeddings</text>
+<rect class="s256" x="450" y="100" width="360" height="120" rx="10"/>
+<text class="t256" x="630" y="122">Sparse inverted index (sharded)</text>
+<rect class="s256" x="472" y="138" width="96" height="62" rx="7"/>
+<text class="u256" x="520" y="166">shard 1</text><text class="u256" x="520" y="182">postings</text>
+<rect class="s256" x="582" y="138" width="96" height="62" rx="7"/>
+<text class="u256" x="630" y="166">shard 2</text><text class="u256" x="630" y="182">postings</text>
+<rect class="s256" x="692" y="138" width="96" height="62" rx="7"/>
+<text class="u256" x="740" y="166">shard T</text><text class="u256" x="740" y="182">postings</text>
+<path class="l256" d="M 250 220 L 250 262 L 380 262 L 380 286"/>
+<path class="l256" d="M 630 220 L 630 262 L 500 262 L 500 286"/>
+<text class="u256" x="250" y="246">dense ranked list</text>
+<text class="u256" x="630" y="246">sparse ranked list</text>
+<rect class="f256" x="320" y="288" width="240" height="56" rx="10"/>
+<text class="t256" x="440" y="312">Reciprocal Rank Fusion</text>
+<text class="u256" x="440" y="330">merge ranks, not raw scores</text>
+</svg>
+<figcaption><strong>Figure 25.6.1:</strong> The shape of distributed hybrid search. One query fans out in parallel to two independent distributed indexes, a sharded dense vector index (Section 25.5) and a sharded sparse inverted index (<a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/section-6.3.html">Chapter 6</a>). Each scatters across its own shards, gathers a ranked list, and the fusion step combines the two lists. Working on ranks rather than raw scores sidesteps the score-normalization problem of Section 3.</figcaption>
+</figure>
+
+<h2>1. Two Retrievers, Opposite Blind Spots <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Dense retrieval encodes the query and every document into the same vector space and ranks by geometric closeness, so it scores documents on what they mean. Its strength is generalization: a query and a passage can rank highly together while sharing not a single word, because the embedding placed them near each other. That same generalization is its weakness for exact terms. A rare token (a stock-keeping unit, a hexadecimal hash, an unusual surname) appears too seldom in the training data for the model to give it a distinctive, reliable position, so it gets averaged into a fog of nearby tokens. Ask for that token literally and the dense index returns plausible neighbors instead of the exact hit.</p>
+<p>Sparse lexical retrieval is the mirror image. An inverted index maps each term to the list of documents containing it (the postings list of <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/section-6.3.html">Chapter 6</a>), and a scoring function like BM25 ranks matches by how often the query terms appear, weighted by how rare each term is across the corpus. Exact tokens are its home turf: a unique code matches exactly one document and shoots to the top. But the inverted index has no notion of meaning. Two passages that say the same thing with different words share no terms, so a paraphrased query scores zero against the document the user actually wanted. The blind spots are complementary, which is the entire argument for running both.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Hybrid Wins Because the Failures Do Not Overlap</div>
+<p>Combining two retrievers helps only when they fail on different queries. Dense search misses exact rare tokens; sparse search misses paraphrases. Because these failure sets barely intersect, a fusion that lets either system rescue a result the other missed lifts recall above both. If the two retrievers failed on the same queries, fusing them would buy nothing. The engineering question is therefore never "is dense better than sparse?" but "do their errors decorrelate enough on my query mix to justify running two distributed indexes?"</p>
+</div>
+
+<h2>2. Learned Sparse Retrieval: A Middle Ground <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Between the pure-meaning dense index and the pure-lexical inverted index sits a third option that has matured into production over the last few years: learned sparse retrieval. The idea is to keep the data structure of the inverted index (terms mapped to postings, with all its decades of distributed-serving engineering) but to let a transformer decide the term weights and, crucially, expand each document with related terms it does not literally contain. A model in the SPLADE family encodes a passage about "automobiles" and writes nonzero weights for "car" and "vehicle" into the sparse vector, so a lexical match on "car" now retrieves the "automobile" passage. The output is still a sparse vector over the vocabulary, indexable by the same sharded inverted-index infrastructure, but it carries some of the semantic generalization that used to require dense embeddings.</p>
+<p>Learned sparse retrieval does not eliminate the need for fusion. It narrows the gap, often pushing a single index to recall that previously needed dense plus sparse, but the strongest systems still fuse a learned-sparse signal with a dense one because the two encoders make different mistakes. For the distributed-systems story the important point is that learned sparse retrieval is operationally a sparse index: it shards, replicates, and serves like the inverted index of <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/section-6.3.html">Chapter 6</a>, not like the ANN index of Section 25.4. That keeps it cheap to scale out, which is a large part of why practitioners reach for it.</p>
+
+<h2>3. Fusing Two Ranked Lists <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Once both indexes have each returned a ranked list of document identifiers, you must merge them into one. The obvious approach, adding the two relevance scores, runs straight into a problem: the scores are not comparable. A cosine similarity from the dense index lives in $[-1, 1]$; a BM25 score is an unbounded positive number whose scale depends on document length and corpus statistics. Summing them lets whichever scoring system happens to produce larger numbers dominate, regardless of which retriever is actually more confident. Any score-based fusion must therefore first normalize the two score distributions onto a common scale, and that normalization is fragile because the distributions shift with every query and every corpus update.</p>
+<p>Reciprocal Rank Fusion (RRF) sidesteps the whole issue by throwing away the raw scores and keeping only the ranks. Each document gets a fused score that is the sum, over every list it appears in, of a term that decays with its rank in that list:</p>
+$$\text{RRF}(d) = \sum_{i=1}^{L} \frac{1}{k + \text{rank}_i(d)},$$
+<p>where $\text{rank}_i(d)$ is the position (starting at 1) of document $d$ in the $i$-th ranked list, $L$ is the number of lists being fused (two here), and $k$ is a small constant, conventionally 60, that damps the influence of very high ranks so the top one or two positions do not completely swamp the rest. A document ranked first in either list contributes $1/(k+1)$; a document that appears near the top of both lists accumulates two such terms and rises above documents that only one retriever liked. Because ranks are dimensionless, RRF needs no normalization and no per-corpus tuning, which is why it is the default fusion in most hybrid systems. Weighted score combination, $\alpha \cdot s_\text{dense} + (1-\alpha) \cdot s_\text{sparse}$ after normalizing each $s$, remains useful when you have labeled data to tune $\alpha$ and want to express that one retriever is generally more trustworthy, but it pays for that expressiveness with the normalization fragility RRF avoids.</p>
+<p>The code below builds both retrievers from scratch over a tiny corpus, a hashless concept-based stand-in for a dense embedding and a real BM25 over an inverted index, then fuses them with RRF and measures recall on a query mix that deliberately contains both paraphrases and exact tokens.</p>
+<pre><code class="language-python">import math, re
+from collections import Counter
+
+corpus = {
+    1: "the model weighs every token against every other to capture long range structure",
+    2: "engineers store learned vectors and serve approximate nearest neighbor lookups",
+    3: "fault E2401 signals a stalled collective on the gradient interconnect",
+    4: "the ranking function scores passages by how rare and frequent each word is",
+    5: "a system understands the gist of a sentence rather than matching letters",
+    6: "the obscure compound Zylophorb is named in exactly one forgotten note",
+    7: "balancing the keyword query load means splitting the posting lists across hosts",
+    8: "deep networks place related ideas near one another in a continuous space",
+}
+
+# A hand-built "semantic" model: meaning-bearing words map onto concept axes. It
+# generalizes across paraphrases but, like a real embedding, blurs rare tokens
+# (codes, names) by simply not placing them on any axis.
+CONCEPTS = {
+    "attention": ["model","weighs","token","capture","structure","attention","context",
+                  "long","range","distant","words","spans","attends"],
+    "vectors":   ["store","vectors","learned","embeddings","nearest","neighbor","approximate",
+                  "lookups","space","continuous","near","nearby","related","ideas","place","placed"],
+    "semantics": ["understands","gist","sentence","meaning","semantic","semantics","rather",
+                  "matching","letters","deep","networks","understand","grasp"],
+    "ranking":   ["ranking","scores","passages","rare","frequent","word","function"],
+    "sharding":  ["balancing","keyword","query","load","splitting","posting","lists","hosts"],
+}
+AXIS = {w: i for i, ws in enumerate(CONCEPTS.values()) for w in ws}
+DIM = len(CONCEPTS)
+tokenize = lambda t: re.findall(r"[a-z0-9]+", t.lower())
+
+def embed(text):
+    v = [0.0] * DIM
+    for tok in tokenize(text):
+        if tok in AXIS:                 # codes / rare names land on no axis: blurred away
+            v[AXIS[tok]] += 1.0
+    n = math.sqrt(sum(x*x for x in v)) or 1.0
+    return [x / n for x in v]
+
+doc_vecs = {d: embed(t) for d, t in corpus.items()}
+cosine = lambda a, b: sum(x*y for x, y in zip(a, b))
+
+def dense_search(query, k=5):
+    q = embed(query)
+    return sorted(corpus, key=lambda d: cosine(q, doc_vecs[d]), reverse=True)[:k]
+
+# BM25 over an inverted-index-style term statistic (the Chapter 6 posting lists).
+N = len(corpus)
+doc_tokens = {d: tokenize(t) for d, t in corpus.items()}
+doc_len = {d: len(toks) for d, toks in doc_tokens.items()}
+avgdl = sum(doc_len.values()) / N
+df = Counter(tok for toks in doc_tokens.values() for tok in set(toks))
+idf = lambda term: math.log(1 + (N - df.get(term, 0) + 0.5) / (df.get(term, 0) + 0.5))
+
+def bm25_search(query, k=5, k1=1.5, b=0.75):
+    scores = {}
+    for d in corpus:
+        tf = Counter(doc_tokens[d]); s = 0.0
+        for term in tokenize(query):
+            if term in tf:
+                f = tf[term]
+                s += idf(term) * (f*(k1+1)) / (f + k1*(1 - b + b*doc_len[d]/avgdl))
+        if s > 0:
+            scores[d] = s
+    return sorted(scores, key=scores.get, reverse=True)[:k]
+
+def rrf(rank_lists, k=60):                          # reciprocal rank fusion
+    fused = {}
+    for ranked in rank_lists:
+        for rank, doc in enumerate(ranked):
+            fused[doc] = fused.get(doc, 0.0) + 1.0 / (k + rank + 1)
+    return sorted(fused, key=fused.get, reverse=True)
+
+def hybrid_search(query, k=5):
+    return rrf([dense_search(query, k), bm25_search(query, k)])[:k]
+
+queries = [                                         # mix of paraphrase and exact-term needs
+    ("attention spans distant context", 1),         # paraphrase: zero word overlap with doc 1
+    ("grasp semantics not letters", 5),             # paraphrase: zero word overlap with doc 5
+    ("related ideas placed nearby", 8),             # paraphrase
+    ("E2401", 3),                                   # exact code, dense blurs it away
+    ("Zylophorb", 6),                               # rare exact token, dense blurs it away
+    ("posting lists keyword load", 7),              # exact keywords, sparse nails it
+]
+recall_at_k = lambda fn, k=3: sum(g in fn(q, k) for q, g in queries) / len(queries)
+print("dense  recall@3      :", f"{recall_at_k(dense_search):.2f}")
+print("sparse recall@3      :", f"{recall_at_k(bm25_search):.2f}")
+print("hybrid recall@3 (RRF):", f"{recall_at_k(hybrid_search):.2f}")
+</code></pre>
+<div class="code-caption"><strong>Code 25.6.1:</strong> Dense search, BM25 sparse search, and their RRF fusion, built from first principles over an eight-document corpus. The dense model deliberately ignores rare tokens to mimic how a real embedding blurs codes and names; the query mix pairs zero-overlap paraphrases with exact-token lookups so each retriever has a genuine blind spot.</div>
+<pre><code class="language-text">dense  recall@3      : 0.83
+sparse recall@3      : 0.83
+hybrid recall@3 (RRF): 1.00</code></pre>
+<div class="code-caption"><strong>Output 25.6.1:</strong> Each retriever alone answers five of six queries; dense misses the rare token <code>Zylophorb</code>, sparse misses the zero-overlap paraphrase about attention. Reciprocal rank fusion recovers both, reaching perfect recall on the mix without any score normalization.</div>
+<p>Output 25.6.1 is the whole argument in three numbers. Dense and sparse each score $0.83$, but on different queries, so fusing their ranked lists with the parameter-free RRF of the formula above reaches $1.00$. Nothing in the fusion step looked at a raw score; it saw only ranks, which is what let it combine a cosine similarity and a BM25 value without ever putting them on the same scale.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Search Box That Could Not Find Its Own Part Numbers</div>
+<p><strong>Who:</strong> A retrieval engineer at an industrial-parts distributor running a RAG assistant over product manuals.</p>
+<p><strong>Situation:</strong> The team had migrated from an old keyword search to a pure dense vector index, and customer-satisfaction scores for "find this exact part" queries fell sharply.</p>
+<p><strong>Problem:</strong> Embeddings answered "what bolt resists corrosion?" beautifully but returned near-misses for literal SKUs like <code>HX-4471-A</code>, the single most common query type.</p>
+<p><strong>Dilemma:</strong> Roll back to keyword search and lose the semantic gains, or keep dense and keep failing on exact codes; each pure approach sacrificed half the traffic.</p>
+<p><strong>Decision:</strong> They kept both, running the existing sharded vector index alongside a sharded inverted index and fusing the two ranked lists with RRF, exactly the structure in Figure 25.6.1.</p>
+<p><strong>How:</strong> Each query fanned out to both indexes in parallel; the inverted index resolved exact SKUs at rank 1 while the vector index handled descriptive queries, and RRF merged them with no score tuning.</p>
+<p><strong>Result:</strong> Exact-part recall returned to its old keyword-era level while descriptive-query quality stayed at the dense level, and median latency rose only by the small gap between the two indexes since they ran concurrently.</p>
+<p><strong>Lesson:</strong> When a query stream mixes "what means this?" with "find this exact string", one index will always disappoint half of it; fusing two cheap indexes beats perfecting one.</p>
+</div>
+
+<h2>4. Metadata Filtering: Pre-Filter or Post-Filter <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Real retrieval rarely asks only "what is relevant?"; it asks "what is relevant among the documents I am allowed to see, in this language, newer than last quarter?" Those constraints are metadata filters, and combining them with vector search forces a choice that has direct cost and recall consequences. Pre-filtering evaluates the metadata predicate first, then searches only the surviving subset. It guarantees that every returned result satisfies the filter and that you get a full top-$k$ of valid documents, but it fights the structure of an approximate-nearest-neighbor index: the graph or inverted-list traversal of Section 25.4 is built to walk the whole space, and confining it to a small allowed subset can wreck its efficiency or force a brute-force scan of the survivors. When the filter is highly selective (a single user's private documents), pre-filtering is usually right because the survivor set is small.</p>
+<p>Post-filtering runs the ANN search over everything, retrieves a top-$k$, then discards results that fail the predicate. It keeps the index fast because the search is unconstrained, but it risks returning fewer than $k$ valid results, or none, when the filter is selective and all the nearest neighbors happen to be filtered out. The common mitigation is to over-fetch, retrieving the top $c \cdot k$ for some cushion $c$ and filtering down, but choosing $c$ is a guess that trades latency against the chance of an underfull result. The honest summary is a trade-off table, not a winner: pre-filter when the predicate is selective and post-filter when it is permissive, and many vector databases now implement filtered ANN that interleaves the two so the traversal skips disallowed nodes as it walks. The sharding from <a href="section-25.5.html">Section 25.5</a> complicates this further, since a filter that aligns with the shard key can prune entire shards before any search runs, while a filter orthogonal to the shard key touches every shard regardless.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Learned Sparse and Unified Hybrid Retrieval (2024 to 2026)</div>
+<p>The line between dense and sparse is blurring. Learned sparse retrievers in the SPLADE lineage (Formal et al.), now widely deployed, produce vocabulary-sparse vectors with transformer-assigned term weights and document expansion, giving an inverted index much of dense retrieval's semantic reach while keeping its cheap distributed serving. A parallel push studies fusion itself: beyond fixed reciprocal rank fusion, recent work tunes per-query weighting and trains rerankers that consume both signals jointly, and benchmarks such as BEIR have made it standard to report dense, sparse, and hybrid side by side rather than crowning one. Vector engines have absorbed the trend, shipping native hybrid pipelines that run dense and learned-sparse retrieval and fuse them in a single query, so the application no longer orchestrates two systems by hand. We meet the reranking half of this story next, where a cross-encoder rescues the fused list; for the web-scale RAG setting these fused retrievers feed, see the case study in <a href="../../part-8-case-studies/module-36-case-web-scale-text-rag/index.html">Chapter 36</a>.</p>
+</div>
+
+<h2>5. The Latency Cost of Running Two Indexes <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Hybrid search buys recall with infrastructure. You now operate two distributed retrieval systems, each sharded and replicated on its own terms, and every query touches both. The saving grace is that the two are independent, so a query fans out to the dense and sparse indexes concurrently and the hybrid latency is the maximum of the two, not their sum, plus a small fusion cost. That maximum, though, is governed by the slower index and by the tail behavior of its shards: a hybrid query is not done until both its scatter-gather rounds complete, so it inherits the worst straggler from either system, the same tail-latency dynamic that <a href="section-25.5.html">Section 25.5</a> raised for a single sharded index, now doubled. The fusion step itself is cheap, merging two short ranked lists of a few hundred candidates, but the two over-fetches that feed it (each index typically returns more than the final $k$ so fusion has material to work with) widen the candidate set that any downstream reranker must process.</p>
+<p>There is also an operational tax that does not show up in a latency number. Two indexes mean two ingestion pipelines, two sharding schemes that can drift out of alignment, and two failure domains; a document added to the vector index but not yet to the inverted index is invisible to half of every hybrid query until both catch up. Keeping the two indexes consistent under a stream of updates is its own distributed-systems problem, a cousin of the dual-write consistency issues that haunt any system maintaining two copies of derived data. The payoff has to clear this combined bar, which is why hybrid search is the default for production RAG over heterogeneous corpora but overkill for a homogeneous, paraphrase-light corpus where one index already answers nearly everything.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Native Hybrid Search in Qdrant, Elasticsearch, and Vespa</div>
+<p>Code 25.6.1 hand-built two retrievers and an RRF merge in roughly fifty lines. Production vector engines expose the whole pipeline (dense query, sparse query, fusion) as a single request, and they run the two retrievals concurrently and shard them for you. Qdrant's Query API takes a list of <code>prefetch</code> branches (one dense, one sparse) and a <code>fusion=Rrf</code> step; Elasticsearch exposes the same idea through its <code>rrf</code> retriever combining a <code>knn</code> and a <code>standard</code> (BM25) retriever; Vespa expresses hybrid ranking as a rank profile that blends a <code>nearestNeighbor</code> operator with <code>bm25</code> in one query.</p>
+<pre><code class="language-python"># Qdrant: dense + sparse fan-out fused by RRF, server-side and sharded.
+from qdrant_client import QdrantClient, models
+
+client = QdrantClient(url="http://localhost:6333")
+hits = client.query_points(
+    collection_name="docs",
+    prefetch=[
+        models.Prefetch(query=dense_vec, using="dense", limit=50),    # ANN branch
+        models.Prefetch(query=sparse_vec, using="sparse", limit=50),  # learned-sparse branch
+    ],
+    query=models.FusionQuery(fusion=models.Fusion.RRF),               # the merge from Section 3
+    limit=10,
+).points
+</code></pre>
+<div class="code-caption"><strong>Code 25.6.2:</strong> The same dense-plus-sparse-plus-RRF pipeline as Code 25.6.1, now one server-side call. The engine runs both branches concurrently across shards, applies reciprocal rank fusion, and returns the merged top ten; the roughly fifty lines of manual fusion collapse to a single <code>query_points</code>, and the library owns the scatter-gather, over-fetch, and shard-level tail handling.</div>
+</div>
+<p>With both retrievers fused, the candidate list is broad and recall is high, but the very top of that list is not yet ordered with the precision a generator needs. Hybrid search optimizes for getting the right document into the candidate set; putting the single best document at rank 1 is a separate, more expensive computation. That is the job of reranking, and stacking a distributed reranker on top of the fused list is where <a href="section-25.7.html">Section 25.7</a> takes the story next.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.6.1: When Fusion Cannot Help <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Section 1 argues that hybrid search helps only when the two retrievers fail on different queries. Construct a query mix and corpus (in words, no code needed) for which dense and sparse have nearly identical recall and fusing them barely improves on either. Then describe the opposite extreme, a mix where fusion gives the largest possible lift. State, in terms of the overlap between the two failure sets, the condition under which adding a second index is worth its infrastructure cost.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.6.2: Weighted Fusion and Score Normalization <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 25.6.1 with a second fusion method: normalize each retriever's scores to $[0,1]$ with min-max scaling over its returned candidates, then combine as $\alpha \cdot s_\text{dense} + (1-\alpha) \cdot s_\text{sparse}$. Sweep $\alpha$ from 0 to 1 and plot or print recall at each value, and compare the best weighted result to RRF's $1.00$. Then construct a single query whose BM25 score is an order of magnitude larger than any cosine value and show how it distorts the unnormalized sum but not RRF. Explain in two sentences why RRF needed no $\alpha$ to tune.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.6.3: The Cost of Two Scatter-Gathers <span class="exercise-type analysis">Analysis</span></div>
+<p>A dense index is sharded across 8 nodes and a sparse index across 4 nodes. A single shard responds in 5 ms at the median but 25 ms at the 99th percentile, and a query is not complete until every shard it touches has replied. Estimate the tail latency of (a) the dense scatter-gather alone, (b) the sparse scatter-gather alone, and (c) the hybrid query that runs both concurrently and then fuses, assuming fusion adds 1 ms. State the assumption you make about shard-latency independence, and explain why the hybrid tail is closer to the maximum of the two than to their sum. Relate your answer to the tail-latency discussion in <a href="section-25.5.html">Section 25.5</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-25.5.html"><span class="nav-label">Previous</span><span class="nav-num">Section 25.5</span><span class="nav-title">Index Sharding and Replication</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 25</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Retrieval and Vector Search</span></a>
+<a class="next" href="section-25.7.html"><span class="nav-label">Next</span><span class="nav-num">Section 25.7</span><span class="nav-title">Multi-Stage Retrieval and Distributed Reranking</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

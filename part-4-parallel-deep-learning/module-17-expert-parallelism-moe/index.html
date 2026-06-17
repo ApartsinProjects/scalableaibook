@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 17: Expert Parallelism and Sparse Distributed Models. How mixture-of-experts architectures decouple parameter count from per-token compute, the gating and routing that send each token to a small subset of experts, expert parallelism that shards experts across nodes, the all-to-all that moves tokens to the device holding their expert, load balancing and capacity factors, token dropping and training stability, serving distributed MoE models, and the trade-offs against dense distributed training." name="description"/>
+<title>Chapter 17: Expert Parallelism and Sparse Distributed Models | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 17: Expert Parallelism and Sparse Distributed Models</a></div>
+<h1>Expert Parallelism and Sparse Distributed Models</h1>
+<p class="chapter-subtitle">Chapter 16 spent its energy fitting a dense model across devices: every parameter fired on every token, and the whole problem was carving that uniform computation into pieces small enough to hold. This chapter changes the model so that most of it stays asleep. A mixture-of-experts layer holds many expert sub-networks but routes each token to only a few of them, so the parameter count can grow into the trillions while the compute spent on any single token barely moves. That sparsity buys enormous capacity, and it buys a new distributed problem: the experts live on different machines, and every token must be shipped to the machine holding the expert it was routed to, computed there, and shipped back. This chapter is about that routing, the all-to-all that carries it, and the load-balancing, capacity, and stability machinery that keeps a sparse model trainable across a cluster.</p>
+</header>
+<main class="content" id="main-content">
+<figure class="chapter-hero">
+<img src="images/hero.png" alt="Conceptual illustration for Chapter 17: Expert Parallelism and Sparse Distributed Models" loading="lazy">
+</figure>
+<blockquote class="epigraph">
+<p>"They built a hundred and twenty-seven of us and promised every token a fair shake. The gate has sent me nothing for three thousand steps. I have so much capacity, and no one to spend it on."</p>
+<cite>An Expert Nobody Routed To</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A mixture-of-experts model replaces a dense layer with many expert sub-networks and a gating function that routes each token to only a small subset of them, so the total parameter count grows with the number of experts while the compute per token stays fixed at the size of the few experts it visits.</strong> The pressure that drives this chapter is the opposite of the one that drove the last. Chapter 16 fought a memory wall by cutting a fixed dense computation into shards; here the computation is no longer fixed, and the design lever is sparsity. When you train with top-$k$ routing out of $E$ experts, the model has roughly $E/k$ times the parameters of the dense layer it replaces but spends the same FLOPs per token, so capacity and cost decouple. That decoupling is the whole appeal, and it forces a new parallelism axis. Experts are too numerous to replicate, so expert parallelism places different experts on different devices, and because the gate assigns tokens to experts without regard to which device a token currently sits on, every step must physically move tokens to the device that holds their expert and move the results back. That movement is an all-to-all, the collective from Chapter 4 that this chapter promotes to a first-class training operation and the fourth dimension of the 4D parallelism Chapter 16 introduced. Routing that is free to send tokens anywhere will send too many to the popular experts and starve the rest, so the chapter develops the load-balancing losses, capacity factors, and token-dropping rules that keep the assignment roughly even and the all-to-all buffers a fixed size. It grounds the architecture in the systems that ship it, GShard, Switch Transformer, DeepSpeed-MoE, Tutel, and the open Mixtral and DeepSeek-V3 models, and it closes by weighing a sparse distributed model against the dense one of the previous chapter: more parameters per dollar of compute, but a harder communication pattern, a trickier training stability story, and a serving problem where most of the weights sit idle for most tokens yet must still be resident somewhere on the fleet.</p>
+</div>
+
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+This is the third chapter of Part IV, and it picks up exactly where the dense partitioning of <a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a> left off. There the model was dense and the engineering was about cutting a uniform computation across devices; here the model is sparse, and the engineering is about deciding, per token, which small piece of the model to run and then moving the token to wherever that piece lives. The binding constraint shifts again: not device memory and not gradient bandwidth, but the irregular, data-dependent communication of routing. The collective to watch is the all-to-all. Chapter 4 introduced it as the most general of the collectives, every rank sending a distinct message to every other rank, and here it becomes the beating heart of every MoE forward and backward pass.
+</p>
+<p>
+The nine sections fall into four groups. The first motivates the architecture and builds it: Section 17.1 contrasts dense and sparse scaling and shows why decoupling parameters from compute is worth the trouble, Section 17.2 constructs the mixture-of-experts layer, and Section 17.3 develops the routing and gating that decide where each token goes. The second group makes it distributed: Section 17.4 introduces expert parallelism that shards experts across nodes, and Section 17.5 develops the all-to-all that moves tokens to their assigned expert and the results back. The third group keeps it trainable: Section 17.6 builds the load-balancing machinery that prevents a few experts from hogging every token, and Section 17.7 develops the capacity factors, token-dropping rules, and stability tricks that bound the communication buffers and tame the optimization. The fourth group steps back to systems and judgment: Section 17.8 takes up serving a distributed MoE model where most weights are idle per token, and Section 17.9 weighs the whole sparse approach against the dense distributed training of Chapter 16.
+</p>
+<p>
+Read in order, the nine sections take you from "a dense layer wastes capacity by running every parameter on every token" to "a cluster trains and serves a model whose parameter count dwarfs its per-token compute, with tokens routed across machines by a gate and carried there by an all-to-all that the load-balancing machinery keeps from collapsing." The argument is cumulative: sparsity creates the opportunity, routing realizes it, expert parallelism distributes it, the all-to-all pays for it, and load balancing and capacity control are what keep the bargain from falling apart at scale.
+</p>
+</div>
+
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>This chapter builds directly on two earlier ones. From <a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16: Model, Pipeline, and Sharded Parallelism</a> you carry the four parallelism axes and especially the idea of mapping each axis onto the interconnect tier its collectives demand, because expert parallelism is the fourth axis that the 3D and 4D strategies of that chapter reserved a slot for, and a real frontier MoE model composes expert parallelism with the tensor, pipeline, and sharded data parallelism you learned there. From <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4: Communication Primitives for Distributed Training</a> you carry the all-to-all collective above all, since the entire routing mechanism of an MoE layer is an all-to-all that scatters tokens to their assigned experts and a second all-to-all that gathers the results, and you cannot reason about MoE communication cost without first understanding what an all-to-all moves and how it scales. The chapter assumes comfortable Python and PyTorch, a working picture of a transformer block and where its feed-forward layer sits, and the basic distributed-training vocabulary of ranks, process groups, and collectives from Part I. No prior experience with sparse models or gating networks is required; Section 17.1 motivates the architecture from the dense baseline before any expert is introduced.</p>
+</div>
+
+<div class="objectives">
+<h3>Learning Objectives</h3>
+<ul>
+<li>Contrast dense and sparse scaling, and explain how top-$k$ routing over many experts decouples a model's parameter count from the compute it spends per token.</li>
+<li>Construct a mixture-of-experts layer, identifying the experts, the gating network, and the combine step that weights and sums the selected experts' outputs.</li>
+<li>Describe token-choice and expert-choice routing, the softmax gate, and the top-$k$ selection that decides which experts each token visits.</li>
+<li>Derive expert parallelism as a sharding of distinct experts across devices, and explain why experts are partitioned rather than replicated.</li>
+<li>Trace the two all-to-all collectives that dispatch tokens to their assigned experts and combine the expert outputs back, and characterize their communication cost.</li>
+<li>Explain the load-imbalance problem and the auxiliary load-balancing loss that pushes the gate toward an even assignment across experts and machines.</li>
+<li>Reason about capacity factors, token dropping, and the stability tricks that bound the per-expert buffers and keep sparse training from diverging.</li>
+<li>Describe the challenges of serving a distributed MoE model, where most parameters are idle for any given token yet must remain resident across the fleet.</li>
+<li>Weigh the trade-offs of a sparse distributed model against a dense one, balancing parameter efficiency against communication, stability, and serving cost.</li>
+</ul>
+</div>
+
+<div class="callout key-takeaway">
+<div class="callout-title">Remember the Chapter as One Sentence</div>
+<p>If you keep one thing from this chapter, keep this: <strong>a mixture-of-experts model grows its parameter count by adding experts but holds its per-token compute fixed by routing each token to only a few of them, and distributing it means sharding those experts across machines and using an all-to-all to ship every token to the device that holds its assigned expert, with load balancing and capacity control keeping that routing from collapsing onto a handful of overworked experts</strong>. Read forward, the sections build the craft in layers: first why sparse scaling beats dense scaling at fixed compute, then the MoE layer and its gating, then expert parallelism and the all-to-all that powers it, then the load-balancing losses and capacity factors that keep it stable, and finally serving and the dense-versus-sparse trade-off. Read as a question, the chapter asks of any layer whose capacity you want to grow without paying for it on every token: how do you route each token to a small specialized piece of a much larger model, how do you spread those pieces across a cluster, and how do you move tokens to their pieces without the communication or the imbalance erasing the win. The roadmap below walks the nine sections that answer it.</p>
+</div>
+
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num">17.1</span>
+<a class="section-title" href="section-17.1.html">Dense vs Sparse Scaling</a>
+<span class="section-desc">Contrasts growing a model by enlarging every dense layer with growing it by adding sparsely activated experts, and shows how the sparse route decouples parameter count from per-token compute.</span>
+</li>
+<li>
+<span class="section-num">17.2</span>
+<a class="section-title" href="section-17.2.html">The Mixture-of-Experts Layer</a>
+<span class="section-desc">Constructs the MoE layer from its experts, gating network, and combine step, replacing a transformer's dense feed-forward block with many specialists that only a few tokens ever visit.</span>
+</li>
+<li>
+<span class="section-num">17.3</span>
+<a class="section-title" href="section-17.3.html">Routing and Gating</a>
+<span class="section-desc">Develops the gating function, the softmax over experts, and the top-$k$ selection, comparing token-choice and expert-choice routing and what each does to load and quality.</span>
+</li>
+<li>
+<span class="section-num">17.4</span>
+<a class="section-title" href="section-17.4.html">Expert Parallelism: Sharding Experts Across Nodes</a>
+<span class="section-desc">Introduces the parallelism axis that places different experts on different devices, explaining why experts are partitioned rather than replicated and how this composes with the other axes.</span>
+</li>
+<li>
+<span class="section-num">17.5</span>
+<a class="section-title" href="section-17.5.html">All-to-All Communication for Token Routing</a>
+<span class="section-desc">Develops the pair of all-to-all collectives that dispatch each token to the device holding its assigned expert and combine the expert outputs back, and characterizes their communication cost.</span>
+</li>
+<li>
+<span class="section-num">17.6</span>
+<a class="section-title" href="section-17.6.html">Load Balancing Across Experts</a>
+<span class="section-desc">Builds the auxiliary load-balancing loss and routing constraints that push the gate toward an even assignment across experts and machines, preventing a few experts from absorbing every token.</span>
+</li>
+<li>
+<span class="section-num">17.7</span>
+<a class="section-title" href="section-17.7.html">Capacity Factors, Token Dropping, and Stability</a>
+<span class="section-desc">Develops the capacity factor that bounds each expert's per-step buffer, the token-dropping rule it implies, and the tricks that keep sparse routing from destabilizing training.</span>
+</li>
+<li>
+<span class="section-num">17.8</span>
+<a class="section-title" href="section-17.8.html">Serving Distributed MoE Models</a>
+<span class="section-desc">Takes up inference for a sparse model, where most parameters sit idle for any given token yet must remain resident across the fleet, and the routing and placement choices that follow.</span>
+</li>
+<li>
+<span class="section-num">17.9</span>
+<a class="section-title" href="section-17.9.html">Trade-Offs vs Dense Distributed Models</a>
+<span class="section-desc">Weighs the sparse approach against the dense distributed training of Chapter 16, balancing parameter efficiency against communication, stability, and serving cost.</span>
+</li>
+</ul>
+
+<p>Read the nine sections in order and you will hold a working blueprint for training and serving a model whose effective size is decoupled from the compute it spends on any single token: <a href="section-17.1.html">Section 17.1</a> establishes why sparse scaling pays, <a href="section-17.2.html">Sections 17.2</a> and <a href="section-17.3.html">17.3</a> build the MoE layer and its gate, <a href="section-17.4.html">Sections 17.4</a> and <a href="section-17.5.html">17.5</a> distribute the experts and route tokens to them with an all-to-all, and <a href="section-17.6.html">Sections 17.6</a> through <a href="section-17.9.html">17.9</a> balance the load, bound the capacity, serve the result, and weigh it all against the dense model. The thread to watch is the all-to-all of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> stepping into the center of the training loop, and the data parallelism of <a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a> giving way to a routing problem where the work a device does depends on where the gate decided to send each token.</p>
+
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>This chapter and the two before it assumed a cluster that stays the same size for the whole run: a fixed set of devices, each holding its assigned shard or expert, all present from the first step to the last. Real training at this scale does not get that luxury. Nodes fail, preemptible instances vanish with a moment's warning, and a job that holds thousands of accelerators for weeks will lose some of them. <a href="../module-18-elastic-fault-tolerant-training/index.html">Chapter 18: Elastic and Fault-Tolerant Distributed Training</a> takes up training that survives a changing cluster: checkpointing that lets a job resume without losing days of work, elastic schedulers that grow and shrink the worker set, and the recovery protocols that rebuild the parallelism layout you spent these three chapters constructing after a device drops out. Read it next, and watch the static device map of expert and sharded parallelism become something that has to heal itself while the loss keeps going down.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+<h3 class="bib-category">Foundations of Sparse Mixture-of-Experts</h3>
+<div class="bib-entry-card">
+<p class="bib-ref">Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le, Q., Hinton, G., Dean, J. "Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer." arXiv:1701.06538, 2017. <a href="https://arxiv.org/abs/1701.06538" target="_blank" rel="noopener">arxiv.org/abs/1701.06538</a></p>
+<p class="bib-annotation">The paper that introduced the sparsely-gated MoE layer, top-$k$ routing, and the load-balancing loss, the architectural foundation for Sections 17.2 and 17.3.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Clark, A., de las Casas, D., Guy, A., Mensch, A., Paganini, M., Hoffmann, J., et al. "Unified Scaling Laws for Routed Language Models." arXiv:2202.01169, 2022. <a href="https://arxiv.org/abs/2202.01169" target="_blank" rel="noopener">arxiv.org/abs/2202.01169</a></p>
+<p class="bib-annotation">The study that derives scaling laws for routed (MoE) models and quantifies how parameter count and per-token compute decouple, the analytical backbone of Section 17.1.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<h3 class="bib-category">Routing, Load Balancing, and Stability</h3>
+<div class="bib-entry-card">
+<p class="bib-ref">Fedus, W., Zoph, B., Shazeer, N. "Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity." arXiv:2101.03961, 2021. <a href="https://arxiv.org/abs/2101.03961" target="_blank" rel="noopener">arxiv.org/abs/2101.03961</a></p>
+<p class="bib-annotation">The work that simplified routing to top-1, introduced the capacity factor and token dropping, and stabilized large MoE training, the direct basis for Sections 17.3 and 17.7.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Zhou, Y., Lei, T., Liu, H., Du, N., Huang, Y., Zhao, V., Dai, A., Chen, Z., Le, Q., Laudon, J. "Mixture-of-Experts with Expert Choice Routing." arXiv:2202.09368, 2022. <a href="https://arxiv.org/abs/2202.09368" target="_blank" rel="noopener">arxiv.org/abs/2202.09368</a></p>
+<p class="bib-annotation">The paper that inverts the routing direction so experts choose tokens, giving perfect load balance by construction, the expert-choice alternative compared in Sections 17.3 and 17.6.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<h3 class="bib-category">Distributed MoE Systems</h3>
+<div class="bib-entry-card">
+<p class="bib-ref">Lepikhin, D., Lee, H., Xu, Y., Chen, D., Firat, O., Huang, Y., Krikun, M., Shazeer, N., Chen, Z. "GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding." arXiv:2006.16668, 2020. <a href="https://arxiv.org/abs/2006.16668" target="_blank" rel="noopener">arxiv.org/abs/2006.16668</a></p>
+<p class="bib-annotation">The system that scaled MoE to 600 billion parameters with automatic sharding and the all-to-all dispatch-and-combine pattern, the basis for the expert parallelism of Sections 17.4 and 17.5.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Rajbhandari, S., Li, C., Yao, Z., Zhang, M., Aminabadi, R. Y., Awan, A. A., Rasley, J., He, Y. "DeepSpeed-MoE: Advancing Mixture-of-Experts Inference and Training to Power Next-Generation AI Scale." arXiv:2201.05596, 2022. <a href="https://arxiv.org/abs/2201.05596" target="_blank" rel="noopener">arxiv.org/abs/2201.05596</a></p>
+<p class="bib-annotation">The framework that pairs expert parallelism with optimized MoE inference and distillation, a primary reference for the distributed training and serving of Sections 17.4 and 17.8.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Hwang, C., Cui, W., Xiong, Y., Yang, Z., Liu, Z., Hu, H., et al. "Tutel: Adaptive Mixture-of-Experts at Scale." arXiv:2206.03382, 2022. <a href="https://arxiv.org/abs/2206.03382" target="_blank" rel="noopener">arxiv.org/abs/2206.03382</a></p>
+<p class="bib-annotation">The system that makes the all-to-all and expert placement adaptive at runtime to handle dynamic load, deepening the communication discussion of Section 17.5.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">DeepSeek-AI. "DeepEP: An Efficient Expert-Parallel Communication Library." GitHub, 2025. <a href="https://github.com/deepseek-ai/DeepEP" target="_blank" rel="noopener">github.com/deepseek-ai/DeepEP</a></p>
+<p class="bib-annotation">An open communication library specialized for the dispatch-and-combine all-to-all of expert parallelism, a current production reference for the routing kernels of Section 17.5.</p>
+<span class="bib-meta">🛠️ Tool</span>
+</div>
+<h3 class="bib-category">Open Frontier MoE Models</h3>
+<div class="bib-entry-card">
+<p class="bib-ref">Jiang, A. Q., Sablayrolles, A., Roux, A., Mensch, A., Savary, B., Bamford, C., et al. "Mixtral of Experts." arXiv:2401.04088, 2024. <a href="https://arxiv.org/abs/2401.04088" target="_blank" rel="noopener">arxiv.org/abs/2401.04088</a></p>
+<p class="bib-annotation">The open-weight sparse MoE language model with eight experts and top-2 routing, a concrete reference architecture for the layer, routing, and serving of Sections 17.2 and 17.8.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">DeepSeek-AI. "DeepSeek-V3 Technical Report." arXiv:2412.19437, 2024. <a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">arxiv.org/abs/2412.19437</a></p>
+<p class="bib-annotation">The report behind a frontier fine-grained MoE model with shared experts and auxiliary-loss-free load balancing, the current state of the art for Sections 17.6 and 17.9.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="../index.html"><span class="nav-label">Previous</span><span class="nav-num">Part IV</span><span class="nav-title">Parallel Deep Learning and Large Models</span></a>
+<a class="up" href="../index.html"><span class="nav-label">Part IV</span><span class="nav-num">Contents</span><span class="nav-title">Parallel Deep Learning and Large Models</span></a>
+<a class="next" href="section-17.1.html"><span class="nav-label">Next</span><span class="nav-num">Section 17.1</span><span class="nav-title">Dense vs Sparse Scaling</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

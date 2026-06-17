@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 14.5: Communication Constraints. Why bandwidth is even scarcer in federated learning than in the datacenter, and how local computation, update compression, and partial participation drive total communication down." name="description"/>
+<title>Section 14.5: Communication Constraints | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Distributed Machine Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 14: Federated and Decentralized Learning</a></div>
+<h1>Communication Constraints</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"In the datacenter I complained about a slow link. Then I joined a phone on a metered cellular plan and learned what slow really costs."</p>
+<cite>A Gradient That Now Travels by Cell Tower</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>In federated learning the network, not the processor, is the binding constraint, and it is far harsher than any datacenter link: clients sit behind slow, metered, asymmetric, and intermittently available connections, so the only quantity worth optimizing is total communication, the number of rounds multiplied by the bytes moved in each one.</strong> A datacenter all-reduce runs over a dedicated hundred-gigabit fabric between machines that never leave; a federated round runs over a phone's cellular uplink, where the device might vanish mid-update and every megabyte may cost the user money. This section makes that asymmetry concrete, shows that the local-update strategy from <a href="section-14.3.html">Section 14.3</a> is the primary lever for shrinking the round count, and pairs it with the compression toolkit from <a href="../module-10-distributed-optimization/section-10.7.html">Chapter 10</a>, now applied to the download as well as the upload. The running tension is that the same local work that saves communication also worsens the client-drift problem of <a href="section-14.4.html">Section 14.4</a>, so the engineering is a balance, not a free lunch.</p>
+</div>
+<p>Every distributed-training method in this book pays a communication tax, and <a href="../module-10-distributed-optimization/index.html">Chapter 10</a> spent considerable effort teaching you to measure and reduce it. Federated learning inherits that tax and then multiplies it. The workers are no longer racks of identical accelerators wired together by a switch the operator controls; they are millions of phones, laptops, and sensors connected to the coordinator through whatever consumer internet link they happen to have. That single change of setting turns communication from one cost among several into the dominant cost, the one that decides whether a federated system is practical at all. The previous section showed that statistical heterogeneity (non-IID data) limits how aggressive you can be; this section shows why you are forced to be aggressive in the first place.</p>
+
+<h2>1. Why Federated Bandwidth Is in a Different League <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Consider the gap quantitatively. Inside a datacenter, two training nodes typically talk over a link rated at tens to hundreds of gigabits per second, the link is always up, and it is symmetric, meaning upload and download run at the same rate. A federated client lives in a different universe. Its uplink might be a few megabits per second on a congested cellular network, the connection drops whenever the user walks into an elevator or a tunnel, and the link is sharply asymmetric: consumer broadband and mobile networks are engineered for downloading, so the upload path, which is exactly the path a client uses to send its model update, is often four to ten times slower than the download path. On top of all that, the bytes are frequently metered, so communication is not merely slow but literally expensive to the person who owns the device.</p>
+<p>These properties stack into three distinct hard constraints that no amount of faster computation on the device can relieve. First, the per-round latency is high and variable, so each additional round of the protocol is costly in wall-clock time. Second, the bytes per round are precious, especially on the upload, so each update must be made as small as possible. Third, clients are intermittently available and may drop mid-round, so the protocol cannot assume that everyone who started a round will finish it. The federated objective that follows from these constraints is blunt: <strong>minimize total communication</strong>, where total communication is the product of how many rounds you run and how many bytes cross the network in each one.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Federated Cost Function Is Rounds Times Bytes, Not FLOPs</div>
+<p>In the datacenter you optimize compute throughput and treat communication as overhead to overlap away. In federated learning the roles invert. Local computation on the device is comparatively cheap and, crucially, free to the coordinator, while every byte that crosses the network is slow, possibly metered, and at risk of being lost to a dropped connection. The lever this hands you is unusual and powerful: you are allowed, even encouraged, to do far more computation per communication than you ever would in the datacenter, because computation is the currency you spend to buy fewer, smaller messages.</p>
+</div>
+
+<h2>2. The Total-Communication Cost Model <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Make the objective precise so it can be optimized. A federated run consists of $R$ rounds. In each round the server pushes the current model to a sampled set of clients (the download) and collects an update back from each (the upload). Let $S$ be the size in bytes of one model-sized message, let $\rho_{\downarrow}$ and $\rho_{\uparrow}$ be the compression ratios on the download and upload paths (a ratio of $1$ means no compression, $\tfrac{1}{4}$ means a fourfold shrink), and let $m$ be the number of clients that participate in a round. The total bytes that move across all clients over the whole run is</p>
+$$\text{Total Communication} \;=\; R \cdot m \cdot S \cdot \big(\rho_{\downarrow} + \rho_{\uparrow}\big).$$
+<p>Every federated communication technique attacks one factor of this product, and naming them this way turns a grab bag of tricks into a single coherent menu. You shrink $R$ by doing more local computation per round, the FedAvg lever from <a href="section-14.3.html">Section 14.3</a>. You shrink $S(\rho_{\downarrow}+\rho_{\uparrow})$ by compressing the messages through quantization or sparsification, the toolkit of <a href="../module-10-distributed-optimization/section-10.7.html">Chapter 10</a>, now applied to both directions because the device pays for the download too. You shrink $m$, or rather keep it small relative to the client population, through client sampling and partial participation, so that the millions of devices in the population do not all transmit every round. The asymmetry of the network means the $\rho_{\uparrow}$ term usually dominates the wall-clock pain even when the byte counts look balanced, so compression effort is best spent on the upload first.</p>
+<p>This is the same family of reasoning as the communication-cost models of <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.8.html">Chapter 3</a> and the communication-efficient SGD lower bounds of <a href="../module-10-distributed-optimization/section-10.9.html">Chapter 10</a>; the difference is only that the per-byte and per-round constants are far larger here, which pushes the optimal operating point toward many local steps and heavy compression. Figure 14.5.1 lays out the trade-off the rest of the section explores.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left panel plots total bytes to reach a target against local epochs per round, a curve that drops steeply then flattens. Right panel shows a server pushing a compressed model down a fast link to a phone and the phone pushing a smaller compressed update up a slow, narrow link.">
+<defs>
+<marker id="arr145" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b145 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w145 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.t145 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s145 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.ax145 { fill:none; stroke:#5a626c; stroke-width:1.4; }
+.cv145 { fill:none; stroke:#b86b1f; stroke-width:2.4; }
+.l145 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr145); }
+.thin145 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr145); stroke-dasharray:1 0; }
+</style>
+<text class="t145" x="220" y="26">Total bytes vs local work per round</text>
+<line class="ax145" x1="80" y1="280" x2="380" y2="280"/>
+<line class="ax145" x1="80" y1="60" x2="80" y2="280"/>
+<text class="s145" x="230" y="305">local epochs per round (more compute) &#8594;</text>
+<text class="s145" x="40" y="170" transform="rotate(-90 40 170)">total bytes to target &#8594;</text>
+<path class="cv145" d="M 100 80 C 140 130, 150 230, 230 255 C 300 270, 340 273, 360 274"/>
+<circle cx="110" cy="92" r="4" fill="#b86b1f"/>
+<text class="s145" x="150" y="92">few epochs: many rounds, huge total</text>
+<circle cx="230" cy="255" r="4" fill="#b86b1f"/>
+<text class="s145" x="300" y="240">more epochs: far fewer rounds</text>
+<text class="s145" x="300" y="292" fill="#9a4242">too many: drift erodes the gains</text>
+<text class="t145" x="650" y="26">One round over an asymmetric link</text>
+<rect class="b145" x="560" y="60" width="180" height="56" rx="8"/>
+<text class="t145" x="650" y="84">Coordinator</text>
+<text class="s145" x="650" y="102">aggregates m updates</text>
+<rect class="w145" x="600" y="250" width="100" height="56" rx="8"/>
+<text class="t145" x="650" y="274">Client</text>
+<text class="s145" x="650" y="292">phone, metered link</text>
+<path class="l145" d="M 610 116 L 610 246"/>
+<text class="s145" x="540" y="155">download:</text>
+<text class="s145" x="540" y="171">model (fast,</text>
+<text class="s145" x="540" y="187">compressed)</text>
+<path class="l145" d="M 692 246 L 692 116"/>
+<text class="s145" x="788" y="155">upload:</text>
+<text class="s145" x="788" y="171">update (slow,</text>
+<text class="s145" x="788" y="187">narrow, costly)</text>
+<rect x="686" y="130" width="12" height="102" fill="none" stroke="#9a4242" stroke-width="1.2" stroke-dasharray="3 3"/>
+<text class="s145" x="650" y="338">the narrow upload path usually dominates the round's wall-clock cost</text>
+</svg>
+<figcaption><strong>Figure 14.5.1:</strong> The two faces of the federated communication problem. Left: total bytes to reach a target accuracy fall steeply as you do more local computation per round (fewer rounds), then flatten, and eventually the client drift of <a href="section-14.4.html">Section 14.4</a> erodes the gains. Right: a single round crosses an asymmetric link, where the upload of the client's update travels a far narrower, costlier path than the model download, so compression effort is spent on the upload first.</figcaption>
+</figure>
+
+<h2>3. Doing More Locally: The Primary Lever <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The single most effective way to cut total communication is to attack the $R$ factor by having each client perform more local computation before it reports back. This is precisely the FedAvg idea from <a href="section-14.3.html">Section 14.3</a>: instead of one gradient step per communication, as in vanilla synchronous SGD, each client runs several local epochs over its own data and sends only the resulting model change. If five local epochs let the global model reach a target in a fifth of the rounds, you have cut the round count, and therefore the latency-bound part of the cost and a large share of the bytes, by roughly fivefold for free, because that local computation never touched the network.</p>
+<p>The catch is the tension named in <a href="section-14.4.html">Section 14.4</a>. More local steps mean each client walks further toward the optimum of <em>its own</em> shard, which on non-IID data is not the global optimum. The local models drift apart, their average is a worse global model, and past some point adding local epochs stops buying you fewer rounds and starts costing you accuracy. The right number of local epochs is therefore a tuned quantity that depends on how heterogeneous the clients are: homogeneous data tolerates many local steps, sharply non-IID data tolerates few. The demonstration below measures exactly this curve, and the compression effect layered on top of it.</p>
+<pre><code class="language-python">import numpy as np
+
+# A toy federated logistic-regression task: 100 clients hold disjoint shards of
+# data from one global distribution, a server runs FedAvg-style rounds. We ask
+# the same question a federated engineer asks: how much TOTAL communication
+# (rounds x bytes/round) does it take to reach a target model quality?
+rng = np.random.default_rng(7)
+N, d, C = 20_000, 30, 100              # examples, features, clients
+X = rng.standard_normal((N, d))
+w_true = rng.standard_normal(d)
+p = 1.0 / (1.0 + np.exp(-(X @ w_true)))
+y = (rng.random(N) < p).astype(float)
+shards = np.array_split(rng.permutation(N), C)
+
+sigmoid = lambda z: 1.0 / (1.0 + np.exp(-z))
+
+def grad(w, idx):                      # local mini-batch gradient on one client
+    Xi, yi = X[idx], y[idx]
+    return Xi.T @ (sigmoid(Xi @ w) - yi) / len(idx)
+
+def loss(w):                           # global logistic loss (server-side probe)
+    z = X @ w
+    return float(np.mean(np.log1p(np.exp(-np.abs(z))) + np.maximum(z, 0) - y * z))
+
+FLOATS = d                             # numbers in one model-update vector
+BYTES_FP32 = FLOATS * 4               # uncompressed update, 4 bytes per value
+BYTES_INT8 = FLOATS * 1 + 8           # 8-bit quantized value + scale header
+
+def run(local_epochs, compress, target=0.255, max_rounds=300,
+        lr=0.3, clients_per_round=10):
+    w = np.zeros(d)
+    up = down = 0
+    for r in range(1, max_rounds + 1):
+        chosen = rng.choice(C, size=clients_per_round, replace=False)
+        deltas, sizes = [], []
+        for c in chosen:
+            idx = shards[c]
+            wc = w.copy()
+            for _ in range(local_epochs):          # MORE local computation here
+                wc -= lr * grad(wc, idx)
+            deltas.append(wc - w)
+            sizes.append(len(idx))
+            b = BYTES_INT8 if compress else BYTES_FP32
+            down += b                              # server -> client model push
+            up += b                                # client -> server update
+        agg = np.average(np.array(deltas), axis=0, weights=np.array(sizes, float))
+        if compress:                               # emulate 8-bit round-trip loss
+            scale = np.max(np.abs(agg)) / 127.0 + 1e-12
+            agg = np.round(agg / scale) * scale
+        w += agg
+        if loss(w) <= target:
+            return r, up, down
+    return max_rounds, up, down
+
+print(f"{'local_epochs':>12} {'compress':>9} {'rounds':>7} "
+      f"{'up_KB':>8} {'down_KB':>8} {'total_KB':>9}")
+for le in (1, 5, 20):
+    for comp in (False, True):
+        r, up, dn = run(le, comp)
+        print(f"{le:>12} {str(comp):>9} {r:>7} "
+              f"{up/1024:>8.1f} {dn/1024:>8.1f} {(up+dn)/1024:>9.1f}")
+</code></pre>
+<div class="code-caption"><strong>Code 14.5.1:</strong> A from-scratch FedAvg loop instrumented to count bytes. It sweeps the number of local epochs per round (the $R$-shrinking lever) crossed with 8-bit quantization of every message (the $S\rho$-shrinking lever), and reports the rounds and kilobytes needed to drive the global loss below a fixed target.</div>
+<pre><code class="language-text">local_epochs  compress  rounds    up_KB  down_KB  total_KB
+           1     False     222    260.2    260.2     520.3
+           1      True     222     82.4     82.4     164.8
+           5     False      45     52.7     52.7     105.5
+           5      True      45     16.7     16.7      33.4
+          20     False      13     15.2     15.2      30.5
+          20      True      12      4.5      4.5       8.9
+</code></pre>
+<div class="code-caption"><strong>Output 14.5.1:</strong> Going from one local epoch to twenty cuts the rounds from 222 to about 13, a roughly seventeenfold drop in total bytes on its own, because the local work never crossed the network. Layering 8-bit compression on top multiplies the saving: the cheapest configuration moves 8.9 KB versus the baseline 520.3 KB, a reduction of roughly 58 times, reaching the same target loss.</div>
+<p>Read the two levers separately in the table. Moving down the <code>local_epochs</code> column collapses the round count, which is the dominant effect: twenty local epochs reach the target in 13 rounds instead of 222. Moving across the <code>compress</code> column shrinks every message by about a factor of three, independently of how many rounds you run. The two multiply, so the combination is what makes the difference between a protocol that is merely expensive and one that is genuinely deployable on a metered phone. Notice also that with twenty local epochs the table is already near the flat part of the Figure 14.5.1 curve; pushing further would invite the drift penalty rather than further savings, which is why this is a tuned operating point and not an unbounded "more is better".</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Keyboard Model That Ran Out of Data Plan</div>
+<p><strong>Who:</strong> A mobile-platform machine learning engineer training a next-word prediction model across a fleet of consumer phones.</p>
+<p><strong>Situation:</strong> A federated training job synchronized every client after a single local epoch, in the comfortable rhythm of a datacenter run.</p>
+<p><strong>Problem:</strong> The job needed hundreds of rounds to converge, and each round pushed and pulled a full-precision model over cellular uplinks, generating support complaints about data-plan usage and stalling whenever clients dropped mid-round.</p>
+<p><strong>Dilemma:</strong> Add more local epochs to cut the round count, which risks the client drift of <a href="section-14.4.html">Section 14.4</a> on each user's idiosyncratic typing, or compress the updates, which adds engineering and a small accuracy hit, or both at once.</p>
+<p><strong>Decision:</strong> They turned both free knobs first, raising local epochs to a tuned five and quantizing every message to 8 bits, holding local epochs back from the aggressive end because typing data is sharply non-IID per user.</p>
+<p><strong>How:</strong> They configured a compressing aggregation strategy and a low participation fraction in their federated framework, exactly the $m$ and $S\rho$ levers of the Section 2 cost model, and measured total bytes per client as the headline metric.</p>
+<p><strong>Result:</strong> Total communication per client fell by more than an order of magnitude, matching the shape of Output 14.5.1, the data-plan complaints stopped, and final accuracy was within noise of the uncompressed baseline.</p>
+<p><strong>Lesson:</strong> Turn the cheap knobs (compression, participation) to their limit and the expensive one (local epochs) only as far as the drift budget allows; on non-IID device data that budget is small, so compression carries most of the saving.</p>
+</div>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Communication Is the Tax, Even Here</div>
+<p>Chapter 1 framed the whole book around a single claim: distribution buys you scale, and communication is the tax you pay for it. Federated learning is that claim taken to its extreme. The workers are weaker, the links are slower, and the network is the one resource you cannot upgrade, so the tax dominates everything. Every technique in this section, more local computation, compressed updates, partial participation, is the same move the book makes everywhere, pushing work off the wire and onto the processor. What changes is only the exchange rate: here a byte saved is worth far more than a FLOP spent, and the algorithms bend hard in that direction.</p>
+</div>
+
+<h2>4. Compressing the Update, in Both Directions <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Reducing the rounds shrinks one factor of the cost; shrinking each message shrinks the other. The compression toolkit is the same one developed for datacenter SGD in <a href="../module-10-distributed-optimization/section-10.7.html">Chapter 10</a>, and it comes in two complementary families. Quantization sends each value in fewer bits: the 8-bit scheme in Code 14.5.1 replaces a 4-byte float with a single byte plus a shared scale, and more aggressive schemes push toward a handful of bits or even signed-single-bit updates. Sparsification sends only the largest-magnitude entries of the update and zeros the rest, often with error feedback so that the dropped mass is accumulated and sent in a later round rather than lost. The two compose, and in practice federated systems use both.</p>
+<p>The federated twist is that compression must run on the download as well as the upload. In datacenter all-reduce the question is symmetric and you tend to think of one direction. Here the device pays, in time and sometimes in money, to receive the model each round, so a serious system compresses the server-to-client push too, for instance by sending only the change since the client last synchronized, or by distributing a quantized model. Because the upload path is the narrow one, as Figure 14.5.1 stresses, the heaviest compression is reserved for the client's outgoing update, while the download can sometimes ride a faster pipe with lighter compression. The general principle is to spend your compression budget where the link is slowest.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Flower and TensorFlow Federated Handle the Wire</div>
+<p>Code 14.5.1 hand-rolls the round loop, the byte accounting, and the quantizer to expose the mechanism. A production federated stack hides all of it. In the <a href="https://flower.ai/">Flower</a> framework you implement a client's local training and the server's aggregation as two small classes, and the framework manages client sampling, the round protocol, dropped-client handling, and serialization of the updates over the network. A compressing strategy that would be dozens of lines of manual quantization and error-feedback bookkeeping becomes a configured aggregation strategy:</p>
+<pre><code class="language-python">import flwr as fl
+
+# The server side: pick a built-in strategy, set the participation fraction,
+# and let the framework run rounds, sample clients, and aggregate updates.
+strategy = fl.server.strategy.FedAvg(
+    fraction_fit=0.01,          # sample ~1% of available clients per round (small m)
+    min_fit_clients=10,
+    min_available_clients=100,  # wait until enough devices have checked in
+)
+fl.server.start_server(
+    config=fl.server.ServerConfig(num_rounds=50),
+    strategy=strategy,          # swap for a compressing strategy to shrink bytes
+)
+</code></pre>
+<div class="code-caption"><strong>Code 14.5.2:</strong> The whole round-management and client-sampling machinery of Code 14.5.1, expressed as a few lines of Flower configuration. The <code>fraction_fit</code> knob is the $m$ lever from the cost model; the strategy object is where quantization or sparsification plugs in, and the framework handles transport, dropped clients, and aggregation internally.</div>
+</div>
+
+<h2>5. Sampling Clients and Surviving Dropouts <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The third factor, $m$, is controlled by partial participation. A cross-device federated population may number in the millions, and there is neither a need nor any way to involve all of them each round. Instead the server samples a small subset, often a fraction of a percent, runs a round with just those, and samples a fresh subset next time. Because the sampled clients are an unbiased draw, their averaged update is a stochastic estimate of what the full population would have produced, much as a mini-batch estimates the full-data gradient, so the math of FedAvg carries over with a little extra variance. Keeping $m$ small is what makes the total-communication product manageable at population scale.</p>
+<p>Partial participation also has to coexist with the brutal availability reality of real devices: a phone only joins when it is idle, charging, and on an unmetered network, and it can drop out of a round at any moment when those conditions change. The protocol therefore over-samples slightly, accepts updates only from the clients that actually finish, and treats the dropouts as if they were simply never sampled. This intermittent, lossy participation is a defining feature of the federated setting and the reason the secure-aggregation protocols of the next section must be explicitly robust to clients vanishing mid-round. The combination of small $m$, many local steps, and compressed messages is what carries a federated system from a theoretical possibility to something that runs on real handsets.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Model That Only Trains at Night</div>
+<p>Eligible federated clients are essentially a clock. A device only volunteers when it is idle, charging, and on an unmetered network, and almost nobody meets all three conditions at two in the afternoon, while tens of millions of phones meet them at three in the morning. The global model therefore does most of its learning overnight, in whatever time zone is currently asleep, and the round schedule has to chase the darkness around the planet. Communication constraints here are not only about how fast the bandwidth is; they are about when the bandwidth is even allowed to exist.</p>
+</div>
+
+<h2>6. The Round-Efficiency Versus Drift Trade-off <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Pulling the threads together gives the central design decision of communication-efficient federated learning. You want to minimize $R \cdot m \cdot S(\rho_{\downarrow}+\rho_{\uparrow})$, and you have four knobs: local epochs (lowers $R$), compression (lowers $S\rho$), participation fraction (sets $m$), and the target accuracy itself. Three of those knobs are nearly free to turn. The fourth, local epochs, is the powerful one, and it is the one that fights back, because every extra local step worsens the client drift of <a href="section-14.4.html">Section 14.4</a> on non-IID data. The optimal configuration is the point where the marginal round you save by adding local work is no longer worth the accuracy you lose to drift, and that point moves left, toward fewer local steps, as the data becomes more heterogeneous.</p>
+<p>This is why communication constraints cannot be studied in isolation from statistical heterogeneity, and why the two sections are neighbors. A practitioner who reads only this section will over-tune local epochs and ship a model that communicates beautifully and predicts poorly; one who reads only the previous section will under-tune and ship a model that is accurate but never finishes training over a cellular link. The art, as so often in this book, is holding two costs in tension at once and finding the operating point that respects both, the same balancing act that the communication-cost models of <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.8.html">Chapter 3</a> taught you to perform for the datacenter, now with the constants cranked to the federated extreme.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Squeezing the Federated Wire (2024 to 2026)</div>
+<p>Communication is still the headline bottleneck of federated learning, and the recent literature attacks every factor of the cost product at once. Local-update schemes in the lineage of FedAvg now borrow the geo-distributed tricks of DiLoCo-style training (Douillard et al., 2024), letting clients take many local steps and synchronize rarely, and the same idea is being pushed toward genuinely over-the-internet collaborative training of large models. On the byte side, work on aggressive update compression combines sub-8-bit quantization with magnitude sparsification and error feedback, and a growing thread compresses the download by sending model deltas or low-rank factors rather than full weights, which matters acutely once the shared model is a multi-billion-parameter foundation model and even a single download would swamp a phone's data plan. Parameter-efficient federated fine-tuning, in which clients transmit only small adapter or low-rank matrices instead of the whole model, has become the dominant way to make foundation-model-scale federated learning fit through a consumer link at all. The unifying theme is the one this section opened with: treat rounds and bytes as the quantity to engineer down, and spend cheap on-device computation to buy it.</p>
+</div>
+<p>You now have the federated communication problem in its full shape: a cost that is rounds times bytes, a primary lever (local computation) that trades against drift, a compression toolkit that must work in both directions, and a participation model that must survive devices vanishing mid-round. That last point, clients dropping out and the need to aggregate without ever seeing any individual update in the clear, is exactly the seam where communication efficiency meets privacy. The next section, <a href="section-14.6.html">Section 14.6</a>, takes up secure aggregation, where the protocol must add up the clients' updates while learning nothing about any single one, and must do so cheaply enough not to undo the byte savings you just won.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.5.1: Read the Cost Model <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A cross-device deployment has a population of two million phones. The shared model is 4 megabytes. The server runs 200 rounds, samples 0.05% of the population each round, and the upload path is six times slower than the download. (a) Using the total-communication formula from Section 2, compute the total bytes moved across all clients over the run with no compression. (b) The team can either halve the rounds by doubling local epochs, or apply 8-bit quantization to the upload only. Estimate the byte saving of each option separately and state which one also reduces wall-clock latency rather than only bytes. (c) Explain, with reference to Section 6, why the team cannot simply double local epochs a second time to halve the rounds again.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.5.2: Make the Data Heterogeneous <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 14.5.1 so the client shards are non-IID rather than IID: sort the examples by their label before sharding, so each client holds data skewed toward one class. Rerun the local-epochs sweep and report the new rounds-to-target for one, five, and twenty local epochs. Show that the round savings from more local computation shrink, and possibly reverse, once the data is heterogeneous, and connect your numbers to the drift mechanism of <a href="section-14.4.html">Section 14.4</a>. If twenty local epochs no longer reaches the target at all, explain what that means for the operating point in Figure 14.5.1.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.5.3: Where the Compression Budget Goes <span class="exercise-type analysis">Analysis</span></div>
+<p>Suppose a client's download runs at 50 megabits per second and its upload at 5 megabits per second, and one model message is 4 megabytes uncompressed. (a) Compute the wall-clock time to download and to upload one uncompressed message. (b) You have a compression budget that can cut either path to one quarter of its bytes, but not both. Which path should you compress to minimize the per-round wall-clock time, and by how much does the round shrink? (c) Generalize the result: given asymmetry ratio $\rho_{\uparrow}/\rho_{\downarrow}$ in link speeds, argue why the slow upload path almost always deserves the compression first, tying your answer to the dominance of the $\rho_{\uparrow}$ term in the Section 2 cost model.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-14.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 14.4</span><span class="nav-title">Non-IID Data</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 14</span><span class="nav-num">Contents</span><span class="nav-title">Federated and Decentralized Learning</span></a>
+<a class="next" href="section-14.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 14.6</span><span class="nav-title">Privacy and Secure Aggregation</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

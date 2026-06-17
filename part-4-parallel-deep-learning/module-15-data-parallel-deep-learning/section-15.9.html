@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 15.9: Practical Bottlenecks and Scaling Efficiency. A practitioner's diagnosis of why a data-parallel job misses linear scaling, the usual suspects, how to measure scaling efficiency and the communication-to-computation ratio, and the verdict on when to leave data parallelism behind." name="description"/>
+<title>Section 15.9: Practical Bottlenecks and Scaling Efficiency | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Data-Parallel Deep Learning</a></div>
+<h1>Practical Bottlenecks and Scaling Efficiency</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They added thirty-two of me and expected thirty-two times the work. Instead I spent my afternoons waiting on the wire, perfectly synchronized and almost entirely idle."</p>
+<cite>A GPU Idling on a Communication Barrier</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Data parallelism delivers near-linear speedup right up to the moment one of four costs stops hiding behind computation, and the whole craft of scaling a training job is finding that moment before your cluster bill does.</strong> A job that runs at 95% efficiency on eight GPUs can collapse to 30% on sixty-four, not because anyone wrote slow code, but because the all-reduce stopped overlapping, the input pipeline ran dry, one worker fell behind, or the per-GPU batch grew too small to keep the accelerator busy. This closing section of the chapter turns the separate cost models you built in Sections 15.3 through 15.8 into a single diagnostic: a way to measure scaling efficiency, name the bottleneck that dominates at a given worker count, and decide when data parallelism has run its course and you must reach for the model, pipeline, and sharded methods of <a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>.</p>
+</div>
+<p>Every prior section of this chapter added one mechanism that makes data-parallel training fast: the exact gradient average (Section 15.3), the all-reduce that combines it (Section 15.4), the bucketing that overlaps communication with the backward pass (Section 15.5), the framework that wires it together (Section 15.6), and the mixed precision that shrinks both the compute and the bytes on the wire (Section 15.8). Each one works. Yet a real job almost never hits the linear speedup the gradient identity promises, and the gap between the speedup you expected and the speedup you got is where a practitioner earns their keep. This section is a diagnosis manual. We catalog the usual suspects, give you the two numbers that localize the fault, and state plainly the conditions under which no amount of tuning will save data parallelism and a different parallelism axis is the only way forward.</p>
+
+<h2>1. The Anatomy of a Training Step <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>To reason about why scaling stalls, hold a clear picture of where time goes inside one optimizer step. Under strong scaling, the regime this section assumes throughout, the global batch is fixed and we add workers to finish each step faster; the per-GPU batch therefore shrinks as the worker count $K$ grows. Three costs run in every step. The first is compute: each worker performs the forward and backward pass on its local shard of the batch, and this time falls roughly as $1/K$ because each worker sees fewer examples. The second is communication: the gradient all-reduce, whose cost per worker for a ring algorithm is close to constant in $K$ (each worker sends and receives about twice the gradient payload regardless of how many peers it has). The third is data loading: the input pipeline must deliver the local batch to each GPU before the step can begin, a cost studied in depth in <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/section-8.5.html">Section 8.5</a>.</p>
+<p>The reason data parallelism scales at all is overlap. As Section 15.5 showed, a good implementation fires the all-reduce for early gradient buckets while the backward pass is still computing later ones, and prefetches the next batch while the current one trains. When communication and loading both hide completely behind compute, the step time is just the compute time and you get linear speedup. The trouble begins when compute shrinks (because $K$ grew) below the fixed cost of communication or loading: now those costs are exposed, the GPU sits idle waiting on the wire or the disk, and adding workers stops helping. Figure 15.9.1 shows this transition as the bend in the scaling-efficiency curve.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A scaling-efficiency curve. The horizontal axis is the worker count K on a logarithmic scale; the vertical axis is speedup. An ideal dashed diagonal rises linearly. The measured solid curve tracks it through the compute-bound region, then bends sharply at a marked knee and flattens in the communication-bound region.">
+<defs>
+<marker id="arr159" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.ax159 { stroke:#14385c; stroke-width:1.6; fill:none; marker-end:url(#arr159); }
+.gr159 { stroke:#d7dde6; stroke-width:1; }
+.id159 { stroke:#b86b1f; stroke-width:1.8; stroke-dasharray:6 5; fill:none; }
+.me159 { stroke:#14385c; stroke-width:2.6; fill:none; }
+.t159 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s159 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.lab159 { font:600 12px sans-serif; fill:#b86b1f; text-anchor:middle; }
+.dot159 { fill:#14385c; }
+.knee159 { fill:#c0392b; }
+</style>
+<!-- axes -->
+<line class="gr159" x1="90" y1="80" x2="800" y2="80"/>
+<line class="gr159" x1="90" y1="140" x2="800" y2="140"/>
+<line class="gr159" x1="90" y1="200" x2="800" y2="200"/>
+<line class="gr159" x1="90" y1="260" x2="800" y2="260"/>
+<line class="ax159" x1="90" y1="320" x2="800" y2="320"/>
+<line class="ax159" x1="90" y1="320" x2="90" y2="55"/>
+<text class="t159" x="445" y="362">workers K  (log scale)</text>
+<text class="t159" x="32" y="195" transform="rotate(-90 32 195)">speedup</text>
+<!-- x ticks -->
+<text class="s159" x="150" y="338">1</text>
+<text class="s159" x="280" y="338">4</text>
+<text class="s159" x="410" y="338">8</text>
+<text class="s159" x="540" y="338">32</text>
+<text class="s159" x="670" y="338">128</text>
+<text class="s159" x="790" y="338">256</text>
+<!-- ideal linear (dashed) -->
+<line class="id159" x1="150" y1="305" x2="790" y2="70"/>
+<text class="lab159" x="700" y="92">ideal linear speedup</text>
+<!-- measured: linear to knee at K=8, then flat -->
+<path class="me159" d="M 150 305 L 280 233 L 410 197 C 520 196 660 198 790 200"/>
+<!-- compute-bound region marker -->
+<text class="s159" x="245" y="285">compute-bound:</text>
+<text class="s159" x="245" y="300">overlap hides comm + load</text>
+<!-- knee -->
+<circle class="knee159" cx="410" cy="197" r="6"/>
+<text class="lab159" x="410" y="172" fill="#c0392b">the knee (K = 8)</text>
+<text class="s159" x="410" y="156" fill="#c0392b">all-reduce becomes exposed</text>
+<!-- flat region marker -->
+<text class="s159" x="620" y="222">communication-bound:</text>
+<text class="s159" x="620" y="237">step time pinned by the all-reduce</text>
+<!-- dots on measured curve -->
+<circle class="dot159" cx="150" cy="305" r="4"/>
+<circle class="dot159" cx="280" cy="233" r="4"/>
+<circle class="dot159" cx="540" cy="197" r="4"/>
+<circle class="dot159" cx="670" cy="199" r="4"/>
+<circle class="dot159" cx="790" cy="200" r="4"/>
+</svg>
+<figcaption><strong>Figure 15.9.1:</strong> The scaling-efficiency curve of a strong-scaled data-parallel job. The measured speedup (solid) tracks the ideal linear line (dashed) through the compute-bound region, where overlap hides communication and data loading entirely. At the knee, here near $K = 8$, the per-GPU compute has shrunk below the fixed all-reduce cost; the communication is now exposed, the curve bends, and further workers buy almost nothing. The simulator of Code 15.9.1 produces exactly this shape and labels the dominant bottleneck at each point.</figcaption>
+</figure>
+
+<h2>2. The Usual Suspects <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>When a data-parallel job misses linear scaling, the cause is almost always one of five recurring failures. Naming them is half the diagnosis, because each has a distinct signature in the profiler and a distinct remedy. Table 15.9.1 lists them with the chapter or section that develops the underlying mechanism.</p>
+<div class="table-caption"><strong>Table 15.9.1:</strong> The five recurring reasons a data-parallel job misses linear scaling, their tell-tale signature, and where the underlying mechanism is developed.</div>
+<table>
+<thead>
+<tr><th scope="col">Suspect</th><th scope="col">Signature in a profile</th><th scope="col">Developed in</th></tr>
+</thead>
+<tbody>
+<tr><td>Exposed all-reduce</td><td>GPUs idle during a communication kernel that no longer overlaps the backward pass</td><td>Sections 15.4, 15.5</td></tr>
+<tr><td>Starved input pipeline</td><td>GPUs idle at the start of each step waiting on the data loader; low GPU utilization, busy CPUs or disk</td><td><a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/section-8.5.html">Section 8.5</a></td></tr>
+<tr><td>Stragglers and load imbalance</td><td>All workers wait on the slowest at the all-reduce barrier; one rank consistently late</td><td><a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.7.html">Section 2.7</a></td></tr>
+<tr><td>Tiny per-GPU batch</td><td>Low arithmetic intensity; GPU busy but far below peak FLOP/s; kernel launch overhead visible</td><td><a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.7.html">Section 3.7</a></td></tr>
+<tr><td>Large-batch optimization breakdown</td><td>Speed is fine but the model converges to worse accuracy or diverges past a global batch threshold</td><td><a href="../../part-3-distributed-ml/module-10-distributed-optimization/section-10.8.html">Section 10.8</a></td></tr>
+</tbody>
+</table>
+<p>The first three are systems failures: the hardware is idle and the fix is to keep it busy. The exposed all-reduce is the most common at scale, because its per-worker cost is roughly constant while per-worker compute shrinks with $K$; eventually the communication pokes out from behind the backward pass and the curve bends, exactly as in Figure 15.9.1. A starved input pipeline is the most embarrassing, because it has nothing to do with distribution at all: the GPUs are waiting on a slow disk or an under-provisioned set of loader processes, and you are paying for accelerators to watch a progress bar. Stragglers turn the synchronous all-reduce into a barrier set to the speed of the slowest worker, so a single hot GPU, a throttled NIC, or one rank that drew a batch of unusually long sequences drags the entire group down, a coordination problem first framed in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.7.html">Section 2.7</a>.</p>
+<p>The last two suspects are subtler because they are not about idle hardware. A tiny per-GPU batch keeps the accelerator nominally busy but at terrible efficiency: with too few examples per step the matrix multiplications are too small to saturate the tensor cores, arithmetic intensity drops, and the roofline analysis of <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.7.html">Section 3.7</a> tells you the GPU is running memory-bound at a fraction of its peak. Worst of all is the large-batch optimization breakdown, the only suspect that is invisible to a systems profiler: strong scaling with a fixed per-GPU batch means the global batch grows with $K$, and past the critical batch size of <a href="../../part-3-distributed-ml/module-10-distributed-optimization/section-10.8.html">Section 10.8</a>, each additional example contributes diminishing gradient information. The job runs fast and the loss curve quietly gets worse. You can be perfectly efficient in wall-clock terms and still be wasting the compute.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Two Different Walls, Easy to Confuse</div>
+<p>Scaling stalls for two fundamentally different reasons, and the cure for one will not touch the other. The <em>systems wall</em> (exposed communication, starved loaders, stragglers, tiny-batch underutilization) wastes hardware: GPUs are idle or running below peak, and the fix is a faster interconnect, a better input pipeline, or a larger per-GPU batch. The <em>statistical wall</em> (the critical batch size) wastes information: the hardware is fully utilized but the extra examples no longer help the model learn, and the only fixes are algorithmic, namely a smarter large-batch optimizer (LARS, LAMB) and a tuned learning-rate schedule. A team that throws a faster network at a critical-batch-size problem buys nothing; a team that tunes the optimizer to fix an exposed-all-reduce problem buys nothing. Localize the wall before you spend.</p>
+</div>
+
+<h2>3. Measuring Scaling Efficiency and the Comm-to-Compute Ratio <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Diagnosis needs numbers, and two are enough to localize almost any scaling problem. The first is scaling efficiency, the formal version of "are we getting our money's worth from these GPUs." For a strong-scaling run with throughput $T(K)$ on $K$ workers, the speedup is $S(K) = T(K)/T(1)$ and the efficiency is</p>
+$$E(K) = \frac{S(K)}{K} = \frac{T(K)}{K \, T(1)}.$$
+<p>Perfect linear scaling gives $E(K) = 1$; an efficiency of $0.6$ means six of every ten GPU-hours you are paying for turn into training and four are lost to communication, idle waiting, or underutilization. Plotting $E(K)$ against $K$ produces the curve in Figure 15.9.1, and the worker count where it falls below your tolerance (commonly $0.8$) is the practical limit of data parallelism for that job on that cluster. This metric and the broader vocabulary for it are developed as part of the evaluation toolkit in <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.4.html">Section 5.4</a>; here we use it as the headline diagnostic.</p>
+<p>The second number tells you <em>why</em> the efficiency fell. It is the communication-to-computation ratio, the time spent moving gradients divided by the time spent computing them in one step:</p>
+$$\gamma(K) = \frac{t_{\text{comm}}(K)}{t_{\text{compute}}(K)}.$$
+<p>While $\gamma < 1$ and the implementation overlaps well, communication hides behind compute and efficiency stays near one. As $K$ grows under strong scaling, $t_{\text{compute}}$ falls like $1/K$ while $t_{\text{comm}}$ stays roughly flat, so $\gamma$ rises; the knee in the efficiency curve is precisely where $\gamma$ crosses one and the all-reduce can no longer hide. A ratio above one is the unambiguous signature of a communication-bound job, and it points straight at the remedies: shrink the payload (mixed precision from Section 15.8, gradient compression from <a href="../../part-3-distributed-ml/module-10-distributed-optimization/section-10.8.html">Section 10.8</a>), improve overlap (Section 15.5), or stop scaling along this axis. The code below assembles the chapter's three cost models into one simulator that computes both numbers and names the dominant bottleneck as $K$ grows.</p>
+<pre><code class="language-python"># Scaling-efficiency simulator: combine the chapter's three cost models
+# (compute, overlapped all-reduce, data loading) and find the dominant
+# bottleneck as the worker count K grows. Pure Python, no dependencies.
+
+P = 1.0e9            # parameters in the gradient
+bytes_per_param = 2  # bf16 gradient payload
+B_global = 8192      # fixed global batch (strong scaling)
+flops_per_ex = 6 * P # rough fwd+bwd FLOPs per example for a P-param model
+gpu_flops = 60e12    # sustained 60 TFLOP/s per GPU
+net_GBps = 25.0      # 25 GB/s effective per-link bandwidth
+loader_ex_per_s = 12000.0  # input pipeline throughput PER WORKER (examples/s)
+
+def step_ms(K):
+    b = B_global / K                                   # per-GPU local batch
+    t_compute = (b * flops_per_ex / gpu_flops) * 1e3   # local fwd+bwd
+    payload = P * bytes_per_param
+    t_comm = (2.0 * (K - 1) / K) * payload / (net_GBps * 1e9) * 1e3  # ring all-reduce
+    t_load = (b / loader_ex_per_s) * 1e3               # deliver b examples
+    # Overlap: comm and loading hide BEHIND compute up to the compute budget.
+    exposed_comm = max(0.0, t_comm - t_compute)
+    exposed_load = max(0.0, t_load - t_compute)
+    t_step = t_compute + max(exposed_comm, exposed_load)
+    if exposed_comm == 0.0 and exposed_load == 0.0:
+        dom = "compute-bound (overlap wins)"
+    elif exposed_comm >= exposed_load:
+        dom = "communication-bound"
+    else:
+        dom = "data-loading-bound"
+    return t_compute, t_comm, t_load, t_step, dom
+
+t1 = step_ms(1)[3]   # single-worker step time, the baseline
+print(f"{'K':>5} {'compute':>9} {'comm':>8} {'load':>8} {'step':>9} "
+      f"{'speedup':>8} {'eff%':>6}  dominant bottleneck")
+print("-" * 78)
+for K in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
+    tc, tk, tl, ts, dom = step_ms(K)
+    speedup = t1 / ts
+    eff = 100.0 * speedup / K
+    print(f"{K:>5} {tc:>8.1f} {tk:>8.1f} {tl:>8.1f} {ts:>8.1f} "
+          f"{speedup:>7.1f}x {eff:>5.0f}  {dom}")
+</code></pre>
+<div class="code-caption"><strong>Code 15.9.1:</strong> A scaling-efficiency simulator that fuses the compute, overlapped all-reduce, and data-loading models of this chapter. For each worker count it reports the per-step breakdown, the speedup and efficiency, and a label for whichever exposed cost dominates the step.</div>
+<pre><code class="language-text">    K   compute     comm     load      step  speedup   eff%  dominant bottleneck
+------------------------------------------------------------------------------
+    1    819.2      0.0    682.7    819.2     1.0x   100  compute-bound (overlap wins)
+    2    409.6     80.0    341.3    409.6     2.0x   100  compute-bound (overlap wins)
+    4    204.8    120.0    170.7    204.8     4.0x   100  compute-bound (overlap wins)
+    8    102.4    140.0     85.3    140.0     5.9x    73  communication-bound
+   16     51.2    150.0     42.7    150.0     5.5x    34  communication-bound
+   32     25.6    155.0     21.3    155.0     5.3x    17  communication-bound
+   64     12.8    157.5     10.7    157.5     5.2x     8  communication-bound
+  128      6.4    158.8      5.3    158.8     5.2x     4  communication-bound
+  256      3.2    159.4      2.7    159.4     5.1x     2  communication-bound
+</code></pre>
+<div class="code-caption"><strong>Output 15.9.1:</strong> Through $K = 4$ the job is compute-bound and scales perfectly (efficiency 100%), because the all-reduce and the loader both hide behind the backward pass. At $K = 8$ the per-GPU compute (102 ms) drops below the all-reduce cost (140 ms): communication becomes exposed, the step time floors out near 155 ms, and efficiency collapses from 100% to single digits. The knee at $K = 8$ is the bend drawn in Figure 15.9.1, and beyond it adding workers barely moves the speedup.</div>
+<p>The simulator makes the lesson concrete: the speedup saturates near $5.9\times$ no matter how many workers you add past the knee, because the step time can never fall below the fixed all-reduce cost. This is Amdahl's law wearing a network cap, and it is the quantitative statement of why data parallelism has a ceiling. The exact location of the knee depends on your model size, interconnect, and per-GPU batch, but the shape is universal, and every production training team learns to find their own knee before committing to a worker count.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The PyTorch Profiler Finds Your Knee for You</div>
+<p>You do not need to derive the breakdown analytically on a real job; the PyTorch profiler measures it directly and attributes every microsecond to compute or communication kernels. Wrapping a few training steps exposes exactly where the time goes and whether the all-reduce overlaps:</p>
+<pre><code class="language-python">import torch
+from torch.profiler import profile, ProfilerActivity, schedule
+
+with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=schedule(wait=1, warmup=1, active=3),  # skip warmup steps
+        record_shapes=True, with_stack=True) as prof:
+    for step, batch in enumerate(loader):
+        train_step(model, batch)   # forward, backward, optimizer.step
+        prof.step()
+
+# Sort by CUDA time: NCCL all-reduce kernels rising to the top is the
+# tell-tale of a communication-bound job whose overlap has broken down.
+print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=12))
+prof.export_chrome_trace("trace.json")   # open in chrome://tracing or Perfetto
+</code></pre>
+<div class="code-caption"><strong>Code 15.9.2:</strong> The PyTorch profiler replaces the analytic model of Code 15.9.1 with a real measurement. The chrome trace shows the backward-pass kernels and the <code>nccl:all_reduce</code> kernels on parallel timelines, so a glance reveals whether communication hides behind compute or pokes out past the knee; the table ranks operators by total CUDA time.</div>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The 4096-GPU Job That Was Waiting on a ZIP File</div>
+<p>A recurring story in large-scale training postmortems: a job spread across thousands of accelerators runs at a fraction of the expected throughput, the team spends a week tuning NCCL ring topologies and interconnect settings, and the eventual culprit turns out to be the data loader decompressing examples on a single overworked CPU thread per node. The most expensive GPUs in the building, idle, waiting on a <code>gzip</code> call. The lesson lands every time: profile before you theorize, because the bottleneck is often the cheapest part of the system, not the most exotic.</p>
+</div>
+
+<h2>4. The Verdict on Data Parallelism <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Data parallelism is the workhorse of distributed deep learning, and for good reason: it is exact (Section 15.3), it is simple to wrap around an existing model (Section 15.6), and through its compute-bound region it scales linearly with almost no effort. For the great majority of training jobs, a model that fits in one accelerator's memory and a worker count below the communication knee, it is not just adequate but optimal, and reaching for anything fancier would add complexity for no gain. The honest verdict is that data parallelism is excellent until one of two limits bites.</p>
+<p>The first limit is the communication wall this section has measured: past the knee, the exposed all-reduce caps your speedup no matter how many workers you add, and the only escape is to move less data per step or to overlap it differently. The second limit is harder and is the one Chapter 16 exists to address: data parallelism replicates the entire model on every worker, so it does nothing at all for a model too large to fit on one device. When the parameters, optimizer state, and activations exceed a single accelerator's memory, you cannot run even a single data-parallel replica, and no number of workers fixes that. At that point you must partition the model itself, with the sharded, pipeline, and tensor-parallel methods of <a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>, often combined with data parallelism into the hybrid strategies that train today's largest models.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: One Axis Reaches Its Limit, So We Add Another</div>
+<p>This section closes the loop opened in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>, where the gradient identity made data parallelism the seed of the entire book. We have now followed that seed to its boundary: data parallelism distributes the training computation along one axis (the batch), and that axis runs out exactly when communication dominates or when the model no longer fits. The book's response is the same move it has made since the six axes of Section 1.2: when one axis saturates, distribute along another. Chapter 16 partitions the model; Chapter 17 partitions the experts; the all-reduce you mastered here returns as the reduce-scatter and all-gather of sharded training. The diagnostic skills of this section, measuring efficiency and the comm-to-compute ratio, transfer directly: they are how you will decide how much of each axis to use when you combine them.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Diagnosing the Job That Stopped Scaling at Thirty-Two GPUs</div>
+<p><strong>Who:</strong> A platform engineer running language-model pretraining for a product team.</p>
+<p><strong>Situation:</strong> A 1.3-billion-parameter model trained at 92% scaling efficiency on 16 GPUs, so the team doubled to 32 expecting to halve the wall-clock.</p>
+<p><strong>Problem:</strong> Throughput on 32 GPUs rose only 18%, an efficiency of 54%, and the cluster bill nearly doubled for almost no speedup.</p>
+<p><strong>Dilemma:</strong> Buy a faster InfiniBand fabric (weeks of procurement and a large capital cost), or accept that the job had hit a wall and rethink the parallelism strategy.</p>
+<p><strong>Decision:</strong> Before spending, they measured. The PyTorch profiler (Code 15.9.2) showed the <code>nccl:all_reduce</code> kernels no longer overlapping the backward pass, and the comm-to-compute ratio $\gamma$ had crossed from $0.7$ at 16 GPUs to $1.4$ at 32: a textbook communication-bound knee.</p>
+<p><strong>How:</strong> Rather than a new fabric, they enabled bf16 gradient communication (Section 15.8), which halved the all-reduce payload and pushed $\gamma$ back below one, then enlarged the per-GPU batch to raise arithmetic intensity, staying under the critical batch size from <a href="../../part-3-distributed-ml/module-10-distributed-optimization/section-10.8.html">Section 10.8</a>.</p>
+<p><strong>Result:</strong> Efficiency on 32 GPUs recovered to 81%, the speedup over 16 GPUs roughly doubled, and no hardware was purchased. The knee had moved out far enough to make 32 workers worthwhile.</p>
+<p><strong>Lesson:</strong> Measure the ratio before you buy the fabric. The cheapest fix to a communication-bound job is usually fewer bytes per step, not faster wire, and the comm-to-compute ratio tells you which knob to turn.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Pushing the Communication Knee Outward (2024 to 2026)</div>
+<p>Because the knee in Figure 15.9.1 is set by the all-reduce cost, a vigorous research line tries to push it outward so data parallelism scales further before yielding to model parallelism. Low-communication optimizers in the DiLoCo lineage (Douillard et al., 2024) let workers take many local steps between synchronizations, slashing the comm-to-computation ratio and enabling training across slow or geo-distributed links; follow-up work has pushed these toward genuinely over-the-internet training of billion-parameter models. Gradient compression methods descended from PowerSGD and the more recent error-feedback schemes shrink the payload by an order of magnitude with little accuracy loss. On the systems side, overlap-maximizing frameworks and compute-communication fusion in compilers aim to hide the all-reduce so completely that the knee disappears for practical worker counts, while bandwidth-optimal collective libraries continue to lower the constant in $t_{\text{comm}}$. The common thread is that the field now treats the scaling-efficiency curve of this section as a quantity to be engineered, not a fixed property of the hardware.</p>
+</div>
+
+<h2>5. Chapter Summary <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Chapter 15 took data parallelism from a single equation to a production training loop and then to its limits. We began with why deep learning needs distributed training, climbed from single-GPU to multi-node execution, and grounded the whole method in the exact gradient average that makes splitting a batch across $K$ workers a reorganization rather than an approximation. We built the all-reduce that combines the partial gradients, the bucketing and overlap that hide its cost behind the backward pass, and the frameworks (PyTorch DDP and Horovod) that wire it all together in a few lines. We added mixed precision as a per-node enabler that shrinks both the compute and the bytes on the wire. This closing section synthesized all of it into a single diagnostic discipline: measure scaling efficiency $E(K)$ and the comm-to-compute ratio $\gamma(K)$, name which of the five suspects dominates, and recognize the knee where data parallelism gives way to the next axis.</p>
+<div class="callout key-takeaway">
+<div class="callout-title">Key Takeaway: The Chapter in One Paragraph</div>
+<p>Data parallelism replicates the model on every worker, splits each batch across them, and combines the exact gradient with an all-reduce; it scales linearly while that all-reduce hides behind computation. Linear scaling ends at the knee, the worker count where per-GPU compute falls below the fixed communication cost and the comm-to-compute ratio $\gamma$ crosses one, after which adding workers barely helps. Diagnose any scaling stall with two numbers, the efficiency $E(K)$ and the ratio $\gamma(K)$, then distinguish the systems wall (exposed communication, starved loaders, stragglers, tiny batches) from the statistical wall (the critical batch size), because their cures are unrelated. When communication dominates or the model no longer fits on one device, data parallelism has reached its boundary and you partition the model itself, the subject of Chapter 16.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.9.1: Read the Curve <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using only Output 15.9.1, answer three questions and justify each from the numbers. (a) At which worker count does the job stop being compute-bound, and what quantity crossed what threshold to cause it? (b) Why does the step time floor out near 155 ms no matter how large $K$ becomes? (c) A colleague proposes running this job on 256 GPUs to "go 256 times faster." State the actual speedup the simulator predicts and explain, in terms of the comm-to-compute ratio, why the extra 248 GPUs past the knee are almost entirely wasted.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.9.2: Move the Knee <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 15.9.1 to print the comm-to-compute ratio $\gamma(K) = t_{\text{comm}}/t_{\text{compute}}$ as an extra column, and confirm that the knee in the efficiency falls exactly where $\gamma$ first exceeds one. Then explore two interventions and report how each moves the knee: (a) halve <code>bytes_per_param</code> from 2 to 1, modeling fp8 gradient communication; (b) double <code>B_global</code>, modeling a larger global batch. For each, report the new worker count at which efficiency first drops below 80% and explain the mechanism. Which intervention risks the statistical wall of <a href="../../part-3-distributed-ml/module-10-distributed-optimization/section-10.8.html">Section 10.8</a>, and why?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.9.3: Localize the Wall <span class="exercise-type analysis">Analysis</span></div>
+<p>For each scenario, name which of the five suspects from Table 15.9.1 is the most likely cause and which single number ($E(K)$, $\gamma(K)$, GPU utilization, or the validation loss) would confirm it: (a) GPU utilization is 35% and the CPUs are pinned at 100% across all nodes; (b) throughput scales linearly to 64 GPUs but validation loss is consistently worse than the 8-GPU run at the same number of epochs; (c) every step, one specific rank finishes its backward pass 40 ms after the others, and all ranks wait at the all-reduce; (d) GPU utilization is 95% but measured FLOP/s is one-fifth of the device peak. For one scenario of your choice, propose a concrete fix and predict its effect on the scaling-efficiency curve.</p>
+</div>
+
+<div class="callout project-ideas">
+<div class="callout-title">Project Ideas</div>
+<p>These open-ended projects turn the diagnostic discipline of this chapter into hands-on practice. Each is sized for a short multi-GPU run or a careful single-GPU emulation.</p>
+<p><strong>1. Measure a real scaling curve.</strong> Train a small model (for example a ResNet or a compact transformer) under PyTorch DDP on 1, 2, 4, and 8 GPUs with a fixed global batch. Plot the measured scaling efficiency $E(K)$ and, using the profiler from Code 15.9.2, the comm-to-compute ratio $\gamma(K)$ at each point. Identify your cluster's knee, then verify that it sits where $\gamma$ crosses one, reproducing Figure 15.9.1 with real numbers.</p>
+<p><strong>2. Hunt the bottleneck.</strong> Deliberately induce each of the five suspects from Table 15.9.1 on the same job and confirm its signature: cap the input-pipeline workers to starve the loaders, inject a sleep in one rank to create a straggler, shrink the per-GPU batch to drop arithmetic intensity, and grow the global batch past the critical size to break optimization. For each, record which number ($E$, $\gamma$, GPU utilization, or validation loss) moved, building a personal lookup table from symptom to cause.</p>
+<p><strong>3. Push the knee outward.</strong> Take a communication-bound configuration from Project 1 and apply two payload-shrinking interventions, bf16 (or fp8) gradient communication and a published gradient-compression method, measuring how far each moves the knee and what it costs in final accuracy. Compare your empirical knee shifts against the predictions of the Code 15.9.1 simulator, and write up where the simple model agrees with reality and where it does not.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-15.8.html"><span class="nav-label">Previous</span><span class="nav-num">Section 15.8</span><span class="nav-title">Mixed Precision as a Per-Node Enabler</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 15</span><span class="nav-num">Contents</span><span class="nav-title">Data-Parallel Deep Learning</span></a>
+<a class="next" href="../module-16-model-pipeline-sharded-parallelism/index.html"><span class="nav-label">Next</span><span class="nav-num">Chapter 16</span><span class="nav-title">Model, Pipeline, and Sharded Parallelism</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

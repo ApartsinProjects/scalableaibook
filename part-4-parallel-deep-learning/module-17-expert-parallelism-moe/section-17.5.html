@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 17.5: All-to-All Communication for Token Routing. Why every Mixture-of-Experts layer pays two all-to-all exchanges, why all-to-all is the heaviest collective and the MoE bottleneck, and how overlap, hierarchical routing, and DeepEP attack it." name="description"/>
+<title>Section 17.5: All-to-All Communication for Token Routing | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 17: Expert Parallelism and Sparse Distributed Models</a></div>
+<h1>All-to-All Communication for Token Routing</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I spent the whole forward pass mailing tokens to strangers and the whole backward pass mailing them home. Nobody asks the postal service how it feels."</p>
+<cite>An All-to-All That Has Routed One Token Too Many</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>In a Mixture-of-Experts layer the experts live on different devices, so after the gate decides where each token should go, the tokens must physically move to the device that owns their expert, be computed there, and then move back: two all-to-all exchanges wrap every single MoE layer.</strong> All-to-all is the most communication-intensive collective, every device talks to every other device, and in a modern sparse model it is the dominant cost, not the expert math. This section shows why the collective is there, writes down what it costs as a function of tokens per device, demonstrates the dispatch-then-combine round trip in pure Python, and surveys the systems work (overlap, hierarchical routing, DeepEP) that keeps the interconnect from becoming the wall the whole model runs into.</p>
+</div>
+<p>The previous section placed each expert on its own device and explained why sparse activation lets a Mixture-of-Experts (MoE) model carry many more parameters than a dense model of the same per-token cost. That placement creates a problem it did not solve. After the gate runs (<a href="section-17.3.html">Section 17.3</a>), a device that processed a slice of the batch holds a pile of tokens, but those tokens are routed all over the cluster: some belong to the expert sitting on this device, most belong to experts on other devices. Nothing computes yet, because the tokens are in the wrong place. The collective that fixes this is all-to-all, and it is the operation that defines how fast an MoE model trains and serves.</p>
+<p>This collective is not new to us. It was introduced as the routing primitive in <a href="../../part-1-foundations/module-04-communication-primitives/section-4.6.html">Section 4.6</a>, alongside all-reduce and all-gather. There we measured its raw cost; here we watch it become the engine, and the bottleneck, of an entire class of models. Where data-parallel training leans on all-reduce (<a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a>) and sharded training leans on reduce-scatter and all-gather (<a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>), expert parallelism is the regime where all-to-all is in charge.</p>
+
+<h2>1. Why Two All-to-Alls Wrap Every MoE Layer <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Picture $D$ devices, each holding one expert and each holding a shard of the current batch of tokens. The gate has already chosen, for every token, the expert it must visit. From one device's point of view, its local tokens are destined for a mix of experts spread across all $D$ devices, and symmetrically, the expert it hosts is the destination for tokens currently sitting on every other device. To compute anything, the tokens and their destinations must be reconciled.</p>
+<p>The <strong>dispatch all-to-all</strong> does exactly that: every device simultaneously sends each of its tokens to the device that owns the token's expert, and simultaneously receives, from every other device, the tokens that belong to its own expert. After this single collective, each device holds precisely the set of tokens its local expert must process, gathered from across the whole cluster. The experts then run their feed-forward computation locally, with no communication. Finally the <strong>combine all-to-all</strong> reverses the exchange: each device ships every processed token back to the device it originally came from, into the exact position it left, so the layer's output lines up with its input for the rest of the network. Two all-to-alls, one before the experts and one after, bracket every MoE layer in the model.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Experts Are Local, the Routing Is Global</div>
+<p>Expert parallelism makes the expensive part (the feed-forward computation) embarrassingly local: once a token arrives, its expert runs with zero communication. The price is that getting the token to the right place, and home again, is a fully global exchange in which every device talks to every other device. The compute is sharded for free; the routing is what you pay for. That inversion, cheap math wrapped in expensive movement, is why an MoE layer's performance is an interconnect question, not a FLOP question.</p>
+</div>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of one Mixture-of-Experts layer: four devices each holding mixed-destination tokens send them through a dispatch all-to-all to the device owning their expert, the experts compute locally, then a combine all-to-all returns each token to its origin device.">
+<defs>
+<marker id="arr175" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b175 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.e175 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.t175 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s175 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.h175 { font:600 13px sans-serif; fill:#b86b1f; text-anchor:middle; }
+.l175 { fill:none; stroke:#9aa6b2; stroke-width:1.2; marker-end:url(#arr175); }
+.bigl175 { fill:none; stroke:#14385c; stroke-width:2; marker-end:url(#arr175); }
+</style>
+<text class="t175" x="90" y="24">Before: mixed tokens</text>
+<rect class="b175" x="40" y="40" width="100" height="40" rx="7"/><text class="s175" x="90" y="65">Device 0</text>
+<rect class="b175" x="40" y="92" width="100" height="40" rx="7"/><text class="s175" x="90" y="117">Device 1</text>
+<rect class="b175" x="40" y="144" width="100" height="40" rx="7"/><text class="s175" x="90" y="169">Device 2</text>
+<rect class="b175" x="40" y="196" width="100" height="40" rx="7"/><text class="s175" x="90" y="221">Device 3</text>
+<text class="t175" x="430" y="24">Dispatch all-to-all &#8594; experts</text>
+<rect class="e175" x="360" y="40" width="140" height="40" rx="7"/><text class="h175" x="430" y="65">Expert 0</text>
+<rect class="e175" x="360" y="92" width="140" height="40" rx="7"/><text class="h175" x="430" y="117">Expert 1</text>
+<rect class="e175" x="360" y="144" width="140" height="40" rx="7"/><text class="h175" x="430" y="169">Expert 2</text>
+<rect class="e175" x="360" y="196" width="140" height="40" rx="7"/><text class="h175" x="430" y="221">Expert 3</text>
+<line class="l175" x1="142" y1="58" x2="358" y2="58"/>
+<line class="l175" x1="142" y1="64" x2="358" y2="108"/>
+<line class="l175" x1="142" y1="110" x2="358" y2="116"/>
+<line class="l175" x1="142" y1="116" x2="358" y2="162"/>
+<line class="l175" x1="142" y1="162" x2="358" y2="70"/>
+<line class="l175" x1="142" y1="168" x2="358" y2="210"/>
+<line class="l175" x1="142" y1="214" x2="358" y2="125"/>
+<line class="l175" x1="142" y1="220" x2="358" y2="178"/>
+<text class="t175" x="730" y="24">Combine all-to-all</text>
+<rect class="b175" x="680" y="40" width="100" height="40" rx="7"/><text class="s175" x="730" y="65">Device 0</text>
+<rect class="b175" x="680" y="92" width="100" height="40" rx="7"/><text class="s175" x="730" y="117">Device 1</text>
+<rect class="b175" x="680" y="144" width="100" height="40" rx="7"/><text class="s175" x="730" y="169">Device 2</text>
+<rect class="b175" x="680" y="196" width="100" height="40" rx="7"/><text class="s175" x="730" y="221">Device 3</text>
+<line class="l175" x1="502" y1="58" x2="678" y2="58"/>
+<line class="l175" x1="502" y1="64" x2="678" y2="162"/>
+<line class="l175" x1="502" y1="110" x2="678" y2="70"/>
+<line class="l175" x1="502" y1="116" x2="678" y2="210"/>
+<line class="l175" x1="502" y1="162" x2="678" y2="110"/>
+<line class="l175" x1="502" y1="210" x2="678" y2="168"/>
+<path class="bigl175" d="M 250 290 L 610 290"/>
+<text class="s175" x="430" y="282">each token: origin device &#8594; its expert &#8594; back to origin slot</text>
+<text class="s175" x="430" y="312">local expert compute happens between the two collectives, no network</text>
+<text class="t175" x="90" y="300">input</text>
+<text class="t175" x="730" y="300">output</text>
+</svg>
+<figcaption><strong>Figure 17.5.1:</strong> One MoE layer on four devices. The dispatch all-to-all (left arrows) sends each token from its origin device to the device owning its expert; the experts compute locally; the combine all-to-all (right arrows) returns each token to the slot it left from. The thick arrow underneath traces a single token's round trip. The crossing lines are the point: every device exchanges with every other device, which is what makes all-to-all the heaviest collective.</figcaption>
+</figure>
+
+<h2>2. What All-to-All Costs, and Why It Is the Bottleneck <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The reason all-to-all dominates is structural. In all-reduce, the total bytes a device sends are roughly the size of one gradient, independent of how many workers there are, because clever ring and tree algorithms reuse the same bytes. In all-to-all there is no such reuse: each device has a distinct message for every other device, so the volume a device must move grows with the data it holds and is spread across $D-1$ partners. If each of $D$ devices holds $T$ tokens of hidden size $h$ (in bytes per token), and routing is uniform, each device sends about a $\frac{D-1}{D}$ fraction of its tokens off-device, giving a per-device transfer of</p>
+$$ B_{\text{dispatch}} \;=\; T \, h \,\frac{D-1}{D} \;\approx\; T\,h \quad\text{for large } D, $$
+<p>and the combine all-to-all moves the same volume back, so a single MoE layer pays roughly $2 T h$ bytes of off-device traffic per device, every forward pass, plus the same again in the backward pass. Multiply by the number of MoE layers in the model and the picture is stark: in a deep sparse model the all-to-all traffic is paid dozens of times per step. Under the alpha-beta cost model of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>, the time for one exchange is about</p>
+$$ t_{\text{a2a}} \;\approx\; (D-1)\,\alpha \;+\; \frac{B_{\text{dispatch}}}{\beta_{\text{eff}}}, $$
+<p>where $\alpha$ is per-message latency, $\beta_{\text{eff}}$ is the effective per-link bandwidth, and the $(D-1)\alpha$ term reflects that every device opens a channel to every other. As the number of experts (and devices) grows, both the latency term and the contention for shared links grow, which is why all-to-all, not the expert FLOPs, has become the MoE bottleneck. The completion time is set by the <em>busiest</em> link, so the cost above is a best case that uniform routing never quite achieves in practice.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Collective That Defines a Model Class</div>
+<p>This book's spine is that a handful of collectives, introduced in <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>, return as the engine of every parallel method. Data parallelism is all-reduce; sharded parallelism is reduce-scatter plus all-gather. Expert parallelism is the case where the collective does not merely synchronize a result computed elsewhere; it <em>is</em> the layer's defining operation. An MoE model's quality comes from its experts, but its speed, its hardware budget, and its scaling limit come almost entirely from how well its two all-to-alls run. When you read that a sparse model is "interconnect-bound," this is the sentence being unpacked.</p>
+</div>
+
+<h2>3. The Dispatch-and-Combine Round Trip in Pure Python <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The mechanics are easier to trust once you watch every token leave home, reach its expert, and return to the exact slot it left from. The simulation below runs one MoE layer across $D$ devices on a single process. It builds the dispatch traffic matrix (who sends how many tokens to whom), routes the tokens, runs a placeholder expert step, then runs the combine all-to-all and checks two things: that the combine exchange is the transpose of the dispatch exchange, and that every token came back to its own origin slot. It also reports the per-device traffic and the load imbalance that <a href="section-17.6.html">Section 17.6</a> will set out to fix. The gate is deliberately skewed so one expert is popular, which is what real routers do before any balancing is applied.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+D = 4          # devices, one expert per device for clarity
+T = 12         # tokens held per device after the local forward pass
+N = D * T      # total tokens in the batch
+
+# Each device d holds T tokens. The gate assigned every token a destination
+# expert in {0..D-1}. We bias the gate so expert 1 is "popular" (load imbalance).
+probs = np.array([0.15, 0.55, 0.20, 0.10])      # destination distribution
+origin = np.repeat(np.arange(D), T)              # which device each token came from
+local_slot = np.tile(np.arange(T), D)            # its slot on that origin device
+dest = rng.choice(D, size=N, p=probs)            # expert each token is routed to
+token_id = np.arange(N)                          # stable identity to check round-trip
+
+# ---- DISPATCH all-to-all: every device sends its tokens to the owning expert.
+# send_counts[s, r] = number of tokens device s ships to device r (the all-to-all
+# traffic matrix). Row sums are what each device sends; column sums are receives.
+send_counts = np.zeros((D, D), dtype=int)
+for s in range(D):
+    for r in range(D):
+        send_counts[s, r] = np.sum((origin == s) &amp; (dest == r))
+
+# After dispatch, expert r processes every token whose dest == r.
+inbox = {r: token_id[dest == r] for r in range(D)}
+expert_load = np.array([len(inbox[r]) for r in range(D)])
+
+# ---- Expert compute is local: each device runs its MLP on the tokens it received,
+# with no network traffic. We carry the token identity through as a marker.
+processed = {r: inbox[r] for r in range(D)}
+
+# ---- COMBINE all-to-all: each expert returns every token to its origin device,
+# into the exact slot it left from. recv[origin][slot] must equal the original id.
+recv = -np.ones((D, T), dtype=int)
+combine_counts = np.zeros((D, D), dtype=int)      # expert r -> origin s
+for r in range(D):
+    for tid in processed[r]:
+        s = origin[tid]
+        slot = local_slot[tid]
+        recv[s, slot] = tid
+        combine_counts[r, s] += 1
+
+# ---- Round-trip correctness: every token came back to its own origin slot.
+expected = token_id.reshape(D, T)                 # slot (s, slot) started as that id
+roundtrip_ok = np.array_equal(recv, expected)
+
+# ---- Traffic &amp; imbalance: off-diagonal sends cross the network; the busiest
+# expert sets the all-to-all completion time, so imbalance directly costs latency.
+cross_device = send_counts.sum() - np.trace(send_counts)
+imbalance = expert_load.max() / expert_load.mean()
+
+print("devices D                :", D)
+print("tokens per device T      :", T, " total tokens:", N)
+print("dispatch send matrix [s->r]:")
+print(send_counts)
+print("expert load (recv per dev):", expert_load.tolist())
+print("cross-device tokens (disp):", cross_device, "of", N)
+print("combine returns == dispatch sends (transpose):",
+      np.array_equal(combine_counts, send_counts.T))
+print("round-trip correct       :", bool(roundtrip_ok))
+print("load imbalance (max/mean):", f"{imbalance:.2f}x")
+</code></pre>
+<div class="code-caption"><strong>Code 17.5.1:</strong> One MoE layer's two all-to-all exchanges simulated on a single process. The <code>send_counts</code> matrix is the dispatch traffic pattern; the combine step rebuilds <code>recv</code> and the assertions confirm both the transpose relationship and the per-token round trip.</div>
+<pre><code class="language-text">devices D                : 4
+tokens per device T      : 12  total tokens: 48
+dispatch send matrix [s->r]:
+[[1 6 5 0]
+ [1 8 1 2]
+ [2 9 0 1]
+ [2 6 4 0]]
+expert load (recv per dev): [6, 29, 10, 3]
+cross-device tokens (disp): 39 of 48
+combine returns == dispatch sends (transpose): True
+round-trip correct       : True
+load imbalance (max/mean): 2.42x
+</code></pre>
+<div class="code-caption"><strong>Output 17.5.1:</strong> Every token completed the round trip (<code>round-trip correct: True</code>) and the combine exchange is exactly the transpose of the dispatch exchange. Note that 39 of 48 tokens crossed devices and that the skewed gate gave expert 1 a load of 29 against a mean of 12, a 2.42x imbalance, the busiest expert that the all-to-all must wait on.</div>
+<p>Two facts in Output 17.5.1 carry the whole section. First, the combine all-to-all is the transpose of the dispatch all-to-all, which is why the round trip is exact: each token returns to its own slot, so the layer's output aligns with its input. Second, the column sums of the send matrix are wildly uneven (expert 1 receives 29 tokens, expert 3 only 3), and because the slowest device sets the collective's finish time, that imbalance is pure wasted wall-clock. The all-to-all is correct regardless of imbalance, but it is only as fast as its most overloaded link, which is the bridge to load balancing in <a href="section-17.6.html">Section 17.6</a>.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Token That Went on a Round Trip to Do One Matrix Multiply</div>
+<p>Trace token 0 in the simulation. It leaves device 0, crosses the network to whichever expert the gate chose, gets multiplied by a weight matrix, then crosses the network again to land back in slot 0 of device 0. The useful work, one feed-forward pass, might take microseconds; the two network crossings can take longer. A surprising amount of MoE engineering is, at heart, the logistics of making sure a token's commute does not dwarf its actual job.</p>
+</div>
+
+<h2>4. Making All-to-All Cheaper: Overlap, Hierarchy, and Kernels <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Because the collective is unavoidable, the engineering goal is to hide it or shrink it. Three ideas do most of the work. The first is <strong>overlap</strong>: the dispatch all-to-all for a layer can run concurrently with the expert computation of tokens that have already arrived, and the backward-pass all-to-all can overlap with gradient computation, so the network time disappears behind math instead of stacking on top of it. The second is <strong>hierarchical all-to-all</strong>: rather than one flat exchange across all $D$ devices, do an intra-node all-to-all over fast NVLink first, aggregate per node, then a smaller inter-node all-to-all over the slower InfiniBand fabric, then a final intra-node spread. This turns most of the traffic onto the fast links and sends far fewer, larger messages across the slow ones, cutting both the $\alpha$ and the contention terms. The third is <strong>fused kernels</strong>: specialized all-to-all implementations that fuse the gather, the network transfer, and the scatter into one optimized operation rather than three library calls with materialized buffers in between.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The MoE Pretraining Run Stalled on Its Interconnect</div>
+<p><strong>Who:</strong> A systems engineer on a team pretraining a 100-billion-parameter sparse model across 32 nodes of 8 GPUs each.</p>
+<p><strong>Situation:</strong> Profiling showed the GPUs idle for nearly 40 percent of each step, waiting on the two all-to-alls in every one of the model's MoE layers.</p>
+<p><strong>Problem:</strong> The expert FLOPs were cheap, exactly as sparse activation intends, so the step time was set almost entirely by inter-node all-to-all over InfiniBand, not by compute.</p>
+<p><strong>Dilemma:</strong> Buy a faster fabric (slow, capital-heavy, and capped by what the data center supports), or restructure the communication in software to use the fabric they already had.</p>
+<p><strong>Decision:</strong> Restructure in software: switch the flat all-to-all to a hierarchical NVLink-then-InfiniBand scheme and overlap the dispatch exchange with expert compute.</p>
+<p><strong>How:</strong> They adopted a dispatch-and-combine library (DeepEP-style) that batches tokens per destination node, routes intra-node traffic over NVLink first, and issues the inter-node exchange asynchronously so it overlaps the experts.</p>
+<p><strong>Result:</strong> GPU idle time on the all-to-all fell from roughly 40 percent to under 12 percent, and step time dropped by about a third with no change to the model or the math.</p>
+<p><strong>Lesson:</strong> When a sparse model is interconnect-bound, the fastest win is usually to reshape the all-to-all to match the network topology, not to compute less or buy more hardware.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: torch.distributed.all_to_all_single Does the Exchange</div>
+<p>The nested loops in Code 17.5.1 build and apply the traffic matrix by hand. In a real expert-parallel job each device declares how many tokens it sends to and receives from every other device, and one collective call performs the entire exchange over the network:</p>
+<pre><code class="language-python">import torch, torch.distributed as dist
+dist.init_process_group("nccl")                # the group of D expert devices
+
+# After the gate: sort local tokens by destination expert and count them.
+send_counts = counts_per_destination(dest)     # length-D list, tokens per dest device
+recv_counts = exchange_counts(send_counts)     # an all-to-all on the counts themselves
+
+# One collective performs the whole dispatch; NCCL handles every device-to-device send.
+dist.all_to_all_single(recv_buf, send_buf,
+                       output_split_sizes=recv_counts,
+                       input_split_sizes=send_counts)
+# ... experts run locally on recv_buf, then a second all_to_all_single combines back.
+</code></pre>
+<div class="code-caption"><strong>Code 17.5.2:</strong> The dispatch all-to-all of Code 17.5.1 as one <code>all_to_all_single</code> call. The hand-built send matrix and per-pair routing collapse into split-size arrays; NCCL performs every device-to-device transfer, and a production stack such as DeepEP or Megatron-MoE wraps this with the overlap and hierarchical routing of Section 4.</div>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: All-to-All as the MoE Battleground (2024 to 2026)</div>
+<p>The all-to-all has become the headline target of sparse-model systems research. <strong>DeepEP</strong> (DeepSeek, 2025) is an open-source expert-parallel communication library built solely around fast dispatch-and-combine: it provides high-throughput intranode (NVLink) and internode (RDMA) kernels, a low-latency inference path, and computation-communication overlap that hides the exchange behind expert math. It grew directly out of the <strong>DeepSeek-V3</strong> training stack (DeepSeek-AI, 2024), which co-designed the routing and the interconnect so that, with 256 experts per layer, all-to-all did not dominate, using node-limited routing to cap how many nodes each token visits. In parallel, work on <strong>expert-parallel all-to-all overlap</strong> (in Megatron-MoE, Tutel, and FasterMoE lineages) schedules the dispatch and combine exchanges to run concurrently with both the expert forward pass and the backward gradient computation, and adaptively reshapes routing to the live network topology. The common thread: the model's quality lives in its experts, but the frontier of making it trainable at all lives in the collective that moves the tokens.</p>
+</div>
+
+<h2>5. Why the Interconnect Decides <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Everything in this section converges on one conclusion: for an MoE model, the interconnect is not a detail, it is the design center. A dense model is mostly a compute problem, so a faster accelerator helps directly. A sparse model deliberately makes compute cheap and pays for it in movement, so the machine that matters is the network: NVLink bandwidth inside a node, InfiniBand or equivalent RDMA fabric between nodes, and the topology that connects them. Two clusters with identical GPUs but different fabrics will train the same MoE model at very different speeds, because the two all-to-alls per layer ride the fabric, not the GPU. This is why MoE training is concentrated on machines with the fastest available interconnects, and why the placement of experts relative to the network topology, an idea developed for general collectives in <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>, is decisive here. The next section confronts the imbalance that Output 17.5.1 exposed: when one expert is far more popular than the rest, the all-to-all is dragged down to the speed of its busiest link, and load balancing is what brings it back.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.5.1: Count the All-to-Alls in a Step <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A model has 60 transformer blocks, of which every second block is an MoE block (so 30 MoE blocks). Each MoE block performs a dispatch and a combine all-to-all in the forward pass, and the same two again in the backward pass. How many all-to-all collectives does one training step issue? If each all-to-all takes 0.4 ms on the cluster's fabric, how much of a step is spent purely in this collective? Explain why this number, not the expert FLOPs, is what a systems engineer profiles first.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.5.2: Measure the Imbalance Tax <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 17.5.1 so the completion time of each all-to-all is modeled as proportional to the <em>maximum</em> column sum of the send matrix (the busiest receiving device), not the total traffic. Run it for a balanced gate (<code>probs</code> uniform) and for the skewed gate given. Report the ratio of modeled times. Then add a simple capacity limit: any tokens beyond a per-expert capacity of $1.25 \times T$ are dropped, and measure how many tokens are lost under each gate. Relate your findings to the capacity-factor mechanism you will meet in <a href="section-17.7.html">Section 17.7</a>.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.5.3: Flat versus Hierarchical Cost <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the cost model $t_{\text{a2a}} \approx (D-1)\alpha + B_{\text{dispatch}}/\beta_{\text{eff}}$, consider 64 devices arranged as 8 nodes of 8, with intra-node bandwidth 10x the inter-node bandwidth and intra-node latency 5x lower. Estimate the time for a flat 64-way all-to-all, then for a hierarchical scheme (intra-node 8-way, then inter-node 8-way, then intra-node 8-way) carrying the same total token volume. Under what ratio of intra- to inter-node bandwidth does the hierarchical scheme stop being worth its extra latency terms? Tie your answer to the alpha-beta model of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-17.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 17.4</span><span class="nav-title">Expert Parallelism: Sharding Experts Across Nodes</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 17</span><span class="nav-num">Contents</span><span class="nav-title">Expert Parallelism and Sparse Distributed Models</span></a>
+<a class="next" href="section-17.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 17.6</span><span class="nav-title">Load Balancing Across Experts</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

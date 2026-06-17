@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 24.5: Prefill/Decode Disaggregation. Why the two phases of LLM generation have opposite resource profiles, how splitting them across specialized GPU pools meets TTFT and TPOT SLOs separately, and what the KV-cache transfer costs." name="description"/>
+<title>Section 24.5: Prefill/Decode Disaggregation | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 24: Distributed LLM Serving</a></div>
+<h1>Prefill/Decode Disaggregation</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I spent my whole life answering one token at a time, then a four-thousand-token prompt walked in and froze the entire room."</p>
+<cite>A Decode Step Stuck Behind a Prefill</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>An LLM request has two phases with opposite appetites: prefill reads the whole prompt in one compute-bound burst, while decode emits tokens one at a time, bound by memory bandwidth and lasting far longer. Forcing both onto the same GPU makes them fight, so a long prefill freezes everyone else's decoding.</strong> Prefill/decode disaggregation answers this the way a distributed system always does: split the workload across specialized machines. One pool of GPUs does nothing but prefill, another does nothing but decode, and the only thing crossing between them is the KV cache from the prompt. Each pool is then tuned and scaled for its own phase, so a serving fleet can meet its time-to-first-token and time-per-output-token targets independently instead of compromising on a single shared schedule. This section shows why the interference is real, what disaggregation costs, and when it wins.</p>
+</div>
+<p>In <a href="section-24.4.html">Section 24.4</a> we built the distributed and paged KV cache, the per-request memory that an LLM accumulates as it reads a prompt and writes a response. That section made the cache a movable object: blocks that can live on one machine and be addressed from another. This section spends that capability. Once the KV cache can travel, the two phases of generation no longer have to run on the same GPU, and pulling them apart turns out to fix one of the most stubborn latency problems in LLM serving. To see why, we first have to look closely at what those two phases actually demand from a GPU, because they could hardly be more different.</p>
+
+<h2>1. Two Phases, Opposite Resource Profiles <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Every token an LLM generates is produced by a forward pass over a transformer, but the first forward pass is unlike all the others. <strong>Prefill</strong> processes the entire prompt at once. If the prompt is $S$ tokens long, prefill runs the attention and feed-forward layers over all $S$ positions in a single large matrix multiply, building the key and value vectors (the KV cache) for every prompt token. This is a dense, highly parallel computation that saturates the GPU's arithmetic units; it is <em>compute-bound</em>. It is also bursty and short: one big pass, then it is done. The longer the prompt, the longer this single burst, and a 4,000-token prompt can occupy a GPU for tens of milliseconds doing nothing but prefill.</p>
+<p><strong>Decode</strong> is the opposite in every respect. After prefill, the model generates the response one token at a time. Each decode step is a forward pass over a <em>single</em> new token, which reads the entire KV cache accumulated so far to compute attention. The arithmetic per step is tiny, but it must stream the whole KV cache and all model weights through the GPU's memory system, so the step is limited by how fast memory can be read, not by how fast the GPU can multiply; it is <em>memory-bandwidth-bound</em>. Decode is also long-running: a request generating 500 tokens performs 500 of these steps, spread over seconds. The contrast is summarized in Table 24.5.1.</p>
+<div class="table-caption"><strong>Table 24.5.1:</strong> The two phases of LLM generation have opposite resource profiles, which is the entire reason disaggregation exists. A schedule tuned for one phase is wrong for the other.</div>
+<table>
+<thead>
+<tr><th scope="col">Property</th><th scope="col">Prefill</th><th scope="col">Decode</th></tr>
+</thead>
+<tbody>
+<tr><td>Work per step</td><td>Whole prompt ($S$ tokens) at once</td><td>One new token at a time</td></tr>
+<tr><td>Bottleneck</td><td>Compute (arithmetic units)</td><td>Memory bandwidth (KV + weights)</td></tr>
+<tr><td>Duration</td><td>Short, bursty</td><td>Long, many steps</td></tr>
+<tr><td>SLO it dominates</td><td>Time to first token (TTFT)</td><td>Time per output token (TPOT)</td></tr>
+<tr><td>Batching benefit</td><td>Limited (already compute-saturated)</td><td>Large (amortizes weight reads)</td></tr>
+</tbody>
+</table>
+<p>Those last two rows name the two latency targets that an LLM serving system lives or dies by. <strong>Time to first token (TTFT)</strong> is how long a user waits after sending a prompt before any output appears; it is dominated by prefill. <strong>Time per output token (TPOT)</strong>, sometimes called inter-token latency, is the gap between successive generated tokens once output starts; it is dominated by decode and governs how fluid the stream feels. A serving fleet typically commits to service-level objectives (SLOs) on both, for example "p99 TTFT under 350 ms and p99 TPOT under 20 ms." The trouble is that on a shared GPU these two goals are in direct conflict.</p>
+
+<h2>2. Why Co-Location Makes Them Interfere <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A standard inference engine runs prefill and decode on the same GPUs, interleaving them in each scheduling round. When a new request arrives, the engine must prefill its prompt before decoding can begin; that prefill is a large compute burst that occupies the GPU. Every other request that was happily decoding is now stalled until the burst finishes, because a GPU executes one kernel at a time. The freshly arrived prompt got its first token reasonably quickly, but it did so by inflating the TPOT of every request already in flight. This is classic head-of-line blocking: a short, latency-sensitive operation (a decode step) waits behind a long one (a prefill) that happened to land in front of it.</p>
+<p>Continuous batching, which we develop in <a href="section-24.6.html">Section 24.6</a>, mixes many requests into one running batch, and that helps throughput enormously, but it does not remove this conflict; it only forces a choice. Batch a big prefill together with ongoing decodes and the whole batch runs at the slower, prefill-bound pace, hurting TPOT. Hold prefills back to protect decode latency and new requests wait longer for their first token, hurting TTFT. The chunked-prefill technique from <a href="../module-22-per-node-inference-efficiency/section-22.7.html">Section 22.7</a> softens the blow by slicing a long prefill into smaller pieces that interleave with decode steps, so no single prefill burst is large enough to freeze the GPU. That is the leading <em>non-disaggregated</em> remedy, and on one node it is often enough. But it is still one set of GPUs trying to satisfy two contradictory schedules at once, and at high load the compromise shows.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: One GPU Cannot Be Tuned for Two Opposite Phases at Once</div>
+<p>Prefill wants to run as a large compute burst; decode wants steady, low-latency, memory-bound steps. On a shared GPU, any schedule that is good for one is bad for the other, so co-located serving always trades TTFT against TPOT along a single dial. Disaggregation removes the dial: it gives each phase its own machines, each batched, tuned, and scaled for exactly one resource profile, so both SLOs can be met at the same time instead of being traded off.</p>
+</div>
+
+<h2>3. Disaggregation: A Pool per Phase <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The distributed-systems instinct, the one this whole book trains, is to stop asking one machine to do contradictory jobs and instead split the work across specialized machines. Prefill/decode disaggregation does exactly that. A <strong>prefill pool</strong> of GPUs accepts incoming prompts, runs the prefill forward pass, and produces the KV cache. The KV cache is then transferred over a fast interconnect to a <strong>decode pool</strong> of GPUs, which holds the cache, runs all the one-token decode steps, and streams the output back to the user. Each pool runs one phase only, so each can be batched and scheduled for its own resource profile, and each can be scaled to its own SLO: add prefill GPUs when TTFT is at risk, add decode GPUs when TPOT is at risk, independently. This is the same heterogeneous-placement idea introduced for the cluster as a whole in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.2.html">Section 1.2</a>, now applied inside a single model's serving path. Figure 24.5.1 contrasts the two designs.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Top: a co-located design where a single GPU pool runs both prefill and decode, with a long prefill burst stalling decode steps. Bottom: a disaggregated design where a prefill pool produces a KV cache that is transferred over an interconnect to a separate decode pool.">
+<defs>
+<marker id="arr245" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b245 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.p245 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.d245 { fill:#eaf5ee; stroke:#1f7a44; stroke-width:1.6; }
+.x245 { fill:#fbeaea; stroke:#b22b2b; stroke-width:1.6; }
+.t245 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s245 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l245 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr245); }
+</style>
+<text class="t245" x="180" y="26">Co-located: one pool, both phases</text>
+<rect class="b245" x="70" y="44" width="300" height="120" rx="10"/>
+<rect class="p245" x="92" y="70" width="118" height="40" rx="6"/>
+<text class="s245" x="151" y="94">prefill burst</text>
+<rect class="d245" x="226" y="70" width="40" height="40" rx="6"/>
+<text class="s245" x="246" y="94">dec</text>
+<rect class="x245" x="276" y="70" width="40" height="40" rx="6"/>
+<text class="s245" x="296" y="94">dec</text>
+<text class="s245" x="220" y="138">decode steps stall behind the prefill burst</text>
+<text class="s245" x="220" y="155">TTFT ok, TPOT suffers</text>
+
+<text class="t245" x="640" y="26">Disaggregated: a pool per phase</text>
+<rect class="p245" x="470" y="44" width="150" height="74" rx="10"/>
+<text class="t245" x="545" y="72">Prefill pool</text>
+<text class="s245" x="545" y="92">compute-bound</text>
+<text class="s245" x="545" y="108">produces KV cache</text>
+<rect class="d245" x="690" y="44" width="150" height="74" rx="10"/>
+<text class="t245" x="765" y="72">Decode pool</text>
+<text class="s245" x="765" y="92">bandwidth-bound</text>
+<text class="s245" x="765" y="108">streams tokens</text>
+<line x1="620" y1="81" x2="688" y2="81" class="l245"/>
+<text class="s245" x="654" y="74">KV</text>
+<text class="s245" x="654" y="136">transfer over interconnect</text>
+<text class="s245" x="654" y="152">(the cost of disaggregation)</text>
+
+<text class="t245" x="430" y="220">Same hardware, two schedules side by side over time</text>
+<rect class="p245" x="70" y="244" width="240" height="34" rx="6"/>
+<text class="s245" x="190" y="266">prefill pool: back-to-back prefills, fully batched</text>
+<rect class="d245" x="70" y="290" width="700" height="34" rx="6"/>
+<text class="s245" x="420" y="312">decode pool: uninterrupted low-latency token steps, never blocked by a prefill</text>
+<text class="s245" x="430" y="356">each pool sized to its own SLO: more prefill GPUs for TTFT, more decode GPUs for TPOT</text>
+<line x1="70" y1="380" x2="790" y2="380" class="l245"/>
+<text class="s245" x="70" y="398" style="text-anchor:start">t = 0</text>
+<text class="s245" x="790" y="398" style="text-anchor:end">time</text>
+</svg>
+<figcaption><strong>Figure 24.5.1:</strong> Top left, a co-located pool runs prefill and decode together, so a prefill burst (orange) stalls the decode steps (green) queued behind it. Top right, disaggregation routes each prompt through a prefill pool that produces the KV cache, ships it over the interconnect to a decode pool, and lets each pool run one phase only. The lower timeline shows the payoff: the decode pool streams tokens without ever being frozen by a prefill, and each pool is scaled to the SLO it owns.</figcaption>
+</figure>
+<p>This is a genuinely distributed design, not a single-node optimization. The two pools are different sets of machines, possibly with different GPU types, different batch sizes, and different replica counts, coordinated by a scheduler that routes each request from prefill to decode. It is the serving-time sibling of the heterogeneous parallelism we used in training: just as <a href="../module-22-per-node-inference-efficiency/section-22.7.html">Chapter 22</a> studied the per-node cost of one request, disaggregation multiplies that economics across a fleet by giving each phase the hardware it actually wants.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Specialized Machines for a Specialized Workload</div>
+<p>The book's spine is that AI at scale is the engineering of work spread across many machines. Disaggregation is that spine applied to a single inference request: rather than scale up one GPU to juggle two incompatible phases, we scale out across two pools, each doing one thing well, and pay a communication cost (the KV transfer from <a href="section-24.4.html">Section 24.4</a>) to connect them. The decision is the same one we made for data-parallel training in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>: a little communication buys non-interference and independent scaling, and at high load that trade is overwhelmingly worth it.</p>
+</div>
+
+<h2>4. Modeling the Cost: TTFT, TPOT, and the KV Transfer <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Disaggregation is not free. The KV cache produced by prefill must be physically moved to the decode pool before decoding can start, and that transfer adds to TTFT. We can write the two metrics as simple sums. For a request whose prompt has $S$ tokens, let $t_{\text{pf}}(S)$ be the prefill time, $t_{\text{q}}$ the time it waits in the prefill queue, and $t_{\text{kv}}$ the KV-cache transfer time. Then</p>
+$$\text{TTFT} = t_{\text{q}} + t_{\text{pf}}(S) + t_{\text{kv}}, \qquad \text{TPOT} = \frac{1}{G}\sum_{j=1}^{G} \big(t_{\text{step}} + t_{\text{wait},j}\big),$$
+<p>where $G$ is the number of generated tokens, $t_{\text{step}}$ is the raw cost of one decode step, and $t_{\text{wait},j}$ is the queueing delay the $j$-th step suffers from contention. In co-located serving, $t_{\text{wait},j}$ is large and spiky because decode steps wait behind prefill bursts; that is the interference. Disaggregation adds the $t_{\text{kv}}$ term to TTFT but drives the $t_{\text{wait},j}$ terms in TPOT down to near zero, because the decode pool never runs a prefill. The whole bet is that the constant $t_{\text{kv}}$ we add is small compared to the spiky waiting we remove, and that the prefill queue $t_{\text{q}}$ stays short because we scaled the prefill pool for it. The next code makes this concrete by simulating both designs and checking each SLO.</p>
+<pre><code class="language-python">import heapq
+from dataclasses import dataclass
+
+# A tiny discrete-event model of LLM serving. Each request has a prompt to
+# prefill (compute-bound, one burst) and tokens to decode (bandwidth-bound,
+# many small steps). We measure two SLO metrics:
+#   TTFT = time to first token  (arrival -> prefill done + KV transfer)
+#   TPOT = time per output token (mean gap between decode steps)
+
+PREFILL_MS_PER_TOK = 0.20   # prefill is fast per token but prompts are long
+DECODE_MS_PER_STEP = 2.0    # one decode step for one request on a free GPU
+KV_TRANSFER_MS     = 4.0    # ship one request's KV cache prefill -> decode
+N_PREFILL_WORKERS  = 4      # disagg: prefill pool sized for the TTFT SLO
+N_DECODE_WORKERS   = 2      # disagg: decode pool sized for the TPOT SLO
+
+@dataclass
+class Req:
+    rid: int; arrival: float; prompt_len: int; gen_len: int
+
+# Eight long-prompt requests arriving in a burst, each generating 60 tokens.
+REQS = [Req(i, arrival=i * 8.0, prompt_len=700, gen_len=60) for i in range(8)]
+
+def colocated(reqs):
+    """One GPU does prefill AND decode, so a prefill burst blocks every decode
+    step queued behind it (head-of-line interference)."""
+    gpu_free = 0.0
+    ttft, gaps = {}, {r.rid: [] for r in reqs}
+    last_dec, rem = {}, {r.rid: r.gen_len for r in reqs}
+    arr  = {r.rid: r.arrival for r in reqs}
+    plen = {r.rid: r.prompt_len for r in reqs}
+    events = [(r.arrival, 0, r.rid) for r in reqs]       # 0 = prefill task
+    heapq.heapify(events)
+    while events:
+        ready, kind, rid = heapq.heappop(events)
+        start = max(ready, gpu_free)                     # contend for the one GPU
+        if kind == 0:                                    # blocking prefill burst
+            gpu_free = start + plen[rid] * PREFILL_MS_PER_TOK
+            ttft[rid] = gpu_free - arr[rid]
+            last_dec[rid] = gpu_free
+            heapq.heappush(events, (gpu_free, 1, rid))
+        else:                                            # one decode step
+            gpu_free = start + DECODE_MS_PER_STEP
+            gaps[rid].append(gpu_free - last_dec[rid])
+            last_dec[rid] = gpu_free
+            rem[rid] -= 1
+            if rem[rid] > 0:
+                heapq.heappush(events, (gpu_free, 1, rid))
+    return summarize(ttft, gaps)
+
+def disaggregated(reqs):
+    """Two pools. The prefill pool (parallel workers) produces the KV cache;
+    the decode pool runs token steps and is never blocked by a prefill."""
+    ttft, gaps, last_dec = {}, {r.rid: [] for r in reqs}, {}
+    prefill_workers = [0.0] * N_PREFILL_WORKERS
+    prefill_done = {}
+    for r in sorted(reqs, key=lambda x: x.arrival):      # earliest-free worker
+        w = min(range(N_PREFILL_WORKERS), key=lambda i: prefill_workers[i])
+        start = max(r.arrival, prefill_workers[w])
+        prefill_workers[w] = start + r.prompt_len * PREFILL_MS_PER_TOK
+        prefill_done[r.rid] = prefill_workers[w] + KV_TRANSFER_MS   # + KV ship
+        ttft[r.rid] = prefill_done[r.rid] - r.arrival
+    decode_workers = [0.0] * N_DECODE_WORKERS
+    rem = {r.rid: r.gen_len for r in reqs}
+    events = []
+    for r in reqs:
+        heapq.heappush(events, (prefill_done[r.rid], r.rid))
+        last_dec[r.rid] = prefill_done[r.rid]
+    while events:                                        # round-robin decode
+        ready, rid = heapq.heappop(events)
+        w = min(range(N_DECODE_WORKERS), key=lambda i: decode_workers[i])
+        start = max(ready, decode_workers[w])
+        decode_workers[w] = start + DECODE_MS_PER_STEP
+        gaps[rid].append(decode_workers[w] - last_dec[rid])
+        last_dec[rid] = decode_workers[w]
+        rem[rid] -= 1
+        if rem[rid] > 0:
+            heapq.heappush(events, (decode_workers[w], rid))
+    return summarize(ttft, gaps)
+
+def summarize(ttft, gaps):
+    n = len(ttft)
+    all_gaps = [g for gs in gaps.values() for g in gs]
+    return (sum(ttft.values()) / n, max(ttft.values()),
+            sum(all_gaps) / len(all_gaps),
+            sorted(all_gaps)[int(0.99 * (len(all_gaps) - 1))])
+
+TTFT_SLO, TPOT_SLO = 350.0, 20.0   # ms, p99 targets
+for name, fn in [("Co-located (one pool)", colocated),
+                 ("Disaggregated (two pools)", disaggregated)]:
+    mt, pt, mtp, ptp = fn(REQS)
+    print(name)
+    print(f"  TTFT mean={mt:7.1f}  p99={pt:7.1f}  SLO<={TTFT_SLO:.0f}  "
+          f"[{'PASS' if pt <= TTFT_SLO else 'FAIL'}]")
+    print(f"  TPOT mean={mtp:7.1f}  p99={ptp:7.1f}  SLO<={TPOT_SLO:.0f}   "
+          f"[{'PASS' if ptp <= TPOT_SLO else 'FAIL'}]\n")
+print(f"KV-cache transfer charged per request (disagg only): {KV_TRANSFER_MS:.1f} ms")
+</code></pre>
+<div class="code-caption"><strong>Code 24.5.1:</strong> A from-scratch discrete-event simulation of one burst of eight long-prompt requests. <code>colocated</code> serves prefill and decode on a single GPU, so prefill bursts inflate the decode gaps; <code>disaggregated</code> runs a four-worker prefill pool and a two-worker decode pool connected by a fixed KV-transfer cost. Both are scored against the same p99 TTFT and TPOT SLOs.</div>
+<pre><code class="language-text">Co-located (one pool)
+  TTFT mean=  602.0  p99= 1064.0  SLO<=350  [FAIL]
+  TPOT mean=   24.1  p99=  292.0  SLO<=20   [FAIL]
+
+Disaggregated (two pools)
+  TTFT mean=  198.0  p99=  252.0  SLO<=350  [PASS]
+  TPOT mean=    5.3  p99=    8.0  SLO<=20   [PASS]
+
+KV-cache transfer charged per request (disagg only): 4.0 ms
+</code></pre>
+<div class="code-caption"><strong>Output 24.5.1:</strong> Under the burst, the co-located pool fails both SLOs: prefills queue (p99 TTFT 1064 ms) and stall decode (p99 TPOT 292 ms). Disaggregation pays a flat 4 ms KV transfer yet meets both targets (p99 TTFT 252 ms, p99 TPOT 8 ms), because each phase runs on a pool sized and scheduled for its own profile.</div>
+<p>The numbers tell the story the model predicted. In the co-located run, the worst-case TPOT of 292 ms is the head-of-line blocking made visible: some decode step waited behind a 140 ms prefill burst, then another, and the inter-token gap exploded far past the 20 ms target. Disaggregation removes that waiting entirely (its p99 TPOT is 8 ms) at the price of a constant 4 ms added to every TTFT, a price so small it is invisible next to the 350 ms budget. The decode pool's tokens flow because nothing on those machines ever does a prefill, and the prefill pool clears the burst quickly because four workers absorb it in parallel. That is the whole argument for disaggregation, reduced to one runnable experiment.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: vLLM Disaggregated Serving in a Config Flag</div>
+<p>The hundred-odd lines of scheduling and KV-transfer logic in Code 24.5.1 are exactly what production inference engines have absorbed. vLLM ships a disaggregated-prefill mode where a prefill instance and a decode instance are connected by a KV-transfer connector, and you opt in through configuration rather than code:</p>
+<pre><code class="language-python"># Prefill instance: produces KV cache and pushes it to the connector.
+# (illustrative kv_transfer_config; see the vLLM disaggregated-prefill docs)
+from vllm import LLM
+prefill = LLM(model="meta-llama/Llama-3.1-8B-Instruct",
+              kv_transfer_config={"kv_role": "kv_producer",
+                                  "kv_connector": "PyNcclConnector"})
+# Decode instance: pulls the KV cache and runs the token steps.
+decode  = LLM(model="meta-llama/Llama-3.1-8B-Instruct",
+              kv_transfer_config={"kv_role": "kv_consumer",
+                                  "kv_connector": "PyNcclConnector"})
+</code></pre>
+<div class="code-caption"><strong>Code 24.5.2:</strong> The same producer/consumer split as Code 24.5.1, now declared through vLLM's <code>kv_transfer_config</code>. The engine handles pool routing, the NCCL-based KV transfer, paged-cache layout, and continuous batching internally; the roughly 110 lines of simulation collapse to two constructor calls plus a launcher that runs the instances on separate GPUs.</div>
+</div>
+
+<h2>5. When Disaggregation Wins, and When It Does Not <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Disaggregation is a trade, and like every trade in this book it has a regime where it pays and a regime where it does not. It wins when the interference it removes costs more than the KV transfer it adds. Concretely, it pays off under <strong>high load</strong>, where prefills arrive often enough that they are constantly stepping on decodes, and under <strong>tight TPOT SLOs</strong>, where even occasional inter-token stalls violate the objective. It also wins when prompts are <strong>long</strong>, because long prompts make prefill bursts large and therefore more disruptive to co-located decode. In these regimes the spiky $t_{\text{wait},j}$ term dominates, and moving it out is worth a constant KV-transfer penalty.</p>
+<p>It does <em>not</em> win when load is light, because an idle GPU has no decode steps to stall, so there is nothing to protect and the KV transfer is pure overhead. It struggles when the interconnect between pools is slow, because then $t_{\text{kv}}$ stops being a small constant and starts dominating TTFT; disaggregation assumes a fast link of the kind built in <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>, and over a thin network it can lose to a co-located engine. And it adds operational complexity: two pools to size, a router to keep them balanced, and a failure mode where a decode replica dies holding KV caches that the prefill pool already discarded. On a single node serving moderate traffic, the chunked-prefill approach from <a href="../module-22-per-node-inference-efficiency/section-22.7.html">Section 22.7</a> is simpler and often sufficient; disaggregation earns its keep at fleet scale, which is exactly where this chapter operates.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Chat Assistant That Could Not Keep Its Stream Smooth</div>
+<p><strong>Who:</strong> An inference platform engineer running a customer-facing LLM chat assistant on a cluster of GPUs.</p>
+<p><strong>Situation:</strong> Traffic was bursty, with long retrieval-augmented prompts (several thousand tokens) arriving alongside many in-flight conversations that were still streaming their answers.</p>
+<p><strong>Problem:</strong> The TTFT SLO was comfortably met, but p99 TPOT kept spiking past the 25 ms target whenever a long prompt arrived, and users saw the answer stream stutter and freeze.</p>
+<p><strong>Dilemma:</strong> Enable chunked prefill on the existing co-located pool, simple but still one set of GPUs juggling both phases, or disaggregate into separate prefill and decode pools, which meets both SLOs cleanly but adds a router, a KV-transfer path, and a second pool to operate.</p>
+<p><strong>Decision:</strong> They disaggregated, because the binding problem was decode-side interference at high load with long prompts, the exact regime where the KV-transfer cost is dwarfed by the stalls it removes.</p>
+<p><strong>How:</strong> They split the fleet into a prefill pool and a larger decode pool over a fast intra-rack interconnect, transferred the paged KV cache from <a href="section-24.4.html">Section 24.4</a> between them, and sized each pool to its own SLO, scaling the decode pool out as concurrency grew.</p>
+<p><strong>Result:</strong> p99 TPOT settled under 10 ms and stopped spiking on long prompts, TTFT rose by only the few-millisecond transfer cost, and each pool could now be scaled on its own metric, just as Output 24.5.1 predicts.</p>
+<p><strong>Lesson:</strong> Disaggregate when decode interference under load is the binding constraint and the interconnect is fast; below that load, or over a slow link, the simpler chunked-prefill remedy is the right tool.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Prompt That Froze the Room</div>
+<p>The epigraph is not much of an exaggeration. A single 8,000-token system prompt landing on a co-located GPU really can freeze every other user's token stream for tens of milliseconds while it prefills, which is why support channels for early LLM products filled with reports of answers that "typed smoothly, then hung, then resumed." Disaggregation is, in effect, giving the long-winded newcomers their own room so the rest of the conversation can keep flowing.</p>
+</div>
+
+<h2>6. The State of the Art <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Disaggregation moved from idea to standard practice over a very short window, and the research record names the milestones. We summarize them here because the design choices they explored (how to size pools, where to put the KV transfer, when to fall back to co-location) are exactly the levers the previous sections described.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Prefill/Decode Disaggregation (2024 to 2026)</div>
+<p>Two 2024 systems established the idea. <strong>DistServe</strong> (Zhong et al., 2024) showed that disaggregating prefill and decode onto separate GPU pools, each tuned for its phase, lets a serving system meet TTFT and TPOT SLOs that a co-located engine cannot, and it formalized how to assign GPUs to each pool given a target SLO. <strong>Splitwise</strong> (Patel et al., 2024) reached the same conclusion from a cost-and-power angle, splitting the phases across machines (even across heterogeneous GPU types, cheaper hardware for memory-bound decode) to raise throughput per watt. Building on these, <strong>Mooncake</strong> (Qin et al., 2024), the serving architecture behind the Kimi assistant, made the KV cache the center of gravity: a disaggregated, KV-cache-centric design with a large pooled cache store that turns the transfer of <a href="section-24.4.html">Section 24.4</a> into a first-class, prefix-shareable resource. <strong>MemServe</strong> (Hu et al., 2024) generalized this with an elastic memory pool (MemPool) that unifies disaggregated serving with prefix caching across instances. The open-source frontier has since absorbed the pattern: vLLM, SGLang, and TensorRT-LLM (<a href="section-24.9.html">Section 24.9</a>) all ship disaggregated-serving modes, and the active questions are now about smarter KV routing, cache-aware pool balancing, and when adaptive engines should collapse back to co-location under light load.</p>
+</div>
+<p>The throughline from DistServe to MemServe is the one this section has argued from first principles: the two phases are different workloads, so give them different machines and connect them with the KV cache. With disaggregation in hand, the remaining question is how requests flow into and between these pools without idling GPUs, which is the scheduling problem we take up next.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.5.1: Where Does the Interference Come From? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the TTFT and TPOT decompositions in Section 4, explain in your own words which term blows up in the co-located run of Output 24.5.1 and why, and which term disaggregation adds in exchange. Then argue what happens to the comparison if every prompt is short (say 20 tokens): does disaggregation still help, and what does that tell you about the role of prompt length in choosing the design? Tie your answer to the "when it wins" conditions in Section 5.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.5.2: Sweep the Load and the Link <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 24.5.1 in two ways. First, sweep the request inter-arrival gap (the <code>arrival=i * 8.0</code> spacing) from very sparse to very dense and plot p99 TPOT for both designs; identify the load at which co-location first violates the TPOT SLO. Second, sweep <code>KV_TRANSFER_MS</code> from 4 ms up to 200 ms (a slow interconnect) and find the transfer cost at which disaggregation's TTFT advantage disappears. State the two break-even points you found and relate them to the win/lose regimes in Section 5.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.5.3: Size the Two Pools <span class="exercise-type analysis">Analysis</span></div>
+<p>Suppose prefill costs $0.2$ ms per prompt token, decode costs $2$ ms per step, prompts average $S = 1000$ tokens, responses average $G = 200$ tokens, and requests arrive at $\lambda = 40$ per second. Estimate the aggregate prefill GPU-seconds and decode GPU-seconds demanded per wall-clock second, and from those numbers propose a ratio of prefill workers to decode workers for the pools. Explain why this ratio is generally not one to one, and how it would shift if average prompt length doubled while response length stayed fixed. Connect your reasoning to the independent-scaling argument of Section 3.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-24.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 24.4</span><span class="nav-title">Distributed and Paged KV Cache</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 24</span><span class="nav-num">Contents</span><span class="nav-title">Distributed LLM Serving</span></a>
+<a class="next" href="section-24.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 24.6</span><span class="nav-title">Request Scheduling and Continuous Batching Across Nodes</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

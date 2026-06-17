@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 15.3: Data Parallelism. The canonical algorithm in full: replicated models, sharded mini-batches, gradient averaging by all-reduce, and the identical update that keeps every replica in lockstep." name="description"/>
+<title>Section 15.3: Data Parallelism | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Data-Parallel Deep Learning</a></div>
+<h1>Data Parallelism</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They handed each of us a different quarter of the batch and the same set of weights, then asked us to come out the other side thinking exactly alike. Reader, we did."</p>
+<cite>A Replica That Never Drifted</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Data parallelism trains one model on many machines by giving every machine a full copy of the model and a different slice of the data, then forcing all the copies to take the identical step.</strong> Each worker runs an ordinary forward and backward pass on its local slice, producing a local gradient that reflects only the examples it saw. The workers then average their gradients with a single collective operation, all-reduce, and every worker applies that one averaged gradient to its own replica. Because they started identical and applied the same update, they stay identical, step after step, with no master copy and no drift. This section states the algorithm in full, proves it is exact rather than approximate, and shows the one thing it cannot do: shrink the model to fit a smaller machine.</p>
+</div>
+<p>Section 1.1 proved, in a single equation, that the gradient of an average loss is itself an average and therefore decomposes across a partition of the data (<a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>). Section 15.2 took that idea off the page and onto hardware, walking from one GPU to many GPUs in one node to many nodes across a network. This section closes the loop: it presents the full data-parallel training algorithm, the one that nearly every large model you have heard of was trained with, and pins down exactly what each worker holds, computes, and exchanges on every step. Everything in the rest of the chapter, gradient synchronization, bucketing, DDP, Horovod, is an optimization of the loop defined here.</p>
+<p>The promise is strong and worth stating plainly before we earn it. Data-parallel training across $K$ workers does not approximate single-machine training on the combined batch; it reproduces it, bit for bit up to floating-point rounding. The workers are not voting or ensembling. They are computing one gradient together and taking one step together, having merely split the arithmetic of that gradient across machines. That exactness is the reason data parallelism is the default, the baseline against which every fancier form of parallelism in Chapters 16 and 17 must justify its added complexity.</p>
+
+<h2>1. The Algorithm, Stated in Full <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Fix a model with parameters $w$ and a mini-batch SGD loop of the kind built in <a href="../../part-3-distributed-ml/module-10-distributed-optimization/section-10.2.html">Section 10.2</a>. Data-parallel training runs $K$ workers, indexed $k = 1, \dots, K$, and maintains one invariant above all others: every worker holds an identical copy of $w$ at the start of every step. One step proceeds in four phases.</p>
+<p>First, <strong>shard the global batch</strong>. A global mini-batch $B$ of size $|B| = b_{\text{global}}$ is split into $K$ disjoint local batches $B_1, \dots, B_K$, one per worker, each of size $b_{\text{local}} = b_{\text{global}} / K$. Worker $k$ sees only $B_k$ and never the other shards. Second, <strong>compute local gradients</strong>. Each worker runs a forward pass and a backward pass through its full model replica on its own local batch, producing a local gradient $g_k$ that is the mean gradient over the $b_{\text{local}}$ examples it processed. Third, <strong>average across workers</strong>. The $K$ local gradients are combined into one averaged gradient $\bar{g}$ by an all-reduce, the collective introduced in <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>. Fourth, <strong>apply the identical update</strong>. Every worker updates its own replica with the same $\bar{g}$ and the same optimizer, so all replicas land on identical parameters and the invariant is restored for the next step.</p>
+<p>The averaged gradient is the only quantity that crosses the network, and its definition is the heart of the method:</p>
+$$\bar{g} \;=\; \frac{1}{K} \sum_{k=1}^{K} g_k, \qquad g_k \;=\; \frac{1}{b_{\text{local}}} \sum_{i \in B_k} \nabla \ell(w; x_i, y_i), \qquad w \;\leftarrow\; w - \eta \, \bar{g}.$$
+<p>Figure 15.3.1 traces these four phases across three workers, showing the shards entering at the top, the local gradients meeting in the all-reduce, and the single averaged gradient flowing back out to drive the identical update on every replica.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three workers each receive a disjoint batch shard, each holds a full model replica, each computes a local gradient; the local gradients meet in a central all-reduce that produces one averaged gradient, which flows back to every replica to drive an identical parameter update.">
+<defs>
+<marker id="arr153" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr153o" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.b153 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w153 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.r153 { fill:#eef6ef; stroke:#2f7d46; stroke-width:1.6; }
+.t153 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s153 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l153 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr153); }
+.lo153 { fill:none; stroke:#b86b1f; stroke-width:1.7; marker-end:url(#arr153o); }
+</style>
+<text class="t153" x="430" y="22">Global mini-batch, sharded into K disjoint local batches</text>
+<rect class="w153" x="70" y="38" width="150" height="30" rx="6"/>
+<text class="s153" x="145" y="58">shard B&#8321; (local batch)</text>
+<rect class="w153" x="355" y="38" width="150" height="30" rx="6"/>
+<text class="s153" x="430" y="58">shard B&#8322; (local batch)</text>
+<rect class="w153" x="640" y="38" width="150" height="30" rx="6"/>
+<text class="s153" x="715" y="58">shard B&#8323; (local batch)</text>
+<rect class="r153" x="70" y="92" width="150" height="78" rx="9"/>
+<text class="t153" x="145" y="118">Worker 1</text>
+<text class="s153" x="145" y="138">full model replica</text>
+<text class="s153" x="145" y="156">forward + backward</text>
+<rect class="r153" x="355" y="92" width="150" height="78" rx="9"/>
+<text class="t153" x="430" y="118">Worker 2</text>
+<text class="s153" x="430" y="138">full model replica</text>
+<text class="s153" x="430" y="156">forward + backward</text>
+<rect class="r153" x="640" y="92" width="150" height="78" rx="9"/>
+<text class="t153" x="715" y="118">Worker 3</text>
+<text class="s153" x="715" y="138">full model replica</text>
+<text class="s153" x="715" y="156">forward + backward</text>
+<line x1="145" y1="68" x2="145" y2="90" class="l153"/>
+<line x1="430" y1="68" x2="430" y2="90" class="l153"/>
+<line x1="715" y1="68" x2="715" y2="90" class="l153"/>
+<text class="s153" x="120" y="200">local g&#8321;</text>
+<text class="s153" x="405" y="200">local g&#8322;</text>
+<text class="s153" x="690" y="200">local g&#8323;</text>
+<rect class="b153" x="300" y="232" width="260" height="58" rx="9"/>
+<text class="t153" x="430" y="256">All-reduce (average)</text>
+<text class="s153" x="430" y="276">g&#773; = (g&#8321; + g&#8322; + g&#8323;) / K</text>
+<path class="l153" d="M 145 170 L 145 261 L 298 261"/>
+<path class="l153" d="M 430 170 L 430 230"/>
+<path class="l153" d="M 715 170 L 715 261 L 562 261"/>
+<rect class="r153" x="70" y="330" width="150" height="56" rx="9"/>
+<text class="t153" x="145" y="354">Worker 1 update</text>
+<text class="s153" x="145" y="372">w &#8592; w &#8722; &#951; g&#773;</text>
+<rect class="r153" x="355" y="330" width="150" height="56" rx="9"/>
+<text class="t153" x="430" y="354">Worker 2 update</text>
+<text class="s153" x="430" y="372">w &#8592; w &#8722; &#951; g&#773;</text>
+<rect class="r153" x="640" y="330" width="150" height="56" rx="9"/>
+<text class="t153" x="715" y="354">Worker 3 update</text>
+<text class="s153" x="715" y="372">w &#8592; w &#8722; &#951; g&#773;</text>
+<path class="lo153" d="M 360 290 L 145 290 L 145 328"/>
+<path class="lo153" d="M 430 290 L 430 328"/>
+<path class="lo153" d="M 500 290 L 715 290 L 715 328"/>
+<text class="s153" x="430" y="408">identical g&#773; to every replica &#8594; replicas stay bit-for-bit identical</text>
+</svg>
+<figcaption><strong>Figure 15.3.1:</strong> One data-parallel training step across three workers. Disjoint shards enter at the top (orange); each worker runs a full forward and backward pass on its own model replica (green) to produce a local gradient $g_k$; the all-reduce (blue) averages the three into one $\bar{g}$; that single averaged gradient flows back (orange arrows) to drive an identical update on every replica. Because the replicas start identical and apply the same $\bar{g}$, they remain identical with no master copy. Only $\bar{g}$ crosses the network.</figcaption>
+</figure>
+<p>Notice what is absent. There is no parameter server holding an authoritative copy, no leader that decides the update, no broadcast of weights between steps. The symmetry is total: every worker runs the same code, holds the same parameters, and the only asymmetry is which shard of data it happened to receive. This peer-to-peer structure is exactly why all-reduce, and not the push-pull of a parameter server from <a href="../../part-3-distributed-ml/module-10-distributed-optimization/section-10.2.html">Chapter 10</a>, is the natural collective here; <a href="section-15.4.html">Section 15.4</a> opens up the all-reduce itself.</p>
+
+<h2>2. Why the Result Is Exact <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The claim is that the averaged gradient $\bar{g}$ computed across $K$ shards equals the gradient that a single machine would compute over the whole global batch at the same parameters. The proof is one line of algebra and rests entirely on the fact that the per-example gradients are the same numbers regardless of which worker holds them, because every worker holds an identical replica $w$. Write the single-machine mean gradient over the global batch $B$, then group the examples by which shard they fell into:</p>
+$$g_{\text{global}} = \frac{1}{b_{\text{global}}} \sum_{i \in B} \nabla \ell(w; x_i, y_i) = \frac{1}{K} \sum_{k=1}^{K} \underbrace{\frac{1}{b_{\text{local}}} \sum_{i \in B_k} \nabla \ell(w; x_i, y_i)}_{g_k} = \frac{1}{K} \sum_{k=1}^{K} g_k = \bar{g}.$$
+<p>The regrouping is legal only because the shards are disjoint and exhaustive (they partition $B$) and equal in size (so the inner mean over $b_{\text{local}}$ and the outer mean over $K$ compose into a single mean over $b_{\text{global}}$). The middle equality is the whole argument: addition does not care how you group the terms. This is the same decomposition first met in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>, now wrapped in a full training loop rather than a single gradient evaluation.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Global Batch Equals K Times Local Batch</div>
+<p>The single number that ties the math to the hardware is $b_{\text{global}} = K \cdot b_{\text{local}}$. When you add workers, you are not running $K$ separate small trainings; you are running one training whose effective batch is $K$ times the per-worker batch. Doubling the worker count doubles the global batch unless you halve $b_{\text{local}}$ to compensate. This is why scaling data-parallel training is also a tour of large-batch optimization: the exactness holds at fixed $w$, but a larger global batch changes the gradient-noise scale and usually demands a re-tuned learning rate and warmup, the subject of large-batch training methods in <a href="../../part-3-distributed-ml/module-10-distributed-optimization/section-10.2.html">Chapter 10</a>.</p>
+</div>
+<p>One subtlety deserves a flag. The exactness is an exactness of the gradient at a given $w$, not a guarantee that the optimization trajectory of a small-batch run and a large-batch run will coincide. They will not, because they take steps on different batch sizes with different gradient noise. What data parallelism guarantees is the narrower, load-bearing claim: a $K$-worker data-parallel run with global batch $b_{\text{global}}$ produces, step for step, exactly the trajectory of a single machine that processed that same global batch of $b_{\text{global}}$ examples per step. That is the equivalence we verify numerically next.</p>
+
+<h2>3. A Runnable Demonstration <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The code below implements the full four-phase loop on a small two-layer network, with $K = 8$ replicas simulated in one process so we can inspect them directly. Each replica is a full copy of the model. On every step, each replica computes a local gradient on its own disjoint shard, the eight gradients are averaged (the all-reduce, done here as an explicit sum and divide), and every replica applies the identical averaged gradient. We then check two things that matter: that the eight replicas remain identical to each other, and that replica zero matches a single machine that trained on the whole global batch.</p>
+<pre><code class="language-python">import numpy as np
+
+# A tiny 2-layer MLP (tanh hidden, linear output) trained with full-batch
+# gradient descent on a regression target. Two runs that must be identical:
+#   (A) single machine over the WHOLE global batch
+#   (B) K replicas, each over a disjoint local shard, gradients averaged
+#       (all-reduce), the identical averaged gradient applied everywhere.
+rng = np.random.default_rng(7)
+N, d, H, K = 4096, 16, 32, 8          # global batch, in-dim, hidden, replicas
+assert N % K == 0
+X = rng.standard_normal((N, d))
+w_star = rng.standard_normal((d, 1))
+y = np.tanh(X @ w_star) + 0.05 * rng.standard_normal((N, 1))
+
+def init_params():                     # every replica starts from the SAME seed
+    g = np.random.default_rng(0)
+    return {"W1": g.standard_normal((d, H)) * 0.1, "b1": np.zeros((1, H)),
+            "W2": g.standard_normal((H, 1)) * 0.1, "b2": np.zeros((1, 1))}
+
+def forward_backward(p, Xb, yb):       # returns (SSE loss, SUMMED gradients)
+    a1 = np.tanh(Xb @ p["W1"] + p["b1"])
+    out = a1 @ p["W2"] + p["b2"]
+    resid = out - yb
+    dout = 2.0 * resid                                  # summed, not averaged
+    da1 = (dout @ p["W2"].T) * (1.0 - a1 ** 2)          # tanh'
+    return float(np.sum(resid ** 2)), {
+        "W1": Xb.T @ da1, "b1": np.sum(da1, axis=0, keepdims=True),
+        "W2": a1.T @ dout, "b2": np.sum(dout, axis=0, keepdims=True)}
+
+lr, steps = 0.02, 200
+
+# (A) single machine, whole global batch
+pA = init_params()
+for _ in range(steps):
+    _, g = forward_backward(pA, X, y)
+    for k in pA: pA[k] -= lr * (g[k] / N)               # mean over global batch
+
+# (B) K replicas, disjoint shards, all-reduce the gradients
+shards = np.array_split(np.arange(N), K)
+reps = [init_params() for _ in range(K)]                # K full model copies
+for _ in range(steps):
+    loc = [forward_backward(reps[r], X[shards[r]], y[shards[r]])[1]
+           for r in range(K)]                           # local SUMMED gradients
+    avg = {k: np.sum([loc[r][k] for r in range(K)], axis=0) / N
+           for k in reps[0]}                            # all-reduce -> mean grad
+    for r in range(K):                                  # IDENTICAL update everywhere
+        for k in reps[r]: reps[r][k] -= lr * avg[k]
+
+drift = max(float(np.max(np.abs(reps[r][k] - reps[0][k])))
+            for k in reps[0] for r in range(1, K))      # replicas vs each other
+gap = max(float(np.max(np.abs(reps[0][k] - pA[k]))) for k in pA)  # vs single machine
+print("global batch N        :", N)
+print("replicas K            :", K, "  local batch per replica:", N // K)
+print("max drift across reps :", f"{drift:.2e}")
+print("max gap vs single-mach:", f"{gap:.2e}")
+print("final single-mach loss:", f"{forward_backward(pA, X, y)[0] / N:.6f}")
+print("final replica-0   loss:", f"{forward_backward(reps[0], X, y)[0] / N:.6f}")
+</code></pre>
+<div class="code-caption"><strong>Code 15.3.1:</strong> The full data-parallel loop in pure NumPy. Eight replicas each train on a disjoint shard; their summed local gradients are added and divided by the global $N$ (the all-reduce), and the one averaged gradient drives an identical update on every replica. The two probes <code>drift</code> and <code>gap</code> test the invariant and the single-machine equivalence directly.</div>
+<pre><code class="language-text">global batch N        : 4096
+replicas K            : 8   local batch per replica: 512
+max drift across reps : 0.00e+00
+max gap vs single-mach: 1.11e-16
+final single-mach loss: 0.179049
+final replica-0   loss: 0.179049
+</code></pre>
+<div class="code-caption"><strong>Output 15.3.1:</strong> After 200 steps the eight replicas are bit-for-bit identical (drift is exactly zero), and replica zero matches the single-machine large-batch run to one unit in the last place ($1.11 \times 10^{-16}$). The final losses agree to six decimals. Splitting the batch across eight replicas changed the trained model by nothing.</div>
+<p>The zero drift is not luck; it is structural. Every replica starts from the same parameters, and on every step they all subtract the same $\bar{g}$, so they can never separate. The gap against the single machine sits at machine epsilon because the only difference between the two runs is the order in which the same per-example gradients were summed, and floating-point addition is not perfectly associative. This is the data-parallel guarantee made tangible: not "close enough", but identical up to the rounding you would also see if you reran the single machine with its examples in a different order.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The All-Reduce, Now Driving a Training Loop</div>
+<p>The all-reduce you summed by hand in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a> has now become the engine of an entire training step. It will not stop here. In <a href="section-15.4.html">Section 15.4</a> it splits into the ring and tree algorithms that make it cheap at scale; in <a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a> it decomposes into reduce-scatter and all-gather so that sharded data parallelism can also cut the memory each worker holds; in <a href="../module-17-expert-parallelism-moe/index.html">Chapter 17</a> it becomes all-to-all when different experts live on different machines. Each later method is, at heart, a different collective wrapped around the same four-phase loop you just ran.</p>
+</div>
+
+<h2>4. What Data Parallelism Cannot Do <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The exactness comes at a price that is easy to miss precisely because the algorithm hides it so well. Every worker holds a <em>full</em> replica: the complete model parameters, the complete optimizer state, and the activations of the full forward pass on its local batch. Data parallelism splits the batch, not the model. If a model and its optimizer state do not fit in the memory of one device, running $K$ data-parallel copies of it does not help at all; you have simply made $K$ devices that each fail to hold the model, rather than one. Adding workers buys throughput, never capacity.</p>
+<p>The memory budget per worker makes this concrete. For a model with $P$ parameters trained in mixed precision with the Adam optimizer, each worker stores roughly the parameters, the gradients, and two optimizer moments plus a master copy, which lands near $16P$ bytes before activations, all of it replicated $K$ times across the cluster with no sharing. A model that needs more than one device's memory for that footprint cannot be trained data-parallel alone, no matter how many devices you have. This is the exact wall that motivates the next chapter: sharded data parallelism (ZeRO and FSDP) and tensor and pipeline parallelism in <a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a> exist to partition that replicated state, trading some extra communication for the ability to hold a model no single device could.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Eight Copies of the Same Mistake</div>
+<p>There is a particular flavor of confidence in a data-parallel cluster where the model is one gigabyte too large. You launch on sixty-four GPUs, watch sixty-four progress bars begin in perfect unison, and feel briefly invincible, right up to the moment all sixty-four raise an out-of-memory error within the same millisecond. Data parallelism is wonderfully democratic: when it cannot fit the model, it cannot fit it everywhere at once, identically, in lockstep. The fix is never a sixty-fifth GPU.</p>
+</div>
+
+<h2>5. Feeding the Replicas: The Distributed Sampler <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The four-phase loop assumes the shards $B_k$ are disjoint, but nothing so far has said how a worker gets only its own shard without the workers colliding or overlapping. That job belongs to the data pipeline, and it is more delicate than it looks: if two workers happened to load the same examples, the "global batch" would secretly contain duplicates and the average would silently double-count them. The standard solution is a distributed sampler that deterministically assigns each worker a disjoint, equal-sized slice of the dataset's indices for each epoch, then reshuffles those assignments between epochs using a shared seed so that every worker computes the same permutation and carves out its own non-overlapping piece.</p>
+<p>This builds directly on the distributed data-loading machinery of <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/section-8.5.html">Section 8.5</a>: each worker reads only its shard from storage, decodes and augments locally, and never has to see the full dataset in memory. The sampler and the loader together guarantee the partition property that the exactness proof in Section 2 depends on. When the dataset size is not divisible by $K$, the sampler either pads the short shard with a few wrapped-around examples or drops the remainder, and either choice must be made consistently across all workers so the local batches stay equal and the simple $1/K$ average remains correct.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: DistributedDataParallel Plus DistributedSampler</div>
+<p>The entire four-phase loop, plus the sharded data feed, is what PyTorch's <code>DistributedDataParallel</code> (DDP) and <code>DistributedSampler</code> give you for a handful of lines. DDP registers backward hooks that fire the gradient all-reduce automatically as gradients become ready, and <code>DistributedSampler</code> hands each worker its disjoint index slice. The dozens of lines of explicit sharding and averaging in Code 15.3.1 collapse to wrapping the model and the loader:</p>
+<pre><code class="language-python"># launch: torchrun --nproc_per_node=8 train.py
+import torch, torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
+
+dist.init_process_group("nccl")               # join the group of K workers
+model = DDP(model.cuda())                      # all-reduce wired into backward()
+sampler = DistributedSampler(dataset)          # disjoint shard per worker
+loader = DataLoader(dataset, batch_size=b_local, sampler=sampler)
+
+for epoch in range(epochs):
+    sampler.set_epoch(epoch)                   # reshuffle shards, shared seed
+    for x, yb in loader:                       # this worker sees ONLY its shard
+        loss = loss_fn(model(x.cuda()), yb.cuda())
+        loss.backward()                        # gradient all-reduce fires here
+        optimizer.step(); optimizer.zero_grad()
+</code></pre>
+<div class="code-caption"><strong>Code 15.3.2:</strong> The same algorithm as Code 15.3.1, now in production form. DDP handles the all-reduce (with bucketing and computation overlap, the subject of Section 15.5) and <code>DistributedSampler</code> handles the disjoint sharding; the training loop looks almost exactly like a single-machine loop. The framework internals are unpacked in <a href="section-15.4.html">Section 15.4</a>.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Duplicate-Shard Bug That Halved the Effective Batch</div>
+<p><strong>Who:</strong> A deep-learning engineer scaling an image-classification model from one GPU to eight.</p>
+<p><strong>Situation:</strong> The single-GPU baseline trained cleanly; the eight-GPU data-parallel version converged to noticeably worse validation accuracy at the same nominal settings.</p>
+<p><strong>Problem:</strong> The training loop wrapped the model in DDP but kept the original <code>DataLoader</code> with plain shuffling, so every one of the eight workers drew from the full dataset independently.</p>
+<p><strong>Dilemma:</strong> Trust that "more GPUs cannot hurt accuracy" and hunt for the bug in the model or the learning rate, or suspect the data feed itself, the one part that changed silently when DDP was added.</p>
+<p><strong>Decision:</strong> They audited the data feed first, logging which example indices each worker actually consumed in one step.</p>
+<p><strong>How:</strong> The logs showed heavy overlap: workers were re-drawing the same images, so the "global batch" of eight local batches contained roughly the variety of a single local batch, and the averaged gradient was effectively computed over far fewer distinct examples than intended.</p>
+<p><strong>Result:</strong> Adding <code>DistributedSampler</code> with <code>set_epoch</code> gave each worker a disjoint shard; the effective batch became a true eight times the local batch, and validation accuracy matched the single-GPU baseline at the correctly re-tuned learning rate.</p>
+<p><strong>Lesson:</strong> The exactness proof assumes disjoint shards. Without a distributed sampler, data parallelism does not average over a larger batch; it averages over duplicates, and the math quietly stops being the math you proved.</p>
+</div>
+
+<h2>6. Where the Frontier Is Pushing <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The classic loop assumes synchronous all-reduce on every step, which couples all $K$ workers to the slowest one and saturates the network with full-gradient exchanges. Both assumptions are now under active attack, and the loop in Section 1 is the baseline these methods measure against.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Relaxing the Synchronous All-Reduce (2024 to 2026)</div>
+<p>Two lines are reshaping data-parallel training. The first loosens the every-step synchronization: local-update schemes in the DiLoCo lineage (Douillard et al., 2024) let each replica take many local steps between communications, turning a per-step all-reduce into an occasional one and making data-parallel training viable over commodity and even geo-distributed links; follow-on work on asynchronous and streaming variants (2024 to 2025) further relaxes the lockstep so slow workers no longer stall the group. The second shrinks the bytes per synchronization: gradient compression and low-precision all-reduce (8-bit and lower, in the lineage of 1-bit Adam and PowerSGD) cut communication volume with little accuracy loss, and are increasingly paired with the overlap techniques of Section 15.5 so the exchange hides behind the backward pass. Both directions accept a controlled departure from the exactness this section proved, in return for breaking the synchronous-network assumption that limits how far data parallelism can scale; we evaluate the trade-offs with the optimization machinery of <a href="../../part-3-distributed-ml/module-10-distributed-optimization/section-10.2.html">Chapter 10</a>.</p>
+</div>
+<p>The throughline is worth holding onto. Plain data parallelism gives you exactness for free, and the frontier is mostly about deciding how much of that exactness to spend, and on what, to buy scale the synchronous loop cannot reach. With the algorithm, its proof, its memory limit, and its data feed now in hand, the obvious next question is how the all-reduce in phase three is actually carried out across a real network, which is exactly where <a href="section-15.4.html">Section 15.4</a> begins.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.3.1: Trace the Invariant <span class="exercise-type conceptual">Conceptual</span></div>
+<p>State the one invariant that makes the eight replicas in Code 15.3.1 stay identical, and identify the exact line of the loop that would break it if you got it wrong. Then argue, without running code, why initializing the replicas from <em>different</em> random seeds would not be fixed by the all-reduce: would the replicas converge back together over time, stay permanently offset, or diverge? Explain which, and why the averaged-gradient update alone cannot repair a broken start.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.3.2: Unequal Shards Break the Simple Average <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 15.3.1 so the shards have unequal sizes (for example, give replica zero half the data and split the rest among the other seven). Keep the combine step as a plain $\frac{1}{K}\sum_k g_k$ of the per-shard <em>mean</em> gradients and measure the <code>gap</code> against the single-machine run; it should now be large. Then fix it by weighting each replica's contribution by its local batch size, or equivalently by summing the per-shard <em>summed</em> gradients and dividing by the global $N$. Explain why the size-weighted form restores exactness and what this implies for a cluster where a straggler-padded shard ends up slightly larger than the others.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.3.3: The Memory Wall <span class="exercise-type analysis">Analysis</span></div>
+<p>A model has $P = 7 \times 10^9$ parameters and is trained in mixed precision with Adam, costing roughly $16P$ bytes per worker for parameters, gradients, and optimizer state, before activations. Estimate the per-worker memory footprint in gigabytes. Given GPUs with 24 GB of memory each, argue from this number alone whether plain data parallelism can train this model, and explain why adding more such GPUs does not change the answer. Name the chapter and the family of methods that exist precisely to break this wall, and state in one sentence what they partition that plain data parallelism replicates.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-15.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 15.2</span><span class="nav-title">Single-GPU, Multi-GPU, and Multi-Node Training</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 15</span><span class="nav-num">Contents</span><span class="nav-title">Data-Parallel Deep Learning</span></a>
+<a class="next" href="section-15.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 15.4</span><span class="nav-title">Gradient Synchronization and All-Reduce</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

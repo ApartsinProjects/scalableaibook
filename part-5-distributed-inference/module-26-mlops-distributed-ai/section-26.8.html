@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 26.8: A/B Testing and Shadow Deployment at Scale. Shadow, canary, and A/B patterns for validating a new model in production, the distributed routing and aggregation mechanics behind them, and the online statistics that decide promote or roll back." name="description"/>
+<title>Section 26.8: A/B Testing and Shadow Deployment at Scale | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 26: MLOps for Distributed AI</a></div>
+<h1>A/B Testing and Shadow Deployment at Scale</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Offline I scored a perfect 0.94. Then they let me touch real traffic for ten minutes, and I learned what the validation set had been too polite to mention."</p>
+<cite>A Challenger Model, Mid-Canary</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>An offline metric tells you how a new model would have scored on data you already had; it cannot tell you how the model behaves once it changes what users see, what they click, and what they ask next.</strong> That gap is why every serious model change is validated in production before it owns production. The three patterns that do this, shadow deployment, canary release, and A/B testing, are a ladder of increasing exposure and increasing evidence: shadow runs the new model on live inputs but serves nothing, canary serves a small slice and watches for harm, and A/B serves a randomized split long enough to measure a causal effect with statistical significance. All three are distributed problems first and statistics problems second, because the traffic split happens at the router across the whole fleet and the metrics must be aggregated correctly across every replica before any test is valid. This section builds the mechanics, the math, and an automated promote-or-roll-back gate.</p>
+</div>
+<p>A model that passes every offline check can still fail in production, and it fails in ways the offline check structurally could not see. The validation set was collected under the old model's behavior, so it never contains the questions users only ask when the new model's answers invite them. Latency that looked fine on a benchmark machine becomes a tail-latency problem under real concurrency. A quality improvement on average can hide a regression on the ten percent of traffic that matters most to the business. Deployment-time evaluation exists precisely because these effects are invisible until the model is wired into the live system, exchanging responses with real users. The discipline of exposing a new model to production gradually, measuring what actually happens, and reverting automatically if it regresses is what this section is about, and it sits directly on top of the fleet-wide monitoring of <a href="section-26.6.html">Section 26.6</a> and the drift detection of <a href="section-26.7.html">Section 26.7</a>.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A router at the top splits incoming traffic three ways: a shadow path that mirrors requests to the challenger but serves only the champion, a canary path that serves a small fraction from the challenger, and an A/B path with a randomized split. Per-variant metrics flow down into an aggregator, which feeds a decision gate that either promotes the challenger or rolls back.">
+<defs>
+<marker id="arr268" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr268g" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#2f7d4f"/></marker>
+<marker id="arr268r" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#a83232"/></marker>
+</defs>
+<style>
+.b268 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.c268 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g268 { fill:#eef7f0; stroke:#2f7d4f; stroke-width:1.6; }
+.r268 { fill:#fbeeee; stroke:#a83232; stroke-width:1.6; }
+.t268 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s268 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l268 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr268); }
+.lg268 { fill:none; stroke:#2f7d4f; stroke-width:1.7; marker-end:url(#arr268g); stroke-dasharray:5 4; }
+.lr268 { fill:none; stroke:#a83232; stroke-width:1.7; marker-end:url(#arr268r); }
+</style>
+<rect class="b268" x="360" y="14" width="160" height="46" rx="8"/>
+<text class="t268" x="440" y="33">Router</text>
+<text class="s268" x="440" y="50">consistent hash on user id</text>
+<text class="t268" x="130" y="92">Shadow</text>
+<rect class="b268" x="40" y="104" width="180" height="64" rx="8"/>
+<text class="t268" x="130" y="128">champion serves</text>
+<text class="s268" x="130" y="146">challenger runs, output</text>
+<text class="s268" x="130" y="160">discarded (0% user risk)</text>
+<text class="t268" x="440" y="92">Canary</text>
+<rect class="c268" x="350" y="104" width="180" height="64" rx="8"/>
+<text class="t268" x="440" y="128">5% to challenger</text>
+<text class="s268" x="440" y="146">95% to champion,</text>
+<text class="s268" x="440" y="160">watch for harm</text>
+<text class="t268" x="745" y="92">A/B</text>
+<rect class="c268" x="655" y="104" width="185" height="64" rx="8"/>
+<text class="t268" x="747" y="128">randomized 50/50</text>
+<text class="s268" x="747" y="146">measure causal effect</text>
+<text class="s268" x="747" y="160">to significance</text>
+<path class="l268" d="M 380 60 L 200 100"/>
+<path class="l268" d="M 440 60 L 440 100"/>
+<path class="l268" d="M 500 60 L 700 100"/>
+<rect class="b268" x="320" y="232" width="240" height="58" rx="8"/>
+<text class="t268" x="440" y="256">Per-variant metric aggregator</text>
+<text class="s268" x="440" y="274">success rate, latency, retries (26.6)</text>
+<path class="l268" d="M 130 168 L 130 200 L 340 200 L 340 230"/>
+<path class="l268" d="M 440 168 L 440 230"/>
+<path class="l268" d="M 747 168 L 747 200 L 540 200 L 540 230"/>
+<rect class="b268" x="340" y="320" width="200" height="46" rx="8"/>
+<text class="t268" x="440" y="343">Decision gate</text>
+<text class="s268" x="440" y="359">two-proportion z-test</text>
+<path class="l268" d="M 440 290 L 440 318"/>
+<rect class="g268" x="150" y="392" width="220" height="30" rx="6"/>
+<text class="t268" x="260" y="412" style="fill:#2f7d4f">PROMOTE: ramp to 100%</text>
+<rect class="r268" x="510" y="392" width="220" height="30" rx="6"/>
+<text class="t268" x="620" y="412" style="fill:#a83232">ROLLBACK: route 0%</text>
+<path class="lg268" d="M 400 366 L 280 390"/>
+<path class="lr268" d="M 480 366 L 600 390"/>
+</svg>
+<figcaption><strong>Figure 26.8.1:</strong> The progressive-delivery ladder. The router (top) splits traffic deterministically by consistent hashing on user id; the three patterns differ only in how much exposure the challenger gets. Shadow serves nothing and risks no user; canary serves a small fraction; A/B serves a randomized split. Per-variant metrics flow into a fleet-wide aggregator, and a decision gate runs the significance test that promotes the challenger (green) or rolls it back (red). The rollback path is the subject of <a href="section-26.9.html">Section 26.9</a>.</figcaption>
+</figure>
+
+<h2>1. Why Offline Metrics Run Out <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>An offline evaluation answers a counterfactual: how would this model have scored on a fixed dataset? That question is necessary, and <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/index.html">Chapter 5</a> spends an entire chapter on doing it well across a distributed fleet. It is also insufficient, for a reason that is structural rather than a matter of dataset quality. The data you evaluate on was generated while the old model was in control. It carries the old model's footprint: the queries users learned to type because they knew what answers came back, the sessions that ended where the old model gave up, the distribution of inputs shaped by months of the old model's behavior. A new model changes that footprint the instant it serves traffic, and the changed traffic is exactly what no historical dataset can contain. This is the feedback-loop problem, and it means the only honest measurement of a deployed model is taken while it is deployed.</p>
+<p>There is a second gap. Offline metrics measure quality on inputs, but a production system is judged on outcomes: did the user click, did the session resolve, did latency stay inside the budget under real concurrency, did the cost per request stay sustainable. A model can improve token-level accuracy and still lengthen sessions, raise infrastructure cost, or regress on a high-value segment that the aggregate average smooths over. Deployment-time evaluation closes both gaps by measuring real outcomes on real traffic, and it does so along a ladder of increasing risk and increasing evidence, which the next three sections climb in order.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Validation Set Was Written by the Old Model</div>
+<p>Every offline dataset is sampled from a world the current production model created. A challenger that changes user behavior, and any good challenger does, generates traffic that no historical sample contains. This is not a data-cleanliness problem you can fix with a bigger validation set; it is a property of feedback loops. The corollary is firm: the final gate on any model change is an online measurement on live traffic, never an offline score alone. Shadow, canary, and A/B exist to take that online measurement at three different points on the risk curve.</p>
+</div>
+
+<h2>2. Shadow Deployment: Measure Without Serving <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Shadow deployment is the safest rung. The router mirrors a copy of each live request to the challenger model, the challenger computes its response, and that response is logged and discarded; the user only ever sees the champion's answer. Because nothing the challenger produces reaches a user, the user-facing risk is exactly zero, which is what makes shadow the natural first step for a model whose failure modes are still unknown. You learn whether the challenger crashes on real inputs, whether its latency holds up under production concurrency, and how its outputs differ from the champion's on the actual input distribution, all before a single user is exposed.</p>
+<p>Shadow buys safety with cost. Mirroring traffic means the challenger runs the full inference workload on every shadowed request, so you pay for a second forward pass on top of the one the user is actually served. At fleet scale this is real money: shadowing one hundred percent of traffic roughly doubles the inference compute for that service, which is why teams often shadow a sampled fraction rather than the whole stream. Shadow also cannot measure anything that depends on the user reacting to the challenger's output, because the user never sees it; click-through, session length, and retry behavior are all invisible to a shadow test. It tells you the challenger is safe to serve, not that serving it is better. For that, you have to let it touch users, which is the canary.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Shadow That Caught a Tokenizer Mismatch</div>
+<p><strong>Who:</strong> A platform engineer rolling out a new intent-classification model behind a customer-support assistant.</p>
+<p><strong>Situation:</strong> The challenger beat the champion by three points of macro-F1 on every offline split, and the team was ready to canary it the same afternoon.</p>
+<p><strong>Problem:</strong> Production inputs included raw, un-normalized user text with emoji and mixed scripts that the offline evaluation set, cleaned months earlier, did not represent.</p>
+<p><strong>Dilemma:</strong> Skip shadow and canary directly, saving a day and the doubled compute, or pay for a shadow pass first on traffic that offline metrics already declared a winner.</p>
+<p><strong>Decision:</strong> They shadowed at twenty percent sampling for two hours before any user exposure, accepting the extra compute as cheap insurance.</p>
+<p><strong>How:</strong> The router mirrored sampled requests to the challenger; a comparator logged every case where the two models disagreed, alongside latency for each.</p>
+<p><strong>Result:</strong> On four percent of real inputs the challenger returned an empty label, traced to a tokenizer version mismatch that the cleaned offline set never triggered. The bug was fixed before a single user saw it, and the corrected model later canaried cleanly.</p>
+<p><strong>Lesson:</strong> Shadow is the cheapest place to discover that production inputs do not look like your validation set. A two-hour shadow pass is worth more than three offline F1 points.</p>
+</div>
+
+<h2>3. Canary and A/B: From Watching for Harm to Measuring a Causal Effect <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A canary release routes a small fraction of real traffic, often one to five percent, to the challenger and watches the per-variant metrics closely. The goal of a canary is asymmetric: it is tuned to catch harm fast, not to prove improvement. If error rates spike, latency blows the budget, or a quality proxy collapses on the canary slice, you roll back having exposed only a sliver of users. If the canary stays healthy, you ramp the fraction up in steps, ten percent, twenty-five, fifty, watching at each step, until the challenger owns all traffic. The canary is a safety valve with a hand on the rollback lever, and the automated version of that lever is what <a href="section-26.9.html">Section 26.9</a> builds out.</p>
+<p>A/B testing asks a stronger question. By assigning users randomly to champion or challenger and holding the split long enough, an A/B test measures the causal effect of the change on a target metric, with a confidence interval and a significance level attached. Randomization is what makes it causal: because assignment is independent of any user property, a difference in outcomes between the two arms can be attributed to the model and not to who happened to land where. Canary asks "is this safe to ramp?"; A/B asks "is this genuinely better, and by how much, with what certainty?". The two are complementary, and most rollouts use both, a canary to clear the safety bar quickly and an A/B held longer to quantify the win before full promotion.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Bird in the Coal Mine</div>
+<p>The name "canary" is borrowed from coal miners, who carried caged canaries underground because the birds collapsed from carbon monoxide before humans noticed it. The canary's job was to fail first, on purpose, so the miners did not. A canary release inherits the metaphor exactly: a small, expendable slice of traffic that is meant to show distress before the whole fleet does. The kindest thing you can do for a canary deployment is wire its alarms tightly enough that it never has to suffer for long.</p>
+</div>
+
+<h2>4. The Distributed Mechanics: Splitting Traffic and Aggregating Metrics <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The split itself happens at the router, the same component that <a href="../module-23-distributed-inference-systems/section-23.2.html">Section 23.2</a> introduced as the front door of a distributed inference service. To be usable for an experiment, the split must be two things at once: deterministic, so a given user always lands in the same arm and does not see the answer flip between consecutive requests, and stateless, so every replica of the router computes the identical assignment without consulting a shared store. Consistent hashing on the user id delivers both. The router hashes the user id into a fixed range of buckets and assigns buckets to variants; the hash is a pure function, so any replica anywhere on the fleet reaches the same decision, and the same user keeps the same assignment for the life of the experiment. If you assigned by a coin flip per request instead, the same user would oscillate between models, contaminating both the experience and the measurement.</p>
+<p>Once traffic is split, each replica records outcomes for the variant it served, and those per-variant counts must be aggregated across the entire fleet before any test is meaningful. A single replica sees only a sliver of each arm; the success rate that the statistics operate on is a sum over every replica's local counters, gathered by the fleet-wide monitoring pipeline of <a href="section-26.6.html">Section 26.6</a>. Getting this aggregation right matters more than it looks: if one replica's counters are double-counted, or a slow replica's data arrives after the test window closes, the arms become incomparable and the conclusion is invalid even when the math that follows is flawless. The experiment is only as trustworthy as the weakest link in its metric aggregation.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: An Experiment Is a Distributed Computation</div>
+<p>It is tempting to file A/B testing under statistics and forget the systems underneath. The whole book argues otherwise. The traffic split is a deterministic routing decision computed independently on every replica, the same consistent-hashing idea that places shards in <a href="../module-23-distributed-inference-systems/section-23.2.html">Chapter 23</a> and keys in distributed caches. The metric the test consumes is a reduction, a sum of per-variant counters scattered across the fleet and aggregated into one number, structurally the same all-reduce that synchronized gradients back in Chapter 15. A correct experiment is a correct distributed computation first; the z-test is the easy part that runs after the hard part already worked.</p>
+</div>
+
+<h2>5. The Statistics: Significance, Sample Size, and the Traps <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>With aggregated per-variant counts in hand, the question becomes whether the observed difference is real or noise. Take a binary success metric, a thumbs-up on the response, and let the champion (arm A) record $s_A$ successes in $n_A$ trials and the challenger (arm B) record $s_B$ in $n_B$. The observed rates are $\hat p_A = s_A / n_A$ and $\hat p_B = s_B / n_B$. Under the null hypothesis that the two arms share one true rate, we pool them, $\hat p = (s_A + s_B)/(n_A + n_B)$, and form the two-proportion z-statistic</p>
+$$z = \frac{\hat p_B - \hat p_A}{\sqrt{\hat p\,(1 - \hat p)\left(\dfrac{1}{n_A} + \dfrac{1}{n_B}\right)}}.$$
+<p>The denominator is the standard error of the difference under the null. A large $|z|$ means the gap is many standard errors wide and unlikely to be chance; the two-sided p-value is $p = 2\,(1 - \Phi(|z|))$ where $\Phi$ is the standard normal cumulative distribution. You fix a significance level $\alpha$ in advance, commonly $0.05$ or, when a wrong promotion is costly, $0.01$, and you declare a real effect only when $p < \alpha$. The required sample size follows from the smallest lift you care to detect: detecting a half-point change in a rate near $0.8$ needs far more traffic than detecting a five-point change, and a canary at one percent of traffic accrues that sample slowly, which is the real reason canaries are held for hours or days rather than minutes.</p>
+<p>Two traps are specific to online experiments and worth stating plainly. The first is peeking: if you recompute the p-value continuously and stop the moment it dips below $\alpha$, you inflate the false-positive rate badly, because a random walk will eventually wander below any fixed threshold. The fix is to decide the sample size up front, or to use a sequential test designed to be monitored continuously. The second is the novelty effect: a change often moves metrics simply because it is new, users click the unfamiliar layout or retry the different answer, and that bump fades within days. Running the test long enough to see the novelty decay, and ignoring the first hours of data, guards against promoting a model whose only virtue was being different. <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/index.html">Chapter 5</a> develops the online-evaluation discipline these traps belong to.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Battle-Tested Two-Proportion Test in One Call</div>
+<p>The pooled z-test in the equation above is worth implementing once to understand it, but you do not maintain your own significance code in production. SciPy and statsmodels ship vetted, edge-case-hardened implementations; <code>statsmodels.proportions_ztest</code> takes the raw counts and returns the statistic and p-value directly:</p>
+<pre><code class="language-python">from statsmodels.stats.proportion import proportions_ztest
+
+successes = [1644, 29719]      # challenger, champion
+trials    = [2020, 37980]
+z, p_value = proportions_ztest(count=successes, nobs=trials, alternative="larger")
+# z, p_value now drive the same promote / hold / rollback gate, no hand-rolled erf.
+</code></pre>
+<div class="code-caption"><strong>Code 26.8.1:</strong> The hand-written z-test and normal survival function of Code 26.8.2 collapse to a single <code>proportions_ztest</code> call. The library handles the pooled-versus-unpooled variance choice, one- versus two-sided alternatives, and the numerical edge cases (tiny counts, rates at 0 or 1) that a from-scratch version gets wrong.</div>
+</div>
+
+<h2>6. The LLM Twist: Measuring Quality You Cannot Label Online <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The z-test above assumes a clean binary success signal, and for a click or a conversion you have one. For a generative model you usually do not. There is no ground-truth label streaming in beside each response telling you whether the answer was good, and you cannot ask a human to grade every reply in real time. The practical response is to measure quality through three weaker channels and triangulate. The first is explicit human feedback, the thumbs-up and thumbs-down users volunteer, which is sparse and biased toward extreme reactions but causal and cheap. The second is LLM-as-judge applied to a sampled stream: a separate, stronger model scores a small random sample of each arm's responses against a rubric, turning unlabeled traffic into a graded proxy metric at a fraction of the cost of human review. The third is behavioral proxy signals that need no grader at all: retries, follow-up questions that signal confusion, abandoned sessions, and session length, each a noisy but continuous readout of whether users got what they came for.</p>
+<p>None of these is as crisp as a click, so the discipline is to watch several together and trust a verdict only when they agree. A challenger that lifts thumbs-up, holds session length steady, and earns a higher LLM-judge score is plausibly better; one that lifts thumbs-up while retries climb is more likely gaming the feedback button than improving. Because the judge model and the proxies are themselves noisy, the significance machinery of the previous section still applies, just to a proxy metric rather than a direct one, and the sample-size demands grow as the signal gets weaker. This is the online-quality problem that the research frontier is actively reshaping.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Online LLM Evaluation and Interleaving (2024 to 2026)</div>
+<p>Measuring generation quality on live traffic is a fast-moving area. LLM-as-judge has matured from a convenience into a studied instrument: work on judge bias, position effects, and self-preference (for example the analyses around LLM-as-a-judge and Chatbot Arena's crowd-preference methodology, 2024 onward) has produced calibration and debiasing recipes that make sampled-traffic scoring trustworthy enough to gate deployments. A second thread revives interleaving, long used in web search, for generative systems: instead of splitting users between two models, an interleaving experiment blends both models' candidates into one response stream and infers preference from which candidates win, extracting a significant signal from far less traffic than a classic A/B split needs. A third thread pushes always-on online evaluation, continuous sampled judging wired straight into the canary gate, so the promote-or-roll-back decision runs on a live quality estimate rather than a delayed offline batch. The common thread is treating online quality as a measurable, debiasable quantity, not an unknowable one.</p>
+</div>
+
+<h2>7. Closing the Loop: An Automated Promote-or-Roll-Back Gate <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The pieces now compose into one automated rollout. The router splits traffic by consistent hashing, each variant accumulates per-request outcomes, the fleet aggregates the counts, the two-proportion z-test scores the difference, and a decision gate compares the p-value against a pre-set $\alpha$ and a minimum-sample guard before it acts. The guard is what defends against peeking: the gate refuses to decide until enough canary samples have accrued, so a lucky early swing cannot trigger a premature promotion. The code below simulates exactly this loop for a challenger that is genuinely a little better, splits a stream of users by hashing, aggregates per-variant success counts, runs the significance test from first principles, and emits a promote, hold, or rollback decision.</p>
+<pre><code class="language-python">import hashlib, math, random
+
+def serve(variant, rng):
+    # Quality proxy: a per-request thumbs-up. Challenger is genuinely better.
+    p_good = 0.78 if variant == "champion" else 0.82
+    return 1 if rng.random() < p_good else 0
+
+def bucket(user_id, salt="canary-2026", buckets=1000):
+    # Deterministic, stateless: any replica computes the same bucket for a user.
+    h = hashlib.sha256(f"{salt}:{user_id}".encode()).hexdigest()
+    return int(h, 16) % buckets
+
+def assign(user_id, canary_pct):
+    return "challenger" if bucket(user_id) < canary_pct * 10 else "champion"
+
+CANARY_PCT = 5.0
+rng = random.Random(0)
+counts = {"champion": [0, 0], "challenger": [0, 0]}   # [successes, trials]
+for uid in range(40_000):
+    v = assign(uid, CANARY_PCT)
+    counts[v][0] += serve(v, rng)
+    counts[v][1] += 1
+
+n_a, s_a = counts["champion"][1],   counts["champion"][0]
+n_b, s_b = counts["challenger"][1], counts["challenger"][0]
+p_a, p_b = s_a / n_a, s_b / n_b
+
+# Two-proportion z-test on the thumbs-up rate.
+p_pool = (s_a + s_b) / (n_a + n_b)
+se = math.sqrt(p_pool * (1 - p_pool) * (1 / n_a + 1 / n_b))
+z  = (p_b - p_a) / se
+p_value = 2 * (1 - 0.5 * (1 + math.erf(abs(z) / math.sqrt(2))))   # two-sided
+
+ALPHA, MIN_TRIALS = 0.01, 1_000        # significance bar and anti-peeking guard
+if n_b < MIN_TRIALS:
+    decision = "HOLD  (insufficient canary samples)"
+elif p_value < ALPHA and p_b > p_a:
+    decision = "PROMOTE  challenger -> ramp to 100%"
+elif p_value < ALPHA and p_b < p_a:
+    decision = "ROLLBACK  challenger regressed"
+else:
+    decision = "HOLD  (no significant difference yet)"
+
+print(f"champion   : {s_a}/{n_a} good rate = {p_a:.4f}")
+print(f"challenger : {s_b}/{n_b} good rate = {p_b:.4f}")
+print(f"lift {p_b - p_a:+.4f}  z {z:.3f}  p {p_value:.2e}")
+print("DECISION   :", decision)
+</code></pre>
+<div class="code-caption"><strong>Code 26.8.2:</strong> A complete canary gate in pure Python: deterministic consistent-hash routing, per-variant aggregation, a from-scratch two-proportion z-test, and an automated decision protected by a minimum-sample guard against peeking.</div>
+<pre><code class="language-text">champion   : 29719/37980 good rate = 0.7825
+challenger : 1644/2020 good rate = 0.8139
+lift +0.0314  z 3.339  p 8.41e-04
+DECISION   : PROMOTE  challenger -> ramp to 100%</code></pre>
+<div class="code-caption"><strong>Output 26.8.2:</strong> The 5% canary routed 2020 users to the challenger, which lifted the thumbs-up rate by 3.1 points. With $p = 8.4 \times 10^{-4}$, well below $\alpha = 0.01$, and the 1000-sample guard cleared, the gate promotes automatically. Had the challenger regressed, the same gate would have routed it to zero instead, the rollback that <a href="section-26.9.html">Section 26.9</a> turns into a full incident-response protocol.</div>
+<p>The decision in Output 26.8.2 is the whole point: a number, a threshold, and an action, with no human in the loop for the routine case. Notice what the guard prevents. With <code>MIN_TRIALS</code> set higher than the 2020 samples the canary collected, the same run would have returned HOLD, refusing to promote on a real but under-powered signal; raising the canary fraction or holding longer is how you earn the right to decide. This automated gate, watching a canary and reverting on regression, is the bridge to the next section, where the rollback stops being one branch of an if-statement and becomes a rehearsed, fleet-wide incident response.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.8.1: Three Rungs, Three Questions <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each scenario, state which of shadow, canary, or A/B you would reach for first and why: (a) a rewritten inference server that should be byte-for-byte identical in output but uses a new runtime, and you fear crashes and latency regressions; (b) a new ranking model that you believe lifts revenue and need to prove it with a defensible number for the business; (c) a chatbot model that scores well offline but whose real-world failure modes are completely unknown. Explain what each pattern can measure that the others cannot, and why running them in the wrong order wastes traffic or risk.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.8.2: Make the Gate Roll Back, and Stop the Peeking <span class="exercise-type coding">Coding</span></div>
+<p>Start from Code 26.8.2. First, flip the challenger to genuinely worse (set its <code>p_good</code> below the champion's) and confirm the gate emits ROLLBACK with a significant p-value. Then demonstrate the peeking trap: run the loop while recomputing the p-value after every 200 new challenger samples and stop the first time $p < \alpha$, recording how often a no-difference challenger (set both rates equal) gets falsely promoted across 200 random seeds. Compare that false-promotion rate to the nominal $\alpha = 0.01$, and explain why the minimum-sample guard alone does not fully fix continuous peeking.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.8.3: Size the Canary <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the two-proportion test, estimate the number of challenger samples needed to detect a lift from a baseline rate of $0.80$ to $0.81$ at $\alpha = 0.05$ with $80\%$ power (you may use the standard approximation $n \approx (z_{\alpha/2} + z_\beta)^2 \cdot 2\,\bar p(1-\bar p) / \delta^2$ per arm). Then, given a service handling 500 requests per second with a 2% canary, compute how many hours the canary must run to accrue that many challenger samples. Comment on what this implies for detecting a tiny but real quality change, and why teams often raise the canary fraction rather than wait.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-26.7.html"><span class="nav-label">Previous</span><span class="nav-num">Section 26.7</span><span class="nav-title">Distributed Drift Detection</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 26</span><span class="nav-num">Contents</span><span class="nav-title">MLOps for Distributed AI</span></a>
+<a class="next" href="section-26.9.html"><span class="nav-label">Next</span><span class="nav-num">Section 26.9</span><span class="nav-title">Rollbacks, Incident Response, and Guardrails</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

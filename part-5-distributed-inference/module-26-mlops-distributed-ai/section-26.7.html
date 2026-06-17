@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 26.7: Distributed Drift Detection. Detecting when a deployed model has gone stale across a whole serving fleet using mergeable per-replica sketches, distribution-distance tests, and a retrain trigger." name="description"/>
+<title>Section 26.7: Distributed Drift Detection | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 26: MLOps for Distributed AI</a></div>
+<h1>Distributed Drift Detection</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Every replica swore its little slice of traffic looked completely normal. It took all of us, added up, to notice the world had moved on without us."</p>
+<cite>A Histogram That Only Saw One Shard</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A model is correct only with respect to the data distribution it was trained on; when production traffic drifts away from that distribution, accuracy decays silently, and the only way to catch it is to measure the distribution of the entire live stream, which no single replica ever sees.</strong> A deployed model does not break loudly the way a crashed server does. It keeps answering, confidently, while the inputs it answers about slowly stop resembling its training data, and its accuracy erodes long before anyone files a bug. Drift detection is the instrument that turns this silent decay into a measured signal, and at scale it is inherently a distributed-aggregation problem: the relevant distribution is the fleet-wide one, assembled from mergeable summaries that each replica computes over its own shard of traffic. This section builds that instrument and wires its alarm to the retraining pipeline, closing the loop that keeps a deployed model alive.</p>
+</div>
+<p>The previous section gave us fleet-wide observability: latency, throughput, and error rates aggregated across every replica so that the serving system reports its own health as one number rather than a thousand. Those metrics tell you whether the system is <em>running</em>. They say nothing about whether the model is still <em>right</em>. A model can be fast, available, and quietly wrong, returning a prediction in eight milliseconds for an input that belongs to a world it was never trained on. Drift detection is the missing half of monitoring: instead of watching the system's vital signs, it watches the statistical relationship between the data the model sees today and the data it learned from, and raises an alarm when that relationship decays. It is the sensor that decides when the continuous-training pipeline of <a href="section-26.4.html">Section 26.4</a> should fire.</p>
+<p>This deepens the streaming view from <a href="../../part-2-distributed-data/module-09-stream-processing-online-ai/index.html">Chapter 9</a>, where drift appeared as a property of a single online learner reacting to a changing stream. Here the model is fixed, the stream is the aggregate of every replica's traffic, and the question is not "how do I adapt one learner online?" but "how do I detect, across a whole serving fleet, that the deployed model has gone stale, and trigger a retrain before users notice?"</p>
+
+<h2>1. Three Kinds of Drift, and the Label-Delay Problem <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Drift is not one phenomenon. It helps to keep three kinds separate, because they have different causes, different detectability, and different remedies. <strong>Data drift</strong> (also called covariate drift) is a shift in the input distribution: $P(x)$ changes while the underlying input-to-output rule stays fixed. A fraud model starts seeing transactions from a new country; a vision model starts seeing photos from a new phone's camera. <strong>Concept drift</strong> is a shift in the relationship itself: $P(y \mid x)$ changes, so the same input should now map to a different answer. Spending patterns that were benign last year are fraudulent this year; the meaning of a word shifts. <strong>Prediction drift</strong> is a shift in the model's output distribution $P(\hat{y})$: the mix of classes the model emits, or the shape of its score histogram, moves. Prediction drift is often the first observable symptom of the other two, because it is computed purely from outputs you already have.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: You Almost Never Get to Measure Accuracy in Real Time</div>
+<p>The only direct measure of staleness is performance against ground-truth labels, and in production those labels arrive late, if at all. A loan model learns whether an applicant defaulted months later; a recommendation learns whether a click converted hours later; many predictions never get a label at all. This is the <strong>label-delay problem</strong>: true accuracy is a lagging indicator you cannot act on in time. So drift detection monitors <em>proxies</em> you can compute immediately from inputs and outputs alone, data drift and prediction drift, and treats a proxy alarm as an early warning that accuracy is probably eroding, well before the delayed labels confirm it.</p>
+</div>
+<p>The practical consequence is a layered strategy. You monitor the cheap, immediate, unlabeled signals continuously (input distributions, output distributions, confidence), and you reconcile them against true accuracy whenever the delayed labels finally land. A spike in data drift that is later confirmed by a drop in labeled accuracy calibrates your thresholds; a spike that is <em>not</em> confirmed teaches you that this particular input shift was harmless. Over time the proxies become trustworthy early sensors for a quantity you can only verify in arrears.</p>
+
+<h2>2. Detection Methods: Measuring the Distance Between Two Distributions <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Every unlabeled drift detector reduces to the same shape: summarize a fixed <strong>reference window</strong> (the distribution the model was validated on), summarize a sliding <strong>current window</strong> of live traffic, and compute a distance between the two. When the distance crosses a threshold, you declare drift. The detectors differ only in what feature they summarize and which distance they use.</p>
+<p>For a single numeric feature, the workhorse is the <strong>Population Stability Index</strong> (PSI), which bins both windows onto a shared grid and sums the per-bin divergence. With reference proportions $r_b$ and current proportions $c_b$ over bins $b = 1, \dots, B$,</p>
+$$\mathrm{PSI} = \sum_{b=1}^{B} (c_b - r_b)\, \ln\!\frac{c_b}{r_b}.$$
+<p>This is a symmetrized, binned cousin of the Kullback-Leibler divergence. A common rule of thumb reads $\mathrm{PSI} < 0.1$ as no material shift, $0.1 \le \mathrm{PSI} < 0.2$ as moderate, and $\mathrm{PSI} \ge 0.2$ as a population that has materially moved and warrants action. The <strong>Kolmogorov-Smirnov</strong> (KS) statistic instead takes the maximum gap between the two empirical cumulative distributions, $D = \sup_x |F_{\text{ref}}(x) - F_{\text{cur}}(x)|$, and comes with a hypothesis test. For high-dimensional features such as embeddings, the <strong>Maximum Mean Discrepancy</strong> (MMD) compares distributions in a kernel feature space without binning, which is what you reach for when the thing that drifted is a 768-dimensional vector rather than a scalar. Alongside these distribution tests, two almost-free signals deserve continuous monitoring: <strong>prediction confidence</strong> (a model growing systematically less certain is often the first whisper of drift) and <strong>class balance</strong> (the proportion of each predicted class), both of which are prediction-drift proxies computable from outputs you are already logging.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Detector That Cried Wolf on Black Friday</div>
+<p>A retail team once wired a PSI alarm directly to an automatic retrain. It fired, correctly, every single year on Black Friday, when the input distribution genuinely did shift, then dutifully retrained the model on one freak day of traffic and shipped something worse than what it replaced. The drift was real. The response was the bug. Seasonality is not staleness, and a detector that cannot tell the difference is a very expensive smoke alarm wired to the sprinklers.</p>
+</div>
+
+<h2>3. Why Drift Detection Is a Distributed-Aggregation Problem <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Here is the distributed twist that makes this a Part V problem rather than a textbook statistics exercise. The distribution you care about is the distribution of the <em>whole</em> traffic stream, across every replica in the serving fleet. No single replica sees it. A load balancer might route a new geography's traffic disproportionately to three replicas out of fifty; each of those three sees a local shift that looks like noise, while the fleet-wide shift that actually matters is invisible to all of them individually. Computing drift correctly means computing it over the union of every replica's traffic, which is exactly the aggregation pattern this book has used since <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a>.</p>
+<p>The mechanism is a <strong>mergeable summary</strong>. Each replica does not ship its raw predictions to a central place; that would be a firehose. Instead each replica maintains a histogram (or a quantile sketch, the same family of mergeable structures introduced with MapReduce-style aggregation in Chapter 6) over a <em>shared, fleet-wide set of bin edges</em>. Because the bins are agreed in advance, the histograms are additive: the central aggregator simply sums the per-replica bin counts to obtain the exact fleet-wide histogram, then normalizes once. This rides the very same telemetry path that <a href="section-26.6.html">Section 26.6</a> built for latency and error metrics; drift sketches are just another mergeable metric flowing through the same pipeline. The aggregated current distribution is then compared against the stored reference, and a single fleet-wide drift score comes out.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Four serving replicas each compute a small input histogram over shared bin edges; the histograms are summed centrally into one fleet-wide distribution, which is compared against a reference distribution to produce a drift score that crosses a threshold and fires a retrain trigger.">
+<defs>
+<marker id="arr267" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b267 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w267 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.r267 { fill:#eef6ee; stroke:#2f7d32; stroke-width:1.6; }
+.a267 { fill:#fbeef0; stroke:#b1283a; stroke-width:1.6; }
+.t267 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s267 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l267 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr267); }
+.bar267 { fill:#b86b1f; }
+.barr267 { fill:#2f7d32; }
+.barc267 { fill:#b1283a; }
+</style>
+<text class="t267" x="120" y="22">Per-replica input histograms (shared bin edges)</text>
+<rect class="w267" x="40" y="36" width="150" height="64" rx="7"/>
+<text class="s267" x="115" y="52">Replica 1</text>
+<rect class="bar267" x="55" y="78" width="9" height="16"/><rect class="bar267" x="67" y="70" width="9" height="24"/><rect class="bar267" x="79" y="64" width="9" height="30"/><rect class="bar267" x="91" y="72" width="9" height="22"/><rect class="bar267" x="103" y="82" width="9" height="12"/>
+<rect class="w267" x="40" y="116" width="150" height="64" rx="7"/>
+<text class="s267" x="115" y="132">Replica 2</text>
+<rect class="bar267" x="55" y="160" width="9" height="14"/><rect class="bar267" x="67" y="152" width="9" height="22"/><rect class="bar267" x="79" y="146" width="9" height="28"/><rect class="bar267" x="91" y="154" width="9" height="20"/><rect class="bar267" x="103" y="164" width="9" height="10"/>
+<rect class="w267" x="40" y="196" width="150" height="64" rx="7"/>
+<text class="s267" x="115" y="212">Replica 3</text>
+<rect class="bar267" x="55" y="240" width="9" height="12"/><rect class="bar267" x="67" y="232" width="9" height="20"/><rect class="bar267" x="79" y="226" width="9" height="26"/><rect class="bar267" x="91" y="234" width="9" height="18"/><rect class="bar267" x="103" y="244" width="9" height="8"/>
+<rect class="w267" x="40" y="276" width="150" height="64" rx="7"/>
+<text class="s267" x="115" y="292">Replica K</text>
+<rect class="bar267" x="55" y="320" width="9" height="14"/><rect class="bar267" x="67" y="312" width="9" height="22"/><rect class="bar267" x="79" y="306" width="9" height="28"/><rect class="bar267" x="91" y="314" width="9" height="20"/><rect class="bar267" x="103" y="324" width="9" height="10"/>
+<line x1="190" y1="68" x2="290" y2="170" class="l267"/>
+<line x1="190" y1="148" x2="290" y2="180" class="l267"/>
+<line x1="190" y1="228" x2="290" y2="194" class="l267"/>
+<line x1="190" y1="308" x2="290" y2="206" class="l267"/>
+<rect class="b267" x="292" y="150" width="150" height="64" rx="8"/>
+<text class="t267" x="367" y="178">Sum bin counts</text>
+<text class="s267" x="367" y="197">mergeable, exact</text>
+<line x1="442" y1="182" x2="512" y2="182" class="l267"/>
+<text class="t267" x="600" y="22">Fleet-wide current vs reference</text>
+<rect class="a267" x="514" y="36" width="172" height="78" rx="7"/>
+<text class="s267" x="600" y="52">Current (drifted)</text>
+<rect class="barc267" x="528" y="92" width="11" height="14"/><rect class="barc267" x="542" y="84" width="11" height="22"/><rect class="barc267" x="556" y="78" width="11" height="28"/><rect class="barc267" x="570" y="70" width="11" height="36"/><rect class="barc267" x="584" y="66" width="11" height="40"/><rect class="barc267" x="598" y="74" width="11" height="32"/><rect class="barc267" x="612" y="84" width="11" height="22"/><rect class="barc267" x="626" y="92" width="11" height="14"/>
+<rect class="r267" x="514" y="128" width="172" height="78" rx="7"/>
+<text class="s267" x="600" y="144">Reference</text>
+<rect class="barr267" x="528" y="184" width="11" height="14"/><rect class="barr267" x="542" y="174" width="11" height="24"/><rect class="barr267" x="556" y="166" width="11" height="32"/><rect class="barr267" x="570" y="162" width="11" height="36"/><rect class="barr267" x="584" y="166" width="11" height="32"/><rect class="barr267" x="598" y="174" width="11" height="24"/><rect class="barr267" x="612" y="184" width="11" height="14"/><rect class="barr267" x="626" y="190" width="11" height="8"/>
+<line x1="686" y1="120" x2="724" y2="120" class="l267"/>
+<rect class="b267" x="726" y="92" width="118" height="56" rx="7"/>
+<text class="t267" x="785" y="116">PSI / KS</text>
+<text class="s267" x="785" y="134">drift score</text>
+<text class="t267" x="600" y="246">Drift score vs threshold over windows</text>
+<rect class="b267" x="514" y="258" width="330" height="150" rx="8"/>
+<line x1="540" y1="388" x2="824" y2="388" stroke="#5a626c" stroke-width="1"/>
+<line x1="540" y1="270" x2="540" y2="388" stroke="#5a626c" stroke-width="1"/>
+<line x1="540" y1="332" x2="824" y2="332" stroke="#b1283a" stroke-width="1.3" stroke-dasharray="5 4"/>
+<text class="s267" x="566" y="328" fill="#b1283a">threshold</text>
+<polyline points="556,382 596,384 636,380 676,383 716,318 756,300 796,288" fill="none" stroke="#14385c" stroke-width="2.2"/>
+<circle cx="716" cy="318" r="4" fill="#b1283a"/>
+<text class="s267" x="716" y="308" fill="#b1283a">cross</text>
+<rect class="a267" x="690" y="396" width="150" height="0" rx="0"/>
+<text class="t267" x="746" y="404" fill="#b1283a">&#8594; retrain trigger</text>
+</svg>
+<figcaption><strong>Figure 26.7.1:</strong> Distributed drift detection as a merge-then-compare pipeline. Each of the $K$ replicas (left) bins only its own slice of traffic into a histogram over shared bin edges. The central aggregator sums those mergeable histograms into the exact fleet-wide current distribution (middle), compares it against the stored reference with a distance such as PSI or KS (top right), and tracks the resulting drift score across monitoring windows (bottom right). When the score crosses the threshold, the retrain trigger fires.</figcaption>
+</figure>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Mergeable Summary Returns, One More Time</div>
+<p>The additive histogram you sum across replicas here is the same mergeable-summary idea that powered combiners in MapReduce (<a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a>) and fleet metric aggregation in the previous section. Drift detection is not a new distributed primitive; it is the old aggregation primitive pointed at a new quantity. Whenever a property of the whole system must be computed from per-machine pieces without shipping the raw data, ask whether the per-machine summary is mergeable. If it is, the central computation is just a sum, and it is exact, exactly as the gradient all-reduce of Chapter 1 was exact.</p>
+</div>
+
+<h2>4. A Fleet-Wide Drift Detector From Scratch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The code below makes the whole pipeline concrete with nothing but NumPy. Four replicas each bin their own slice of traffic over shared edges; the aggregator sums the histograms into one fleet-wide distribution; a PSI score is computed against a reference window each monitoring window; and a retrain trigger fires when PSI crosses $0.2$. The stream is deliberately stable for four windows, then drifts: the input mean slides and the spread widens, the signature of covariate drift.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+
+# Fixed bin edges agreed fleet-wide so every replica's histogram is mergeable.
+EDGES = np.linspace(-6.0, 6.0, 21)          # 20 bins over the score range
+N_REPLICAS = 4
+WINDOW = 5_000                              # predictions per replica per window
+THRESHOLD = 0.2                            # PSI > 0.2 == material drift, retrain
+
+def replica_histogram(samples):
+    """One replica bins ONLY its own slice of traffic into a shared grid."""
+    counts, _ = np.histogram(samples, bins=EDGES)
+    return counts.astype(np.float64)
+
+def fleet_distribution(per_replica_counts):
+    """Central aggregator sums mergeable histograms, then normalizes once."""
+    total = np.sum(per_replica_counts, axis=0)
+    return total / total.sum()
+
+def psi(reference, current, eps=1e-6):
+    """Population Stability Index between two binned distributions."""
+    r = np.clip(reference, eps, None)
+    c = np.clip(current, eps, None)
+    return float(np.sum((c - r) * np.log(c / r)))
+
+# Reference window: the input score distribution the model was validated on.
+ref_counts = [replica_histogram(rng.normal(0.0, 1.0, WINDOW)) for _ in range(N_REPLICAS)]
+reference = fleet_distribution(ref_counts)
+
+# Stream eight monitoring windows. The serving population drifts after window 4:
+# the mean of the input scores slides and the spread widens (covariate drift).
+print(f"{'window':&gt;6} {'fleet mean':&gt;11} {'PSI':&gt;8}  trigger")
+print("-" * 38)
+for w in range(8):
+    if w &lt; 4:
+        mu, sigma = 0.0, 1.0                # stable regime
+    else:
+        mu, sigma = 0.6 + 0.25 * (w - 4), 1.0 + 0.18 * (w - 4)   # drifting regime
+    per_replica = [replica_histogram(rng.normal(mu, sigma, WINDOW)) for _ in range(N_REPLICAS)]
+    current = fleet_distribution(per_replica)
+    score = psi(reference, current)
+    fired = "RETRAIN" if score &gt; THRESHOLD else "."
+    print(f"{w:&gt;6} {mu:&gt;11.2f} {score:&gt;8.4f}  {fired}")
+</code></pre>
+<div class="code-caption"><strong>Code 26.7.1:</strong> A from-scratch fleet-wide drift detector. The mergeable per-replica histograms are summed in <code>fleet_distribution</code> before any distance is computed, so the PSI score reflects the whole stream rather than any one replica's local view.</div>
+<pre><code class="language-text">window  fleet mean      PSI  trigger
+--------------------------------------
+     0        0.00   0.0011  .
+     1        0.00   0.0008  .
+     2        0.00   0.0018  .
+     3        0.00   0.0008  .
+     4        0.60   0.3682  RETRAIN
+     5        0.85   0.6938  RETRAIN
+     6        1.10   1.1481  RETRAIN
+     7        1.35   1.6833  RETRAIN
+</code></pre>
+<div class="code-caption"><strong>Output 26.7.1:</strong> The four stable windows sit far below the $0.2$ threshold (PSI near $0.001$, ordinary sampling noise); the instant the population shifts at window 4 the score jumps past $0.36$ and the retrain trigger fires, climbing further as the drift deepens.</div>
+<p>The detector did exactly what Figure 26.7.1 promised: it stayed quiet while the fleet-wide distribution matched the reference, and it fired the moment that distribution moved, with a score that grows monotonically as the gap widens. Note that the PSI was computed on the <em>summed</em> histogram; had we instead averaged four per-replica PSI scores, a shift concentrated on a few replicas could have been diluted below the threshold, which is precisely the local-blindness trap that motivates fleet-wide aggregation.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Evidently, NannyML, and river Do This For You</div>
+<p>Code 26.7.1 is the teaching version. In production you would not hand-roll the binning, the multiple-testing correction, and the report. <strong>Evidently</strong> computes data-drift, prediction-drift, and target-drift reports across many features with per-feature tests chosen automatically; <strong>NannyML</strong> specializes in the label-delay problem, estimating model performance <em>without labels</em> from the confidence distribution and reconciling it when labels arrive; and <strong>river</strong> supplies streaming detectors (ADWIN, Page-Hinkley, KSWIN) that update incrementally per event for the online setting of <a href="../../part-2-distributed-data/module-09-stream-processing-online-ai/index.html">Chapter 9</a>. A full multi-feature drift report collapses to a few lines:</p>
+<pre><code class="language-python">from evidently.report import Report
+from evidently.metric_preset import DataDriftPreset
+
+report = Report(metrics=[DataDriftPreset()])    # per-feature tests, auto-chosen
+report.run(reference_data=reference_df, current_data=current_df)
+report.as_dict()["metrics"][0]["result"]["dataset_drift"]   # True / False fleet verdict
+</code></pre>
+<div class="code-caption"><strong>Code 26.7.2:</strong> The same detect-and-decide logic as Output 26.7.1 in three lines with Evidently, which picks an appropriate test per feature and applies multiple-testing control so you are not left tuning one PSI threshold by hand.</div>
+</div>
+
+<h2>5. Drift in LLM Serving: Embeddings and Quality Proxies <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>For a classifier, the monitored feature is a tidy numeric score. For a large language model serving free-form text, there is no single scalar to bin, and the methods generalize rather than transfer directly. The standard move is to monitor the <strong>embedding distribution</strong> of inputs and outputs: encode each prompt and each response into a vector, and track that high-dimensional distribution over windows with a binning-free distance such as MMD, or by reducing to a few summary statistics (mean cosine distance to the reference centroid, the share of inputs whose nearest reference cluster is far away). A surge of out-of-distribution prompts, a new jailbreak template, a topic the model was never tuned for, shows up as the input embedding cloud drifting away from the reference cloud, long before any human flags a bad answer.</p>
+<p>Because an LLM has no cheap ground-truth label either, output quality is tracked through <strong>quality proxies</strong>: response length distribution, refusal rate, toxicity and safety-classifier scores, retrieval-grounding scores in a RAG system, and increasingly an LLM-as-judge score sampled on a fraction of traffic. Each is a mergeable per-replica statistic that aggregates fleet-wide exactly like the histogram in Code 26.7.1, so the distributed machinery is unchanged; only the monitored quantity is richer.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Label-Free Performance Estimation and LLM Drift Monitoring (2024 to 2026)</div>
+<p>The frontier is detecting decay <em>without</em> waiting for labels. NannyML's confidence-based performance estimation (CBPE) and its direct-loss-estimation successors (2024 to 2025) estimate a model's true accuracy from the shape of its predicted-probability distribution alone, turning the label-delay problem from a blocker into an estimate you can monitor live. For generative systems, a fast-moving line monitors embedding-space drift of prompts and responses and pairs it with automated LLM-as-judge evaluation run continuously on sampled production traffic, with open tooling such as Evidently's LLM evaluation suite and observability platforms like Arize Phoenix and LangSmith productizing it through 2025 and into 2026. The hard open problems are disentangling genuine concept drift from benign seasonality at fleet scale, and controlling the false-alarm rate when hundreds of features and prompt clusters are each tested every window. We borrow the multiple-testing discipline for that from the evaluation methodology of <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/index.html">Chapter 5</a>.</p>
+</div>
+
+<h2>6. From Detection to Action: Closing the Loop Without Crying Wolf <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A drift score is only useful if it drives an action, and the action is a small state machine. Below the threshold, do nothing. Above it, raise an alert to the on-call channel and, depending on confidence, trigger the retraining pipeline that <a href="section-26.1.html">Section 26.1</a> and <a href="section-26.4.html">Section 26.4</a> built, which pulls a fresh labeled window, retrains, evaluates against a held-out set, and promotes the new model only if it actually beats the incumbent. The detector closes the loop from a deployed-and-decaying model back to a freshly trained one, which is the whole point of an MLOps pipeline: a model that maintains itself.</p>
+<p>The dominant failure mode is the false alarm, and two causes account for most of them. The first is <strong>seasonality</strong>: traffic legitimately shifts on weekends, holidays, and promotions, and a detector that treats every shift as decay will retrain on freak data and ship regressions, as the Black Friday note warned. The remedy is to compare against a seasonally matched reference (this Monday against prior Mondays, not against an all-time average) and to require persistence, a score that stays high for several consecutive windows rather than one spike. The second is <strong>multiple testing</strong>: with hundreds of features each tested every window, some will cross any fixed threshold by pure chance, and the fleet-level false-alarm rate compounds. The remedy is a correction such as controlling the false-discovery rate across features, so the system reports the few features that genuinely moved rather than the noise floor, which is the same statistical hygiene the evaluation chapter applies to comparing systems.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Fraud Model That Drifted One Region at a Time</div>
+<p><strong>Who:</strong> An ML platform engineer at a payments company running a fraud classifier across a fifty-replica serving fleet.</p>
+<p><strong>Situation:</strong> A new market launched, and its transactions, routed by geography, landed on only a handful of replicas while the rest served the old traffic mix unchanged.</p>
+<p><strong>Problem:</strong> Per-replica drift dashboards looked calm; each replica's local PSI hovered in the noise, because the shifted traffic was a small fraction of any one replica's stream, and accuracy was quietly sliding on the new market.</p>
+<p><strong>Dilemma:</strong> Lower every replica's local threshold and drown in false alarms from ordinary per-replica noise, or aggregate fleet-wide and risk a real but localized shift being diluted in the average.</p>
+<p><strong>Decision:</strong> They switched from averaging per-replica scores to summing mergeable per-replica histograms into one fleet-wide distribution before computing PSI, exactly the pattern in Code 26.7.1, and segmented the report by region so a localized shift stayed visible instead of being averaged away.</p>
+<p><strong>How:</strong> Each replica emitted an additive histogram over shared bin edges on the existing metrics path from Section 26.6; the aggregator summed them, computed segmented PSI, required two consecutive windows over threshold, then called the retrain trigger.</p>
+<p><strong>Result:</strong> The fleet-wide segmented PSI for the new region crossed threshold within two windows, the retrain pulled labeled data weighted toward the new market, and the promoted model recovered accuracy there with no regression on existing regions.</p>
+<p><strong>Lesson:</strong> Drift is a property of the whole stream. Compute it from mergeable summaries aggregated across the fleet, segment to keep localized shifts visible, and require persistence before you act.</p>
+</div>
+<p>With drift detection in place, the serving system gains the last sense it was missing: it now knows not just whether it is running and how fast, but whether it is still <em>right</em>, and it can summon a fresh model when it is not. The next section turns to the question of how to roll a candidate model out safely once retraining has produced one, comparing the incumbent and the challenger on live traffic without betting users on an unproven model, through A/B testing and shadow deployment at fleet scale, in <a href="section-26.8.html">Section 26.8</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.7.1: Which Drift, Which Proxy? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each scenario, classify the drift as data drift, concept drift, or prediction drift, state whether an unlabeled detector could catch it, and name the proxy you would monitor: (a) a sentiment model trained before a product launch starts seeing reviews full of a new product name it has never encountered; (b) a credit model where, after a recession, applicants with previously safe profiles begin defaulting while their application features look identical to before; (c) a content classifier whose output mix suddenly tilts from ninety percent "safe" to sixty percent "safe" with no code change. Explain why the label-delay problem makes one of these three much harder to confirm than the others.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.7.2: Add a KS Test and a Persistence Rule <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 26.7.1 in two ways. First, alongside PSI compute a two-sample Kolmogorov-Smirnov statistic between the fleet-wide current and reference samples (you may reconstruct approximate samples from bin counts, or store raw samples per window) and print both scores side by side; compare which one fires earlier as the drift deepens. Second, replace the single-window trigger with a persistence rule that fires only when the score exceeds the threshold for two consecutive windows. Re-run and confirm the persistence rule still catches the real drift at windows 4 onward while it would suppress a single isolated spike. Explain what false alarm the persistence rule is designed to prevent.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.7.3: The Cost of Aggregation Granularity <span class="exercise-type analysis">Analysis</span></div>
+<p>Suppose a fleet of $K = 200$ replicas each serves $2{,}000$ predictions per minute, and you must choose how often to ship drift histograms to the central aggregator. Shipping every second gives fast detection but $200$ messages per second of telemetry; shipping every five minutes is nearly free but delays detection. Using the mergeable-histogram structure, argue why the <em>detection latency</em> is bounded by the shipping interval but the <em>statistical power</em> depends on the total sample count accumulated, not the shipping frequency. Then estimate, for a true shift large enough to give PSI $\approx 0.4$ on a full window, roughly how many total predictions you need before the score reliably clears a $0.2$ threshold, and use that to recommend a shipping interval. Tie your answer to the fleet-metric aggregation trade-offs of <a href="section-26.6.html">Section 26.6</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-26.6.html"><span class="nav-label">Previous</span><span class="nav-num">Section 26.6</span><span class="nav-title">Fleet-Wide Monitoring and Observability</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 26</span><span class="nav-num">Contents</span><span class="nav-title">MLOps for Distributed AI</span></a>
+<a class="next" href="section-26.8.html"><span class="nav-label">Next</span><span class="nav-num">Section 26.8</span><span class="nav-title">A/B Testing and Shadow Deployment at Scale</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

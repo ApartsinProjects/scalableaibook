@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 10.4: Asynchronous Distributed SGD. Removing the synchronization barrier so workers never wait, what that buys in throughput, and what stale gradients cost in convergence." name="description"/>
+<title>Section 10.4: Asynchronous Distributed SGD | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Distributed Machine Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 10: Distributed Optimization</a></div>
+<h1>Asynchronous Distributed SGD</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I never wait for the others. I read what is on the board, scribble my correction, and walk off before anyone checks whether the board still says what I read."</p>
+<cite>A Parameter Server Under Mild Staleness</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Synchronous SGD makes every worker wait for the slowest one at a barrier on each step; asynchronous SGD removes that barrier, letting each worker read the shared parameters, compute a gradient, and apply its update whenever it is ready, without coordinating with anyone.</strong> The reward is throughput: no worker ever idles on a straggler, so the cluster does more gradient updates per second. The bill comes due in correctness of timing, not correctness of math: by the time a worker's update lands, the parameters it read have usually moved, so the gradient is <em>stale</em>, and stale gradients slow or destabilize convergence. This section makes that throughput-versus-convergence trade explicit, shows where it still wins (sparse and embedding-heavy workloads, reinforcement learning), and where dense deep learning abandoned it for the synchronized all-reduce of the next section.</p>
+</div>
+<p>The previous section built synchronous distributed SGD: all workers read the same parameters, compute gradients on their shards, and a collective averages those gradients before any worker takes a step. That design has a single, stubborn weakness. The step cannot complete until the last gradient arrives, so one slow worker, a <em>straggler</em>, holds up every other worker on every step. On a cluster where machines share network links, contend for storage, and occasionally garbage-collect at the worst moment, some worker is almost always a little behind, and the barrier converts every transient slowdown into a global stall. Asynchronous SGD asks a blunt question: what if we simply never wait?</p>
+<p>The answer reorganizes the training loop around a shared parameter store that workers hit independently. This is the natural home of the <em>parameter server</em>, an architecture we introduce here only as far as the optimizer needs it and develop fully in <a href="../module-11-parameter-servers-embeddings/index.html">Chapter 11</a>. The synchronous-versus-asynchronous distinction itself is one we first met as a coordination question in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/index.html">Chapter 2</a>; here it becomes an optimization question with a measurable price.</p>
+
+<h2>1. The Barrier Is the Problem <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>In synchronous SGD, the update rule for step $t$ averages the gradients computed by all $K$ workers on the <em>same</em> parameter vector $w_t$:</p>
+$$w_{t+1} = w_t - \eta \cdot \frac{1}{K} \sum_{k=1}^{K} \nabla \ell\!\left(w_t; \xi_t^{(k)}\right),$$
+<p>where $\xi_t^{(k)}$ is the mini-batch worker $k$ drew for step $t$. The subscript $t$ appearing on every $w_t$ inside the sum is the barrier made visible: every gradient is evaluated at the current parameters, which is exactly what forces all workers to finish before the step can be taken. If worker $k$ needs time $T_k$ to produce its gradient, the wall-clock cost of one step is $\max_k T_k$, the slowest worker, no matter how fast the rest were. A cluster of identical machines wastes a little this way; a cluster with real heterogeneity, shared storage, and stragglers wastes a lot. We met this straggler tax abstractly in <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a> when Amdahl's law turned any serialized fraction into a ceiling on speedup; the synchronization barrier is precisely such a serialized fraction.</p>
+<p>Asynchronous SGD deletes the shared subscript. Worker $k$ reads whatever parameters are currently in the shared store, call that version $w_{t - \tau_k}$, computes a gradient there, and applies it to whatever the latest version happens to be by the time it returns:</p>
+$$w_{t+1} = w_t - \eta \cdot \nabla \ell\!\left(w_{t - \tau_k}; \xi^{(k)}\right).$$
+<p>The number $\tau_k \ge 0$ is the <em>staleness</em>, or delay: how many updates other workers slipped in between this worker's read and its write. When $\tau_k = 0$ the update is fresh and this reduces to ordinary SGD; when $\tau_k$ is large, the gradient points in a direction that was downhill for an old version of the model and may no longer be downhill for the current one. No worker ever waits, so the wall-clock cost of an update is set by how fast a single worker finishes, not by the slowest. Figure 10.4.1 shows the mechanism: three workers reading and writing a shared parameter server at different times, with one of them committing a gradient it computed on a version that has since moved.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of three workers interacting with a shared parameter server at different times. A central timeline of parameter versions runs across the middle. Worker A and Worker C apply fresh updates; Worker B reads an old version, the server advances while B computes, and B's update lands stale against a newer version.">
+<defs>
+<marker id="arrA" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arrR" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b03030"/></marker>
+</defs>
+<style>
+.ps { fill:#eef3f9; stroke:#14385c; stroke-width:1.6; }
+.ver { fill:#ffffff; stroke:#14385c; stroke-width:1.4; }
+.wk { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.wkstale { fill:#fbe9e7; stroke:#b03030; stroke-width:1.6; }
+.tt { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.tw { font:600 13px sans-serif; fill:#7a4a12; text-anchor:middle; }
+.ss { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.sr { font:11.5px sans-serif; fill:#b03030; text-anchor:middle; }
+.lf { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arrA); }
+.lr { fill:none; stroke:#b03030; stroke-width:1.9; marker-end:url(#arrR); stroke-dasharray:5 3; }
+</style>
+<text class="tt" x="430" y="24">Shared parameter server (a timeline of parameter versions)</text>
+<rect class="ps" x="40" y="150" width="780" height="60" rx="10"/>
+<rect class="ver" x="70" y="162" width="62" height="36" rx="6"/><text class="ss" x="101" y="185">w(t)</text>
+<rect class="ver" x="250" y="162" width="62" height="36" rx="6"/><text class="ss" x="281" y="185">w(t+1)</text>
+<rect class="ver" x="430" y="162" width="62" height="36" rx="6"/><text class="ss" x="461" y="185">w(t+2)</text>
+<rect class="ver" x="610" y="162" width="62" height="36" rx="6"/><text class="ss" x="641" y="185">w(t+3)</text>
+<rect class="ver" x="730" y="162" width="62" height="36" rx="6"/><text class="ss" x="761" y="185">w(t+4)</text>
+<rect class="wk" x="60" y="56" width="120" height="46" rx="8"/><text class="tw" x="120" y="84">Worker A</text>
+<path class="lf" d="M 101 162 L 101 104"/>
+<path class="lf" d="M 140 104 L 250 160"/>
+<text class="ss" x="120" y="124">read w(t), write fresh</text>
+<rect class="wk" x="540" y="56" width="120" height="46" rx="8"/><text class="tw" x="600" y="84">Worker C</text>
+<path class="lf" d="M 461 162 L 461 104"/>
+<path class="lf" d="M 540 104 L 610 160"/>
+<text class="ss" x="600" y="124">read w(t+2), write fresh</text>
+<rect class="wkstale" x="300" y="262" width="150" height="50" rx="8"/><text class="tw" x="375" y="284" fill="#b03030">Worker B (slow)</text>
+<text class="sr" x="375" y="302">gradient on w(t)</text>
+<path class="lr" d="M 101 198 L 101 287 L 298 287"/>
+<text class="sr" x="195" y="252">reads old w(t) ...</text>
+<path class="lr" d="M 452 287 L 730 287 L 745 200"/>
+<text class="sr" x="600" y="332">... server moved 4 versions; B's stale update lands on w(t+4)</text>
+</svg>
+<figcaption><strong>Figure 10.4.1:</strong> Asynchronous SGD against a shared parameter server. Workers A and C read a recent version and write back almost immediately, so their gradients are nearly fresh. Worker B is slow: it reads version $w(t)$, the server advances four versions while B computes, and B's update (red dashed path) applies a gradient evaluated at $w(t)$ to the much newer $w(t+4)$. The gap of four versions is B's staleness $\tau$.</figcaption>
+</figure>
+
+<h2>2. Hogwild! and Lock-Free Updates <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The cleanest argument that asynchrony can work came from <em>Hogwild!</em> (Recht, Re, Wright and Niu, 2011), and it is worth stating because it explains exactly when async is cheap. Many large machine learning problems are <em>sparse</em>: each training example touches only a handful of the model's parameters. A click-prediction model with a hundred million features sees, on any one example, the few dozen features that example actually fired. When two workers process two examples that share no features, their gradient updates touch disjoint coordinates of $w$, so they cannot interfere even if applied at the literal same instant.</p>
+<p>Hogwild! takes the radical step of dropping locks entirely. Workers update the shared parameter vector in place, with no synchronization and no mutual exclusion, accepting that occasionally two workers will collide on the same coordinate and one update will be partly lost. The paper's result is that when the problem is sufficiently sparse, these collisions are rare enough that the algorithm still converges at essentially the serial rate, and removing the locking overhead makes it run far faster in practice. Lock-free, in this setting, is not recklessness; it is a calculated bet that conflicts are statistically negligible.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Asynchrony Trades Statistical Efficiency for Hardware Efficiency</div>
+<p>Synchronous SGD maximizes the value of each step: every gradient is fresh, so each step moves the model as much as the math allows. Asynchronous SGD maximizes the number of steps per second: no worker ever idles, so the hardware is never blocked. These optimize different things. Async wins whenever the throughput gain (more updates per second) outweighs the staleness penalty (each update worth less because it was computed on outdated parameters). That balance tips toward async when staleness is small, which happens when updates are sparse (Hogwild!), when workers are heterogeneous enough that the barrier wastes a lot, or when the network makes synchronization expensive; it tips toward sync when gradients are dense and staleness piles up.</p>
+</div>
+
+<h2>3. The Throughput-Versus-Convergence Trade, Measured <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The argument so far is qualitative: async does more steps per second, but each step is worth less. The code below makes both halves concrete on a convex least-squares problem, the same kind of problem whose gradient we dissected in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>. It runs two schedulers on identical data from an identical start. The synchronous scheduler averages $K$ fresh gradients per step but pays the slowest worker on every step (one worker is a $20\times$ straggler). The asynchronous scheduler applies one gradient per update, computed on a parameter version up to forty updates stale, but its wall-clock advances at the cadence of a single fast worker because nothing ever waits. We count both the number of steps each needs to reach the same target loss and the simulated wall-clock each spends getting there.</p>
+<pre><code class="language-python">import numpy as np
+
+# A convex least-squares problem: minimize (1/N) * ||X w - y||^2.
+# Both schedulers below optimize the SAME problem from the SAME start so the
+# only difference is synchronous vs asynchronous parameter updates.
+rng = np.random.default_rng(7)
+N, d, K = 20_000, 30, 8                       # examples, features, workers
+X = rng.standard_normal((N, d))
+w_star = rng.standard_normal(d)
+y = X @ w_star + 0.05 * rng.standard_normal(N)
+
+def grad(w, idx):
+    """Stochastic gradient of the MSE loss on a mini-batch of rows."""
+    Xb, yb = X[idx], y[idx]
+    return (2.0 / len(idx)) * (Xb.T @ (Xb @ w - yb))
+
+def loss(w):
+    r = X @ w - y
+    return float(r @ r) / N
+
+lr, batch, target = 0.03, 16, 0.30            # step size, batch size, stop threshold
+loss0 = loss(np.zeros(d))
+
+# ---- Synchronous SGD: every "step" is a barrier. All K workers read the SAME
+# parameters, compute K gradients, and the step applies their average. One step
+# costs the time of the SLOWEST worker (a straggler stalls everyone).
+def run_sync(max_steps, slow):
+    w = np.zeros(d)
+    wall = 0.0                                # simulated wall-clock (arbitrary units)
+    for step in range(1, max_steps + 1):
+        g = np.zeros(d)
+        worker_times = []
+        for k in range(K):
+            idx = rng.integers(0, N, batch)
+            g += grad(w, idx)
+            # worker k's compute time; one straggler is 'slow' x slower.
+            worker_times.append(slow if k == 0 else 1.0)
+        w -= lr * (g / K)                      # average of K gradients
+        wall += max(worker_times)             # barrier: pay the slowest
+        if loss(w) <= target:
+            return step, wall, loss(w)
+    return max_steps, wall, loss(w)
+
+# ---- Asynchronous SGD: no barrier. Each worker, when it finishes, applies its
+# gradient to the shared parameters immediately, but that gradient was computed
+# on a STALE version read 'tau' updates ago. Workers never wait, so wall-clock
+# advances by the FASTEST available worker, not the slowest.
+def run_async(max_updates, max_stale):
+    w = np.zeros(d)
+    history = [w.copy()]                      # past parameter versions (the PS log)
+    wall = 0.0
+    for upd in range(1, max_updates + 1):
+        # a random worker finishes; its read was 'tau' versions behind the latest.
+        tau = int(rng.integers(0, max_stale + 1))
+        stale_w = history[max(0, len(history) - 1 - tau)]
+        idx = rng.integers(0, N, batch)
+        g = grad(stale_w, idx)                # gradient on STALE parameters
+        w = w - lr * g                        # applied to the LATEST parameters
+        history.append(w.copy())
+        # one async update arrives at the aggregate cadence of K overlapping
+        # workers; a slow worker delays only ITS OWN update, never the stream.
+        wall += 1.0
+        if loss(w) <= target:
+            return upd, wall, loss(w)
+    return max_updates, wall, loss(w)
+
+slow = 20.0                                   # the straggler is 20x slower
+s_steps, s_wall, s_loss = run_sync(4000, slow)
+a_steps, a_wall, a_loss = run_async(20000, max_stale=40)
+
+print(f"initial loss            : {loss0:.3f}")
+print(f"target loss             : {target:.3f}")
+print(f"straggler slowdown      : {slow:.0f}x")
+print("--- synchronous SGD (barrier every step) ---")
+print(f"  steps to converge     : {s_steps}")
+print(f"  wall-clock (units)    : {s_wall:.0f}")
+print(f"  final loss            : {s_loss:.3f}")
+print("--- asynchronous SGD (stale reads, no barrier) ---")
+print(f"  updates to converge   : {a_steps}")
+print(f"  wall-clock (units)    : {a_wall:.0f}")
+print(f"  final loss            : {a_loss:.3f}")
+print(f"updates/steps ratio     : {a_steps / s_steps:.2f}x  (async needs MORE steps)")
+print(f"wall-clock speedup      : {s_wall / a_wall:.2f}x  (async finishes SOONER)")
+</code></pre>
+<div class="code-caption"><strong>Code 10.4.1:</strong> A pure-Python simulation of synchronous versus asynchronous SGD on one convex problem. The staleness model (read a version up to <code>max_stale</code> updates old, apply the gradient to the latest version) is the mechanism of Figure 10.4.1 reduced to a few lines; the wall-clock model charges synchronous steps the slowest worker and asynchronous updates the fast cadence.</div>
+<pre><code class="language-text">initial loss            : 23.481
+target loss             : 0.300
+straggler slowdown      : 20x
+--- synchronous SGD (barrier every step) ---
+  steps to converge     : 35
+  wall-clock (units)    : 700
+  final loss            : 0.277
+--- asynchronous SGD (stale reads, no barrier) ---
+  updates to converge   : 258
+  wall-clock (units)    : 258
+  final loss            : 0.299
+updates/steps ratio     : 7.37x  (async needs MORE steps)
+wall-clock speedup      : 2.71x  (async finishes SOONER)</code></pre>
+<div class="code-caption"><strong>Output 10.4.1:</strong> The trade made numeric. Asynchronous SGD needed $7.37\times$ more gradient updates to reach the same loss, the direct cost of stale gradients, yet finished in $2.71\times$ less wall-clock time because no update ever waited on the $20\times$ straggler. More steps, each worth less, but more steps per unit time.</div>
+<p>Output 10.4.1 is the whole section in two numbers. The $7.37\times$ blow-up in update count is the staleness penalty: every gradient computed on an outdated version does less useful work, so it takes many more of them to descend the same distance. The $2.71\times$ wall-clock speedup is the throughput reward: with the barrier gone, the straggler can no longer hold the cluster hostage. Which number dominates depends entirely on how severe the straggler is and how large the staleness grows. Push the straggler slowdown up and async wins by more; let staleness grow unbounded and the update-count penalty eventually swamps the throughput gain, and async loses or fails to converge at all. The unbounded-staleness failure mode, and the bounded-staleness fix that tames it, are the subject of <a href="../module-11-parameter-servers-embeddings/index.html">Chapter 11</a>, with the convergence theory deepened in Section 10.6.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Wikipedia-Edit Model of Async SGD</div>
+<p>Asynchronous SGD is the optimization version of a heavily edited wiki page. You open an article, spend ten minutes writing a careful correction, and hit save, only to find six other people edited the same paragraph while you were typing. Your edit still applies, but it was written against a version of the text that no longer exists. Most of the time it is harmless and the page improves faster than if everyone had to take turns; occasionally two edits clobber each other and someone has to clean up. Hogwild! is the observation that if the article is long enough and editors rarely touch the same sentence, you can skip the locking and just let everyone type at once.</p>
+</div>
+
+<h2>4. Why Async Faded for Dense Deep Learning, and Where It Persists <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Asynchronous SGD on a parameter server was the dominant way to train large models around 2012 to 2016, the era of Google's DistBelief and the original parameter-server papers. It then faded for mainstream deep learning, and the reason is instructive. Modern dense neural networks have the opposite of sparse gradients: nearly every parameter receives a nonzero gradient from nearly every example, so the Hogwild! argument evaporates and staleness bites hard. At the same time, fast collective hardware (high-bandwidth interconnects with optimized all-reduce, the subject of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>) made the synchronization barrier cheap enough that paying it bought clean, fresh gradients for little wall-clock cost. When the barrier is cheap and staleness is expensive, synchronous all-reduce wins, which is exactly the design the next section builds.</p>
+<p>Async did not disappear; it retreated to the workloads where its assumptions still hold. Large recommendation and ranking systems train enormous, sparse embedding tables where each example touches a tiny slice of parameters, the Hogwild! regime, and they run on parameter servers to this day (<a href="../module-11-parameter-servers-embeddings/index.html">Chapter 11</a>). Reinforcement learning is the other stronghold: in actor-learner architectures, many actors generate experience asynchronously against a policy that the learner is continuously updating, so the actors are always slightly behind, a structural staleness the system is designed around rather than against. That actor-learner pattern, and the synchronous-versus-asynchronous choice within it, returns in <a href="../../part-4-parallel-deep-learning/module-20-distributed-rl-infrastructure/index.html">Chapter 20</a>.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Ad-Ranking Team That Kept the Parameter Server</div>
+<p><strong>Who:</strong> An ML platform team training a click-through-rate model for an ad exchange.</p>
+<p><strong>Situation:</strong> The model was a wide-and-deep network over a sparse feature space of roughly two hundred million embedding entries, retrained continuously on a firehose of impression logs.</p>
+<p><strong>Problem:</strong> A company-wide push to standardize on synchronous all-reduce, successful for the vision and language teams, slowed the ad model down instead of speeding it up.</p>
+<p><strong>Dilemma:</strong> Conform to the standard synchronous DDP stack for consistency and tooling, or keep the older asynchronous parameter-server training loop that the platform team wanted to retire.</p>
+<p><strong>Decision:</strong> They kept the asynchronous parameter server for this workload, because each impression touched only a few dozen of the two hundred million embeddings, so updates were almost always disjoint and staleness stayed tiny, exactly the Hogwild! regime.</p>
+<p><strong>How:</strong> Workers pulled only the embedding rows their mini-batch needed, computed gradients, and pushed updates back asynchronously; the dense layers, which were small, used a brief synchronous reduction.</p>
+<p><strong>Result:</strong> Training throughput stayed roughly $3\times$ higher than the synchronous prototype at equal model quality, because the all-reduce of a two-hundred-million-row table would have been ruinous while sparse async updates were nearly free.</p>
+<p><strong>Lesson:</strong> Async is not obsolete; it is specialized. When gradients are genuinely sparse, the parameter server still beats all-reduce, which is why <a href="../module-11-parameter-servers-embeddings/index.html">Chapter 11</a> exists alongside <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">the data-parallel story</a>.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Ray Replaces the Hand-Written Async Loop</div>
+<p>Code 10.4.1 simulated the async mechanism in one process. A real asynchronous trainer needs a shared parameter store, remote workers, and non-blocking pulls and pushes. Ray expresses that directly: a stateful actor holds the parameters, and worker tasks fetch them, compute gradients, and apply updates without any barrier. The roughly fifty lines of socket and queue plumbing you would otherwise write collapse to a handful, because Ray handles the process group, the remote references, and the message transport:</p>
+<pre><code class="language-python"># pip install ray ; conceptual skeleton of async parameter-server SGD
+import ray
+
+@ray.remote
+class ParameterServer:
+    def __init__(self, dim):
+        self.w = make_zeros(dim)
+    def pull(self):                 # a worker reads the CURRENT (possibly newer) params
+        return self.w
+    def push(self, grad, lr):       # apply a gradient computed on a STALE read
+        self.w = self.w - lr * grad
+
+@ray.remote
+def worker(ps, lr, steps):
+    for _ in range(steps):
+        w = ray.get(ps.pull.remote())     # non-blocking pull, no barrier
+        g = compute_gradient(w)           # gradient on whatever version we got
+        ps.push.remote(g, lr)             # fire the update and move on
+
+ps = ParameterServer.remote(dim=30)
+ray.get([worker.remote(ps, 0.03, 1000) for _ in range(8)])   # 8 async workers
+</code></pre>
+<div class="code-caption"><strong>Code 10.4.2:</strong> The async parameter-server pattern of Output 10.4.1 as a Ray program. The <code>pull</code> and <code>push</code> calls are the read and write of Figure 10.4.1; Ray supplies the shared actor, the remote scheduling, and the transport, and the bounded-staleness controls that production systems add ride on top of this same skeleton in <a href="../module-11-parameter-servers-embeddings/index.html">Chapter 11</a>.</div>
+</div>
+
+<h2>5. When to Reach for Async <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The decision is a comparison of two effects you can now estimate. Asynchrony helps when the throughput it unlocks exceeds the convergence it costs, and that happens under three recognizable conditions. First, sparse gradients, where updates rarely collide and staleness stays small, the recommendation and embedding case. Second, severe heterogeneity or unreliable workers, where the synchronous barrier wastes so much on stragglers that even a stale-gradient penalty is cheaper than waiting, which is common across the public internet and on preemptible spot fleets. Third, structurally asynchronous workloads such as actor-learner reinforcement learning, where the staleness is inherent to the problem and the system is built to absorb it.</p>
+<p>Async hurts, and synchronous all-reduce wins, when gradients are dense (so staleness damages every step), when the interconnect is fast enough that the barrier is cheap, and when reproducibility matters, because asynchronous updates make a run depend on the exact timing of every worker and so are hard to reproduce bit-for-bit. Most large dense-model training today lives in this second regime, which is why <a href="section-10.5.html">Section 10.5</a> develops gradient aggregation and all-reduce SGD as the default, and treats the staleness analysis of Section 10.6 as the tool for deciding when to step off that default.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Async Returns for Geo-Distributed and RLHF Training (2024 to 2026)</div>
+<p>Asynchrony is being rediscovered precisely where synchronous all-reduce is hardest: across slow, unreliable links. Local-update methods in the DiLoCo lineage (Douillard et al., 2024) let workers take many local steps between rare communications, and their <em>asynchronous</em> variants (Async Local SGD, and DeepMind's streaming-DiLoCo work) drop the outer barrier so geographically separated clusters never wait on the slowest region, an extreme-heterogeneity setting where the straggler tax of Output 10.4.1 is enormous. In reinforcement learning from human feedback and large-scale RL post-training, asynchronous actor-learner pipelines (for example the design behind systems like AReaL and asynchronous PPO variants, 2024 to 2025) generate rollouts against a slightly stale policy so expensive generation never blocks the learner, reporting large throughput gains at controlled staleness. The open research question is the same one this section framed: how much staleness can the optimizer absorb before the update-count penalty overtakes the throughput win, and how to bound it adaptively. We return to the bounded-staleness machinery in <a href="../module-11-parameter-servers-embeddings/index.html">Chapter 11</a>.</p>
+</div>
+
+<p>Asynchronous SGD, then, is the barrier removed and the bill itemized: more updates per second in exchange for each update being computed on stale parameters and therefore worth less. We have seen where the trade pays off (sparse, heterogeneous, and reinforcement-learning workloads) and where it does not (dense deep learning on fast interconnects). The next section takes the opposite tack and asks how to make the synchronous barrier so cheap that you rarely need to remove it, by building the gradient aggregation and all-reduce machinery that dense training relies on. That is <a href="section-10.5.html">Section 10.5</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.4.1: Read the Staleness Off the Picture <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using Figure 10.4.1, answer three questions in prose. (a) Why are Worker A's and Worker C's updates nearly fresh while Worker B's is stale, in terms of how long each held the parameters between read and write? (b) If Worker B were instead the <em>fastest</em> worker and Workers A and C were the slow ones, how would the staleness pattern change? (c) Explain why making all workers equally fast would shrink the average staleness toward zero, and connect this to why a homogeneous cluster on a fast interconnect prefers synchronous SGD over asynchronous.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.4.2: Find Where Async Stops Winning <span class="exercise-type coding">Coding</span></div>
+<p>Take Code 10.4.1 and sweep the asynchronous staleness bound <code>max_stale</code> over the values 0, 5, 10, 20, 40, 80, 160 while holding everything else fixed. For each value, record the updates-to-converge, the async wall-clock, and whether it reached the target within the update cap. Plot updates-to-converge against <code>max_stale</code>. Identify the staleness at which async's wall-clock first exceeds the synchronous baseline of 700 units, and explain in two sentences why beyond some point increasing staleness causes the run to need so many updates that the throughput advantage is erased. Then repeat the sweep with the straggler slowdown <code>slow</code> set to 4 instead of 20 and describe how the crossover staleness moves.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.4.3: When Does Throughput Beat Staleness? <span class="exercise-type analysis">Analysis</span></div>
+<p>Model the two schedulers analytically. Let synchronous SGD need $S$ steps at wall-clock cost $T_{\max}$ per step (the slowest worker), and let asynchronous SGD need $S \cdot f(\bar\tau)$ updates, where $f(\bar\tau) \ge 1$ is a staleness inflation factor growing with the average staleness $\bar\tau$, at wall-clock cost $T_{\text{fast}}$ per update with $T_{\text{fast}} \le T_{\max}$. Write the condition on $f(\bar\tau)$, $T_{\max}$, and $T_{\text{fast}}$ under which asynchronous SGD finishes in less total wall-clock. Using the numbers in Output 10.4.1 ($S = 35$, async updates $= 258$, $T_{\max}/T_{\text{fast}} = 20$), compute the realized $f(\bar\tau)$ and verify it satisfies your condition. State what your condition predicts as the straggler ratio $T_{\max}/T_{\text{fast}}$ goes to 1 (a homogeneous cluster), and relate that to the Amdahl-style serialization argument from <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-10.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 10.3</span><span class="nav-title">Synchronous Distributed SGD</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 10</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Optimization</span></a>
+<a class="next" href="section-10.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 10.5</span><span class="nav-title">Gradient Aggregation and All-Reduce SGD</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

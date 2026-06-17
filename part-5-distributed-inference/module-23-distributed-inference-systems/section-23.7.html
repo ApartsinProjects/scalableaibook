@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 23.7: Availability, Failover, and Redundancy. Keeping an inference service up despite replica failures with health checks, draining, N+k redundancy, careful retries and circuit breakers, multi-region failover, and graceful degradation." name="description"/>
+<title>Section 23.7: Availability, Failover, and Redundancy | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 23: Distributed Inference Systems</a></div>
+<h1>Availability, Failover, and Redundancy</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I answered every health check with a cheerful yes, right up until the moment my kernel deadlocked. The router believed me. The users did not."</p>
+<cite>A Replica That Was Alive but Not Well</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A serving fleet is a distributed system that must keep answering requests while individual replicas crash, hang, run out of memory, or quietly degrade, and the engineering of that continuity is what turns a pile of GPU boxes into a dependable service.</strong> The earlier sections of this chapter made the fleet fast and elastic; this one makes it survive. The moves are familiar from general distributed systems (<a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.4.html">Section 2.4</a> introduced failure and recovery), but inference adds a sharp twist: a request can occupy a scarce GPU slot for seconds, so the cheap web-serving reflexes (retry everything, fan out aggressively) can melt the very fleet they were meant to protect. We will set an availability target, size redundancy with a short calculation, detect and drain bad replicas, retry without starting a stampede, and fall back to a smaller model rather than drop work. The thread running through all of it: every reliability mechanism that helps a stateless web tier must be re-examined for a fleet where the unit of work is expensive.</p>
+</div>
+<p>By this point in the chapter the fleet routes batches well (<a href="section-23.6.html">Section 23.6</a> handled cold starts and warm pools), scales on queue depth, and packs many models onto shared GPUs. All of that assumes the replicas it talks to are working. They will not always be. A GPU throws an uncorrectable memory error and the process dies. A CUDA kernel deadlocks and the replica accepts connections but never returns a token. An out-of-memory event leaves a replica that loads but cannot run the largest batch. A whole availability zone loses power. Availability engineering is the discipline of keeping the service's promise to its users while any of these is happening somewhere in the fleet, and because a large fleet always has something broken, it is not an edge case but the steady state.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A router performs health checks on a pool of GPU replicas, removes an unhealthy one and drains its in-flight requests, keeps N+k redundancy in the local region, and fails over to a second region when the first is lost.">
+<defs>
+<marker id="arr237" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arrR237" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b22222"/></marker>
+</defs>
+<style>
+.box237 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.ok237 { fill:#eaf6ec; stroke:#2e7d32; stroke-width:1.6; }
+.bad237 { fill:#fdecec; stroke:#b22222; stroke-width:1.6; }
+.spare237 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.t237 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.tw237 { font:600 13px sans-serif; fill:#2e7d32; text-anchor:middle; }
+.s237 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.sb237 { font:11.5px sans-serif; fill:#b22222; text-anchor:middle; }
+.l237 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr237); }
+.lx237 { fill:none; stroke:#b22222; stroke-width:1.7; stroke-dasharray:5 4; marker-end:url(#arrR237); }
+</style>
+<text class="t237" x="440" y="24">Region A (primary)</text>
+<rect class="box237" x="40" y="44" width="150" height="60" rx="9"/>
+<text class="t237" x="115" y="70">Router</text>
+<text class="s237" x="115" y="90">health checks + drain</text>
+<rect class="ok237" x="260" y="44" width="120" height="52" rx="8"/>
+<text class="tw237" x="320" y="66">Replica 1</text>
+<text class="s237" x="320" y="84">healthy</text>
+<rect class="ok237" x="260" y="116" width="120" height="52" rx="8"/>
+<text class="tw237" x="320" y="138">Replica 2</text>
+<text class="s237" x="320" y="156">healthy</text>
+<rect class="bad237" x="260" y="188" width="120" height="52" rx="8"/>
+<text class="t237" x="320" y="210" fill="#b22222">Replica 3</text>
+<text class="sb237" x="320" y="228">OOM / stuck kernel</text>
+<rect class="spare237" x="260" y="260" width="120" height="52" rx="8"/>
+<text class="t237" x="320" y="282" fill="#b86b1f">Replica 4</text>
+<text class="s237" x="320" y="300">spare (the +k)</text>
+<path class="l237" d="M 190 66 L 256 66"/>
+<path class="l237" d="M 190 78 L 230 78 L 230 138 L 256 138"/>
+<path class="lx237" d="M 190 90 L 215 90 L 215 210 L 256 210"/>
+<text class="sb237" x="207" y="178">removed</text>
+<path class="l237" d="M 190 84 L 245 84 L 245 282 L 256 282"/>
+<rect class="box237" x="440" y="188" width="180" height="58" rx="9"/>
+<text class="s237" x="530" y="212">drain in-flight requests</text>
+<text class="s237" x="530" y="230">before reclaiming GPU</text>
+<path class="lx237" d="M 380 214 L 436 214"/>
+<line x1="40" y1="340" x2="840" y2="340" stroke="#9aa3ad" stroke-width="1" stroke-dasharray="3 4"/>
+<text class="t237" x="440" y="366">Region B (standby): same model version, N+k of its own</text>
+<rect class="ok237" x="300" y="380" width="110" height="40" rx="7"/>
+<text class="s237" x="355" y="404">Replica 1'</text>
+<rect class="ok237" x="430" y="380" width="110" height="40" rx="7"/>
+<text class="s237" x="485" y="404">Replica 2'</text>
+<rect class="spare237" x="560" y="380" width="110" height="40" rx="7"/>
+<text class="s237" x="615" y="404">spare'</text>
+<path class="lx237" d="M 115 104 L 115 400 L 296 400"/>
+<text class="sb237" x="150" y="330">regional failover</text>
+<text class="sb237" x="150" y="346">if Region A is lost</text>
+</svg>
+<figcaption><strong>Figure 23.7.1:</strong> The shape of availability engineering for a serving fleet. The router probes each replica, removes the unhealthy Replica 3 (out of memory or a stuck kernel) and drains its in-flight requests before the GPU is reclaimed, while the spare Replica 4 (the $+k$) absorbs the lost capacity so the SLO holds. If all of Region A is lost, traffic fails over to Region B, which runs the same model version with its own $N+k$ pool. The red dashed arrows are the failure paths; the solid arrows are normal routing.</figcaption>
+</figure>
+
+<h2>1. Availability as a Number, and the Redundancy It Buys <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Availability is not a vibe; it is a fraction you commit to and then design toward. If a single replica is up with probability $a$ (its individual availability, set by crash rate and repair time), and the service needs at least $N$ working replicas to serve its peak load within the latency SLO, then running exactly $N$ replicas means the service is healthy only when all $N$ are simultaneously up, with probability $a^{N}$. For $a = 0.99$ and $N = 8$ that is $0.99^{8} \approx 0.923$, an alarming seven-percent chance of being under-provisioned at any moment. The fix is to over-provision: deploy $N + k$ replicas so the service stays above its capacity floor as long as no more than $k$ are down at once.</p>
+<p>With $M = N + k$ identical replicas, each up independently with probability $a$, the number that are up follows a binomial distribution, and the service meets its capacity floor when at least $N$ of the $M$ are up:</p>
+$$A(N, k) = \Pr[\text{at least } N \text{ up}] = \sum_{j=N}^{N+k} \binom{N+k}{j}\, a^{j} (1-a)^{\,N+k-j}.$$
+<p>Each extra spare $k$ adds another term and pushes $A$ rapidly toward one, because the probability of $k+1$ simultaneous failures shrinks geometrically. This is the serving-side echo of the fault-tolerance arc that began with re-execution in MapReduce (<a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.4.html">Section 2.4</a>) and elastic recovery in training (<a href="../../part-4-parallel-deep-learning/module-18-elastic-fault-tolerant-training/index.html">Chapter 18</a>): there, redundancy let a job finish despite lost workers; here, it lets a service answer despite lost replicas. The formula assumes independent failures, which is exactly why a single shared power rail or a single bad model build, correlating the failures, is so dangerous and why multi-zone placement (Section 4) matters.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Live Replica Is Not a Healthy Replica</div>
+<p>The availability math above silently assumes you can tell an up replica from a down one. On a GPU fleet that assumption is the hard part. A replica whose process is running, whose TCP port is open, and whose liveness probe returns 200 can still be useless: its CUDA kernel is deadlocked, it cannot allocate memory for the next batch, or it returns tokens so slowly that every request blows the latency budget. Liveness ("is the process alive?") and readiness ("can this replica serve a real request within the SLO right now?") are different questions, and routing decisions must be driven by the second. The cheapest way to be down is to keep a sick replica in the rotation because it still answers pings.</p>
+</div>
+
+<h2>2. Health Checks, Readiness Probes, and Draining a Bad Replica <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Because a GPU replica can be alive but unhealthy, a serving fleet uses two distinct probes. A <em>liveness</em> probe asks whether the process should be restarted at all; failing it triggers a kill and relaunch. A <em>readiness</em> probe asks whether the replica should receive traffic right now; failing it removes the replica from the router's pool without killing it, so it can drain and perhaps recover. For inference the readiness probe must exercise the real path: not just "is the HTTP server up?" but "can you run a tiny forward pass and return a token in under $X$ milliseconds, and is your KV-cache memory below the danger line?" A probe that only checks the socket is the classic way to keep a deadlocked GPU in rotation, silently failing a slice of traffic.</p>
+<p>When the router decides a replica is unhealthy, it must do two things in order. First, stop sending it new requests, immediately, so no further work lands on the bad replica. Second, <em>drain</em> the requests already in flight: let the in-progress generations finish (or time out and be reissued elsewhere) before the replica is restarted or its GPU reclaimed. Draining matters more for inference than for a stateless web tier because an in-flight LLM request may represent several seconds of completed decode work and a populated KV cache; killing it hard throws that work away and forces an expensive retry. The detection itself is never instant: between the moment a replica goes bad and the moment the probe confirms it, some requests route into the void, which is why the simulation in Section 5 models a detection lag and why fast, cheap, frequent readiness probes are worth their overhead.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Replica That Always Said Yes</div>
+<p>The most expensive outages are often the quiet ones. A socket-only health check is the serving equivalent of a smoke detector wired to always read "no smoke." Everything looks green on the dashboard, the replica answers every probe with enthusiasm, and meanwhile one eighth of your users are staring at spinners because that replica's kernel hung forty minutes ago. The lesson the on-call engineer learns at 3 a.m.: a probe that cannot fail is not a health check, it is a decoration.</p>
+</div>
+
+<h2>3. Retries, Timeouts, and Circuit Breakers Without a Stampede <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Retries are the reflex of every web client: a request failed, send it again, probably to a different replica. On a stateless web tier this is nearly free and almost always right. On a GPU inference fleet it is a loaded weapon. An inference request can occupy a scarce accelerator slot for seconds, so a retried request is not a cheap duplicate packet; it is a second expensive computation competing for capacity that is already scarce, precisely when capacity is scarce because something is failing. If every client retries every timeout, a fleet that is briefly degraded sees its offered load multiply, the extra load pushes more requests past their timeout, those time out and retry, and the fleet spirals into a self-inflicted overload. This is a retry storm, and it can turn a recoverable five-percent failure into a total outage.</p>
+<p>Three disciplines tame it. <strong>Timeouts</strong> must be set deliberately and be longer than a healthy request's tail latency, so a slow-but-fine generation is not mistaken for a failure and retried needlessly. <strong>Bounded retries with backoff and jitter</strong> cap the multiplier: at most one or two retries, spaced out and randomized so clients do not resynchronize into a thundering herd. <strong>Circuit breakers</strong> stop the bleeding at the source: when a replica's recent error rate crosses a threshold, the router trips its breaker and stops routing to it entirely for a cooldown window, so doomed requests are shed fast instead of consuming a GPU slot, failing, and being retried. The breaker converts a slow, capacity-eating failure into a fast, cheap one, which is exactly what an overloaded fleet needs.</p>
+<p>There is one more AI-specific subtlety. Inference requests are usually idempotent in their effect (asking the same question twice produces an answer twice, with no side effect), which makes retries and even <em>hedged requests</em> (sending a duplicate to a second replica after a short delay and taking whichever returns first) safe to consider. Hedging trims tail latency beautifully, but it doubles work for the hedged fraction, so it is only safe under spare capacity and with a tight cap; switch it on blindly during an overload and it becomes a retry storm wearing a nicer name. If a request <em>does</em> carry a side effect (it writes to a store, charges a credit, or appends to a conversation log), it needs an idempotency key so a retry cannot double-apply it.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Retry Config That Took Down the Whole Fleet</div>
+<p><strong>Who:</strong> An SRE on the platform team running a 64-GPU text-generation service for an internal developer tool.</p>
+<p><strong>Situation:</strong> One availability zone had a network blip that made about 15 percent of replicas slow for ninety seconds. Normally a non-event.</p>
+<p><strong>Problem:</strong> The client library defaulted to aggressive retries, up to five attempts with almost no backoff, and a timeout shorter than the model's tail latency, so even healthy slow requests were retried.</p>
+<p><strong>Dilemma:</strong> The blip itself was minor; the question was whether to chase the network issue or the amplification. The offered load had jumped roughly fourfold, turning a 15-percent slowdown into queue saturation across all 64 GPUs, including the healthy ones.</p>
+<p><strong>Decision:</strong> Treat the retry policy as the root cause. They capped retries at one, raised the per-request timeout above the measured p99, added jittered backoff, and put a circuit breaker in front of each replica keyed on its recent error rate.</p>
+<p><strong>How:</strong> The breaker tripped on any replica exceeding a 40-percent error rate over its last 25 calls, shedding traffic from it for a 60-tick cooldown rather than retrying into it.</p>
+<p><strong>Result:</strong> During the next zone blip the fleet shed the bad replicas in seconds, wasted GPU calls fell by roughly an order of magnitude (the effect Output 23.7.1 reproduces), and goodput held near the healthy-capacity ceiling instead of collapsing.</p>
+<p><strong>Lesson:</strong> On an expensive-per-request fleet, the retry policy is a capacity-planning decision, not a client-side afterthought. Bound it, back it off, and front it with a breaker.</p>
+</div>
+
+<h2>4. Multi-Zone, Multi-Region, and Graceful Degradation <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The redundancy formula in Section 1 assumed independent failures, but a single rack, a single power domain, or a single availability zone correlates them: lose the zone and you lose every replica in it at once, no matter how large $k$ was within it. The defense is to spread the $N + k$ replicas across multiple zones so the loss of any one zone still leaves enough capacity, and for the highest tiers to run a standby fleet in a second region that can take the full load if the primary region is lost. Multi-region availability is real insurance, and it is not free. You pay for idle or lightly used capacity in the standby region, you pay cross-region data-transfer costs, and you take on a consistency problem: the standby must serve the <em>same model version</em> as the primary, or a failover silently changes the model behind users' backs.</p>
+<p>That model-version consistency is a genuine distributed-consistency question, the serving-side instance of the trade-offs in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.5.html">Section 2.5</a>. Pushing a new model build to every region atomically is a distributed commit; doing it lazily means that during a rollout the two regions disagree, so a failover can move a user from model v5 in Region A to model v4 in Region B mid-conversation. Most teams accept eventual consistency on model version (regions converge within a rollout window) but gate failover so it never crosses a major version boundary, trading a little staleness for behavioral stability. The cost-versus-availability dial here is explicit: active-active across regions maximizes availability and burns the most money; active-standby is cheaper but has a failover lag; single-region with multi-zone is cheapest and survives a zone but not a region.</p>
+<p>When even redundancy and failover cannot keep full capacity, the last and most AI-specific line of defense is <em>graceful degradation</em>: rather than dropping requests on the floor under overload, fall back to a smaller, cheaper, faster model that still answers, just less well. A distilled or quantized variant of the production model (the techniques are exactly those of <a href="../module-22-per-node-inference-efficiency/section-22.4.html">Section 22.4</a>) fits more requests per GPU and runs faster, so a fleet can shed quality to preserve availability. A search assistant under a traffic spike might route overflow to a 7-billion-parameter fallback instead of the 70-billion-parameter flagship; users get a slightly weaker answer instead of an error page, and the SLO on <em>answering at all</em> is preserved. The design choice is which dimension to sacrifice first under stress (latency, quality, or completeness), and graceful degradation says: sacrifice quality before availability, because a worse answer beats no answer for most products.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Per-Node Economics, Multiplied Into a Reliability Budget</div>
+<p>The scale-up techniques of <a href="../module-22-per-node-inference-efficiency/index.html">Chapter 22</a> were introduced as a per-node prerequisite, and here they return scaled out into a fleet-level reliability budget. Quantization and distillation are not only about making one GPU faster; they set how cheap your spare $+k$ replicas are, how small your standby region can be, and how light your degraded fallback model is. A fleet whose per-node efficiency is twice as good can afford twice the redundancy for the same money, or the same redundancy for half the money. Availability engineering is therefore inseparable from per-node economics: the cheaper each replica, the more of them you can keep in reserve, and reserve capacity is the raw material of availability.</p>
+</div>
+
+<h2>5. A Fleet Under Failure, Simulated <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The two central claims of this section, that redundancy buys SLO attainment and that a circuit breaker prevents a retry cascade, are both quantitative, so we simulate them with nothing but the Python standard library. Part A runs an $N{=}8$ fleet for twenty thousand ticks under random replica failures, with a health check that drains a bad replica after a short detection lag, and sweeps the spare count $k$. Part B pushes half an eight-replica fleet into a sick state for the middle third of a run and compares a naive-retry policy against one with a per-replica circuit breaker, under a hard fleet-wide GPU-slot ceiling so that doomed retries genuinely steal capacity from fresh work.</p>
+<pre><code class="language-python">import random
+
+# Part A: N+k redundancy. A fleet needs N healthy replicas to meet its SLO.
+# Replicas fail at random; a health check detects a bad replica after a short
+# lag and the router drains it. Sweep the spare count k and measure
+# availability (requests served by a healthy replica) and SLO attainment
+# (fraction of time at least N are healthy).
+def redundancy(N_needed, k, ticks=20000, p_fail=0.002, p_recover=0.05,
+               req_per_tick=40, detect_lag=3, seed=0):
+    rng = random.Random(seed)
+    total = N_needed + k
+    state = ["healthy"] * total
+    bad_since = [None] * total
+    served_ok = served_total = slo_met = 0
+    for t in range(ticks):
+        for i in range(total):                      # failures and recoveries
+            if state[i] == "healthy" and rng.random() < p_fail:
+                state[i] = "bad"; bad_since[i] = t
+            elif state[i] == "drained" and rng.random() < p_recover:
+                state[i] = "healthy"; bad_since[i] = None
+        for i in range(total):                      # health check drains bad ones
+            if state[i] == "bad" and t - bad_since[i] >= detect_lag:
+                state[i] = "drained"
+        live = [i for i in range(total) if state[i] == "healthy"]
+        undetected = [i for i in range(total) if state[i] == "bad"]
+        targets = live + undetected                 # router still hits undetected-bad
+        for _ in range(req_per_tick):
+            served_total += 1
+            if targets and state[rng.choice(targets)] == "healthy":
+                served_ok += 1
+        if len(live) >= N_needed:
+            slo_met += 1
+    return served_ok / served_total, slo_met / ticks
+
+print("Part A:  N+k redundancy for a fleet that needs N=8 healthy replicas")
+print(f"{'redundancy':>12} | {'replicas':>8} | {'availability':>12} | {'SLO attainment':>14}")
+print("-" * 58)
+N = 8
+for k in range(0, 5):
+    av, slo = redundancy(N, k)
+    print(f"{'N+'+str(k):>12} | {N+k:>8} | {av*100:>11.3f}% | {slo*100:>13.3f}%")
+
+# Part B: retry storm vs circuit breaker. Half of an 8-replica fleet goes sick
+# for the middle third of the run. Each tick the fleet has n*C = 80 GPU slots;
+# one inference call (success OR failure) takes one slot. Failed calls are
+# retried, so doomed retries to sick replicas steal slots from fresh work. The
+# breaker stops routing to a replica once its recent error rate is high.
+def serve(policy, ticks=4000, C=10, n=8, arrivals=72, seed=1):
+    rng = random.Random(seed)
+    open_until = [0] * n
+    err = [0.0] * n                                 # per-replica EWMA error rate
+    offered = good = burned = 0
+    pending = 0
+    for t in range(ticks):
+        sick = (ticks // 3) <= t < (2 * ticks // 3)
+        offered += arrivals
+        queue = arrivals + pending                  # fresh requests plus carried retries
+        pending = 0
+        slots = [C] * n
+        used = 0
+        while queue > 0 and used < n * C:
+            elig = [r for r in range(n) if slots[r] > 0 and
+                    not (policy == "breaker" and open_until[r] > t)]
+            if not elig:
+                break
+            r = rng.choice(elig)
+            slots[r] -= 1; used += 1; queue -= 1
+            replica_sick = sick and r < n // 2
+            ok = (not replica_sick) and rng.random() < 0.98
+            err[r] = 0.85 * err[r] + 0.15 * (0.0 if ok else 1.0)
+            if ok:
+                good += 1
+            else:
+                burned += 1
+                pending += 1                        # this request retries next tick
+                if policy == "breaker" and err[r] > 0.4:
+                    open_until[r] = t + 60           # trip the breaker on this replica
+        pending = min(pending + queue, arrivals * 4)
+    return good / offered, burned
+
+print()
+print("Part B:  partial outage (half the fleet sick for the middle third)")
+print(f"{'policy':>16} | {'goodput':>8} | {'wasted GPU calls':>16}")
+print("-" * 48)
+for pol in ("naive retry", "circuit breaker"):
+    key = "naive" if pol.startswith("naive") else "breaker"
+    g, burned = serve(key)
+    print(f"{pol:>16} | {g*100:>6.1f}% | {burned:>16}")
+</code></pre>
+<div class="code-caption"><strong>Code 23.7.1:</strong> A pure-Python fleet simulator. Part A sweeps the redundancy level $k$ and reports availability and SLO attainment; Part B contrasts a naive-retry policy with a circuit-breaker policy under a partial outage and a fixed GPU-slot ceiling. No libraries beyond <code>random</code>; the failure, detection-lag, and capacity dynamics are all explicit.</div>
+<pre><code class="language-text">Part A:  N+k redundancy for a fleet that needs N=8 healthy replicas
+  redundancy | replicas | availability | SLO attainment
+----------------------------------------------------------
+         N+0 |        8 |      99.379% |        66.830%
+         N+1 |        9 |      99.465% |        95.295%
+         N+2 |       10 |      99.410% |        99.015%
+         N+3 |       11 |      99.395% |        99.855%
+         N+4 |       12 |      99.371% |        99.970%
+
+Part B:  partial outage (half the fleet sick for the middle third)
+          policy |  goodput | wasted GPU calls
+------------------------------------------------
+     naive retry |   84.9% |            58319
+ circuit breaker |   84.4% |             5094
+</code></pre>
+<div class="code-caption"><strong>Output 23.7.1:</strong> Part A shows SLO attainment climbing from 66.8 percent at $N{+}0$ to 99.97 percent at $N{+}4$: each spare replica sharply raises the odds that at least $N$ are healthy, exactly as the binomial formula $A(N,k)$ predicts. Part B shows the circuit breaker cutting wasted GPU calls roughly elevenfold (58,319 to 5,094) at essentially identical goodput, because during a deep outage goodput is capped by the surviving healthy capacity either way; the breaker's win is reclaiming the slots that doomed retries would otherwise burn.</div>
+<p>Two lessons fall out of the numbers. First, redundancy is the cheapest availability you can buy: going from zero spares to four spares barely changes per-request availability (which was already high because the router avoids known-bad replicas) but transforms SLO attainment, the property that actually protects users during correlated failures, from a coin-flip 67 percent to a dependable 99.97 percent. Second, the breaker does not magically conjure goodput out of a fleet that has lost half its capacity (nothing can; the healthy replicas are the ceiling), but it stops the fleet from wasting eleven times as much expensive GPU work on requests that were never going to succeed, which is what keeps latency bounded and prevents the slow, capacity-eating failure from becoming a fast, total one. Both effects are exactly the mechanisms Sections 1 and 3 argued for, now measured.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Health Checks, Draining, and Breakers You Do Not Hand-Roll</div>
+<p>Code 23.7.1 simulates detection, draining, and breaking from first principles to expose the dynamics. In production you declare them. On Kubernetes, a serving Deployment specifies <code>readinessProbe</code> and <code>livenessProbe</code> with a real model-path check, and the platform removes a not-ready pod from the Service endpoints and drains it on shutdown:</p>
+<pre><code class="language-yaml"># Pod spec excerpt: the platform drains and reroutes for you.
+readinessProbe:                 # gates traffic; fail = removed from rotation
+  httpGet: { path: /healthz/ready, port: 8000 }
+  periodSeconds: 2
+  failureThreshold: 2
+livenessProbe:                  # gates restart; fail = pod killed and relaunched
+  httpGet: { path: /healthz/live, port: 8000 }
+  periodSeconds: 5
+terminationGracePeriodSeconds: 30   # in-flight requests drain before SIGKILL
+</code></pre>
+<p>The retry, timeout, and circuit-breaker logic of Part B is a one-liner in a service mesh: an Istio or Envoy <code>DestinationRule</code> sets <code>outlierDetection</code> (eject a replica after N consecutive 5xx, the breaker), and a <code>VirtualService</code> sets <code>retries</code> with a per-try timeout and bounded attempts. Roughly a hundred lines of hand-rolled probe loops, drain logic, EWMA error tracking, and ejection collapse into a few dozen lines of declarative config, and the mesh handles the jittered backoff, the consecutive-error counting, and the cooldown that we wrote out by hand.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Reliability for Disaggregated and Spot-Backed Serving (2024 to 2026)</div>
+<p>Two trends are reshaping serving reliability. First, <em>prefill/decode disaggregation</em> (the subject of Chapter 24, as in DistServe and Splitwise, 2024) splits a single request across separate prefill and decode replicas, so a request now depends on two pools and the KV cache must migrate between them; a decode-node failure mid-generation is a new failure mode that ordinary replica-level redundancy does not cover, and 2024 to 2025 work on KV-cache checkpointing and request migration targets exactly this. Second, serving on <em>preemptible spot GPUs</em> to cut cost (the same preemption pressure that shaped elastic training in <a href="../../part-4-parallel-deep-learning/module-18-elastic-fault-tolerant-training/index.html">Chapter 18</a>) turns replica loss from a rare accident into a routine event, pushing systems such as SkyServe and SpotServe (2024) toward fast checkpoint-and-restore of in-flight decode state and toward spreading replicas across spot pools whose preemptions are uncorrelated. The frontier question both share: how do you preserve seconds of accumulated KV-cache work when the replica holding it can vanish at any moment, without paying its full recomputation cost?</p>
+</div>
+<p>Availability, failover, and redundancy complete the operational picture of a serving fleet: it now scales, recovers from cold starts, shares GPUs, and stays up through replica and region loss. What remains is to stop hand-assembling these mechanisms and adopt the frameworks that package routing, batching, health checking, draining, and autoscaling into a coherent serving runtime. That is the subject of <a href="section-23.8.html">Section 23.8</a>, which surveys Triton, Ray Serve, and KServe as the production homes for everything this chapter built by hand.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.7.1: Liveness or Readiness? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each symptom, decide whether the right response is to fail the <em>liveness</em> probe (kill and restart the replica) or the <em>readiness</em> probe (remove from rotation but keep running), and justify the choice in one sentence: (a) the replica's CUDA context is corrupted and every forward pass now errors; (b) the replica is temporarily out of KV-cache memory because it is finishing several long generations; (c) a model-weights file failed to load on startup so the server is up but has no model; (d) the replica is healthy but a rolling deployment wants to take it down. Explain what goes wrong if you swap liveness and readiness for cases (a) and (b).</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.7.2: Tune the Redundancy and the Breaker <span class="exercise-type coding">Coding</span></div>
+<p>Start from Code 23.7.1. (a) In Part A, raise the per-tick failure probability <code>p_fail</code> from 0.002 to 0.01 (more fragile replicas) and find the smallest $k$ that still reaches 99.9 percent SLO attainment; relate your answer to the binomial $A(N,k)$. (b) In Part B, add a third policy "hedged" that, for any request still unserved after one tick, sends a duplicate to a second eligible replica and counts the request done if either copy succeeds. Measure goodput and wasted GPU calls during the outage and outside it, and explain why hedging helps tail latency under spare capacity but hurts during the overload window.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.7.3: The Cost of an Extra Nine <span class="exercise-type analysis">Analysis</span></div>
+<p>A fleet needs $N = 20$ replicas at peak, each with individual availability $a = 0.995$, and each GPU costs \$2 per hour. Using $A(N,k) = \sum_{j=N}^{N+k} \binom{N+k}{j} a^{j}(1-a)^{N+k-j}$, compute the smallest $k$ that reaches three nines (0.999) and the smallest that reaches four nines (0.9999) of SLO attainment, and the monthly cost of the spare replicas in each case. Then argue, using the multi-region trade-offs of Section 4, when paying for a full standby region beats simply buying a larger $k$ in one region, and what failure modes a larger $k$ cannot protect against no matter how big it is.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-23.6.html"><span class="nav-label">Previous</span><span class="nav-num">Section 23.6</span><span class="nav-title">Large-Model Loading, Cold Starts, and Warm Pools</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 23</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Inference Systems</span></a>
+<a class="next" href="section-23.8.html"><span class="nav-label">Next</span><span class="nav-num">Section 23.8</span><span class="nav-title">Serving Frameworks</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

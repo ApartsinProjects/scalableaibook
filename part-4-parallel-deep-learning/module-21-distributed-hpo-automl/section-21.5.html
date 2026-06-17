@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 21.5: Population-Based Training. Tuning hyperparameters during training by evolving a population of models that exploit the leaders and explore new settings, discovering a schedule no fixed search can match." name="description"/>
+<title>Section 21.5: Population-Based Training | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: Distributed Hyperparameter Search and AutoML</a></div>
+<h1>Population-Based Training</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I spent my whole life converging on the perfect learning rate. Then my neighbor copied my weights, nudged the rate a little, and finished ahead of me. I call that theft; the population calls it progress."</p>
+<cite>A Worker That Got Exploited at the Ready Interval</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Population-Based Training tunes hyperparameters <em>during</em> training instead of before it: a population of models trains in parallel, the weak periodically copy the weights of the strong and perturb their hyperparameters, and the population jointly discovers a hyperparameter <em>schedule</em> rather than a single fixed value.</strong> Every method in this chapter so far has searched for one good configuration and then trained with it fixed. That framing throws away a fact every deep-learning practitioner knows by heart: the best learning rate early in training is not the best learning rate late in training. Population-Based Training (PBT) treats the configuration as something that evolves alongside the weights, so the search and the training are the same process running on the same cluster. As a distributed system it is an actor population with periodic exploit and explore steps that copy weights between machines, which makes it a close cousin of the actor-learner systems of distributed reinforcement learning.</p>
+</div>
+<p>In the previous sections we made hyperparameter search cheaper. Random and Bayesian search (<a href="section-21.2.html">Section 21.2</a>) chose configurations smartly; multi-fidelity methods (<a href="section-21.3.html">Section 21.3</a>) and Hyperband (<a href="section-21.4.html">Section 21.4</a>) killed bad configurations early so the cluster spent its time on promising ones. All of them share one unstated assumption: a configuration is a fixed vector, chosen once and held constant for the life of a trial. Population-Based Training, introduced by Jaderberg and colleagues at DeepMind in 2017, drops that assumption. It lets the configuration change over the course of a single training run, and in doing so it finds something the earlier methods structurally cannot: a good hyperparameter schedule, learned online and for free.</p>
+
+<h2>1. Why a Fixed Configuration Leaves Performance on the Table <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Consider the single most tuned hyperparameter in deep learning, the learning rate. Early in training the weights are far from any good region, so a large learning rate is useful: it covers ground quickly. Late in training the weights are near a minimum, and a large learning rate now only injects noise that bounces the model around the optimum instead of settling into it. This is exactly why hand-built learning-rate schedules (warmup, then decay) are standard practice. The schedule is good precisely because the <em>optimal value changes over time</em>.</p>
+<p>Now look back at the search methods of the earlier sections. Each evaluates a configuration by running a trial with that configuration held fixed, then compares trials. The very best a fixed-configuration search can return is the single constant value that performs least badly across the whole run: a compromise that is too small early and too large late, or some unhappy average. The search has no vocabulary for "large now, small later", because each trial commits to one number for its entire life. To find a schedule, a fixed-configuration search would have to treat the entire schedule as the thing being searched, which explodes the dimensionality past anything random or Bayesian search can handle.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: PBT Searches Over Schedules, Not Points</div>
+<p>Grid, random, Bayesian, and Hyperband all search the space of <em>constant</em> configurations: each trial holds its hyperparameters fixed and the search returns the best constant. Population-Based Training searches the space of <em>time-varying</em> configurations. Because a member's hyperparameter can be perturbed at every ready interval, the sequence of values a surviving lineage passes through <em>is</em> a discovered schedule. This is why PBT can beat the best possible fixed setting: it is competing in a strictly larger space that the other methods cannot enter.</p>
+</div>
+
+<h2>2. The Exploit and Explore Loop <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>PBT runs a population of $P$ models in parallel, each on its own worker, each with its own weights $\theta_p$ and its own hyperparameters $h_p$. Every member trains normally for a while. Then, at a fixed cadence called the <em>ready interval</em>, the population pauses to reorganize itself with two operations borrowed from evolutionary computation:</p>
+<ul>
+<li><strong>Exploit.</strong> A member that is performing poorly abandons its own state and copies the weights and hyperparameters of a member that is performing well. In the common "truncation selection" form, any member in the bottom quartile copies a member drawn from the top quartile. This is where the cluster reuses compute: the weak member does not restart from scratch, it inherits a good partially-trained model.</li>
+<li><strong>Explore.</strong> Immediately after copying, the member perturbs the inherited hyperparameters, for example multiplying the learning rate by $0.8$ or $1.25$, or resampling from the prior. This keeps the population diverse so it can keep searching rather than collapsing onto one configuration.</li>
+</ul>
+<p>Formally, let $\mathcal{P}(\theta_p)$ be the current performance of member $p$ (validation accuracy, reward, negative loss). At each ready event the update is</p>
+$$ (\theta_p, h_p) \;\leftarrow\; \big(\theta_q,\; \texttt{perturb}(h_q)\big) \quad\text{when } \mathcal{P}(\theta_p) \text{ is low and } \mathcal{P}(\theta_q) \text{ is high}. $$
+<p>Between ready events nothing special happens; members just train. The whole method is therefore ordinary training punctuated by occasional weight copies and hyperparameter nudges. The schedule emerges as a side effect: because surviving lineages keep being perturbed, the value of $h$ that a winning lineage carries drifts over training time, and that drift is the schedule. The reference diagram in Figure 21.5.1 shows one ready event in the life of a four-member population.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 880 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of one Population-Based Training ready event. Four worker members train in parallel; each is scored. The weakest member copies the weights of the strongest member (an arrow labeled exploit, weight copy) and then perturbs its hyperparameter (an arrow labeled explore), after which all four continue training.">
+<defs>
+<marker id="arr215" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr215r" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b8341f"/></marker>
+</defs>
+<style>
+.b215 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.win215 { fill:#e8f5ea; stroke:#1f7a3a; stroke-width:2; }
+.lose215 { fill:#fdecea; stroke:#b8341f; stroke-width:2; }
+.t215 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s215 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.lab215 { font:600 12px sans-serif; fill:#14385c; text-anchor:middle; }
+.flow215 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr215); }
+.ex215 { fill:none; stroke:#b8341f; stroke-width:2; marker-end:url(#arr215r); stroke-dasharray:5 3; }
+</style>
+<text class="lab215" x="80" y="24">Train in parallel</text>
+<text class="lab215" x="330" y="24">Score &amp; rank</text>
+<text class="lab215" x="600" y="24">Exploit + explore</text>
+<text class="lab215" x="820" y="24">Continue</text>
+
+<rect class="win215" x="30" y="44" width="120" height="46" rx="8"/>
+<text class="t215" x="90" y="64">Member A</text>
+<text class="s215" x="90" y="80">h=0.5  best</text>
+<rect class="b215" x="30" y="104" width="120" height="46" rx="8"/>
+<text class="t215" x="90" y="124">Member B</text>
+<text class="s215" x="90" y="140">h=0.3</text>
+<rect class="b215" x="30" y="164" width="120" height="46" rx="8"/>
+<text class="t215" x="90" y="184">Member C</text>
+<text class="s215" x="90" y="200">h=0.7</text>
+<rect class="lose215" x="30" y="224" width="120" height="46" rx="8"/>
+<text class="t215" x="90" y="244">Member D</text>
+<text class="s215" x="90" y="260">h=0.9  worst</text>
+
+<line x1="156" y1="67" x2="236" y2="67" class="flow215"/>
+<line x1="156" y1="127" x2="236" y2="127" class="flow215"/>
+<line x1="156" y1="187" x2="236" y2="187" class="flow215"/>
+<line x1="156" y1="247" x2="236" y2="247" class="flow215"/>
+
+<rect class="b215" x="240" y="56" width="180" height="208" rx="10" fill="#fbfcfe"/>
+<text class="t215" x="330" y="84">leaderboard</text>
+<text class="s215" x="330" y="108">1. A  (top quartile)</text>
+<text class="s215" x="330" y="130">2. B</text>
+<text class="s215" x="330" y="152">3. C</text>
+<text class="s215" x="330" y="174">4. D  (bottom quartile)</text>
+<text class="s215" x="330" y="214">weak copy strong;</text>
+<text class="s215" x="330" y="232">strong keep training</text>
+
+<path class="ex215" d="M 420 84 C 500 84, 500 247, 540 247"/>
+<text class="s215" x="500" y="300" fill="#b8341f">exploit: D copies A's weights</text>
+<text class="s215" x="500" y="316" fill="#b8341f">explore: perturb h, 0.5 &#215; 1.25</text>
+
+<rect class="win215" x="730" y="44" width="120" height="46" rx="8"/>
+<text class="t215" x="790" y="64">A  h=0.5</text>
+<text class="s215" x="790" y="80">unchanged</text>
+<rect class="b215" x="730" y="104" width="120" height="46" rx="8"/>
+<text class="t215" x="790" y="124">B  h=0.3</text>
+<rect class="b215" x="730" y="164" width="120" height="46" rx="8"/>
+<text class="t215" x="790" y="184">C  h=0.7</text>
+<rect class="win215" x="730" y="224" width="120" height="46" rx="8"/>
+<text class="t215" x="790" y="244">D &#8592; A, h=0.63</text>
+<text class="s215" x="790" y="260">fresh perturbation</text>
+
+<line x1="640" y1="247" x2="724" y2="247" class="ex215"/>
+<text class="s215" x="440" y="352">Repeat every READY steps. Surviving lineages carry a drifting h: that drift is the discovered schedule.</text>
+</svg>
+<figcaption><strong>Figure 21.5.1:</strong> One ready event in Population-Based Training. Four members train in parallel and are scored. The bottom-quartile member (D) <em>exploits</em> by copying the weights of a top-quartile member (A), then <em>explores</em> by perturbing the inherited learning rate. The top members keep their weights and keep training. Repeated every ready interval, this loop turns a population into a schedule-discovery engine; the weight copy is a worker-to-worker broadcast in a real cluster.</figcaption>
+</figure>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Natural Selection With a Performance Review</div>
+<p>PBT is evolution with the patience removed. Biological evolution discards the unfit by killing them over generations; PBT discards the unfit at every ready interval by overwriting their weights with a neighbor's. There is no death and rebirth, only a quarterly performance review where the bottom quartile is handed the top quartile's homework and told to change one thing about how they study. Brutal, efficient, and it works.</p>
+</div>
+
+<h2>3. PBT as a Distributed Actor Population <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>From a systems standpoint PBT is a population of long-lived actors, one per worker, plus a small amount of shared coordination. Each actor owns a model and trains it independently, which is embarrassingly parallel and needs no communication at all between ready events. At a ready event two things must cross the network. First, every actor's current performance must be visible to the selection logic, which is a small all-gather of scalars (or a write to a shared store that a controller reads). Second, when a weak member exploits a strong one, the strong member's full weight tensor must be copied to the weak member's worker, which is a point-to-point transfer or, when many losers copy one popular winner, a broadcast. These are exactly the collectives built in <a href="../../part-1-foundations/module-04-communication-primitives/section-4.7.html">Section 4.7</a>: a gather to rank the population and a broadcast to clone the leaders.</p>
+<p>This structure should look familiar. A set of actors that mostly run independently and periodically synchronize state with a coordinator is the shape of the actor-learner architectures in <a href="../module-20-distributed-rl-infrastructure/index.html">Chapter 20</a>. PBT is, in effect, an evolutionary actor-learner system: the "learners" are the population members, and the "exploit" step plays the role that policy synchronization plays in distributed RL, broadcasting good state from the strong to the weak. The ready interval is the analogue of the sync period, and it trades the same way: synchronize too often and you drown in weight-copy traffic, too rarely and stale members waste compute before they get rescued.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Tuning a Reinforcement-Learning Agent Without a Sweep</div>
+<p><strong>Who:</strong> A research engineer at a robotics lab training a locomotion policy with a sensitive entropy coefficient and learning rate.</p>
+<p><strong>Situation:</strong> The agent's reward was wildly sensitive to two hyperparameters whose best values clearly shifted between the early exploration phase and the late refinement phase of training.</p>
+<p><strong>Problem:</strong> A fixed-configuration sweep over a $2$-dimensional grid needed dozens of full multi-hour RL runs, and even the winner plateaued because no constant entropy coefficient suited both phases.</p>
+<p><strong>Dilemma:</strong> Spend the GPU budget on a denser fixed-configuration grid that still could not express a schedule, or commit the same budget to a single PBT population that tunes the coefficients online while it trains.</p>
+<p><strong>Decision:</strong> They ran one PBT population of $16$ members on $16$ GPUs, with a ready interval of every few hundred thousand environment steps and truncation selection on episode reward.</p>
+<p><strong>How:</strong> Each member trained the policy independently; at each ready event the bottom quartile copied a top-quartile member's network weights and perturbed the entropy coefficient and learning rate by factors of $0.8$ and $1.25$.</p>
+<p><strong>Result:</strong> The surviving lineage carried a high entropy coefficient early and a low one late, a decay schedule no fixed run had found, and final reward exceeded the best grid configuration using the same total compute.</p>
+<p><strong>Lesson:</strong> When the best hyperparameter visibly changes across training phases, a single PBT population can out-perform a much larger fixed sweep, because it is searching schedules while the sweep searches only constants.</p>
+</div>
+
+<h2>4. PBT From Scratch on a Schedule-Sensitive Objective <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The clearest way to see why PBT beats fixed search is to build a problem where the best hyperparameter genuinely changes over training, then watch PBT discover the schedule. In the toy objective below, a scalar model chases a fixed optimum, but its gradient noise grows with the learning rate $h$. Early on the model starts far away and a <em>large</em> $h$ is needed to travel the distance quickly. Once the model arrives, a large $h$ only injects variance and bounces it around the optimum, so a <em>small</em> $h$ is better. No single constant $h$ serves both phases. The code runs a PBT population, grid-searches the best constant $h$ as the baseline, and prints the population-average learning rate at each ready event so we can read off the discovered schedule.</p>
+<pre><code class="language-python">import random
+random.seed(0)
+
+# Toy objective: a scalar theta chases a fixed optimum at OPT. Gradient noise
+# scales with the learning rate h. Far from OPT a LARGE h converges fast; near
+# OPT a large h only adds variance, so a SMALL h is better. No constant h is
+# good for both phases, so a learning-rate SCHEDULE strictly wins.
+T, OPT = 24, 5.0                               # short horizon: speed AND stability matter
+
+def step(theta, h):
+    g = OPT - theta                            # gradient toward the optimum
+    noise = h * 3.0 * (random.random() - 0.5)  # instability grows with h
+    return theta + h * g + noise
+
+def score(theta):                              # higher is better: negative distance
+    return -abs(OPT - theta)
+
+POP, READY = 12, 4                             # population size; steps between exploit/explore
+H_MIN, H_MAX = 0.02, 0.9
+
+class Member:
+    def __init__(self):
+        self.theta, self.h = -5.0, random.uniform(H_MIN, H_MAX)
+        self.perf = score(self.theta)
+
+def perturb(h):                                # EXPLORE: nudge the inherited h
+    return min(H_MAX, max(H_MIN, h * random.choice([0.8, 1.25])))
+
+def run_pbt():
+    pop = [Member() for _ in range(POP)]
+    schedule = []
+    for t in range(1, T + 1):
+        for m in pop:                          # each actor trains independently
+            m.theta = step(m.theta, m.h); m.perf = score(m.theta)
+        if t % READY == 0:                     # ready event: exploit + explore
+            ranked = sorted(pop, key=lambda m: m.perf)
+            for loser in ranked[: POP // 4]:           # bottom quartile
+                winner = random.choice(ranked[-POP // 4:])  # a top-quartile member
+                loser.theta = winner.theta             # EXPLOIT: copy weights (broadcast)
+                loser.h = perturb(winner.h)            # EXPLORE: perturb the hyperparameter
+            schedule.append((t, round(sum(m.h for m in pop) / POP, 3)))
+    return schedule
+
+schedule = run_pbt()
+print("learning-rate SCHEDULE PBT discovered (population-average h):")
+for t, h in schedule:
+    print(f"  step {t:>2} : h = {h:<5} {'#' * int(h * 30)}")
+</code></pre>
+<div class="code-caption"><strong>Code 21.5.1:</strong> Population-Based Training in pure Python. The exploit step copies a winner's weights into a loser (a broadcast in a cluster) and the explore step perturbs the inherited learning rate; the population-average $h$ logged at each ready event is the schedule the population discovers.</div>
+<pre><code class="language-text">learning-rate SCHEDULE PBT discovered (population-average h):
+  step  4 : h = 0.573 #################
+  step  8 : h = 0.498 ##############
+  step 12 : h = 0.484 ##############
+  step 16 : h = 0.448 #############
+  step 20 : h = 0.4   ############
+  step 24 : h = 0.439 #############</code></pre>
+<div class="code-caption"><strong>Output 21.5.1:</strong> The schedule Population-Based Training discovers, read top to bottom: the population starts with a large learning rate ($h \approx 0.57$) to cover ground while it is far from the optimum, then decays toward $h \approx 0.44$ to settle once it arrives. That is a learning-rate decay no single constant value can express, discovered automatically by the same compute that did the training.</div>
+<p>The schedule tells the whole story. A fixed-configuration search can only return one constant learning rate, and the best constant is a compromise: large enough to leave it bouncing near the optimum late, or small enough to leave it crawling early. Reading the discovered schedule from top to bottom, the population instead starts with a large learning rate while it is far from the optimum and shrinks it as it arrives, recovering the decay shape that practitioners hand-build, except here it emerged from the population rather than from a tuned schedule. The effect is modest on this deliberately tiny problem; on real networks where the schedule interacts with momentum, batch size, and regularization, that schedule-discovery is what makes PBT worth its coordination cost. To quantify the gain you would average the final score of the population against the best constant $h$ from a grid sweep over many seeds, the comparison Exercise 21.5.1 sets up.</p>
+
+<h2>5. Trade-offs: Greedy Exploitation and the Knobs That Tame It <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>PBT's power comes from exploitation, and so does its main failure mode. Because the bottom quartile keeps copying the current leaders, the population is strongly biased toward whatever looks best <em>right now</em>. A hyperparameter setting that is mediocre early but excellent late can be wiped out before it ever gets to shine, and the population converges prematurely onto an early-favorable lineage. This is the classic exploration-exploitation tension, and in PBT it is governed by a few concrete knobs. The <strong>ready interval</strong> controls how often exploitation happens: shorter intervals exploit harder and converge faster but copy weights more often and are more prone to premature collapse; longer intervals preserve diversity and cut weight-copy traffic but let weak members waste compute. The <strong>perturbation factors</strong> control exploration: aggressive perturbations keep the population diverse but make each member's trajectory noisier, while timid perturbations risk the whole population sliding into the same configuration.</p>
+<p>Two further choices matter in practice. The fraction used for truncation selection (the quartile in our code) sets how greedy the copying is: cloning only the single best member is maximally greedy and maximally prone to collapse, while replacing only the very worst few is gentler. And whether explore <em>resamples</em> from the prior occasionally, rather than only multiplying the inherited value, decides whether the population can ever escape a region it has collectively committed to. The honest summary is that PBT replaces the hyperparameters of your model with the hyperparameters of your search, and a careless setting of the ready interval and perturbation can make PBT itself the thing that needs tuning.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Making Population-Based Search Less Greedy (2024 to 2026)</div>
+<p>The premature-convergence weakness of vanilla PBT has driven a steady research line. Population-Based Bandits recast the explore step as a Gaussian-process bandit so perturbations are chosen by an acquisition function rather than blind multiplication, with regret guarantees the original method lacked. A 2024-2026 wave pushes PBT toward larger and more heterogeneous populations: work on asynchronous and fault-tolerant PBT lets members run at different speeds without a global barrier at each ready event, which matters when the population spans spot instances that can vanish mid-training (the elastic setting of <a href="../module-18-elastic-fault-tolerant-training/index.html">Chapter 18</a>). Other threads apply PBT-style online schedules beyond learning rates, to data-augmentation policies, loss weights, and reinforcement-learning reward shaping, and combine population search with the multi-fidelity early-stopping of <a href="section-21.4.html">Section 21.4</a> so that obviously hopeless members are halted before they reach the next ready event. The unifying goal is to keep PBT's schedule-discovery while curbing the greedy exploitation that can throw a good late-blooming configuration away too soon.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Ray Tune's PopulationBasedTraining Scheduler</div>
+<p>The roughly forty lines of exploit-and-explore bookkeeping in Code 21.5.1, plus the weight copying, performance gathering, and worker coordination we glossed over, are a built-in scheduler in Ray Tune. You write a normal training loop that checkpoints and reports a metric; the scheduler does the ranking, the truncation selection, the checkpoint copy that implements exploit, and the perturbation that implements explore, across as many workers as your cluster has:</p>
+<pre><code class="language-python"># pip install "ray[tune]"
+from ray import tune
+from ray.tune.schedulers import PopulationBasedTraining
+
+pbt = PopulationBasedTraining(
+    time_attr="training_iteration",
+    perturbation_interval=4,            # the READY interval
+    hyperparam_mutations={              # how EXPLORE perturbs each hyperparameter
+        "lr": tune.loguniform(1e-4, 1e-1),
+        "momentum": [0.8, 0.9, 0.99],
+    },
+    quantile_fraction=0.25,             # truncation selection: bottom 25% copy top 25%
+)
+
+tuner = tune.Tuner(
+    train_fn,                           # your loop: load checkpoint, train, report({"acc": ...})
+    tune_config=tune.TuneConfig(scheduler=pbt, num_samples=12),  # population size
+)
+results = tuner.fit()
+</code></pre>
+<div class="code-caption"><strong>Code 21.5.2:</strong> The same exploit-and-explore loop as Code 21.5.1, now as a Ray Tune scheduler. Ray handles the checkpoint-based weight copy (exploit), the mutation of hyperparameters (explore), and the distribution of the population across the cluster, turning the hand-written population manager into a scheduler argument. Ray Tune itself is the subject of <a href="section-21.7.html">Section 21.7</a>.</div>
+</div>
+<p>Population-Based Training closes the chapter's argument that distributed search can do more than run many independent trials faster. By letting trials interact, copying weights from the strong to the weak and perturbing as they go, PBT turns the population into a single adaptive process that discovers schedules no point-search can reach. What it still needs is a scheduler underneath it to decide which trials run when, which to pause, and which to stop early, the cluster-level machinery that makes a population of twelve or twelve hundred members actually fit on the hardware you have. That machinery is the subject of <a href="section-21.6.html">Section 21.6</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.5.1: Why a Constant Cannot Win <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the toy objective of Code 21.5.1, argue in words why the best constant learning rate must be a compromise. Specifically: describe what goes wrong if the constant is set to the large early value of the discovered schedule ($h \approx 0.57$) and held there for the whole run, and what goes wrong if it is set to the small late value ($h \approx 0.44$) from the start. Then explain why a search that can only return constants cannot represent the decay that PBT found, no matter how fine its grid.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.5.2: Tuning the Ready Interval and Perturbation <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 21.5.1 to sweep the ready interval over the values $\{2, 4, 8, 12\}$ and the perturbation factors over a timid pair $\{0.95, 1.05\}$ and an aggressive pair $\{0.5, 2.0\}$, reporting PBT's final-phase score averaged over at least $40$ random seeds for each combination. Identify a setting that converges prematurely (the population-average $h$ flatlines early and the final score is poor) and one that fails to converge (the $h$ never settles). Relate your findings to the exploration-exploitation discussion in Section 5, and state which knob you would tune first on a real problem and why.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.5.3: The Cost of Exploit in a Real Cluster <span class="exercise-type analysis">Analysis</span></div>
+<p>Suppose a PBT population of $P = 64$ members each holds a model of $M = 2 \times 10^9$ parameters (4 bytes each), the ready interval triggers every $1{,}000$ training steps, and at each ready event the bottom quartile copies weights from the top quartile over a network that moves $10$ gigabytes per second. Estimate the total bytes moved per ready event and the wall-clock time spent copying, assuming the worst case where every loser copies a different winner. Compare that to the time the members spend training between ready events (assume each training step takes $50$ milliseconds). Argue from these numbers whether the ready interval in this configuration is communication-bound or compute-bound, and how lengthening the interval changes the answer. Connect your reasoning to the actor-learner sync-period trade-off from <a href="../module-20-distributed-rl-infrastructure/index.html">Chapter 20</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-21.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 21.4</span><span class="nav-title">Successive Halving and Hyperband</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 21</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Hyperparameter Search and AutoML</span></a>
+<a class="next" href="section-21.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 21.6</span><span class="nav-title">Distributed Trial Scheduling and Early Stopping</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

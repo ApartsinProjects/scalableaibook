@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 19.8: Distributed Alignment: A Systems View. Why RLHF is the most complex distributed workload in the book, juggling four models plus online generation, and how DPO collapses that footprint to two models and no generation." name="description"/>
+<title>Section 19.8: Distributed Alignment: A Systems View | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 19: Training Foundation Models at Scale</a></div>
+<h1>Distributed Alignment: A Systems View</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I held four models in my memory at once and asked one of them to keep talking while the others judged it. The placement diagram I drew that night still gives me nightmares."</p>
+<cite>A Scheduler That Has Placed One Too Many Reward Models</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Aligning a pretrained model is not just an algorithm; it is the most demanding distributed workload in this book, because the classic recipe (RLHF) keeps several whole models resident at once and interleaves text generation with gradient training inside every step.</strong> Supervised fine-tuning teaches the model a format, and then preference optimization teaches it a ranking over outputs. The supervised stage looks like ordinary distributed training from <a href="section-19.7.html">Section 19.7</a>. The preference stage is where the systems problem explodes: reinforcement learning from human feedback (RLHF) juggles a policy being trained, a frozen reference, a reward model, and a value model, while one of them generates rollouts token by token, so it fuses distributed training (<a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>) with distributed inference (<a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>) under an actor-learner structure (<a href="../module-20-distributed-rl-infrastructure/index.html">Chapter 20</a>). This section reads alignment as a placement-and-overlap problem, and shows why direct preference optimization (DPO) deleted most of the difficulty by removing the reward model and online generation.</p>
+</div>
+<p>By this point in the chapter the model has been pretrained: it has seen a web-scale corpus and predicts the next token well. What it has not learned is to behave, to follow an instruction, to refuse the unsafe request, to prefer the helpful answer over the merely fluent one. Post-training is the set of stages that close that gap, and it splits cleanly into two phases. First comes supervised fine-tuning (SFT), which continues next-token training on curated instruction-response pairs; mechanically it is the distributed fine-tuning loop of the previous section, just on a smaller, cleaner dataset. Then comes preference optimization, where the model learns from comparisons (this answer is better than that one) rather than from a single gold target. The supervised phase is a solved distributed problem. The preference phase is the one that forces a new system design, and it is the subject of this section.</p>
+<p>We treat alignment strictly as a distributed-systems question. What models must be resident, on which GPUs do they sit, what flows between them each step, and where does the wall-clock go? The answer to those questions, not the choice of loss function, is what determines whether an alignment run needs four GPUs or forty, and whether each step is dominated by training or by waiting for a model to finish talking.</p>
+
+<h2>1. Two Phases: Format First, Then Preference <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Supervised fine-tuning is the gentle phase. You take the pretrained weights, continue the same next-token objective on a dataset of high-quality instruction-response pairs, and the only distributed machinery you need is the data-parallel and sharded training you already built in <a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a> and <a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>. One model is resident, gradients flow through an all-reduce or a reduce-scatter, and the loss is the familiar cross-entropy. Nothing about SFT changes the placement diagram from <a href="section-19.7.html">Section 19.7</a>. If alignment ended here, this section would be a footnote.</p>
+<p>It does not end here, because next-token imitation cannot express the most important kind of supervision: that one full response is preferable to another. Humans find it far easier to rank two answers than to write the single perfect one, so the second phase trains on preferences. There are two dominant ways to consume those preferences, and they have radically different distributed footprints. RLHF turns the preferences into a learned reward function and then optimizes the policy against that reward with reinforcement learning. DPO skips the reward function and optimizes a classification-style loss directly on the preference pairs. The algorithms are close cousins; the systems they require are not.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Hard Part of Alignment Is a Placement Problem, Not a Loss Function</div>
+<p>The difference between an easy alignment run and a brutal one is not the mathematics of the objective; it is how many whole models must be co-resident and whether a generation (inference) loop runs inside the training step. RLHF keeps up to four models live and generates rollouts every step, so it inherits both the memory pressure of multi-model placement and the latency of autoregressive decoding. DPO keeps two models and never generates online. When you hear "RLHF is expensive," the cost is overwhelmingly a systems cost: GPUs spent holding extra models and time spent waiting for the policy to finish talking.</p>
+</div>
+
+<h2>2. Why RLHF Is the Heaviest Workload in This Book <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>RLHF, in its canonical proximal-policy-optimization (PPO) form, is heavy because it asks one cluster to do two fundamentally different jobs at once. The first job is generation: the policy must produce sample responses to a batch of prompts, which is autoregressive decoding, the exact inference workload that <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a> is devoted to. The second job is training: those responses are scored, an advantage is computed, and a gradient updates the policy. Generation is latency-bound and sequential; training is throughput-bound and parallel. Fusing them in one loop is what makes RLHF the most complex distributed workload we study.</p>
+<p>On top of that, four distinct models are in play. The <em>policy</em> is the model being trained. A frozen <em>reference</em> (usually the SFT checkpoint) anchors the policy with a Kullback-Leibler penalty so it does not drift into gibberish that games the reward. A <em>reward model</em> scores each response. And PPO additionally needs a <em>value model</em> (a critic) to estimate expected return for variance reduction. Two of these (policy and value) are trained and therefore carry optimizer state; two (reference and reward) are frozen and carry only weights. The KL-regularized objective the policy maximizes is</p>
+$$\max_{\pi_\theta}\; \mathbb{E}_{x\sim\mathcal{D},\, y\sim\pi_\theta(\cdot\mid x)}\big[\, r_\phi(x,y)\,\big] \;-\; \beta\, \mathrm{KL}\!\big(\pi_\theta(\cdot\mid x)\,\big\|\,\pi_{\mathrm{ref}}(\cdot\mid x)\big),$$
+<p>where $r_\phi$ is the reward model and $\pi_{\mathrm{ref}}$ the frozen reference. Every term in that expression is a separate model that must be placed somewhere and fed activations every step. This actor-learner pattern, where actors generate experience and learners consume it, is the spine of distributed reinforcement learning, built in full in <a href="../module-20-distributed-rl-infrastructure/index.html">Chapter 20</a>; RLHF is its most parameter-heavy instance because every actor and learner is a multi-billion-parameter language model rather than a small game-playing network.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Alignment Is Where Three Distribution Axes Collide</div>
+<p>RLHF is the one place in the book where distributing the model (<a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>), distributing inference (<a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>), and the actor-learner structure of distributed RL (<a href="../module-20-distributed-rl-infrastructure/index.html">Chapter 20</a>) all bind at once on the same cluster, in the same step. The six axes of Section 1.2 were introduced as separable so they could be taught one at a time; alignment is the worked example proving that the interesting systems live where several axes meet. Reading RLHF as "training plus serving under an actor-learner loop" is what turns it from an algorithm into a placement diagram you can actually schedule.</p>
+</div>
+
+<h2>3. The Placement Problem, Made Concrete <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Placement is the decision of which model sits on which GPU and how generation overlaps with training. The naive layout gives every model its own GPUs: the policy and value (trained, expensive) get sharded across many devices, while the frozen reference and reward sit on their own. That isolates them but wastes memory, because the frozen models idle during the training pass and the trainers idle during generation. The sophisticated layouts colocate models that are never busy simultaneously and overlap the policy's generation with the previous batch's training, so a GPU is rarely stalled. The figure below contrasts the full RLHF footprint with DPO's, and Code 19.8.1 then puts numbers on both.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left panel shows RLHF with four models (policy, value, reference, reward) plus an autoregressive generation loop spread across many GPUs. Right panel shows DPO with only a policy and a frozen reference and no generation loop.">
+<defs>
+<marker id="arr198" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.train198 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.frozen198 { fill:#eef1f5; stroke:#6b7480; stroke-width:1.6; }
+.gen198 { fill:#e8f3ec; stroke:#2f7d4f; stroke-width:1.6; }
+.t198 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s198 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.hd198 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.l198 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr198); }
+.div198 { stroke:#c4ccd6; stroke-width:1.2; stroke-dasharray:5 4; }
+</style>
+<text class="hd198" x="225" y="26">RLHF / PPO: four models + online generation</text>
+<rect class="train198" x="40" y="44" width="170" height="44" rx="8"/>
+<text class="t198" x="125" y="63">policy (trained)</text>
+<text class="s198" x="125" y="79">16 B/param, optimizer state</text>
+<rect class="train198" x="240" y="44" width="170" height="44" rx="8"/>
+<text class="t198" x="325" y="63">value / critic (trained)</text>
+<text class="s198" x="325" y="79">16 B/param, optimizer state</text>
+<rect class="frozen198" x="40" y="100" width="170" height="44" rx="8"/>
+<text class="t198" x="125" y="119">reference (frozen)</text>
+<text class="s198" x="125" y="135">2 B/param, KL anchor</text>
+<rect class="frozen198" x="240" y="100" width="170" height="44" rx="8"/>
+<text class="t198" x="325" y="119">reward (frozen)</text>
+<text class="s198" x="325" y="135">2 B/param, scores y</text>
+<rect class="gen198" x="40" y="170" width="370" height="60" rx="8"/>
+<text class="t198" x="225" y="194">generation loop (policy decodes y token by token)</text>
+<text class="s198" x="225" y="214">autoregressive, latency-bound, the inference job of Ch 24</text>
+<path class="l198" d="M 225 144 L 225 168"/>
+<text class="s198" x="225" y="258">policy generates -&gt; reference + reward score -&gt; PPO updates policy + value</text>
+<text class="s198" x="225" y="280">4 models co-resident; generation interleaved with training every step</text>
+<line class="div198" x1="450" y1="40" x2="450" y2="300"/>
+<text class="hd198" x="668" y="26">DPO: two models, no generation</text>
+<rect class="train198" x="500" y="44" width="190" height="44" rx="8"/>
+<text class="t198" x="595" y="63">policy (trained)</text>
+<text class="s198" x="595" y="79">16 B/param, optimizer state</text>
+<rect class="frozen198" x="500" y="100" width="190" height="44" rx="8"/>
+<text class="t198" x="595" y="119">reference (frozen)</text>
+<text class="s198" x="595" y="135">2 B/param, fixed anchor</text>
+<rect class="gen198" x="500" y="170" width="320" height="60" rx="8" fill="#f7f7f7" stroke="#c4ccd6" stroke-dasharray="5 4"/>
+<text class="s198" x="660" y="198">no generation loop</text>
+<text class="s198" x="660" y="216">preferences are precomputed offline</text>
+<path class="l198" d="M 595 144 L 595 168"/>
+<text class="s198" x="660" y="258">one forward + backward over (prompt, chosen, rejected)</text>
+<text class="s198" x="660" y="280">2 models; pure data-parallel training, like SFT</text>
+<rect x="740" y="44" width="80" height="100" rx="8" fill="none" stroke="#2f7d4f" stroke-width="1.4" stroke-dasharray="4 3"/>
+<text class="s198" x="780" y="90" fill="#2f7d4f">2 fewer</text>
+<text class="s198" x="780" y="106" fill="#2f7d4f">models</text>
+</svg>
+<figcaption><strong>Figure 19.8.1:</strong> The distributed footprint of alignment. On the left, RLHF keeps four models co-resident (two trained in orange, two frozen in grey) and runs an autoregressive generation loop (green) inside every training step, fusing the inference workload of <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a> with sharded training. On the right, DPO keeps only the policy and a frozen reference, deletes the reward and value models, and removes online generation entirely, collapsing to a data-parallel loop that looks like SFT.</figcaption>
+</figure>
+<p>The code below models the two layouts directly. It computes the resident model state for a 7-billion-parameter policy under standard mixed-precision accounting (trained models carry weights, gradients, and Adam state; frozen models carry weights only), counts the GPUs each layout needs purely to hold that state, and breaks the per-iteration wall-clock into generation, scoring, and training. It is not a simulation of training quality; it is a placement-and-time model, the kind you sketch before requesting a cluster allocation.</p>
+<pre><code class="language-python">P = 7.0e9            # a 7B-parameter policy
+GB = 1024 ** 3
+
+# Mixed-precision bytes per parameter:
+#   trained model = 2 (bf16 weight) + 2 (bf16 grad) + 12 (fp32 master + 2 Adam moments) = 16
+#   frozen  model = 2 (bf16 weight only)                                                 = 2
+mem_trainable = lambda p: p * 16
+mem_frozen    = lambda p: p * 2
+
+# RLHF/PPO: policy + value are trained; reference + reward are frozen.
+rlhf = {"policy (trained)": mem_trainable(P), "value (trained)": mem_trainable(P),
+        "reference (frozen)": mem_frozen(P), "reward (frozen)": mem_frozen(P)}
+# DPO: policy trained, reference frozen. No reward, no value, no generation.
+dpo  = {"policy (trained)": mem_trainable(P), "reference (frozen)": mem_frozen(P)}
+
+import math
+def gpus(total_bytes, per_gpu_gb=80.0, util=0.75):     # H100-80GB, 75% usable for state
+    return math.ceil(total_bytes / GB / (per_gpu_gb * util))
+
+# Per-iteration seconds. RLHF pays for a sequential decode loop; DPO does not.
+rlhf_gen, rlhf_score, rlhf_train = 9.0, 1.5, 4.0       # generate, then score, then update
+dpo_train = 4.5                                        # one forward+backward, no decode
+
+rlhf_total, dpo_total = sum(rlhf.values()), sum(dpo.values())
+rlhf_step = rlhf_gen + rlhf_score + rlhf_train
+
+print(f"RLHF: {len(rlhf)} models, {rlhf_total/GB:.0f} GB state, >= {gpus(rlhf_total)} H100")
+print(f"      step = {rlhf_step}s (generation is {100*rlhf_gen/rlhf_step:.0f}% of it)")
+print(f"DPO : {len(dpo)} models, {dpo_total/GB:.0f} GB state, >= {gpus(dpo_total)} H100")
+print(f"      step = {dpo_train}s (no decode loop)")
+print(f"DPO drops {100*(1-dpo_total/rlhf_total):.0f}% of model state and "
+      f"{100*(rlhf_gen+rlhf_score)/rlhf_step:.0f}% of the step time")
+</code></pre>
+<div class="code-caption"><strong>Code 19.8.1:</strong> A placement-and-time model for RLHF versus DPO on a 7B policy. Trained models are charged 16 bytes per parameter and frozen models 2, GPUs are counted against an 80 GB H100 at 75% usable capacity, and the per-iteration time is decomposed into generation, scoring, and training. Run with <code>python</code>; no libraries required.</div>
+<pre><code class="language-text">RLHF: 4 models, 235 GB state, >= 4 H100
+      step = 14.5s (generation is 62% of it)
+DPO : 2 models, 117 GB state, >= 2 H100
+      step = 4.5s (no decode loop)
+DPO drops 50% of model state and 72% of the step time</code></pre>
+<div class="code-caption"><strong>Output 19.8.1:</strong> DPO halves the resident model state (four models to two) and removes 72% of the per-step wall-clock, the entire generation-plus-scoring portion. The remaining DPO step is a plain forward-and-backward pass, which is why it distributes like the supervised fine-tuning of <a href="section-19.7.html">Section 19.7</a> rather than like reinforcement learning.</div>
+<p>The numbers make the design pressure visible. In the RLHF layout almost two thirds of every step is autoregressive generation, time during which the trainer GPUs would sit idle unless you overlap the next generation with the current update, exactly the actor-learner overlap that <a href="../module-20-distributed-rl-infrastructure/index.html">Chapter 20</a> formalizes. This is also why production RLHF stacks borrow a dedicated high-throughput generation engine (a vLLM or TensorRT-LLM instance) for the rollout phase rather than decoding with the training framework, and why naive RLHF wastes so many GPU-hours: the cluster spends most of its time serving, not learning.</p>
+
+<h2>4. How DPO Deleted the Hard Part <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Direct preference optimization made the observation that the KL-regularized RLHF objective has a closed-form optimal policy, and that substituting it back lets you train directly on preference pairs with a simple classification-style loss, no reward model and no sampling required. The DPO loss over a preference pair $(x, y_w, y_l)$, where $y_w$ is preferred to $y_l$, is</p>
+$$\mathcal{L}_{\mathrm{DPO}} = -\log \sigma\!\left(\beta \log \frac{\pi_\theta(y_w\mid x)}{\pi_{\mathrm{ref}}(y_w\mid x)} - \beta \log \frac{\pi_\theta(y_l\mid x)}{\pi_{\mathrm{ref}}(y_l\mid x)}\right),$$
+<p>which needs only the policy and the frozen reference: two log-probability evaluations of each, fed into a sigmoid. There is no $r_\phi$ to host and no $y \sim \pi_\theta$ to generate, because the preferred and rejected responses are drawn from a static, precomputed dataset. From a systems standpoint this is the whole story. The reward and value models vanish, the generation loop vanishes, and what remains is a forward-and-backward pass over a fixed batch, distributed with the same data-parallel and sharded machinery as any other fine-tune.</p>
+<p>Offline preference optimization is far easier to distribute than online RL for a reason that recurs throughout the book: a static dataset can be sharded, shuffled, and replayed deterministically, while online generation couples data production to the current policy and forces production and consumption onto the same hot path. By moving preferences offline, DPO converts an actor-learner problem back into a supervised one, which is the single biggest reason it spread so quickly. The trade is real (a learned reward model can generalize beyond the exact pairs it was trained on, and online methods can keep exploring), but for most teams the order-of-magnitude drop in systems complexity decides it.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Alignment Run That Fit Back on the Training Cluster</div>
+<p><strong>Who:</strong> An ML platform engineer at a startup fine-tuning a 7B assistant on human preference data.</p>
+<p><strong>Situation:</strong> The team had a working SFT pipeline on eight GPUs and wanted to add preference alignment without buying a second cluster.</p>
+<p><strong>Problem:</strong> A PPO-based RLHF prototype needed the policy, a value model, a frozen reference, and a reward model co-resident, plus a generation engine, and kept hitting out-of-memory before any useful batch size.</p>
+<p><strong>Dilemma:</strong> Stand up a separate RLHF cluster with a dedicated rollout-generation tier and an actor-learner scheduler, powerful but a major operational lift, or switch to DPO and keep alignment on the existing training cluster, simpler but giving up online exploration.</p>
+<p><strong>Decision:</strong> They chose DPO, because their preference data was already collected offline as ranked pairs and online exploration was not buying measurable quality at their scale.</p>
+<p><strong>How:</strong> They reused the SFT data-parallel loop, loaded the SFT checkpoint twice (as policy and frozen reference), and swapped the cross-entropy loss for the DPO loss, about a forty-line change.</p>
+<p><strong>Result:</strong> Alignment ran on the same eight GPUs the SFT job used, each step a plain forward-and-backward with no generation stall, matching the two-model footprint in Output 19.8.1, and shipped in days rather than the weeks the RLHF stand-up would have taken.</p>
+<p><strong>Lesson:</strong> When preferences can be collected offline, DPO turns alignment back into ordinary distributed fine-tuning, and the cheapest cluster is the one you already have.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Reward Model Was the Roommate Who Never Did Dishes</div>
+<p>In a PPO-based RLHF run the reward model is frozen: it never learns, never updates, and yet it occupies GPU memory for the entire job and demands a forward pass on every rollout. DPO's quiet act of genius was realizing that this permanent houseguest could be evicted, its judgment baked into the preference labels once, offline, and never invited back onto the training cluster. Two models moved out, and the rent (in GPU-hours) dropped accordingly.</p>
+</div>
+
+<h2>5. Frameworks and the State of the Art <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Because the placement and overlap problems are intricate, almost nobody writes an RLHF loop from the primitives. DeepSpeed-Chat was an early end-to-end pipeline that scripted the SFT, reward-model, and PPO stages with ZeRO-backed sharding. OpenRLHF and veRL are the current high-throughput stacks: they separate the rollout-generation tier (often a vLLM engine) from the training tier and schedule the actor-learner overlap explicitly, which is what keeps the trainer GPUs from idling through the 62% of each step that Output 19.8.1 spends generating. The Transformers Reinforcement Learning library (TRL) from Hugging Face is the most widely used entry point, exposing <code>SFTTrainer</code>, <code>DPOTrainer</code>, and <code>PPOTrainer</code> behind a uniform interface so that switching from a four-model RLHF run to a two-model DPO run is largely a change of trainer class.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: TRL Turns a Two-Model Alignment Run Into One Object</div>
+<p>The placement, the frozen reference, the log-probability bookkeeping, and the data-parallel sharding that Code 19.8.1 only accounted for are all handled inside a single trainer. A complete DPO run is essentially a dataset and a loss choice:</p>
+<pre><code class="language-python"># pip install trl ; launch with: accelerate launch dpo.py
+from trl import DPOTrainer, DPOConfig
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B-Instruct")   # the SFT policy
+tok   = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
+pairs = load_dataset("trl-lib/ultrafeedback_binarized", split="train")     # offline (chosen, rejected)
+
+trainer = DPOTrainer(                       # frozen reference is cloned from `model` automatically
+    model, args=DPOConfig(beta=0.1, output_dir="dpo-7b"),
+    train_dataset=pairs, processing_class=tok,
+)
+trainer.train()                             # data-parallel forward+backward, no generation loop
+</code></pre>
+<div class="code-caption"><strong>Code 19.8.2:</strong> A full DPO alignment run in TRL. The hundreds of lines of placement and reference-model bookkeeping behind Output 19.8.1's two-model layout collapse to one <code>DPOTrainer</code> object; swapping it for <code>PPOTrainer</code> reintroduces the reward model, value model, and generation loop that make RLHF the heavier workload. The library handles process-group setup, the frozen reference clone, and the sharded all-reduce internally.</div>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Cheaper Preference Optimization (2024 to 2026)</div>
+<p>The field is actively shrinking alignment's distributed footprint further. Group Relative Policy Optimization (GRPO), introduced with the DeepSeekMath and DeepSeek-R1 work (2024 to 2025), removes the value model from PPO by estimating the baseline from a group of sampled responses, cutting one of the four trained models and the optimizer state it carried, which matters directly for the placement count in Output 19.8.1. On the offline side, DPO variants multiply: IPO regularizes against the overfitting that plagues raw DPO, KTO learns from unpaired thumbs-up or thumbs-down signals (loosening the data requirement), and ORPO folds the preference term into the SFT loss so the reference model itself disappears, leaving a single resident model. Meanwhile OpenRLHF and veRL push the systems side, disaggregating generation onto dedicated vLLM tiers and overlapping rollout with training so that even the four-model RLHF path keeps its GPUs busy. The throughline is the one this section has drawn: each advance is judged not only by alignment quality but by how many models it keeps resident and whether it must generate online.</p>
+</div>
+<p>With alignment understood as a placement-and-overlap problem (four models and online generation for RLHF, two models and offline pairs for DPO) the chapter has now covered the full life of a foundation model from pretraining through fine-tuning to alignment. What remains is the bill: the energy, the dollar cost, and the responsibility that come with running these workloads at scale, which <a href="section-19.9.html">Section 19.9</a> takes up next.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.8.1: Count the Resident Models <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each alignment method, list every model that must be resident during a training step and mark it trained or frozen: (a) PPO-based RLHF; (b) DPO; (c) GRPO (PPO with the value model removed); (d) ORPO (the preference term folded into the SFT loss, no separate reference). Then order the four methods by resident model count and explain, in one sentence each, how that count maps to the GPU requirement in Output 19.8.1. Which method has the smallest distributed footprint, and what does it give up to get there?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.8.2: Extend the Placement Model <span class="exercise-type coding">Coding</span></div>
+<p>Starting from Code 19.8.1, add a GRPO column that removes the value model (three models: policy trained, reference and reward frozen) but keeps online generation, and an ORPO column (one trained model, no reference, no generation). Recompute the resident-state GB, the GPU count, and the per-step time decomposition for all four methods. Then add a parameter that lets generation overlap with training (model the step as $\max(\text{generate}, \text{train}) + \text{score}$ instead of the sum) and report how much of RLHF's wall-clock penalty the overlap recovers. State which method you would request a cluster for if GPUs were scarce.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.8.3: When Is Online Generation Worth It? <span class="exercise-type analysis">Analysis</span></div>
+<p>DPO's offline pairs are fixed at collection time, while RLHF and GRPO generate fresh responses from the current policy every step. Argue, from a distributed-systems cost model rather than an alignment-quality one, under what conditions the extra GPUs and generation latency of online methods could still pay off (consider distribution shift between the offline pairs and the evolving policy, and the cost of re-collecting preferences). Then estimate, using the 62% generation fraction from Output 19.8.1, how many more GPU-hours an online run costs per training step than a DPO run of equal batch size, and what quality improvement would have to materialize to justify it.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-19.7.html"><span class="nav-label">Previous</span><span class="nav-num">Section 19.7</span><span class="nav-title">Distributed Fine-Tuning</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 19</span><span class="nav-num">Contents</span><span class="nav-title">Training Foundation Models at Scale</span></a>
+<a class="next" href="section-19.9.html"><span class="nav-label">Next</span><span class="nav-num">Section 19.9</span><span class="nav-title">Energy, Cost, and Responsible Scaling</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

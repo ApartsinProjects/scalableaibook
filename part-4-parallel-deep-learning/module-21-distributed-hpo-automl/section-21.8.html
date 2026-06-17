@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 21.8: Cost-Aware Distributed Experimentation. Hyperparameter search as resource allocation under a fixed dollar budget: best-model-per-dollar, multi-fidelity early stopping, spot trials, hyperparameter transfer, and knowing when to stop." name="description"/>
+<title>Section 21.8: Cost-Aware Distributed Experimentation | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: Distributed Hyperparameter Search and AutoML</a></div>
+<h1>Cost-Aware Distributed Experimentation</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They gave me a thousand workers and a credit-card limit. The workers were the easy part."</p>
+<cite>A Search Coordinator Watching the Meter</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Hyperparameter search is not a compute problem; it is a resource-allocation problem under a fixed budget, and the only metric that matters is the best model found per dollar.</strong> The earlier sections of this chapter made search go fast: random and Bayesian sampling propose configurations, multi-fidelity methods like successive halving and ASHA cut losing trials early, population-based training mutates on the fly, and a distributed scheduler keeps a thousand workers busy. All of that machinery exists to answer one question well, and it is an economic question. You have a compute budget measured in GPU-hours and a calendar measured in dollars; the goal is to spend both so that the model you ship is the best one those dollars could buy. This closing section reframes everything that came before as budget allocation, names the three levers that move the most cost (do not finish losers, rent cheap interruptible compute, and tune small then transfer), and shows in one runnable comparison that the cost-aware strategy wins by a wide margin.</p>
+</div>
+<p>Every previous section of this chapter optimized for speed: how to evaluate more configurations per hour, how to stop bad trials sooner, how to keep workers from idling at a rung barrier. Speed is a means, not the end. A team that runs ten thousand trials and a team that runs one hundred can land on the same model if the second team spent its budget more wisely, and the second team will have money left over. The right accounting unit for distributed hyperparameter optimization (HPO) is therefore not the trial and not the GPU-hour but the dollar, and the right objective is the quality of the best configuration discovered for a fixed spend. This is the same cost-aware lens that <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.9.html">Section 3.9</a> applied to scaling decisions and that <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.5.html">Section 5.5</a> applied to energy and cost reporting; here we turn it on the search itself.</p>
+
+<h2>1. Search as Budget Allocation <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Fix a total budget $B$, in dollars, and let a search strategy spend it across a set of trials. Each trial $t$ consumes some compute and returns a validation quality $q_t$ (say, negative validation loss, so larger is better). The search returns the best configuration it saw, with quality $q^\star = \max_t q_t$. The natural figure of merit is not how many trials ran but how much quality each dollar bought,</p>
+$$\text{cost-efficiency} = \frac{q^\star}{B}, \qquad q^\star = \max_{t}\, q_t \;\; \text{subject to} \;\; \sum_t c_t \le B,$$
+<p>where $c_t$ is the dollar cost of trial $t$. Written this way, every technique in this chapter is a strategy for raising $q^\star$ under the constraint $\sum_t c_t \le B$. Smarter sampling raises the expected quality of each trial; multi-fidelity methods shrink the $c_t$ of trials that were going to lose anyway, freeing budget for more trials; cheaper compute shrinks every $c_t$ uniformly. The art of cost-aware experimentation is choosing where to push so that the constraint binds as late as possible and $q^\star$ climbs as high as possible before the money runs out.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Trials Run Is a Vanity Metric; Quality per Dollar Is the Objective</div>
+<p>A search that completes more trials is not better; a search that finds a better model for the same money is. Optimizing for trials-run rewards cheap, useless evaluations and punishes the expensive trial that actually finds the winner. Optimize instead for $q^\star / B$: the quality of the single best configuration found, divided by the dollars spent to find it. Every lever in this section (early stopping, spot compute, hyperparameter transfer) is justified only insofar as it moves that ratio, and each of them moves it a lot.</p>
+</div>
+
+<h2>2. Three Levers That Move the Budget <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The chapter gives three concrete levers, in increasing order of how much money they save. The first is multi-fidelity evaluation with early stopping: do not finish losers. Successive halving and ASHA (<a href="section-21.3.html">Section 21.3</a> and <a href="section-21.4.html">Section 21.4</a>) spend full budget only on configurations that survive a cheap screening at low fidelity, so most trials are killed after a fraction of their cost. The dollars saved on the losers buy more configurations explored, which directly raises $q^\star$. This is the lever that turns the embarrassingly parallel breadth of search into something the budget can actually afford.</p>
+<p>The second lever is the kind of compute you rent. Because a hyperparameter trial is short, self-contained, and restartable, it is the ideal workload for spot or preemptible instances, which clouds sell at sixty to ninety percent off the on-demand price in exchange for the right to reclaim them at any moment. A trial that is preempted is simply re-launched or resumed from its last checkpoint, exactly the elastic, fault-tolerant machinery of <a href="../module-18-elastic-fault-tolerant-training/section-18.6.html">Section 18.6</a>, scheduled by the cluster manager of <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/index.html">Chapter 33</a>. Running a search on spot capacity shrinks every $c_t$ by the same large factor, so the same dollar budget buys several times the compute.</p>
+<p>The third lever is the most powerful for large models, and it sidesteps the search almost entirely: hyperparameter transfer. Instead of tuning the model you intend to ship, you tune a much smaller proxy and carry the winning hyperparameters across. The maximal-update parametrization (muP) makes this rigorous for neural networks by reparametrizing so that the optimal learning rate and related hyperparameters are stable as width grows; you tune at small width for pennies and transfer the result to a model hundreds of times larger. We quantify the three levers next, but their ordering is the lesson: each one saves more than the one before, and the last one can replace the search on the expensive model with a search on a cheap one.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two curves of best validation quality found versus dollars spent. The naive full-search curve rises slowly and flattens low; the cost-aware curve rises steeply, reaches higher quality, and stops early once returns diminish.">
+<defs>
+<marker id="arr218" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.ax218 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr218); }
+.gl218 { fill:none; stroke:#d7dee7; stroke-width:1; }
+.naive218 { fill:none; stroke:#b86b1f; stroke-width:2.6; }
+.cost218 { fill:none; stroke:#1f7a4d; stroke-width:2.6; }
+.t218 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s218 { font:11.5px sans-serif; fill:#5a626c; }
+.lg218 { font:600 12.5px sans-serif; }
+.dot218 { fill:#1f7a4d; }
+</style>
+<line class="gl218" x1="90" y1="80" x2="800" y2="80"/>
+<line class="gl218" x1="90" y1="150" x2="800" y2="150"/>
+<line class="gl218" x1="90" y1="220" x2="800" y2="220"/>
+<line class="ax218" x1="90" y1="300" x2="810" y2="300"/>
+<line class="ax218" x1="90" y1="300" x2="90" y2="50"/>
+<text class="t218" x="450" y="338">dollars spent &#8594;</text>
+<text class="t218" x="28" y="180" transform="rotate(-90 28 180)">best quality found &#8594;</text>
+<!-- cost-aware: steep rise, high plateau, stop early -->
+<path class="cost218" d="M 90 290 C 160 150, 230 105, 340 92 C 430 84, 520 82, 560 81"/>
+<circle class="dot218" cx="560" cy="81" r="5"/>
+<text class="s218" x="566" y="74" fill="#1f7a4d">stop: returns gone flat</text>
+<!-- naive: slow rise, low plateau, keeps paying -->
+<path class="naive218" d="M 90 290 C 220 250, 360 215, 520 198 C 640 188, 730 184, 800 182"/>
+<text class="lg218" x="600" y="150" fill="#1f7a4d">cost-aware (ASHA + spot + early stop)</text>
+<text class="lg218" x="610" y="210" fill="#b86b1f">naive full search</text>
+<line x1="560" y1="81" x2="560" y2="300" stroke="#1f7a4d" stroke-width="1" stroke-dasharray="4 3"/>
+<text class="s218" x="535" y="315" fill="#1f7a4d">B*</text>
+</svg>
+<figcaption><strong>Figure 21.8.1:</strong> Best validation quality found as a function of dollars spent, for a naive full search (orange) and a cost-aware search (green) that combines multi-fidelity early stopping, spot compute, and disciplined stopping. The cost-aware curve climbs faster because each dollar screens more configurations, reaches a higher plateau, and is stopped at budget $B^\star$ once the marginal quality per dollar has gone flat. The naive search keeps paying for trials long after its curve has stalled at a lower quality.</figcaption>
+</figure>
+
+<h2>3. Best Model per Dollar, Measured <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The reframing is only convincing with numbers, so the program below pits three strategies against the same fixed dollar budget and reports the best validation loss each one finds. Each candidate configuration has a hidden asymptotic loss; an evaluation at $r$ epochs returns that loss plus a bias and noise that both shrink as $r$ grows, so cheap low-fidelity looks are informative but unreliable. Full random search trains every sampled configuration to the full fidelity. ASHA spends full fidelity only on survivors of cheap rungs, so it explores far more configurations per dollar. ASHA on spot does the same arithmetic at the spot price, which here is roughly one third of on-demand. Lower loss is better; the figure of merit is the best loss found before the budget is exhausted.</p>
+<pre><code class="language-python">import math, random
+random.seed(11)
+
+BUDGET_USD  = 300.0     # the fixed experiment budget
+ON_DEMAND   = 3.00      # $ per GPU-hour, on-demand
+SPOT        = 0.90      # $ per GPU-hour, spot / preemptible (~70% off)
+EPOCH_HOURS = 0.05      # wall-clock hours to train one config for 1 epoch
+R_MAX, ETA  = 27, 3     # full-fidelity epochs; ASHA halving factor
+
+def sample_config():                       # hidden asymptotic loss
+    return {"true_loss": random.uniform(0.10, 0.90)}
+
+def observe(cfg, epochs):                  # cheap looks are biased and noisy
+    gap   = 0.6 * math.exp(-epochs / 6.0)
+    noise = random.gauss(0, 0.20 / math.sqrt(epochs))
+    return cfg["true_loss"] + gap + noise
+
+def cost_for(epochs, price):
+    return epochs * EPOCH_HOURS * price
+
+def full_random(price):                    # train every config to R_MAX
+    spent, best, trials = 0.0, math.inf, 0
+    while spent + cost_for(R_MAX, price) <= BUDGET_USD:
+        spent += cost_for(R_MAX, price)
+        best   = min(best, observe(sample_config(), R_MAX)); trials += 1
+    return best, trials, spent
+
+def asha(price):                           # full fidelity only for survivors
+    rungs = [ETA**k for k in range(int(math.log(R_MAX, ETA)) + 1)]
+    n0 = ETA ** (len(rungs) - 1)
+    def bracket_cost():
+        c, n = 0.0, n0
+        for r in rungs: c += cost_for(r, price) * n; n = max(1, n // ETA)
+        return c
+    bc, spent, best, trials = bracket_cost(), 0.0, math.inf, 0
+    while spent + bc <= BUDGET_USD:
+        alive = [sample_config() for _ in range(n0)]; trials += len(alive)
+        for r in rungs:
+            spent += cost_for(r, price) * len(alive)
+            alive = sorted(alive, key=lambda c: observe(c, r))[:max(1, len(alive)//ETA)]
+            for c in alive: best = min(best, observe(c, r))
+    return best, trials, spent
+
+rows = [("full random (on-demand)", *full_random(ON_DEMAND)),
+        ("ASHA (on-demand)",        *asha(ON_DEMAND)),
+        ("ASHA on spot",            *asha(SPOT))]
+print(f"{'strategy':&lt;26}{'best loss':&gt;11}{'configs':&gt;10}{'$/quality':&gt;12}")
+for name, best, trials, spent in rows:
+    cpq = spent / max(1e-6, 1.0 - best)    # dollars per unit of quality
+    print(f"{name:&lt;26}{best:&gt;11.4f}{trials:&gt;10}{cpq:&gt;12.2f}")
+print(f"\nconfigs explored, ASHA-on-spot vs full random : "
+      f"{rows[2][2] / rows[0][2]:.1f}x more")
+</code></pre>
+<div class="code-caption"><strong>Code 21.8.1:</strong> A pure-Python budget bake-off. Three strategies receive the identical $300 budget; the table reports best validation loss, configurations explored, and dollars spent per unit of quality $1 - \text{loss}$. Only the price per GPU-hour and the early-stopping logic differ between rows.</div>
+<pre><code class="language-text">strategy                    best loss   configs   $/quality
+full random (on-demand)        0.0851        74      327.57
+ASHA (on-demand)               0.0836       486      318.20
+ASHA on spot                   0.0596      1647      315.26
+
+configs explored, ASHA-on-spot vs full random : 22.3x more
+</code></pre>
+<div class="code-caption"><strong>Output 21.8.1:</strong> Under the same $300, ASHA explores 6.6 times more configurations than full random by not finishing losers, and adding spot compute pushes that to 22.3 times more, which finds a model with measurably lower loss (0.060 versus 0.085) at a lower dollar cost per unit of quality. The cost-aware strategy wins on both quality and price.</div>
+<p>The numbers make the case Figure 21.8.1 drew. Early stopping alone (the jump from row one to row two) multiplies the configurations explored without raising the spend, because the budget no longer drains into trials that were never going to win. Spot pricing (row three) multiplies the affordable compute again, and the extra exploration converts directly into a better model. Cost-per-quality, the dollars spent per unit of $1 - \text{loss}$, falls across the rows even though all three nearly exhaust the budget: the cost-aware search simply buys more quality with the same money.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Cost-Aware Search Is a Few Arguments in Ray Tune and Optuna</div>
+<p>The bake-off above is hand-rolled for clarity, but you never write the rung bookkeeping or the spot retry loop yourself. A scheduler and a small amount of configuration give you all three levers:</p>
+<pre><code class="language-python"># Ray Tune: ASHA early stopping + spot retries, the cost-aware combo in ~10 lines.
+from ray import tune
+from ray.tune.schedulers import ASHAScheduler
+
+tuner = tune.Tuner(
+    train_fn,
+    tune_config=tune.TuneConfig(
+        scheduler=ASHAScheduler(metric="val_loss", mode="min",
+                                max_t=27, grace_period=1, reduction_factor=3),
+        num_samples=2000),                 # propose many; ASHA kills losers early
+    run_config=tune.RunConfig(
+        storage_path="s3://my-bucket/hpo", # checkpoints survive spot preemption
+        failure_config=tune.FailureConfig(max_failures=-1)))  # retry preempted trials
+results = tuner.fit()
+print(results.get_best_result(metric="val_loss", mode="min").config)
+</code></pre>
+<div class="code-caption"><strong>Code 21.8.2:</strong> The roughly forty lines of rung and pricing logic in Code 21.8.1 collapse to a scheduler choice and two run-config options. Ray Tune handles the multi-fidelity promotion, checkpoint-to-object-store, and automatic retry of preempted spot trials; Optuna with its <code>HyperbandPruner</code> and a similar retry policy does the same.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Search Budget That Was Spent Three Times Over</div>
+<p><strong>Who:</strong> An ML platform engineer running shared hyperparameter search for several product teams on one cloud account.</p>
+<p><strong>Situation:</strong> Teams launched grid searches on on-demand GPUs, each training every configuration to convergence, and the monthly cloud bill for HPO alone had passed forty thousand dollars.</p>
+<p><strong>Problem:</strong> Finance capped the HPO budget at twelve thousand dollars a month, and the teams insisted that cutting the budget would cut model quality.</p>
+<p><strong>Dilemma:</strong> Cap the number of trials, which feels like directly sacrificing quality, or change how each dollar is spent without telling teams to search less.</p>
+<p><strong>Decision:</strong> Keep the breadth of search but change the spending: move every trial to spot capacity with checkpointing, and replace grid search with ASHA so losing trials die at one ninth of their cost.</p>
+<p><strong>How:</strong> They wrapped existing training functions in Ray Tune with an <code>ASHAScheduler</code>, pointed checkpoints at object storage so preempted trials resumed, and let the scheduler retry interruptions automatically.</p>
+<p><strong>Result:</strong> The bill fell from forty thousand to under ten thousand dollars a month, inside the cap, while the best models found were equal or better because the saved budget funded more configurations explored.</p>
+<p><strong>Lesson:</strong> A budget cut is not a quality cut. Spending the same search breadth on cheap interruptible compute with early stopping bought more quality per dollar, exactly as Output 21.8.1 predicts.</p>
+</div>
+
+<h2>4. Diminishing Returns and When to Stop <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The last cost-aware skill is knowing when to stop searching. The quality curve of Figure 21.8.1 is concave: the first dollars buy large gains as the search escapes obviously bad regions, and later dollars buy progressively less as it polishes an already good configuration. The rational stopping point is where the marginal quality per dollar, $\mathrm{d}q^\star / \mathrm{d}B$, falls below what that dollar is worth to you elsewhere, whether that is a different experiment, a larger training run, or simply not spent. Continuing past that point is the most common waste in practice: a search that has plateaued still bills for every trial. A simple, robust rule is to stop when the best quality has not improved by more than a small threshold over the last several brackets, which is the search-level analogue of the per-trial early stopping that ASHA already applies inside a bracket.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Hyperparameter Transfer for Foundation Models (2024 to 2026)</div>
+<p>The most active cost-aware frontier removes the search from the expensive model altogether. The maximal-update parametrization (muP) of Yang and Hu, extended in the muTransfer work of Yang et al., reparametrizes a network so that optimal hyperparameters such as the learning rate are invariant to width; you tune a small proxy and transfer the winners to a model orders of magnitude larger, turning a multi-million-dollar search into a small one. The 2024 to 2026 literature pushes this further: depth-wise and data-scaling transfer (the muP-to-depth and "u-muP" lines), unit-scaled variants that compose transfer with low-precision training, and open reports from large-model groups (Cerebras, EleutherAI, and others) that tune sub-billion-parameter proxies and ship the hyperparameters to models with hundreds of billions of parameters. The companion line of cost-aware and multi-fidelity Bayesian optimization (BoTorch's cost-aware acquisition, Hyperband descendants that model dollar cost directly) treats price as a first-class term in the acquisition function rather than a postscript. The shared message is the one this section opened with: the budget, not the trial count, is the object being optimized.</p>
+</div>
+
+<div class="callout key-takeaway">
+<div class="callout-title">Key Takeaway: Chapter 21 in One Breath</div>
+<p>Hyperparameter search and AutoML are embarrassingly parallel in form but hard in allocation. Launching many trials is trivial; spending a fixed budget so the best model is found is the real problem. The chapter built the toolkit for that allocation: smarter sampling (random and Bayesian) to propose better configurations, multi-fidelity evaluation (successive halving, Hyperband, ASHA) to kill losers cheaply, population-based training to adapt configurations during training, and distributed schedulers (Ray Tune) to keep many asynchronous workers productive. This final section bound them together under one objective: maximize the quality of the best configuration found per dollar, using early stopping, spot compute, and hyperparameter transfer to stretch every dollar, and stopping the search once its returns go flat. Search is easy to parallelize; allocation is the discipline that makes the parallelism pay.</p>
+</div>
+
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Closing Part IV, Parallel Deep Learning</div>
+<p>Part IV took the exact gradient identity of <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Chapter 1</a> and built it all the way up to training and tuning the largest models across many machines. Data parallelism (Chapter 15) replicated the model and all-reduced gradients; model, pipeline, and sharded parallelism (Chapter 16) split a model too big for one device; expert parallelism (Chapter 17) routed tokens to experts on different machines; elastic and fault-tolerant training (Chapter 18) kept those runs alive through failure and preemption; foundation-model training (<a href="../module-19-training-foundation-models/index.html">Chapter 19</a>) combined every axis at once; distributed reinforcement learning (<a href="../module-20-distributed-rl-infrastructure/index.html">Chapter 20</a>) fanned out actors and learners; and this chapter wrapped the whole effort in a search that spends its budget wisely. Across the part, one theme held: a collective communication primitive spread across machines, governed by a cost model, is how large models get trained and tuned. We can now build and refine models no single machine could hold. The remaining question is how to serve them.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>A spot instance is the cloud equivalent of a restaurant seat that someone with a reservation might claim at any moment. For a leisurely dinner that is a terrible deal. For a hyperparameter trial that checkpoints every few minutes and does not mind being asked to leave, it is the best table in the house at a third of the price, because losing the seat costs you only the last few bites.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.8.1: Trials Run Is the Wrong Trophy <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Two teams report on the same problem. Team A ran 50,000 trials and found a model with validation loss 0.18; Team B ran 800 trials and found validation loss 0.16, spending the same dollars. A manager praises Team A for "ten times the experimentation." Using the objective $q^\star / B$ from Section 1, explain precisely why Team B's search was the better one, and describe what Team A most likely did with its budget that Team B avoided. State one situation in which a higher trial count would genuinely indicate a better search and one in which it indicates a worse one.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.8.2: Add a Stopping Rule <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 21.8.1 so that each strategy stops early once its best loss has not improved by more than $\varepsilon = 0.002$ over the last three brackets (for full random, over the last 50 trials), and report the dollars actually spent alongside the best loss. Measure how much budget the cost-aware strategy returns unspent, then plot best loss against dollars spent to reproduce the concave curve of Figure 21.8.1. Discuss how the choice of $\varepsilon$ trades returned budget against the small risk of stopping just before a late improvement.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.8.3: Price the Transfer <span class="exercise-type analysis">Analysis</span></div>
+<p>You must tune a 70-billion-parameter model. A direct search of 200 trials at full scale costs $C_{\text{big}}$ per trial. Alternatively, you tune a 1-billion-parameter proxy under muP for the same 200 trials at $C_{\text{small}}$ per trial, where $C_{\text{small}} \approx C_{\text{big}}/64$, then run a single confirmation training at full scale. Write the total dollar cost of each approach, find the break-even number of confirmation runs at which transfer stops being cheaper, and argue from <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.9.html">Section 3.9</a>'s cost models why hyperparameter transfer is the single largest cost lever for foundation models even when the transfer is imperfect and needs one or two corrective runs.</p>
+</div>
+
+<div class="callout project-ideas">
+<div class="callout-title">Project Ideas</div>
+<p><strong>1. Cost-aware ASHA on spot.</strong> Take a small image or text model and run a real ASHA search with Ray Tune on a pool of spot or preemptible instances. Checkpoint to object storage so preempted trials resume, log the dollar cost of every trial, and produce the best-loss-versus-dollars curve of Figure 21.8.1 from real billing data. Compare the cost-per-quality against the same search on on-demand instances and report the savings.</p>
+<p><strong>2. Verify a hyperparameter-transfer claim.</strong> Implement muP for a small transformer, tune the learning rate at several widths, and check empirically that the optimal learning rate is stable across widths. Then transfer the winner from the smallest width to the largest and measure the quality gap against a search performed directly at the large width, reporting the dollar cost of each path.</p>
+<p><strong>3. A budget-aware scheduler.</strong> Build a meta-controller that, given a fixed dollar budget and a live cost feed, decides each round whether to launch more trials, promote survivors to higher fidelity, or stop the search because marginal quality per dollar has fallen below a threshold. Evaluate it against a fixed-trial-count baseline on the quality found per dollar.</p>
+</div>
+
+<p>Part IV ends here. We began the part able to compute an exact gradient on one machine and now can train, shard, route, recover, and tune models that no single device could hold, always under an explicit cost budget. The models exist; the next problem is making them answer. Part V turns to distributed inference and serving, and it opens by establishing the per-node efficiency that the whole serving fleet multiplies, in <a href="../../part-5-distributed-inference/module-22-per-node-inference-efficiency/index.html">Chapter 22</a>.</p>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-21.7.html"><span class="nav-label">Previous</span><span class="nav-num">Section 21.7</span><span class="nav-title">Ray Tune</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 21</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Hyperparameter Search and AutoML</span></a>
+<a class="next" href="../../part-5-distributed-inference/module-22-per-node-inference-efficiency/index.html"><span class="nav-label">Next</span><span class="nav-num">Part V &#183; Chapter 22</span><span class="nav-title">Per-Node Inference Efficiency</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

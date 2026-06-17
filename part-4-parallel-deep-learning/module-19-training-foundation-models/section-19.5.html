@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 19.5: Tokenization at Scale. Turning a multi-trillion-token corpus into the packed token stream a foundation model consumes, as an embarrassingly parallel map over shards followed by padding-free sequence packing." name="description"/>
+<title>Section 19.5: Tokenization at Scale | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 19: Training Foundation Models at Scale</a></div>
+<h1>Tokenization at Scale</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They told me I was a preprocessing step. Then they handed me thirty trillion characters and asked for them back by Tuesday, evenly chopped, nicely packed, with no wasted space."</p>
+<cite>A Tokenizer That Was Promised It Would Be Quick</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A foundation model never sees text; it sees a stream of integer token IDs, and producing that stream from a multi-trillion-character corpus is itself one of the largest distributed jobs in the entire pretraining pipeline.</strong> Tokenization has two phases with opposite shapes. Training the tokenizer learns a fixed vocabulary from a modest sample and is cheap. Applying it then rewrites the whole corpus into token IDs, an embarrassingly parallel map over shards that must touch every byte, and the output is not yet ready: variable-length documents must be packed into fixed-length training sequences without wasting compute on padding. This section shows how the vocabulary is learned, why its size and quality control downstream compute, how tokenization maps cleanly onto the same shard-parallel pattern as Chapter 6, and how sequence packing turns ragged documents into the dense, padding-free token shards that feed the data loader of Chapter 8.</p>
+</div>
+<p>The previous section deduplicated and quality-filtered the raw corpus into a clean text dataset. That dataset is still text, and a transformer cannot read text. Between the clean corpus and the first training step sits a translation: every document must be rewritten as a sequence of integer token IDs drawn from a fixed vocabulary, and those sequences must be reshaped into the uniform fixed-length blocks the training loop expects. It is tempting to treat this as a one-line call to a library and move on, and for a small dataset that is exactly right. At corpus scale the picture changes. Tokenizing tens of trillions of tokens is a job whose runtime is measured in thousands of core-hours, and how you pack the result decides how much of your accelerator budget is spent learning versus spent multiplying by zeros. Tokenization is where data engineering and model compute meet, and getting it wrong is expensive in both.</p>
+<p>We proceed in three moves. First, what a subword vocabulary is and how it is learned from a sample. Second, why vocabulary size and tokenizer quality, captured by a single number called fertility, ripple through context length and training cost. Third, the distributed mechanics: tokenization as a parallel map, and sequence packing as the step that removes padding waste before the token shards reach the loader.</p>
+
+<h2>1. Why Subwords, and How a Vocabulary Is Learned <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A tokenizer needs a vocabulary: a finite set of units, each with an integer ID, that together can represent any input text. Two naive choices bracket the design space and both fail. A word-level vocabulary (one ID per distinct word) is simple but cannot represent words it never saw during construction, and a web corpus has an effectively unbounded word count once you include names, code identifiers, typos, and every language on Earth. A character-level vocabulary (one ID per character) can represent anything but makes sequences brutally long, since a single English word becomes five or six tokens, and sequence length drives transformer cost quadratically in attention. The accepted compromise is subword tokenization: a vocabulary of common character sequences, so that frequent words become a single token while rare words gracefully decompose into a handful of meaningful pieces. Nothing is ever unrepresentable, because the vocabulary always retains the individual characters as a fallback.</p>
+<p>Three algorithms dominate. Byte-pair encoding (BPE) starts from individual characters and repeatedly merges the most frequent adjacent pair into a new symbol, growing the vocabulary one merge at a time until it reaches a target size; this is the scheme behind the GPT family. WordPiece, used by BERT, merges by a likelihood criterion rather than raw frequency. The Unigram language model, the default in the SentencePiece toolkit, instead starts from a large candidate vocabulary and prunes it down to the subset that best explains the corpus under a probabilistic model. They differ in detail but share the same two-phase structure that matters for distribution: a <em>training</em> phase that learns the vocabulary from a sample, and an <em>application</em> phase that uses the frozen vocabulary to encode the full corpus.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Train the Tokenizer on a Sample, Apply It to Everything</div>
+<p>Learning the vocabulary is a small job and applying it is a huge one, and the two must not be confused. The vocabulary is statistically saturated after a few gigabytes to tens of gigabytes of representative text; pushing more data into the training phase changes the merge list almost not at all, so you train on a sample. Encoding, by contrast, must touch every byte of the corpus exactly once, so its cost scales with the full dataset. This asymmetry is what makes tokenization a distributed problem: the expensive phase is a pure, stateless map that applies one small frozen artifact (the merge list or vocabulary file) independently to every shard.</p>
+</div>
+<p>Because the application phase is stateless and per-document, it parallelizes the same way the MapReduce word count of <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/section-6.3.html">Section 6.3</a> did: broadcast the frozen tokenizer to every worker, hand each worker a slice of the input files, and let them emit token shards independently with no communication between them. We will make that structure explicit in Section 3. First, the cost.</p>
+
+<h2>2. Vocabulary Size and Fertility: The Cost Knobs <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Two related quantities decide how much a given tokenizer costs you. The first is the vocabulary size $V$, the number of distinct tokens, which is a hyperparameter you choose (modern models sit between roughly 32,000 and 256,000). The second is <em>fertility</em>: the average number of tokens the tokenizer emits per word (or, language-neutrally, per unit of raw text). Fertility is not a free parameter; it is an outcome of how well the vocabulary matches the text. A vocabulary tuned on English will shatter Hindi or Thai or a stream of source code into many short pieces, inflating fertility on exactly the data you may care about most.</p>
+<p>Fertility matters because a transformer's compute and memory are budgeted in tokens, not in words or characters. If tokenizer A needs $1.6$ tokens per word and tokenizer B needs $2.4$ for the same text, then B consumes $50\%$ more sequence positions to express the same content. That has three consequences at once. The same fixed context window holds less actual information, since more of it is spent on fragmentation. The same training compute budget, denominated in tokens by the scaling laws of <a href="section-19.2.html">Section 19.2</a>, covers less real text. And inference costs more per useful character produced. A blunt way to state it: fertility is a multiplier on every token-denominated cost in the system, so a one-time investment in a better-matched vocabulary pays a recurring dividend across the entire training and serving life of the model.</p>
+<p>The relationship between vocabulary size and fertility is a trade-off. A larger $V$ lowers fertility, because more words fit in a single token, but it enlarges the embedding and output-projection matrices (each row is a $d$-dimensional vector, so they cost $V \times d$ parameters) and spends model capacity on rare tokens that appear too seldom to learn well. Writing fertility as $f$ and the raw text as $C$ words, the model processes</p>
+$$T = f \cdot C \quad \text{tokens}, \qquad \text{embedding parameters} = V \cdot d,$$
+<p>and the design goal is to push $f$ down (cheaper sequences) without pushing $V$ so high that the embedding tables and rare-token waste dominate. For multilingual or code-heavy models the honest fix is not a single global vocabulary stretched thin but a vocabulary <em>trained on a representative mixture</em> of all the target languages and code, so that no single domain pays a punishing fertility tax. This is why the tokenizer training sample, small as it is, must mirror the language and domain distribution of the full corpus.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Token That Cost a Fortune</div>
+<p>Early multilingual models trained on English-dominant vocabularies were quietly unfair: a sentence in a low-resource language could need three to five times as many tokens as its English translation. Since many APIs bill per token, speakers of those languages paid several times more for the identical request, and their models had effectively shorter memories because the context window filled up faster. The vocabulary, a humble lookup table fixed before training even began, turned out to encode a pricing policy nobody intended.</p>
+</div>
+
+<h2>3. Tokenization as an Embarrassingly Parallel Map <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Now the distributed core. Once the vocabulary is frozen, encoding the corpus has the cleanest possible parallel structure: it is a map with no reduce. Split the clean corpus into shards (the same shards your storage layer already exposes), broadcast the small tokenizer artifact to every worker, and let each worker stream its shard through the encoder, writing out a shard of token IDs. Workers never talk to each other, there is no shuffle, and a failed shard is simply re-run, exactly the fault-tolerance story of MapReduce in <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/section-6.3.html">Section 6.3</a>. The diagram in Figure 19.5.1 shows the full path from text shards to packed sequences, with the parallel tokenize step in the middle and the packing step we build next on the right.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Dataflow diagram. On the left, four text shards. Each feeds an independent tokenizer worker holding a copy of the frozen vocabulary, producing variable-length token streams. On the right, those streams are concatenated and cut into fixed-length packed training sequences with document-boundary markers.">
+<defs>
+<marker id="arr195" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b195 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w195 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.p195 { fill:#eaf6ee; stroke:#1f7a44; stroke-width:1.6; }
+.t195 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s195 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.m195 { font:600 11px sans-serif; fill:#b86b1f; text-anchor:middle; }
+.l195 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr195); }
+</style>
+<text class="t195" x="95" y="24">Text shards</text>
+<text class="t195" x="420" y="24">Parallel tokenize (map, no reduce)</text>
+<text class="t195" x="780" y="24">Packed sequences</text>
+<rect class="b195" x="30" y="46" width="130" height="44" rx="7"/>
+<text class="s195" x="95" y="73">shard 1 (text)</text>
+<rect class="b195" x="30" y="106" width="130" height="44" rx="7"/>
+<text class="s195" x="95" y="133">shard 2 (text)</text>
+<rect class="b195" x="30" y="166" width="130" height="44" rx="7"/>
+<text class="s195" x="95" y="193">shard 3 (text)</text>
+<rect class="b195" x="30" y="226" width="130" height="44" rx="7"/>
+<text class="s195" x="95" y="253">shard 4 (text)</text>
+<rect class="w195" x="320" y="46" width="200" height="44" rx="7"/>
+<text class="t195" x="420" y="64">Worker 1</text>
+<text class="m195" x="420" y="80">frozen vocab</text>
+<rect class="w195" x="320" y="106" width="200" height="44" rx="7"/>
+<text class="t195" x="420" y="124">Worker 2</text>
+<text class="m195" x="420" y="140">frozen vocab</text>
+<rect class="w195" x="320" y="166" width="200" height="44" rx="7"/>
+<text class="t195" x="420" y="184">Worker 3</text>
+<text class="m195" x="420" y="200">frozen vocab</text>
+<rect class="w195" x="320" y="226" width="200" height="44" rx="7"/>
+<text class="t195" x="420" y="244">Worker 4</text>
+<text class="m195" x="420" y="260">frozen vocab</text>
+<line class="l195" x1="160" y1="68" x2="316" y2="68"/>
+<line class="l195" x1="160" y1="128" x2="316" y2="128"/>
+<line class="l195" x1="160" y1="188" x2="316" y2="188"/>
+<line class="l195" x1="160" y1="248" x2="316" y2="248"/>
+<rect class="p195" x="700" y="58" width="160" height="30" rx="5"/>
+<text class="s195" x="780" y="78">seq A (full)</text>
+<rect class="p195" x="700" y="98" width="160" height="30" rx="5"/>
+<text class="s195" x="780" y="118">seq B (full)</text>
+<rect class="p195" x="700" y="138" width="160" height="30" rx="5"/>
+<text class="s195" x="780" y="158">seq C (full)</text>
+<rect class="p195" x="700" y="178" width="160" height="30" rx="5"/>
+<text class="s195" x="780" y="198">seq D (full)</text>
+<rect class="p195" x="700" y="218" width="160" height="30" rx="5"/>
+<text class="s195" x="780" y="238">seq E (full)</text>
+<path class="l195" d="M 520 150 L 600 150 L 600 152"/>
+<rect class="b195" x="560" y="152" width="80" height="56" rx="7"/>
+<text class="s195" x="600" y="176">concat</text>
+<text class="s195" x="600" y="192">+ EOD</text>
+<path class="l195" d="M 640 180 L 696 180"/>
+<text class="s195" x="600" y="288">variable-length</text>
+<text class="s195" x="600" y="304">token streams in,</text>
+<text class="s195" x="600" y="320">fixed-length out</text>
+</svg>
+<figcaption><strong>Figure 19.5.1:</strong> Tokenization and packing at corpus scale. Text shards (left) are tokenized by independent workers (center), each carrying a copy of the frozen vocabulary and emitting variable-length token streams with no inter-worker communication. Those streams are concatenated with end-of-document (EOD) markers and cut into dense fixed-length training sequences (right). The map step inherits its fault tolerance from <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/section-6.3.html">Section 6.3</a>; the packed shards feed the loader of <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/section-8.6.html">Section 8.6</a>.</figcaption>
+</figure>
+<p>The often-overlooked cost lives in that middle column. Each worker runs a non-trivial encoder over every byte it owns, and "every byte" across a frontier-scale corpus is tens of trillions of characters. This is not a preprocessing afterthought you can fold into the first training epoch; it is a standalone distributed batch job, frequently run once and cached, whose output (the token shards) becomes the real input to training. Treating it as such, with its own scheduling, retries, and monitoring, is what separates a pretraining pipeline that starts on time from one that spends its first day watching a single-threaded tokenizer crawl through the dataset.</p>
+<p>The remaining waste is at the boundaries. Documents have ragged lengths, but the training loop wants uniform fixed-length sequences. Pad each document up to the sequence length and you spend a large fraction of every batch on padding tokens that produce no gradient signal: pure wasted compute. <em>Sequence packing</em> fixes this by concatenating tokenized documents end to end, inserting an end-of-document (EOD) marker between them, and then slicing the long stream into fixed-length windows. Almost every position now carries real content; only the final partial window needs any padding at all. The EOD markers let the model (and the attention mask) tell where one document ends and the next begins, so that <em>document-boundary masking</em> can prevent attention from leaking across two unrelated documents that happen to share a packed sequence.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Packing Buys Back Wasted Accelerator Cycles</div>
+<p>Padding is compute you pay for and learn nothing from. With short or highly variable document lengths, naive one-document-per-sequence layouts can leave well under two thirds of every batch doing useful work. Packing raises utilization toward 100%, which means the same number of optimizer steps now consumes more real text, equivalently, fewer steps and less wall-clock to reach the same token budget. The cost is a slightly more careful attention mask (document-boundary masking) so that packed neighbors do not attend across the EOD marker. It is one of the highest-leverage, lowest-glamour optimizations in the whole pretraining stack.</p>
+</div>
+<p>The runnable demo below carries all three ideas end to end in pure Python with no external libraries. It trains a tiny BPE tokenizer on a small sample, applies it to a corpus as a map over four shards (the parallel pattern, executed serially here for reproducibility), reports the resulting fertility, and then compares padded against packed token utilization on the same tokenized documents.</p>
+<pre><code class="language-python">import re
+from collections import Counter
+
+# ---- 1. Train a tiny BPE tokenizer on a small SAMPLE ----------------------
+sample = ("distributed training scales the model across many machines "
+          "the model reads many tokens and the tokenizer maps text to tokens "
+          "data parallel training reads sharded data and trains the model "
+          "many machines train one model on many tokens of text data ") * 40
+
+def get_words(text):                       # word -> freq; words end with </w>
+    freq = Counter(text.split())
+    return {tuple(list(w) + ["</w>"]): c for w, c in freq.items()}
+
+def count_pairs(vocab):
+    pairs = Counter()
+    for symbols, c in vocab.items():
+        for i in range(len(symbols) - 1):
+            pairs[(symbols[i], symbols[i + 1])] += c
+    return pairs
+
+def merge(vocab, pair):                     # fuse one adjacent pair everywhere
+    out = {}
+    for symbols, c in vocab.items():
+        new, i = [], 0
+        while i < len(symbols):
+            if i < len(symbols) - 1 and (symbols[i], symbols[i + 1]) == pair:
+                new.append(symbols[i] + symbols[i + 1]); i += 2
+            else:
+                new.append(symbols[i]); i += 1
+        out[tuple(new)] = c
+    return out
+
+NUM_MERGES = 80
+vocab, merges = get_words(sample), []
+for _ in range(NUM_MERGES):                 # greedy most-frequent-pair merges
+    pairs = count_pairs(vocab)
+    if not pairs: break
+    best = max(pairs, key=pairs.get); merges.append(best); vocab = merge(vocab, best)
+
+# ---- 2. Encode any word by replaying merges in learned order --------------
+merge_rank = {pair: i for i, pair in enumerate(merges)}
+def encode_word(word):
+    symbols = list(word) + ["</w>"]
+    while True:
+        best = best_rank = best_i = None
+        for i in range(len(symbols) - 1):
+            r = merge_rank.get((symbols[i], symbols[i + 1]))
+            if r is not None and (best_rank is None or r < best_rank):
+                best, best_rank, best_i = (symbols[i], symbols[i + 1]), r, i
+        if best is None: break
+        symbols = symbols[:best_i] + [best[0] + best[1]] + symbols[best_i + 2:]
+    return symbols
+def encode(text):
+    out = []
+    for w in text.split(): out.extend(encode_word(w))
+    return out
+
+# ---- 3. Tokenize a CORPUS as a parallel-style map over shards -------------
+docs = ["distributed training reads many tokens",
+        "the tokenizer maps text data to tokens",
+        "many machines train one model",
+        "data parallel training scales the model",
+        "the model reads sharded data of text",
+        "tokens of text feed the training data loader",
+        "scaling laws relate compute and tokens",
+        "one model many machines many tokens"]
+NUM_SHARDS = 4
+shards = [docs[i::NUM_SHARDS] for i in range(NUM_SHARDS)]       # round-robin split
+def tokenize_shard(shard_docs):              # a "worker": independent, no comms
+    return [encode(d) for d in shard_docs]
+shard_results = [tokenize_shard(s) for s in shards]            # the map
+tokenized_docs = [doc for r in shard_results for doc in r]     # concatenate
+
+# ---- 4. Sequence packing vs naive padding ---------------------------------
+SEQ_LEN, EOD = 16, "<eod>"
+padded_real = sum(len(t[:SEQ_LEN]) for t in tokenized_docs)
+padded_seqs = len(tokenized_docs)
+padded_slots = padded_seqs * SEQ_LEN
+stream = []
+for t in tokenized_docs: stream.extend(t + [EOD])             # pack with EOD markers
+packed_seqs = [stream[i:i + SEQ_LEN] for i in range(0, len(stream), SEQ_LEN)]
+packed_slots = len(packed_seqs) * SEQ_LEN
+
+print(f"vocabulary size       : {len({s for w in get_words(sample) for s in w} | {a+b for a,b in merges})} subword tokens")
+total_tokens = sum(len(t) for t in tokenized_docs)
+print(f"fertility (tok/word)  : {total_tokens / sum(len(d.split()) for d in docs):.3f}")
+print(f"padded  : {padded_seqs} seqs, util {padded_real / padded_slots:.1%}")
+print(f"packed  : {len(packed_seqs)} seqs, util {len(stream) / packed_slots:.1%}")
+print(f"sequences saved       : {padded_seqs - len(packed_seqs)} "
+      f"({1 - len(packed_seqs)/padded_seqs:.0%} fewer)")
+</code></pre>
+<div class="code-caption"><strong>Code 19.5.1:</strong> A complete tokenize-and-pack pipeline in standard-library Python: a greedy BPE trainer, a merge-replay encoder, a four-shard parallel-style map, and a padded-versus-packed utilization comparison on the same tokenized documents.</div>
+<pre><code class="language-text">vocabulary size       : 103 subword tokens
+fertility (tok/word)  : 1.640
+padded  : 8 seqs, util 57.8%
+packed  : 6 seqs, util 93.8%
+sequences saved       : 2 (25% fewer)
+</code></pre>
+<div class="code-caption"><strong>Output 19.5.1:</strong> The learned 103-token vocabulary tokenizes the corpus at a fertility of $1.64$ tokens per word. Packing lifts batch utilization from $57.8\%$ (padded) to $93.8\%$, eliminating $48$ padding slots and cutting the sequence count by a quarter, so the same token budget is reached in fewer steps.</div>
+<p>The numbers in Output 19.5.1 are small because the corpus is a toy, but the ratios are exactly the lever that matters at scale: moving utilization from the high fifties to the low nineties means roughly a third fewer training sequences for the identical content, which is a third less wall-clock and accelerator cost spent reaching the same token budget. Multiply that across a run that processes trillions of tokens and packing alone repays its modest engineering cost many times over.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Pretraining Run That Spent Its First Week Padding</div>
+<p><strong>Who:</strong> A data-infrastructure engineer on a team pretraining a 7-billion-parameter multilingual model.</p>
+<p><strong>Situation:</strong> The cleaned corpus was ready and the cluster was booked, but the first metrics showed throughput far below the theoretical accelerator rate.</p>
+<p><strong>Problem:</strong> The data path tokenized each document into its own sequence and padded up to the context length; with a long context and many short documents, batches were more than 40% padding, so nearly half of every expensive GPU-hour computed gradients for padding tokens.</p>
+<p><strong>Dilemma:</strong> Buy more accelerators to brute-force the throughput gap (fast to provision, linearly more expensive, and wasteful), or change the offline data preparation to pack sequences (a one-time engineering cost that then runs on cheap CPU nodes ahead of training).</p>
+<p><strong>Decision:</strong> They fixed the data preparation, because the bottleneck was wasted compute, not insufficient compute, and no number of extra GPUs makes padding tokens useful.</p>
+<p><strong>How:</strong> They added a packing pass that concatenated tokenized documents with EOD markers into fixed-length sequences and emitted a document-boundary mask, exactly the structure of Code 19.5.1, writing packed token shards that the loader of <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/section-8.6.html">Section 8.6</a> streamed directly.</p>
+<p><strong>Result:</strong> Effective tokens-per-step rose by roughly $1.7\times$, the run finished comfortably inside its cluster reservation, and the per-token training cost dropped proportionally, with no change to model quality.</p>
+<p><strong>Lesson:</strong> At scale, tokenization and packing are not preprocessing trivia but a distributed job whose efficiency directly sets your training cost. Pack before you train, and never pay an accelerator to multiply by a padding token.</p>
+</div>
+<p>Two practical notes complete the picture. First, the packed token shards are the artifact the rest of training consumes, so they live in the same sharded, sequentially streamable layout the data loader expects; the handoff to <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/section-8.6.html">Section 8.6</a> is direct, with no further reshaping. Second, document-boundary masking is not optional politeness: without it, the model would learn spurious dependencies between the tail of one document and the head of an unrelated one that share a packed window, quietly degrading quality in a way that is hard to diagnose later.</p>
+
+<h2>4. Reaching for the Library <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Code 19.5.1 is a teaching implementation, deliberately written from scratch so the mechanics are visible. In production you would never hand-roll a BPE trainer: the mature toolkits are fast (Rust-backed), handle Unicode normalization and byte-level fallbacks correctly, and serialize to a single portable artifact you can broadcast to every tokenization worker. The shortcut below trains a comparable tokenizer in a handful of lines.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: HuggingFace tokenizers and SentencePiece</div>
+<p>The from-scratch trainer, encoder, and merge-replay logic of Code 19.5.1 (roughly fifty lines) collapse to a few calls. The HuggingFace <code>tokenizers</code> library trains a byte-level BPE in Rust and saves one self-contained JSON file; Google's <code>sentencepiece</code> offers BPE and the Unigram model from a single command. The library handles pre-tokenization, Unicode normalization, byte-level fallback so nothing is ever out-of-vocabulary, parallel training across CPU cores, and the frozen-artifact serialization you broadcast to workers.</p>
+<pre><code class="language-python"># pip install tokenizers
+from tokenizers import Tokenizer, models, trainers, pre_tokenizers
+
+tok = Tokenizer(models.BPE())
+tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=True)
+trainer = trainers.BpeTrainer(vocab_size=32000, special_tokens=["&lt;eod&gt;"])
+
+tok.train(files=["corpus_sample.txt"], trainer=trainer)   # train on a SAMPLE
+tok.save("tokenizer.json")                                 # one portable artifact
+
+ids = tok.encode("distributed training at scale").ids      # apply to a document
+
+# SentencePiece equivalent (Unigram or BPE), also one artifact:
+# import sentencepiece as spm
+# spm.SentencePieceTrainer.train(
+#     input="corpus_sample.txt", model_prefix="tok",
+#     vocab_size=32000, model_type="unigram")
+</code></pre>
+<div class="code-caption"><strong>Code 19.5.2:</strong> Training and saving a production tokenizer with HuggingFace <code>tokenizers</code> (with the SentencePiece equivalent commented below). The single saved file is the small frozen artifact each worker in Figure 19.5.1 carries.</div>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Tokenizer-Free and Byte-Level Models (2024 to 2026)</div>
+<p>A live research line questions the fixed-vocabulary tokenizer entirely, since it is a brittle, language-biased artifact frozen before training and a known source of multilingual unfairness. Byte-level and tokenizer-free architectures operate on raw bytes and learn where the boundaries should fall. The MEGABYTE design (Yu et al., 2023) made long byte sequences tractable with a hierarchical patching transformer, and the Byte Latent Transformer (Pagnoni et al., 2024) replaced fixed tokens with dynamic, entropy-driven patches that allocate more compute to harder-to-predict regions, matching token-based models at scale while sidestepping the vocabulary entirely. In parallel, work on fairer and larger multilingual vocabularies, and on extending or retrofitting an existing model's tokenizer to new languages without full retraining, attacks the same fertility-inequality problem from the vocabulary side. The open question for systems builders is whether the cleaner byte-level data path (no separate tokenization job, no vocabulary to maintain) outweighs the extra sequence length it must process, a trade-off that turns directly on the packing and attention-cost mechanics of this section.</p>
+</div>
+<p>With the corpus now a stream of packed, document-masked token shards, every upstream data concern is settled: the dataset is cleaned, deduplicated, tokenized, and packed into the exact fixed-length blocks the training loop ingests. What remains is to drive that token stream through a distributed training run, coordinating thousands of accelerators, checkpoints, and restarts over weeks of wall-clock. That orchestration is the subject of <a href="section-19.6.html">Section 19.6</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.5.1: Fertility Across Domains <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A vocabulary is trained on a sample that is 95% English prose and 5% source code, then applied to a corpus that is 50% code. Explain qualitatively what happens to fertility on the code portion versus the English portion, and trace the downstream effects on (a) how much real content fits in a fixed context window, (b) the token budget consumed for a fixed amount of code, and (c) inference cost per useful character of generated code. State concretely how you would change the tokenizer <em>training sample</em> to fix the problem, and why changing only the vocabulary size $V$ would not be enough.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.5.2: Measure the Packing Win <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 19.5.1 so the corpus documents have a realistic length distribution (for example, sample document lengths from a heavy-tailed distribution with many short documents and a few long ones). For a sweep of sequence lengths <code>SEQ_LEN</code> in $\{32, 128, 512, 2048\}$, compute and plot (or tabulate) the padded utilization, the packed utilization, and the ratio of sequences saved. Explain why the advantage of packing over padding grows as <code>SEQ_LEN</code> increases relative to the typical document length, and relate the result to the per-step token throughput of a real training loop.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.5.3: Cost of the Tokenization Job <span class="exercise-type analysis">Analysis</span></div>
+<p>Suppose a clean corpus holds $30$ trillion tokens, a single CPU core tokenizes at $2$ million tokens per second, and you have a pool of $2{,}000$ cores available, structured as the embarrassingly parallel map of Figure 19.5.1. Estimate the wall-clock time to tokenize the whole corpus once, ignoring I/O. Now argue, using the asymmetry from the Key Insight in Section 1, why you would run this job once and cache the token shards rather than tokenizing on the fly inside each training epoch, and quantify the saving if training makes four passes over the data. What changes in this argument if the tokenizer artifact is updated mid-project?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-19.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 19.4</span><span class="nav-title">Distributed Deduplication and Data Quality</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 19</span><span class="nav-num">Contents</span><span class="nav-title">Training Foundation Models at Scale</span></a>
+<a class="next" href="section-19.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 19.6</span><span class="nav-title">Orchestrating Distributed Pretraining</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

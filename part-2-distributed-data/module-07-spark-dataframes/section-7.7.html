@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 7.7: Joins, Shuffles, and Data Skew. Broadcast hash join versus sort-merge join, why the shuffle dominates cost, how a hot key creates a straggler task, and the salting and adaptive-query-execution fixes that rebalance it." name="description"/>
+<title>Section 7.7: Joins, Shuffles, and Data Skew | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Distributed Data Processing for AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 7: Spark and Distributed DataFrames</a></div>
+<h1>Joins, Shuffles, and Data Skew</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Seven of my tasks finished in nine seconds. The eighth is still running, and it has started leaving the cluster passive-aggressive notes about how it carries this team."</p>
+<cite>A Stage Waiting on Its Last Task</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Almost every Spark job that runs slower than you expected is paying for a shuffle, and almost every shuffle that runs slower than its peers is paying for skew.</strong> A join asks a deceptively simple question, "for each key on the left, find the matching rows on the right," but answering it across a cluster forces a choice: either copy the small table to every machine and avoid moving the big one, or move both tables across the network so that matching keys land together. The first choice, a broadcast hash join, has almost no network cost; the second, a sort-merge join, pays the full price of a shuffle. When the keys are evenly spread, that shuffle is merely expensive. When one key is far more common than the rest, the shuffle becomes lopsided: most of the data lands on one task, that task becomes a straggler, and the whole stage waits for it. This section explains how Spark's optimizer chooses a join strategy, why the shuffle is the dominant cost in distributed data processing, and how three fixes, salting, broadcasting, and Adaptive Query Execution, turn a stalled stage back into a balanced one.</p>
+</div>
+<p>In <a href="section-7.6.html">Section 7.6</a> we controlled how a DataFrame is laid out across the cluster: partitioning by a column, caching a reused result, and choosing a sensible number of partitions. Those controls matter most when two DataFrames meet in a join, because a join is where Spark must reconcile two independent layouts into one. This section takes the join apart. We first separate the two physical strategies Spark can use, then isolate the shuffle as the cost that dominates everything else, and finally confront the failure mode that turns a healthy shuffle into a stalled one: data skew. The join material here deepens the reduce-side and broadcast joins introduced for raw MapReduce in <a href="../module-06-mapreduce-distributed-algorithms/section-6.5.html">Section 6.5</a>; Spark adds a cost-based optimizer that chooses between them for you, and a runtime engine that can repair a bad choice mid-flight.</p>
+
+<h2>1. Two Ways to Join Across Machines <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Suppose you are joining a large table of user events (billions of rows) against a small dimension table of user profiles (a few million rows), matching on a user key. There are two fundamentally different ways to place this work on a cluster, and they differ in exactly one quantity: how much data crosses the network.</p>
+<p>The first strategy is the <strong>broadcast hash join</strong>. Because the profile table is small, Spark ships a full copy of it to every executor, where each executor builds an in-memory hash table keyed by the user key. The large events table never moves; each executor probes the broadcast hash table with the events rows it already holds. No shuffle of the big table is required. This is the cheapest join Spark can perform, and it is available whenever one side is small enough to fit in each executor's memory.</p>
+<p>The second strategy is the <strong>sort-merge join</strong> (and its cousin the shuffle hash join). When neither side is small enough to broadcast, Spark must instead bring matching keys together by shuffling both sides: every row is hashed by its join key and sent to the task that owns that key's partition, so that all rows for a given key, from both tables, end up on the same task. Each task then sorts its partition by key and walks the two sorted streams in lockstep, emitting matches. This works for arbitrarily large inputs, but it moves both tables across the network, which is the expensive part.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left panel shows a broadcast hash join in which a small table is copied to every executor while the large table stays put; right panel shows a sort-merge join in which both tables are shuffled across the network so matching keys meet on the same task.">
+<defs>
+<marker id="arr77" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr77b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.b77 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w77 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.t77 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s77 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.h77 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.l77 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr77); }
+.lb77 { fill:none; stroke:#b86b1f; stroke-width:1.6; marker-end:url(#arr77b); }
+</style>
+<text class="h77" x="215" y="24">Broadcast hash join (no shuffle)</text>
+<rect class="w77" x="160" y="40" width="110" height="34" rx="6"/>
+<text class="t77" x="215" y="62">small table</text>
+<rect class="b77" x="40" y="120" width="100" height="48" rx="6"/>
+<text class="t77" x="90" y="142">Exec 1</text>
+<text class="s77" x="90" y="158">big shard 1</text>
+<rect class="b77" x="165" y="120" width="100" height="48" rx="6"/>
+<text class="t77" x="215" y="142">Exec 2</text>
+<text class="s77" x="215" y="158">big shard 2</text>
+<rect class="b77" x="290" y="120" width="100" height="48" rx="6"/>
+<text class="t77" x="340" y="142">Exec 3</text>
+<text class="s77" x="340" y="158">big shard 3</text>
+<path class="lb77" d="M 195 74 L 100 116"/>
+<path class="lb77" d="M 215 74 L 215 116"/>
+<path class="lb77" d="M 235 74 L 330 116"/>
+<text class="s77" x="215" y="210">small table copied to every executor;</text>
+<text class="s77" x="215" y="226">big table never moves</text>
+<line x1="430" y1="30" x2="430" y2="330" stroke="#cbd2da" stroke-width="1.5" stroke-dasharray="4 4"/>
+<text class="h77" x="645" y="24">Sort-merge join (full shuffle)</text>
+<rect class="b77" x="470" y="48" width="90" height="40" rx="6"/>
+<text class="t77" x="515" y="73">big A</text>
+<rect class="w77" x="730" y="48" width="90" height="40" rx="6"/>
+<text class="t77" x="775" y="73">big B</text>
+<rect class="b77" x="500" y="180" width="86" height="48" rx="6"/>
+<text class="t77" x="543" y="202">Task k1</text>
+<text class="s77" x="543" y="218">key % T = 0</text>
+<rect class="b77" x="602" y="180" width="86" height="48" rx="6"/>
+<text class="t77" x="645" y="202">Task k2</text>
+<text class="s77" x="645" y="218">key % T = 1</text>
+<rect class="b77" x="704" y="180" width="86" height="48" rx="6"/>
+<text class="t77" x="747" y="202">Task k3</text>
+<text class="s77" x="747" y="218">key % T = 2</text>
+<path class="l77" d="M 510 88 L 540 176"/>
+<path class="l77" d="M 520 88 L 640 176"/>
+<path class="l77" d="M 530 88 L 742 176"/>
+<path class="lb77" d="M 770 88 L 548 176"/>
+<path class="lb77" d="M 775 88 L 648 176"/>
+<path class="lb77" d="M 780 88 L 750 176"/>
+<text class="s77" x="645" y="262">both tables hashed by key and shuffled;</text>
+<text class="s77" x="645" y="278">matching keys meet on the same task</text>
+<text class="s77" x="645" y="312" font-style="italic">network cost grows with both table sizes</text>
+</svg>
+<figcaption><strong>Figure 7.7.1:</strong> The two physical join strategies. On the left, a broadcast hash join copies the small table to every executor (orange arrows) while the large table stays put, so no big-table shuffle occurs. On the right, a sort-merge join hashes both tables by the join key and shuffles them (blue arrows from table A, orange from table B) so that matching keys arrive on the same task. The broadcast join moves a few million rows once; the sort-merge join moves billions of rows across the network.</figcaption>
+</figure>
+<p>The decision between them rests on one threshold. If the smaller side fits comfortably in executor memory, broadcast it and skip the shuffle entirely; otherwise, shuffle both sides. Spark formalizes this threshold, as we see next, and Figure 7.7.1 makes the contrast concrete: the same logical join, two radically different physical plans.</p>
+
+<h2>2. How the Optimizer Picks, and the Broadcast Threshold <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Spark's Catalyst optimizer chooses the physical join from an estimate of each side's size in bytes. The governing knob is <code>spark.sql.autoBroadcastJoinThreshold</code>, which defaults to 10 megabytes. If Catalyst estimates that one side of the join, after all filters and projections, is smaller than this threshold, it plans a broadcast hash join; otherwise it falls back to a sort-merge join. The logic is a direct cost comparison. Broadcasting a table of $b$ bytes to $E$ executors moves $b \cdot E$ bytes over the network, which is cheap when $b$ is small. Shuffling two tables of sizes $S_L$ and $S_R$ moves roughly $S_L + S_R$ bytes, which is enormous when both are large. Broadcasting wins precisely when</p>
+$$b \cdot E \;\ll\; S_L + S_R,$$
+<p>and since $E$ is at most a few hundred while $S_L + S_R$ can be terabytes, a small $b$ makes the left side of that inequality tiny. The threshold encodes a safe value of $b$ below which the broadcast is always worth it.</p>
+<p>Two practical wrinkles matter. First, the estimate can be wrong. If Spark lacks column statistics, it may overestimate a table's size and skip a broadcast that would have been ideal, or underestimate it and attempt a broadcast that runs the driver out of memory. Second, you can override the optimizer with an explicit hint when you know better than the statistics do, which we show in the library shortcut below. The threshold and the hint together give you both an automatic default and a manual escape hatch.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Join Strategy Is a Bet on One Number</div>
+<p>Every Spark join is, underneath, a single decision: is one side small enough to broadcast? If yes, you pay $b \cdot E$ bytes of network and no shuffle. If no, you pay $S_L + S_R$ bytes of shuffle, sorting, and the risk of skew. The entire art of fast joins is making the small side genuinely small (filter and project before the join so the broadcast estimate shrinks) and giving the optimizer accurate statistics so its bet is informed. A broadcast join that should have fired but did not is one of the most common causes of a Spark job that is ten times slower than it needs to be.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: broadcast() and the AQE Settings</div>
+<p>You rarely implement a join strategy by hand in Spark; you hint and configure. The <code>broadcast()</code> function forces a broadcast hash join regardless of the size estimate, and a handful of <code>spark.sql.adaptive</code> settings let the runtime fix skew on its own. The illustrative snippet below shows both:</p>
+<pre><code class="language-python">from pyspark.sql.functions import broadcast
+
+# Force a broadcast hash join: ship `profiles` to every executor, no shuffle of events.
+joined = events.join(broadcast(profiles), on="user_id", how="inner")
+
+# Let the runtime detect and split skewed partitions during the shuffle.
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+# Raise the auto-broadcast threshold to 64 MB when executors have the memory.
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", 64 * 1024 * 1024)
+</code></pre>
+<div class="code-caption"><strong>Code 7.7.1:</strong> The production join controls. One <code>broadcast()</code> wrapper pins the strategy; three config lines hand the skew problem to Adaptive Query Execution. What would be hundreds of lines of manual partitioning, replication, and straggler detection collapses into a hint and three settings, with Spark handling the network transport, hash-table construction, and runtime partition splitting internally.</div>
+</div>
+
+<h2>3. The Shuffle Is the Dominant Cost <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Why does the sort-merge join cost so much more than the broadcast join? Because of the shuffle, the same all-to-all data exchange that powered the reduce phase of MapReduce in <a href="../module-06-mapreduce-distributed-algorithms/section-6.5.html">Section 6.5</a>. A shuffle writes every row to local disk, partitioned by destination, then transfers those partitions across the network to the tasks that will consume them. For a cluster with $T$ tasks, a shuffle is a quadratic communication pattern: in principle every task can send data to every other task, so the number of transfer streams scales as $T^2$. Each row pays for serialization, a disk write on the map side, a network hop, and a disk read and deserialization on the reduce side. Computation, by contrast, is often just a comparison or a hash lookup per row. The ratio is lopsided enough that for most join-heavy and aggregation-heavy jobs, the shuffle dominates the wall-clock time.</p>
+<p>This is the same lesson that runs through the whole book, seen from the data-processing side: communication is the tax on distribution. In <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a> we model that tax with an alpha-beta cost equation; here it appears as the concrete bytes a shuffle moves. The MapReduce shuffle of <a href="../module-06-mapreduce-distributed-algorithms/section-6.5.html">Section 6.5</a> returns later still as the gradient all-reduce of data-parallel training in <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>, where the "shuffle" of a training step is the all-reduce that synchronizes gradients. Same primitive, same dominant cost, different payload.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The 200-Partition Mystery</div>
+<p>For years, Spark users wondered why their shuffles always produced exactly 200 partitions regardless of data size. The answer is a single default, <code>spark.sql.shuffle.partitions = 200</code>, chosen long ago and never tuned to your data. On a tiny dataset it spawns 200 nearly empty tasks; on a huge one it makes each task swallow far too much. Adaptive Query Execution finally retired the mystery by coalescing those partitions to a sensible count at runtime, which is why turning AQE on often speeds up a job you never explicitly tuned.</p>
+</div>
+
+<h2>4. Data Skew: When One Key Stalls the Stage <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A shuffle assumes the keys are roughly evenly distributed, so that each of the $T$ tasks receives about $1/T$ of the rows. Real data rarely cooperates. A "country" key is dominated by a few populous countries; a "user_id" join against an events table is dominated by a handful of power users and bots; a "null" key absorbs every unmatched row. When one key carries most of the rows, the shuffle sends most of the data to the single task that owns that key, and that task becomes a straggler: it runs long after its peers have finished, and the stage cannot complete until it does. This is exactly the straggler phenomenon introduced in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.7.html">Section 2.7</a>, now arising from data rather than from a slow machine. A stage is only as fast as its slowest task, so a single hot key can make a 64-machine cluster run at the speed of one core.</p>
+<p>The demonstration below makes the straggler visible without a real cluster. It builds a left table whose join key is heavily skewed (one "hot" key carries 92 percent of the rows) and models the shuffle that a sort-merge join performs: each row goes to task $\text{hash(key)} \bmod T$. It counts the rows landing on each task, then applies <strong>salting</strong>, the standard fix, in which the hot key is split into many sub-keys by appending a random salt, so its rows fan out across all tasks instead of piling onto one. The small right side is replicated once per salt value so the matches still find each other.</p>
+<pre><code class="language-python">from collections import Counter
+import random, hashlib
+
+NUM_TASKS = 8
+HOT_KEY = "country=US"
+
+# Left side (events) with a heavily skewed join key: one hot key dominates.
+left_rows = []
+for i in range(1_000_000):
+    if i % 100 < 92:                 # 92% of rows carry the hot key
+        left_rows.append(HOT_KEY)
+    else:
+        left_rows.append(f"country=C{i % 200}")   # 200 cold keys
+
+def task_of(key):
+    """A shuffle sends every row with a given key to one task: hash(key) % T.
+    A seed-independent hash (md5) is used so this demo reproduces exactly."""
+    h = int.from_bytes(hashlib.md5(key.encode()).digest()[:4], "big")
+    return h % NUM_TASKS
+
+# Plain sort-merge join: partition by the raw key.
+plain = Counter(task_of(k) for k in left_rows)
+
+# Salted join: the hot key splits into SALT sub-keys that hash independently,
+# so its rows fan out across tasks; the small right side is replicated per salt.
+SALT = 4 * NUM_TASKS
+random.seed(0)
+
+def task_of_salted(key):
+    if key == HOT_KEY:
+        return task_of(f"{key}#{random.randrange(SALT)}")
+    return task_of(key)
+
+salted = Counter(task_of_salted(k) for k in left_rows)
+</code></pre>
+<div class="code-caption"><strong>Code 7.7.2:</strong> A skewed join and its salting fix in pure Python. <code>plain</code> models the per-task row counts of an unsalted sort-merge join; <code>salted</code> splits the hot key into <code>SALT</code> independent sub-keys so the same rows spread across every task. No Spark is needed to see the load imbalance and its repair.</div>
+<pre><code class="language-text">rows=1,000,000  tasks=8  distinct keys=17
+
+BEFORE salting (sort-merge join, hot key on one task):
+  task 0: 940,000  ########################################
+  task 1:       0
+  task 2:   5,000
+  task 3:   5,000
+  task 4:  10,000
+  task 5:  20,000  #
+  task 6:   5,000
+  task 7:  15,000  #
+  busiest task holds  94.0% of all rows (perfect balance = 12.5%)
+
+AFTER salting the hot key across all tasks:
+  task 0: 221,181  ########################################
+  task 1: 143,832  ##########################
+  task 2:  91,141  ################
+  task 3:  62,429  ###########
+  task 4: 153,820  ############################
+  task 5: 106,385  ###################
+  task 6: 148,576  ###########################
+  task 7:  72,636  #############
+  busiest task holds  22.1% of all rows (perfect balance = 12.5%)
+</code></pre>
+<div class="code-caption"><strong>Output 7.7.2:</strong> Before salting, task 0 holds 94 percent of all rows and becomes the straggler that stalls the stage; the other seven tasks finish almost immediately and wait. After salting, the busiest task holds 22.1 percent, the hot key now spread across the cluster instead of crushing one task. The balance is not yet perfect because the salt count is finite, but the straggler is gone.</div>
+<p>The numbers tell the whole story. With the raw key, one task carries 94 percent of the work while task 1 sits completely idle; the stage runs at the speed of that one overloaded task. After salting, no task exceeds 23 percent, and the work is spread across all eight. The same logical join now finishes in a fraction of the time, because no single task is the bottleneck. Figure 7.7.2 visualizes this before-and-after rebalance.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two bar charts. The left chart shows one tall bar and seven tiny bars, a single overloaded straggler task. The right chart shows eight bars of similar moderate height after salting spreads the hot key.">
+<style>
+.axis77 { stroke:#5a626c; stroke-width:1.4; }
+.barhot { fill:#b86b1f; }
+.barok { fill:#14385c; }
+.barbal { fill:#3a7d5d; }
+.cap77 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.tick77 { font:10px sans-serif; fill:#5a626c; text-anchor:middle; }
+.note77 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+</style>
+<text class="cap77" x="215" y="24">Before salting: one straggler</text>
+<line class="axis77" x1="60" y1="210" x2="380" y2="210"/>
+<rect class="barok" x="66" y="206" width="32" height="4"/>
+<rect class="barhot" x="104" y="40" width="32" height="170"/>
+<rect class="barok" x="142" y="204" width="32" height="6"/>
+<rect class="barok" x="180" y="207" width="32" height="3"/>
+<rect class="barok" x="218" y="208" width="32" height="2"/>
+<rect class="barok" x="256" y="208" width="32" height="2"/>
+<rect class="barok" x="294" y="208" width="32" height="2"/>
+<rect class="barok" x="332" y="209" width="32" height="1"/>
+<text class="tick77" x="120" y="34">94%</text>
+<text class="note77" x="215" y="246">task 0 holds nearly all rows;</text>
+<text class="note77" x="215" y="262">the other seven wait for it</text>
+<line x1="430" y1="20" x2="430" y2="280" stroke="#cbd2da" stroke-width="1.5" stroke-dasharray="4 4"/>
+<text class="cap77" x="645" y="24">After salting: balanced</text>
+<line class="axis77" x1="490" y1="210" x2="810" y2="210"/>
+<rect class="barbal" x="496" y="170" width="32" height="40"/>
+<rect class="barbal" x="534" y="122" width="32" height="88"/>
+<rect class="barbal" x="572" y="83" width="32" height="127"/>
+<rect class="barbal" x="610" y="117" width="32" height="93"/>
+<rect class="barbal" x="648" y="127" width="32" height="83"/>
+<rect class="barbal" x="686" y="100" width="32" height="110"/>
+<rect class="barbal" x="724" y="100" width="32" height="110"/>
+<rect class="barbal" x="762" y="92" width="32" height="118"/>
+<text class="tick77" x="588" y="77">22%</text>
+<text class="note77" x="645" y="246">the hot key fans out across tasks;</text>
+<text class="note77" x="645" y="262">no single straggler remains</text>
+</svg>
+<figcaption><strong>Figure 7.7.2:</strong> The salting rebalance from Output 7.7.2, drawn as per-task load. Before salting (left), task 0 towers over the rest at 94 percent of all rows while seven tasks sit nearly empty, a textbook straggler. After salting (right), the hot key's rows fan out so the busiest task holds only 22 percent and the cluster works in parallel. The bars need not be exactly equal; eliminating the single tall bar is what recovers the speed.</figcaption>
+</figure>
+<p>Salting is the manual fix, and it is worth understanding because it shows exactly what the runtime does for you. The three mitigations in practice are: <strong>broadcast the small side</strong> when it fits, which sidesteps the shuffle and therefore the skew entirely; <strong>salt the hot key</strong> when both sides are large, as above; and <strong>let Adaptive Query Execution split the skewed partition</strong> at runtime, which automates the salting without a code change. We turn to that automated path next.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Feature Join That Ran All Night</div>
+<p><strong>Who:</strong> A data engineer building the training-feature table for a fraud-detection model at a payments company.</p>
+<p><strong>Situation:</strong> A nightly Spark job joined two billion transaction events against an account-features table on <code>account_id</code>, producing the labeled feature set the model trained on each morning.</p>
+<p><strong>Problem:</strong> The job's final stage routinely ran for six hours, with the Spark UI showing 199 tasks finished in under two minutes and one task still running for the remaining six hours.</p>
+<p><strong>Dilemma:</strong> Throw more executors at the job (which would not help, since one task was the bottleneck and idle executors cannot share its load), or diagnose why a single task carried almost all the work.</p>
+<p><strong>Decision:</strong> They inspected the join key and found a sentinel <code>account_id = 0</code> assigned to every guest checkout, which accounted for 80 percent of all events; the join was funneling all of them to one task, a straggler exactly as in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.7.html">Section 2.7</a>.</p>
+<p><strong>How:</strong> They enabled <code>spark.sql.adaptive.skewJoin.enabled</code> and, because the features table was under 50 megabytes after projection, also raised the broadcast threshold so the join became a broadcast hash join with no shuffle at all.</p>
+<p><strong>Result:</strong> The stage fell from six hours to eleven minutes, and the morning model retraining stopped missing its deployment window.</p>
+<p><strong>Lesson:</strong> A slow Spark stage with one long-running task is almost never a shortage of machines; it is skew. Look at the key distribution first, then broadcast or split before you scale the cluster.</p>
+</div>
+
+<h2>5. Adaptive Query Execution Repairs Skew at Runtime <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Salting works, but it requires you to know the hot key in advance and to rewrite the join. Adaptive Query Execution (AQE), enabled by default since Spark 3.2, removes both requirements. AQE re-optimizes a query plan using statistics gathered at runtime, after each shuffle has written its data and the true partition sizes are known rather than estimated. For skew specifically, AQE compares each shuffle partition against the median partition size; when a partition is both far larger than the median and above an absolute byte threshold, AQE splits that one oversized partition into several smaller sub-partitions and runs them as separate tasks. This is salting performed automatically and only where it is needed, with the matching side replicated to preserve correctness. AQE also coalesces the many tiny partitions left by the default 200-partition setting and can switch a planned sort-merge join to a broadcast join once it sees a side is small enough, all without a code change.</p>
+<p>The relevant settings are <code>spark.sql.adaptive.enabled</code> and <code>spark.sql.adaptive.skewJoin.enabled</code> from Code 7.7.1, plus <code>spark.sql.adaptive.skewJoin.skewedPartitionFactor</code> (how many times the median a partition must exceed to count as skewed, default 5) and <code>spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes</code> (the absolute floor, default 256 megabytes). A partition is treated as skewed only when it crosses both bars, which prevents AQE from over-splitting on a dataset that merely has a few moderately uneven partitions.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Vectorized Engines and Smarter Skew Handling (2024 to 2026)</div>
+<p>Two active lines are reshaping the shuffle. The first is the move to vectorized, native execution engines: Databricks Photon (Behm et al., 2022) rewrites Spark's row-at-a-time SQL operators as columnar, SIMD-accelerated C++ kernels, and the open-source efforts Apache Gluten and Apache DataFusion Comet (2024 to 2025) push the same vectorized execution into community Spark, cutting the per-row serialization cost that makes shuffles expensive. The second is smarter, data-aware skew handling: recent work pushes AQE toward sampling key distributions earlier and choosing per-join salt factors automatically, and toward push-based shuffle (Magnet, merged into Spark 3.2) that pre-merges shuffle blocks on the reduce side to cut the $T^2$ small-fetch overhead. The throughline is that the shuffle remains the cost center of distributed data processing, so the frontier is making each shuffled byte cheaper and making skewed bytes rarer. We meet the same pressure again as gradient compression in distributed training in <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>.</p>
+</div>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Shuffle Is the Scale-Out Tax, Again</div>
+<p>The shuffle behind a sort-merge join is the same all-to-all exchange that this book keeps returning to. It is the reduce-side data movement of MapReduce in <a href="../module-06-mapreduce-distributed-algorithms/section-6.5.html">Section 6.5</a>, the all-reduce that synchronizes gradients in data-parallel training in <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>, and the all-to-all that routes tokens between experts in mixture-of-experts models later in Part IV. Each time, the lesson is identical: distribution buys you parallel compute but charges you for moving data between machines, and the engineering that matters is minimizing and balancing that movement. Skew is what happens when the movement is not balanced, and salting, broadcasting, and AQE are three ways to rebalance it.</p>
+</div>
+<p>With joins, shuffles, and skew understood, you have the core of Spark performance tuning: most slow jobs are a missed broadcast or an unhandled hot key, and both now have names and fixes. The next section turns from tuning Spark for general data work to using it specifically for AI: assembling training features, preprocessing at scale, and feeding distributed model training, which <a href="section-7.8.html">Section 7.8</a> takes up.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.7.1: Pick the Join Strategy <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each join, state whether Spark should use a broadcast hash join or a sort-merge join, and why: (a) a 5-terabyte clickstream table joined against a 2-megabyte table of campaign metadata; (b) two 800-gigabyte tables of user events from different sources joined on <code>user_id</code>; (c) a 1-terabyte orders table joined against a 40-megabyte products table when <code>spark.sql.autoBroadcastJoinThreshold</code> is left at its 10-megabyte default. For (c), name the one config change that would convert a slow sort-merge join into a fast broadcast join, and the risk it introduces.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.7.2: Measure and Mitigate Skew <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 7.7.2 so that the right (dimension) side is modeled too: give the hot key one matching row and replicate it once per salt value, then verify that the salted join still produces the same total number of matched pairs as the unsalted join (correctness must survive the rebalance). Next, sweep the salt factor over the values 1, 2, 8, 32, and 128 and plot or print the busiest task's share at each. Explain the diminishing returns you observe and why an unboundedly large salt factor is not free.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.7.3: When Does Broadcast Beat Shuffle? <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the cost comparison $b \cdot E \ll S_L + S_R$ from Section 2, suppose you have $E = 200$ executors, a large left table of $S_L = 2{,}000$ gigabytes, and a right table you can shrink by filtering and projecting. At what right-table size $b$ does the broadcast cost $b \cdot E$ equal the shuffle cost $S_L + b$? Below that crossover, broadcasting moves less total data; above it, shuffling does. Compute the crossover $b$, compare it to the 10-megabyte default threshold, and explain why Spark's default is far more conservative than the raw break-even point. We make this kind of network-cost estimate rigorous in <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-7.6.html"><span class="nav-label">Previous</span><span class="nav-num">Section 7.6</span><span class="nav-title">Partitioning and Caching</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 7</span><span class="nav-num">Contents</span><span class="nav-title">Spark and Distributed DataFrames</span></a>
+<a class="next" href="section-7.8.html"><span class="nav-label">Next</span><span class="nav-num">Section 7.8</span><span class="nav-title">PySpark for AI Workloads</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

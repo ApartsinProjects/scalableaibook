@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 17.3: Routing and Gating. How tokens choose experts in a mixture-of-experts layer, why the gate is a small learned softmax with hard top-k selection, and how token-choice and expert-choice routing trade load balance against token coverage." name="description"/>
+<title>Section 17.3: Routing and Gating | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 17: Expert Parallelism and Sparse Distributed Models</a></div>
+<h1>Routing and Gating</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They told me I was free to choose any expert I wanted. Then they told me seven of them were full, the eighth was on another continent, and my gradient was due in 40 milliseconds."</p>
+<cite>A Token Awaiting Its Assignment</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A mixture-of-experts layer is only as good as the small learned function that decides, for every token, which experts compute on it; that function, the gate, is a one-line softmax whose discrete top-$k$ output silently dictates load balance, training stability, and which machine each token must travel to.</strong> The previous section built the MoE layer and showed that sparsity buys capacity without buying proportional compute. This section opens the box that makes the sparsity work: the router. We will see that routing is a hard, non-differentiable selection wrapped around a differentiable score, that the choice between letting tokens pick experts or letting experts pick tokens is the difference between skewed and balanced load, and that the routing decision is not an internal detail but a network-placement decision, because the chosen expert may live on a different node. Get the gate wrong and the model collapses onto a few experts or thrashes its assignments every step; get it right and a trillion-parameter model trains on the compute budget of a much smaller dense one.</p>
+</div>
+<p>In <a href="section-17.2.html">Section 17.2</a> we assembled the mixture-of-experts layer: a bank of $E$ independent feed-forward networks (the experts) plus a gate that activates only a few of them per token. The layer's promise, capacity that grows with $E$ while per-token compute stays fixed, rests entirely on the gate making good, cheap decisions. This section is about that gate. It is the most delicate component in the whole sparse design, because a single small matrix decides, token by token, where computation happens and therefore where data must move. A poorly behaved gate does not merely waste capacity; it can route nearly every token to the same one or two experts, leaving the rest idle and the model effectively dense and tiny. Understanding why that happens, and the routing variants invented to prevent it, is the prerequisite for everything that follows: load balancing (<a href="section-17.6.html">Section 17.6</a>), capacity limits (<a href="section-17.7.html">Section 17.7</a>), and the all-to-all shuffle that physically delivers tokens to experts on other machines (<a href="section-17.5.html">Section 17.5</a>).</p>
+
+<h2>1. The Gate Is a Tiny Learned Softmax <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The gate, also called the router, is almost embarrassingly small. For an MoE layer with $E$ experts operating on token representations of dimension $d$, the gate is a single linear map $W_g \in \mathbb{R}^{d \times E}$, often with no bias and no nonlinearity of its own. Given a token's hidden vector $x \in \mathbb{R}^d$, the gate produces one score per expert and turns those scores into a distribution:</p>
+$$h = x^{\top} W_g \in \mathbb{R}^{E}, \qquad p_i = \mathrm{softmax}(h)_i = \frac{e^{h_i}}{\sum_{j=1}^{E} e^{h_j}}.$$
+<p>The vector $p$ assigns a probability to each expert, but the layer does not run all $E$ experts; that would forfeit the entire point of sparsity. Instead it selects the top $k$ experts by score (typically $k = 1$ or $k = 2$), routes the token only to those, and combines their outputs weighted by the corresponding gate probabilities. Writing $\mathcal{T}_k(h)$ for the index set of the $k$ largest entries of $h$, the layer output for token $x$ is</p>
+$$y = \sum_{i \in \mathcal{T}_k(h)} \frac{p_i}{\sum_{j \in \mathcal{T}_k(h)} p_j}\, E_i(x),$$
+<p>where $E_i$ is the $i$-th expert network. The renormalization in the denominator keeps the surviving gate weights summing to one, so an unrouted expert contributes nothing and the kept experts share full responsibility for the token. This is the standard "noisy top-$k$ gating" recipe from the work that revived MoE for deep learning (Shazeer et al., 2017), minus the noise, which we add in Section 4. The whole router is a few thousand parameters bolted onto a layer that may hold billions, yet it governs the behavior of all of them.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Gate Decides Placement, Not Just Computation</div>
+<p>In a dense layer, every token follows the same path through the same weights on the same device. In an MoE layer, the gate's top-$k$ output is simultaneously a compute decision (which experts run) and a placement decision (which devices those experts live on). Because experts are sharded across nodes (<a href="section-17.4.html">Section 17.4</a>), the moment the gate names an expert it has implicitly named a destination machine for that token. The router is therefore the only component in deep learning whose forward pass schedules network traffic. This is why a gate that sends 21% of tokens to one expert is not just a statistical imbalance; it is a hot link in the cluster and a straggler waiting to happen.</p>
+</div>
+
+<h2>2. Why the Hard Selection Hurts: Gradients Through a Discrete Choice <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Softmax is smooth and differentiable; the top-$k$ that follows it is neither. Selecting the $k$ largest scores is a discrete, piecewise-constant operation: nudge a token's hidden vector by an infinitesimal amount and the chosen expert set usually does not change at all, then suddenly flips when one score overtakes another. The selection itself has a gradient of zero almost everywhere and is undefined at the ties. This is the central awkwardness of routing, and it shapes how the gate learns.</p>
+<p>The practical resolution is that gradients flow only through the experts that were actually chosen, and they reach the gate only through the continuous weights $p_i$ that multiply those experts' outputs. Concretely, the backward pass treats the index set $\mathcal{T}_k(h)$ as a fixed, non-differentiable mask for the current step, while the gate probabilities $p_i$ of the selected experts remain live numbers in the computation graph. So the router does receive a learning signal: if expert $i$ produced a useful output for this token, the loss pushes $p_i$ up, which pushes the corresponding logit $h_i$ up, which makes the gate more likely to select expert $i$ for similar tokens next time. What the gate never directly learns is the counterfactual, how an unchosen expert would have performed, because that expert was never run. A token only ever gets feedback about the roads it took, never the roads it skipped. This one-sidedness is exactly what drives the instabilities in Section 5, and it is why exploration (Section 4) has to be injected deliberately rather than emerging on its own.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A diagram with three stages on top showing a token vector mapped through a gate matrix to per-expert scores, then softmaxed, then top-k selected to two experts. Below, two routing schemes are contrasted: token-choice where each token picks its top experts producing uneven expert loads, and expert-choice where each expert picks its top tokens producing perfectly even loads.">
+<defs>
+<marker id="arr173" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b173 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w173 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g173 { fill:#eaf6ee; stroke:#1f7a44; stroke-width:1.6; }
+.hot173 { fill:#fbe4e4; stroke:#b03030; stroke-width:1.6; }
+.t173 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s173 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.hd173 { font:700 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.l173 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr173); }
+</style>
+<!-- top pipeline -->
+<text class="hd173" x="430" y="22">The gate: score, softmax, then hard top-k select</text>
+<rect class="b173" x="40" y="44" width="80" height="44" rx="8"/>
+<text class="t173" x="80" y="62">token x</text>
+<text class="s173" x="80" y="78">d-vector</text>
+<line x1="120" y1="66" x2="160" y2="66" class="l173"/>
+<rect class="b173" x="160" y="44" width="96" height="44" rx="8"/>
+<text class="t173" x="208" y="62">gate W_g</text>
+<text class="s173" x="208" y="78">d x E linear</text>
+<line x1="256" y1="66" x2="296" y2="66" class="l173"/>
+<rect class="b173" x="296" y="40" width="120" height="52" rx="8"/>
+<text class="s173" x="356" y="58">scores h, softmax p</text>
+<text class="s173" x="356" y="76">[.41 .07 .22 .30 ...]</text>
+<line x1="416" y1="66" x2="456" y2="66" class="l173"/>
+<rect class="g173" x="456" y="40" width="120" height="52" rx="8"/>
+<text class="t173" x="516" y="60">top-k select</text>
+<text class="s173" x="516" y="78">keep k best</text>
+<line x1="576" y1="66" x2="616" y2="66" class="l173"/>
+<rect class="w173" x="616" y="40" width="96" height="24" rx="6"/>
+<text class="s173" x="664" y="56">expert 0</text>
+<rect class="w173" x="616" y="68" width="96" height="24" rx="6"/>
+<text class="s173" x="664" y="84">expert 3</text>
+<text class="s173" x="772" y="58">chosen</text>
+<text class="s173" x="772" y="74">k=2</text>
+<!-- divider -->
+<line x1="40" y1="118" x2="820" y2="118" stroke="#c4ccd6" stroke-width="1" stroke-dasharray="4 4"/>
+<!-- token-choice -->
+<text class="hd173" x="225" y="146">Token-choice: each token picks its top experts</text>
+<text class="s173" x="225" y="164">load follows the gate, which can skew hard</text>
+<rect class="b173" x="60" y="178" width="40" height="22" rx="5"/><text class="s173" x="80" y="193">t1</text>
+<rect class="b173" x="60" y="206" width="40" height="22" rx="5"/><text class="s173" x="80" y="221">t2</text>
+<rect class="b173" x="60" y="234" width="40" height="22" rx="5"/><text class="s173" x="80" y="249">t3</text>
+<rect class="b173" x="60" y="262" width="40" height="22" rx="5"/><text class="s173" x="80" y="277">t4</text>
+<text class="s173" x="80" y="300">tokens</text>
+<rect class="hot173" x="300" y="178" width="86" height="30" rx="6"/><text class="s173" x="343" y="197">expert 0 (busy)</text>
+<rect class="g173" x="300" y="214" width="86" height="22" rx="6"/><text class="s173" x="343" y="229">expert 1</text>
+<rect class="g173" x="300" y="242" width="86" height="22" rx="6"/><text class="s173" x="343" y="257">expert 2</text>
+<rect class="b173" x="300" y="270" width="86" height="16" rx="6"/><text class="s173" x="343" y="282">expert 3 idle</text>
+<path class="l173" d="M 100 189 L 296 191"/>
+<path class="l173" d="M 100 217 L 296 195"/>
+<path class="l173" d="M 100 245 L 296 224"/>
+<path class="l173" d="M 100 273 L 296 251"/>
+<!-- expert-choice -->
+<text class="hd173" x="635" y="146">Expert-choice: each expert picks its top tokens</text>
+<text class="s173" x="635" y="164">every expert takes exactly C, load is flat</text>
+<rect class="b173" x="470" y="178" width="40" height="22" rx="5"/><text class="s173" x="490" y="193">t1</text>
+<rect class="b173" x="470" y="206" width="40" height="22" rx="5"/><text class="s173" x="490" y="221">t2</text>
+<rect class="b173" x="470" y="234" width="40" height="22" rx="5"/><text class="s173" x="490" y="249">t3</text>
+<rect class="b173" x="470" y="262" width="40" height="22" rx="5"/><text class="s173" x="490" y="277">t4</text>
+<text class="s173" x="490" y="300">tokens</text>
+<rect class="g173" x="700" y="178" width="86" height="24" rx="6"/><text class="s173" x="743" y="194">expert 0 (C)</text>
+<rect class="g173" x="700" y="208" width="86" height="24" rx="6"/><text class="s173" x="743" y="224">expert 1 (C)</text>
+<rect class="g173" x="700" y="238" width="86" height="24" rx="6"/><text class="s173" x="743" y="254">expert 2 (C)</text>
+<rect class="g173" x="700" y="268" width="86" height="24" rx="6"/><text class="s173" x="743" y="284">expert 3 (C)</text>
+<path class="l173" d="M 510 189 L 696 190"/>
+<path class="l173" d="M 510 217 L 696 220"/>
+<path class="l173" d="M 510 245 L 696 250"/>
+<path class="l173" d="M 510 273 L 696 280"/>
+<text class="s173" x="635" y="320">a token wanted by no expert is dropped</text>
+<text class="s173" x="225" y="320">no token is dropped, but experts overflow</text>
+</svg>
+<figcaption><strong>Figure 17.3.1:</strong> The router pipeline and the two routing regimes. Top: a token vector $x$ is mapped by the gate $W_g$ to per-expert scores, softmaxed into $p$, and reduced to the $k$ highest-scoring experts by a hard, non-differentiable top-$k$. Bottom left: token-choice routing lets each token select its experts, so expert load tracks the gate distribution and can collapse onto a few experts (expert 0 hot, expert 3 idle). Bottom right: expert-choice routing lets each expert select exactly $C$ tokens, making load perfectly flat by construction but dropping tokens that no expert ranked highly. The measured load skew of both regimes appears in Output 17.3.1.</figcaption>
+</figure>
+
+<h2>3. Two Ways to Match Tokens and Experts <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>So far we have described token-choice routing: each token looks at its gate scores and picks its own top-$k$ experts. This is the standard, the formulation used by the GShard and Switch Transformer line of work, and it has an intuitive appeal, every token goes where it most wants to go. Its weakness is equally intuitive. Because each token chooses independently and the gate is shared, nothing stops a large fraction of tokens from all preferring the same expert. The load on each expert is an emergent statistic of the gate, not a controlled quantity, and gates left to themselves tend to concentrate. An expert that receives twice its fair share of tokens becomes the slowest stage in the layer, and on a real cluster it is a single overloaded device that the other devices wait for.</p>
+<p>Expert-choice routing (Zhou et al., 2022) inverts the selection to fix this at the source. Instead of every token picking its experts, every expert picks its tokens. Each expert is given a fixed capacity $C$ (a number of token slots) and selects the $C$ tokens that score it highest. Because every expert takes exactly $C$ tokens, the per-expert load is perfectly uniform by construction; there is no balancing loss to tune and no possibility of an overloaded expert. The cost is symmetric to token-choice's: a token that no expert ranks within its top $C$ receives no expert at all and is dropped (passed through by a residual connection), while a token loved by many experts can be processed several times. Token-choice can overload an expert but never starves a token; expert-choice can starve a token but never overloads an expert. The demo in Section 6 measures exactly this trade.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Dinner-Party Seating Problem</div>
+<p>Token-choice is a dinner where every guest walks to whichever table looks best. The popular table ends up with thirty people standing and three tables sit empty. Expert-choice is a dinner where every table has exactly eight chairs and the hosts hand out the chairs to whoever they like most. No table is over capacity, but a few wallflowers nobody invited end up eating in the hallway. Real MoE systems are still arguing, paper by paper, about which kind of party to throw.</p>
+</div>
+
+<h2>4. Noisy Top-k Gating: Buying Exploration on Purpose <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Recall from Section 2 that the gate only ever learns about experts it actually used. Early in training this is dangerous: whichever experts happen to score slightly higher at initialization get all the tokens, get all the gradient, improve fastest, and score even higher, a rich-get-richer loop that can lock the layer onto a handful of experts before the others ever run. The original fix, and still a common one, is to add learned noise to the gate scores before the top-$k$ selection:</p>
+$$h_i = (x^{\top} W_g)_i + \varepsilon_i \cdot \mathrm{softplus}\big((x^{\top} W_{\text{noise}})_i\big), \qquad \varepsilon_i \sim \mathcal{N}(0, 1).$$
+<p>The noise term perturbs the ranking just enough that an expert which is currently second-best sometimes wins the slot, runs on the token, and produces a gradient that lets the gate discover whether it was actually any good. A second learned matrix $W_{\text{noise}}$ controls how much noise each token injects, so the model can be exploratory where it is uncertain and decisive where it is confident. This is direct exploration bought at the price of a little routing randomness, and it matters most in the opening phase of training when the gate's preferences are still arbitrary. As training proceeds the useful experts genuinely pull ahead and the noise becomes a minor jitter rather than a coin flip. The mechanism is the gating analogue of the exploration-exploitation balance that recurs throughout distributed learning, and it is worth keeping in mind that without it, a top-$k$ gate has no built-in reason to ever try an expert it has not already favored.</p>
+
+<h2>5. The Two Failure Modes: Collapse and Fluctuation <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Two instabilities haunt every router, and naming them precisely is half the cure. The first is representation collapse (also called routing collapse): the gate learns to send nearly all tokens to a small subset of experts. The remaining experts, starved of tokens, never receive gradient, never improve, and the model's effective capacity shrinks to the few experts in use, defeating the entire purpose of the sparse layer. Collapse is the equilibrium that the rich-get-richer loop of Section 4 reaches if nothing opposes it. The standard countermeasure is an auxiliary load-balancing loss that penalizes uneven expert utilization, which we develop in full in <a href="section-17.6.html">Section 17.6</a>; expert-choice routing sidesteps collapse entirely by making balance structural rather than learned.</p>
+<p>The second failure mode is router fluctuation: the expert assigned to a given token keeps changing from step to step as the gate weights wobble during training. Each time a token's preferred expert flips, the token's representation is suddenly shaped by a different expert with different parameters, which destabilizes the experts downstream (they keep seeing a shifting distribution of inputs) and slows convergence. Fluctuation is most acute when several experts have nearly equal gate scores for a token, so a tiny weight update tips the top-$k$ from one to another. Modern training recipes damp it with router z-losses that keep gate logits small and well-separated, and with careful learning-rate schedules for the gate. Collapse is too much agreement (everything to a few experts); fluctuation is too little (assignments that will not settle). A healthy router lives between them, and keeping it there is an active subject of research.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Loss-Free and Structurally Balanced Routing (2024 to 2026)</div>
+<p>The auxiliary load-balancing loss that prevents collapse also fights the main objective, since pushing tokens toward underused experts can override where they would most usefully go. A vigorous 2024 to 2026 line removes that tension. DeepSeek's auxiliary-loss-free balancing (Wang et al., 2024, used in DeepSeek-V3) drops the balancing loss entirely and instead maintains a per-expert bias term that is nudged up for underloaded experts and down for overloaded ones, balancing the load through the routing decision itself without ever perturbing the gradient of the language-model loss. In parallel, expert-choice routing (Zhou et al., 2022) and its descendants make balance a structural guarantee rather than a soft penalty, and sparse-upcycling and fine-grained-expert designs (as in DeepSeekMoE and Qwen's MoE variants) shrink each expert so that top-$k$ selects from a larger, more granular pool, which empirically reduces both collapse and fluctuation. The throughline is a move away from bolting a balancing loss onto a token-choice gate and toward routing schemes that are balanced by their own construction. We quantify the load skew these methods target in Output 17.3.1.</p>
+</div>
+
+<h2>6. Demo: Token-Choice Skews, Expert-Choice Balances <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The cleanest way to feel the difference between the two routing regimes is to run both on the same batch and look at the resulting per-expert load. The code below builds a deliberately biased gate (two experts made intrinsically more attractive, the collapse pressure of Section 5), then routes 4096 tokens two ways: token-choice top-$1$, where each token picks its single best expert, and expert-choice with capacity $C = T/E$, where each expert claims its top $C$ tokens. It reports, for each scheme, the per-expert load fractions, the coefficient of variation (standard deviation over mean, zero when perfectly balanced), and for expert-choice the fraction of tokens left unserved. Everything is plain NumPy; there is no framework and no GPU, so the routing logic is fully visible.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+T, D, E, k = 4096, 64, 8, 1          # tokens, model dim, experts, top-k
+
+# A batch of token representations and a learned gate (router) weight matrix.
+X = rng.standard_normal((T, D))
+# Bias the gate so a few experts are intrinsically more attractive: this is the
+# representation-collapse pressure the section warns about.
+W_gate = rng.standard_normal((D, E))
+W_gate[:, 0] += 1.8                  # expert 0 made artificially appealing
+W_gate[:, 3] += 1.1                  # expert 3 too
+
+def softmax(z, axis):
+    z = z - z.max(axis=axis, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(axis=axis, keepdims=True)
+
+scores = X @ W_gate                  # (T, E) raw gate logits
+probs = softmax(scores, axis=1)      # per-token distribution over experts
+
+# ---- Token-choice top-k routing: each token picks its own top-k experts. ----
+topk = np.argsort(-scores, axis=1)[:, :k]      # (T, k) chosen experts per token
+tc_load = np.bincount(topk.reshape(-1), minlength=E)
+
+# ---- Expert-choice routing: each expert picks its top-C tokens. ----
+# Capacity per expert so total picks match token-choice: C = T*k / E.
+C = (T * k) // E
+ec_load = np.zeros(E, dtype=int)
+covered = np.zeros(T, dtype=bool)
+for e in range(E):
+    order = np.argsort(-scores[:, e])          # tokens this expert wants most
+    chosen = order[:C]
+    ec_load[e] = len(chosen)
+    covered[chosen] = True
+
+def stats(load):
+    load = np.asarray(load, dtype=float)
+    frac = load / load.sum()
+    cv = load.std() / load.mean()              # coefficient of variation
+    return frac, cv, load.max() / load.mean()
+
+tc_frac, tc_cv, tc_max = stats(tc_load)
+ec_frac, ec_cv, ec_max = stats(ec_load)
+
+np.set_printoptions(precision=3, suppress=True)
+print("tokens T, experts E, top-k :", T, E, k)
+print("expert-choice capacity C   :", C, "tokens per expert")
+print()
+print("token-choice load (counts):", tc_load)
+print("token-choice load (frac)  :", tc_frac)
+print(f"token-choice  CV={tc_cv:.3f}  max/mean={tc_max:.3f}  busiest expert={tc_frac.max():.1%} of tokens")
+print()
+print("expert-choice load (counts):", ec_load)
+print("expert-choice load (frac)  :", ec_frac)
+print(f"expert-choice CV={ec_cv:.3f}  max/mean={ec_max:.3f}  busiest expert={ec_frac.max():.1%} of tokens")
+print()
+print(f"tokens left unserved by expert-choice : {int((~covered).sum())} of {T} ({(~covered).mean():.1%})")
+</code></pre>
+<div class="code-caption"><strong>Code 17.3.1:</strong> Token-choice top-$k$ gating and expert-choice routing on one batch, sharing the same biased gate, compared by per-expert load. <code>tc_load</code> is what each expert receives when tokens choose; <code>ec_load</code> is what each expert receives when experts choose; <code>covered</code> tracks which tokens expert-choice left unserved.</div>
+<pre><code class="language-text">tokens T, experts E, top-k : 4096 8 1
+expert-choice capacity C   : 512 tokens per expert
+
+token-choice load (counts): [872 387 469 548 343 517 600 360]
+token-choice load (frac)  : [0.213 0.094 0.115 0.134 0.084 0.126 0.146 0.088]
+token-choice  CV=0.315  max/mean=1.703  busiest expert=21.3% of tokens
+
+expert-choice load (counts): [512 512 512 512 512 512 512 512]
+expert-choice load (frac)  : [0.125 0.125 0.125 0.125 0.125 0.125 0.125 0.125]
+expert-choice CV=0.000  max/mean=1.000  busiest expert=12.5% of tokens
+
+tokens left unserved by expert-choice : 1476 of 4096 (36.0%)</code></pre>
+<div class="code-caption"><strong>Output 17.3.1:</strong> With eight experts, a perfectly balanced gate would send 12.5% of tokens to each. Token-choice sends 21.3% to the biased expert 0, which is 1.7 times its fair share, and as little as 8.4% to the least popular expert, a coefficient of variation of 0.32. Expert-choice flattens the load to an exact 12.5% everywhere (CV of 0.00), but 36% of tokens fall outside every expert's top-512 and go unserved. The skew of token-choice and the coverage gap of expert-choice are the two costs Section 17.6 and Section 17.7 manage.</div>
+<p>The numbers make the trade concrete. Token-choice respects every token's preference and serves all 4096, but its busiest expert does 1.7 times the work of an average one, and on a real cluster that single expert is the device every other device waits for at the all-to-all barrier. Expert-choice gives perfect load balance for free, no auxiliary loss and no tuning, but at this capacity it drops more than a third of the tokens. Neither is strictly better; the choice depends on whether your bottleneck is straggling devices (favor expert-choice) or token coverage and simplicity (favor token-choice with a balancing loss). This is the seam where routing meets the systems layer, and it is why the next section moves from "which expert" to "which machine".</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Production Router in a Few Lines</div>
+<p>Code 17.3.1 spelled out the gate, the softmax, and the selection so the mechanism is visible. In a real model you do not hand-roll routing; a library gives you a configured MoE layer whose router, capacity handling, and balancing loss are already wired. The token-choice gate of Code 17.3.1 is essentially these lines, with the framework adding the dispatch and combine tensors that physically move tokens to experts (<a href="section-17.5.html">Section 17.5</a>):</p>
+<pre><code class="language-python"># Megatron-Core / Tutel-style top-k router; the heavy lifting is one config + one call.
+import torch
+import torch.nn.functional as F
+
+class TopKRouter(torch.nn.Module):
+    def __init__(self, d_model, num_experts, k):
+        super().__init__()
+        self.gate = torch.nn.Linear(d_model, num_experts, bias=False)
+        self.k = k
+    def forward(self, x):                     # x: (tokens, d_model)
+        logits = self.gate(x)                 # (tokens, num_experts)
+        probs = F.softmax(logits, dim=-1)
+        weights, experts = probs.topk(self.k, dim=-1)   # hard top-k select
+        weights = weights / weights.sum(dim=-1, keepdim=True)  # renormalize
+        return experts, weights               # who runs, and with what weight
+</code></pre>
+<div class="code-caption"><strong>Code 17.3.2:</strong> The same token-choice gate as Code 17.3.1 expressed as a reusable module. Frameworks such as Megatron-Core, Tutel, and DeepSpeed-MoE wrap this with capacity-aware dispatch, the load-balancing loss of <a href="section-17.6.html">Section 17.6</a>, and the all-to-all of <a href="section-17.5.html">Section 17.5</a>, so a working distributed MoE layer is a constructor call rather than the dozens of lines those pieces would take by hand.</div>
+</div>
+
+<h2>7. From Routing Decision to Network Hop <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Everything in this section has treated routing as a question of which experts compute on a token. In a distributed MoE that question is inseparable from a second one: where does the token have to go? When the $E$ experts are sharded across many devices, as they must be once the layer is too large for one accelerator, the gate's top-$k$ output is a list of destination devices, and the token's hidden vector must be physically shipped to each chosen expert's device, processed there, and shipped back to be combined. This is the all-to-all communication pattern, the third member of the collective family alongside the all-reduce of <a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a> and the reduce-scatter of <a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>, and it is the subject of <a href="section-17.5.html">Section 17.5</a>. The reason load balance matters so much, the reason this section spent so long on collapse and capacity, is that an unbalanced router turns this all-to-all into a traffic jam: the device holding the popular expert receives a flood of tokens while others sit idle, and the whole layer runs at the speed of its busiest hop. Routing quality and communication cost are the same problem viewed from two ends.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Expert That Ate the Cluster</div>
+<p><strong>Who:</strong> An ML systems engineer bringing up a 64-expert MoE language model on a 64-GPU pod, one expert per device.</p>
+<p><strong>Situation:</strong> Training ran at a third of the throughput the FLOP budget predicted, and the profiler showed every device idling at the all-to-all barrier for most of each step.</p>
+<p><strong>Problem:</strong> Token-choice top-$2$ routing had collapsed onto a few experts; one device was receiving roughly five times the average token count while a dozen experts saw almost none.</p>
+<p><strong>Dilemma:</strong> Add an auxiliary load-balancing loss and retune its weight against the language-model loss, risking a quality regression, or switch to expert-choice routing and accept that some tokens would be dropped.</p>
+<p><strong>Decision:</strong> They first added a load-balancing loss, which evened the load but cost perplexity; they then moved to a loss-free bias-adjustment router (the DeepSeek-style scheme from the research-frontier box) that balanced load without touching the gradient.</p>
+<p><strong>How:</strong> They replaced the gate's hard top-$k$ with a per-expert bias nudged each step toward the underloaded experts, exactly the structural-balance idea this section argues for, and left the language-model loss untouched.</p>
+<p><strong>Result:</strong> Per-expert load skew (the max-over-mean of Output 17.3.1) fell from about 5.0 to under 1.1, the all-to-all barrier stalls vanished, and throughput rose to near the FLOP-predicted ceiling with no perplexity penalty.</p>
+<p><strong>Lesson:</strong> A router's load distribution is a systems metric, not just a statistic; an imbalanced gate manifests as an idle cluster, and balancing it through the routing decision beats balancing it through the loss.</p>
+</div>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Data Parallelism's Sparse Cousin Needs a New Collective</div>
+<p>Dense data-parallel training (<a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a>) sends the same computation to every worker and combines with all-reduce, the exact, group-agnostic sum from Section 1.1. Expert parallelism is its sparse cousin: it sends different computation to different workers, chosen per token by the gate, and so it cannot use a symmetric all-reduce. It needs an all-to-all, a collective in which each device sends a different slice to every other device. The router you built in this section is precisely what decides the contents of that all-to-all. This is the book's recurring move (a primitive returns, scaled out) playing out one more time: the same instinct that made data parallelism exact now demands a routing layer and a new collective to make sparse parallelism work at all. We trace the exact-versus-approximate consequences of that shift in <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a> and <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.3.1: Where Does the Gradient Go? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A token is routed top-$2$ to experts 3 and 5 with gate probabilities $p_3 = 0.7$ and $p_5 = 0.3$ (after renormalization over the chosen pair). Expert 1 had probability $p_1 = 0.25$ before selection but was not chosen. During the backward pass for this token, which of the gate logits $h_1, h_3, h_5$ receive a gradient, and which do not? Explain in one or two sentences why the discrete top-$2$ selection contributes a zero gradient almost everywhere, and why this is exactly the reason the noisy gating of Section 4 has to be added by hand rather than learned for free.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.3.2: Tune the Capacity Knob <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 17.3.1 so the expert-choice capacity is $C = \lfloor 1.5 \cdot T / E \rfloor$ (a capacity factor of 1.5 rather than 1.0). Recompute the fraction of unserved tokens and the new per-expert load (it will no longer be a flat 12.5% because experts may now share tokens). Then sweep the capacity factor from 1.0 to 2.0 in steps of 0.25 and plot, or print, unserved-token fraction against capacity factor. At what capacity factor does the unserved fraction fall below 5%, and what does the extra capacity cost in redundant expert compute? Relate your finding to the capacity-factor discussion of <a href="section-17.7.html">Section 17.7</a>.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.3.3: Price the Imbalance as a Straggler <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the token-choice load from Output 17.3.1, suppose each of the 8 experts lives on its own device, every device processes its assigned tokens at the same per-token rate, and the layer cannot finish until the slowest device finishes (the all-to-all barrier of <a href="section-17.5.html">Section 17.5</a>). If a perfectly balanced layer would take time $T_{\text{bal}}$, estimate how much longer the token-choice layer takes, expressed as a multiple of $T_{\text{bal}}$, using the busiest expert's share. Then argue from the coefficient of variation why adding more experts (larger $E$) tends to make this straggler penalty worse, not better, unless the router is balanced. Connect your reasoning to the Amdahl-style cost models of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-17.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 17.2</span><span class="nav-title">The Mixture-of-Experts Layer</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 17</span><span class="nav-num">Contents</span><span class="nav-title">Expert Parallelism and Sparse Distributed Models</span></a>
+<a class="next" href="section-17.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 17.4</span><span class="nav-title">Expert Parallelism: Sharding Experts Across Nodes</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

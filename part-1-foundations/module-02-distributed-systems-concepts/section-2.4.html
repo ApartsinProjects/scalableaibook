@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 2.4: Fault Tolerance and Recovery. Why failure is the norm at scale, the failure models that matter, the independent-failure math that drives P(at least one node down) toward one, and the recovery mechanisms (checkpoint/restart, re-execution, lineage, replication) that keep large jobs alive." name="description"/>
+<title>Section 2.4: Fault Tolerance and Recovery | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Distributed AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 2: Distributed Systems Concepts for AI</a></div>
+<h1>Fault Tolerance and Recovery</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"On one machine, failure was an event. On ten thousand machines, failure became the weather, and I had to learn to forecast it."</p>
+<cite>A Coordinator That Stopped Counting on Luck</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>At the scale where distributed AI lives, individual components do not fail occasionally; something is broken almost all of the time, so correctness can no longer assume that every machine completes its work.</strong> A job on one server either runs to the end or it does not, and you simply rerun it. A job on a thousand servers runs inside a population where, at any given moment, a disk is full, a link is congested, or a process has just died. The arithmetic of independent failure makes this unavoidable: even very reliable nodes, multiplied by enough of them, guarantee that some node is down. This section establishes the failure models worth designing against, derives the probability that pushes failure from a rare event to the expected case, and surveys the four recovery mechanisms (checkpoint/restart, deterministic re-execution, lineage, and replication) that every later chapter reuses to keep large jobs alive.</p>
+</div>
+<p>In the previous section we partitioned data and parameters across machines so that no single node had to hold everything. That very partitioning is what now exposes us to failure. The moment a computation depends on $K$ machines instead of one, its success depends on all $K$ of them staying up long enough, and the more machines we recruit to go faster, the more ways the whole has to break. This is the central tension of scale-out: the same multiplicity that buys throughput also multiplies the failure surface. Fault tolerance is the discipline of buying back reliability that distribution spent, and it is not optional infrastructure bolted on at the end; it is a property you design for from the first line, because a training run that cannot survive a single preempted worker will not survive a week on a real cluster.</p>
+<p>We proceed in three moves. First we name the ways a component can fail, from the merciful (it simply stops) to the malicious (it lies). Then we do the short calculation that turns "failures are rare" into "failures are certain," which is the reason this section exists at all. Finally we walk the recovery mechanisms, each one a different answer to the question "how do we make progress survive a death," and we trace each forward to the chapter where distributed AI puts it to work.</p>
+
+<h2>1. The Failure Models Worth Designing Against <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Not all failures are the same, and the cost of tolerating one depends sharply on how badly it can misbehave. Distributed systems theory orders failure models from weakest (easiest to tolerate) to strongest (hardest), and choosing the right model for your setting is the difference between a design that is robust and one that is needlessly expensive. The four models that matter for distributed AI are crash-stop, omission, partition, and Byzantine, summarized in Table 2.4.1.</p>
+<p>In the <strong>crash-stop</strong> (or fail-stop) model, a node works correctly until some instant and then halts permanently, producing no further output. A worker whose machine loses power, whose process is killed by the out-of-memory reaper, or whose spot instance is reclaimed by the cloud provider all behave this way: they were correct, then they were gone. This is the friendliest model, because a survivor can safely assume that anything it did not hear from the dead node simply never happened, and almost all production training systems are designed against exactly this assumption.</p>
+<p>The <strong>omission</strong> model is slightly harder: a node or link drops some messages but not others, so a request or a gradient update can silently vanish without the sender crashing. Closely related, and the dominant headache in practice, is the <strong>network partition</strong>, in which a working group of nodes is split into subgroups that can each talk internally but cannot reach each other. The cruelty of a partition is that, from inside each subgroup, the nodes on the other side are indistinguishable from crashed: you cannot tell "it died" from "I cannot reach it." This ambiguity is the seed of the consistency dilemmas that <a href="section-2.5.html">Section 2.5</a> formalizes as the CAP trade-off.</p>
+<p>The <strong>Byzantine</strong> model is the strongest and the rarest: a node may behave arbitrarily, sending different and even maliciously crafted messages to different peers, whether from a bug, corrupted memory, or an actual adversary. Tolerating Byzantine faults is expensive (classical agreement needs more than two-thirds of nodes honest) and most data-center training quite reasonably assumes it away. It returns as a first-class concern only where participants are untrusted, most prominently in federated learning, where a malicious client can poison the global model by reporting a corrupted gradient; the Byzantine-robust aggregation rules that defend against this are developed in <a href="../../part-7-infrastructure/module-35-reliable-secure-distributed-ai/index.html">Chapter 35</a>.</p>
+<div class="table-caption"><strong>Table 2.4.1:</strong> The four failure models, ordered from easiest to hardest to tolerate, with the distributed-AI setting where each one binds. A system designed against a stronger model also tolerates all weaker ones, at higher cost.</div>
+<table>
+<thead>
+<tr><th scope="col">Model</th><th scope="col">What the faulty node does</th><th scope="col">Where it binds in distributed AI</th></tr>
+</thead>
+<tbody>
+<tr><td>Crash-stop</td><td>Works correctly, then halts forever</td><td>Spot-instance preemption, OOM kills, power loss (the default assumption)</td></tr>
+<tr><td>Omission</td><td>Silently drops some messages</td><td>Lossy networks, overloaded parameter servers dropping updates</td></tr>
+<tr><td>Partition</td><td>Splits into groups that cannot reach each other</td><td>Rack or switch failure; "is it dead or unreachable?" ambiguity</td></tr>
+<tr><td>Byzantine</td><td>Behaves arbitrarily, may lie to different peers</td><td>Federated learning with untrusted clients; gradient poisoning</td></tr>
+</tbody>
+</table>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Match the Failure Model to the Threat, Not to Paranoia</div>
+<p>The strength of failure model you tolerate is a cost decision, not a measure of caution. Designing a data-center training job against the Byzantine model would multiply its cost for protection it does not need, because the machines are yours and the threat is a dead worker, not a lying one. Designing a federated system against only crash-stop would leave it open to a single poisoned client. The skill is to identify the weakest model that still covers the faults your environment actually produces, then design exactly to it: crash-stop for the cluster you own, Byzantine-robust only where you do not trust the participants.</p>
+</div>
+
+<h2>2. Why Failure Becomes Certain: The Independent-Failure Math <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The reason fault tolerance is unavoidable at scale is not engineering pessimism; it is arithmetic. Suppose each node, over some window of operation, fails independently with a small probability $p$. A cluster has $K$ such nodes. The probability that a <em>particular</em> node survives the window is $1 - p$, and because the failures are independent, the probability that <em>all</em> $K$ survive is the product of the individual survival probabilities,</p>
+$$P(\text{all } K \text{ survive}) = (1 - p)^K.$$
+<p>The quantity we actually care about, the probability that the job is disrupted by at least one failure, is the complement,</p>
+$$P(\text{at least one of } K \text{ fails}) = 1 - (1 - p)^K.$$
+<p>This expression is small for small $K$ but climbs toward $1$ as $K$ grows, and it climbs fast. For tiny $p$ we can read off the rate of climb with the approximation $(1-p)^K \approx e^{-pK}$, so the failure probability is roughly $1 - e^{-pK}$; once the product $pK$ reaches the order of $1$, disruption is more likely than not. The expected number of failed nodes is even simpler, $\mathbb{E}[\text{failures}] = pK$ by linearity of expectation, which makes the threshold concrete: when you have enough nodes that you expect on average one of them to fail in a window, you must plan for failures within that window. The code below tabulates both quantities for a fixed per-node failure probability across realistic cluster sizes.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A curve of the probability that at least one node fails, rising from near zero at small cluster size toward one as the number of nodes grows, with the crossover where failure becomes more likely than not marked near one hundred nodes.">
+<defs>
+<marker id="arr24" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.ax24 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr24); }
+.gr24 { stroke:#e3e8ef; stroke-width:1; }
+.cv24 { fill:none; stroke:#b86b1f; stroke-width:2.8; }
+.t24  { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s24  { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.dash24 { fill:none; stroke:#14385c; stroke-width:1.3; stroke-dasharray:5 4; }
+</style>
+<!-- gridlines -->
+<line class="gr24" x1="110" y1="60"  x2="780" y2="60"/>
+<line class="gr24" x1="110" y1="130" x2="780" y2="130"/>
+<line class="gr24" x1="110" y1="200" x2="780" y2="200"/>
+<line class="gr24" x1="110" y1="270" x2="780" y2="270"/>
+<!-- axes -->
+<line class="ax24" x1="110" y1="300" x2="800" y2="300"/>
+<line class="ax24" x1="110" y1="300" x2="110" y2="40"/>
+<!-- y labels -->
+<text class="s24" x="92" y="304" text-anchor="end">0.0</text>
+<text class="s24" x="92" y="234" text-anchor="end">0.25</text>
+<text class="s24" x="92" y="164" text-anchor="end">0.5</text>
+<text class="s24" x="92" y="94"  text-anchor="end">0.75</text>
+<text class="s24" x="92" y="64"  text-anchor="end">1.0</text>
+<!-- x labels (log-spaced ticks) -->
+<text class="s24" x="110" y="320">1</text>
+<text class="s24" x="278" y="320">10</text>
+<text class="s24" x="446" y="320">100</text>
+<text class="s24" x="614" y="320">1,000</text>
+<text class="s24" x="782" y="320">10,000</text>
+<!-- the curve 1 - (1-p)^K, p=0.01, x mapped on log scale of K -->
+<!-- sampled points: K=1..10000 on log axis x=110+168*log10(K), y=300-280*P -->
+<path class="cv24" d="M 110,297.2 L 278,273.2 L 446,122.5 L 614,60.1 L 782,60.0"/>
+<!-- crossover marker at P=0.5 -->
+<line class="dash24" x1="110" y1="160" x2="430" y2="160"/>
+<line class="dash24" x1="430" y1="160" x2="430" y2="300"/>
+<circle cx="430" cy="160" r="4.5" fill="#b86b1f"/>
+<text class="s24" x="430" y="150">crossover: failure more likely than not</text>
+<text class="t24" x="455" y="30">P(at least one of K nodes fails), per-node p = 0.01</text>
+<text class="t24" x="455" y="352">cluster size K (log scale)</text>
+<text class="t24" x="34" y="170" transform="rotate(-90 34 170)">P(&#8805;1 failure)</text>
+</svg>
+<figcaption><strong>Figure 2.4.1:</strong> The failure-probability curve $1 - (1-p)^K$ for a per-node failure probability $p = 0.01$, plotted against cluster size $K$ on a logarithmic axis. At $K = 1$ the disruption probability equals $p$; by $K \approx 100$ it has crossed one half (the marked crossover), and by $K = 1000$ it is essentially one. The numbers behind this curve are produced by Code 2.4.1 and printed in Output 2.4.1.</figcaption>
+</figure>
+<pre><code class="language-python">import math
+
+# Each node fails independently in a time window with probability p.
+# With K independent nodes, P(no node fails) = (1-p)^K, so
+# P(at least one fails) = 1 - (1-p)^K, and E[failures] = p*K.
+p = 0.01  # 1% chance a single node fails during the window
+print("Per-node failure probability p =", p)
+print(f"{'K':&gt;7} | {'P(&gt;=1 fails)':&gt;14} | {'E[failures]':&gt;12}")
+print("-" * 40)
+for K in [1, 10, 100, 1000, 10000]:
+    p_any  = 1.0 - (1.0 - p) ** K        # complement of all-survive
+    e_fail = K * p                        # expected number of dead nodes
+    print(f"{K:&gt;7} | {p_any:&gt;14.6f} | {e_fail:&gt;12.2f}")
+</code></pre>
+<div class="code-caption"><strong>Code 2.4.1:</strong> Computing the disruption probability and the expected failure count as a function of cluster size, directly from the independent-failure identity. No simulation is needed; the closed form is exact.</div>
+<pre><code class="language-text">Per-node failure probability p = 0.01
+      K |   P(&gt;=1 fails) |  E[failures]
+----------------------------------------
+      1 |       0.010000 |         0.01
+     10 |       0.095618 |         0.10
+    100 |       0.633968 |         1.00
+   1000 |       0.999957 |        10.00
+  10000 |       1.000000 |       100.00
+</code></pre>
+<div class="code-caption"><strong>Output 2.4.1:</strong> A per-node failure chance of just one percent gives a single machine excellent odds, but at one thousand machines the probability that some machine fails is $0.999957$, and at ten thousand it rounds to one. This is the curve of Figure 2.4.1 in numbers.</div>
+<p>Read the table from top to bottom and the thesis of this entire section appears as a column. At one node, you can ignore failure and rerun on the rare bad day. At one hundred nodes, a job is disrupted more often than not, and you expect to lose one machine per window on average. At one thousand nodes, disruption is a near certainty on every run, and the question is no longer <em>whether</em> a worker dies during your job but how many and how often. A training run that takes hours on thousands of accelerators will, with overwhelming probability, outlive at least one of its workers, so the recovery machinery of the next section is not insurance against an unlikely event; it is the mechanism by which the job finishes at all.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Birthday Problem Wearing a Hard Hat</div>
+<p>The shape of $1 - (1-p)^K$ is the same shape that makes the birthday paradox feel surprising: a small per-item probability, compounded over enough items, becomes a near certainty far sooner than intuition expects. Twenty-three people suffice for a shared birthday to be more likely than not; about seventy nodes at one percent each suffice for a failure to be more likely than not. Operators who have run large clusters stop being surprised and start pre-allocating spare nodes, the cluster-engineering equivalent of not betting against a shared birthday in a crowded room.</p>
+</div>
+
+<h2>3. Four Ways to Make Progress Survive a Death <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Given that failures are certain, recovery is the art of ensuring that a node's death does not erase the work the cluster has already done. Four mechanisms dominate distributed AI, and they are best understood as four different answers to one question: what do we save, and how do we rebuild what was lost? They are checkpoint/restart, deterministic re-execution, lineage-based recovery, and replication. Most real systems combine several of them.</p>
+<p><strong>Checkpoint/restart</strong> is the most general and the most widely used in deep learning. At intervals the job writes its entire recoverable state (model parameters, optimizer moments, the data-loader position, the random-number-generator seeds) to durable storage. When any worker dies, the job restarts every worker from the most recent checkpoint and replays forward. Nothing about the computation needs to be deterministic or re-derivable; you simply paid, in advance, to be able to rewind. The cost is the wasted work between the last checkpoint and the crash, plus the time spent writing checkpoints that are never used, which sets up the optimization problem we solve in Section 4. This mechanism is the backbone of fault-tolerant training, and the elastic variant that resizes the worker set on the fly without losing the checkpoint is the subject of <a href="../../part-4-parallel-deep-learning/module-18-elastic-fault-tolerant-training/index.html">Chapter 18</a>.</p>
+<p><strong>Deterministic re-execution</strong> is cheaper when it applies. If a unit of work is a pure function of inputs that still exist somewhere, you do not need to have saved its output; you can simply run it again. This is the recovery model of MapReduce: each map and reduce task is deterministic over its input split, so when a worker dies, the scheduler reassigns its tasks to a survivor and reruns them from the durable input, with no global checkpoint at all. The completed work of other tasks is untouched. We develop this re-execution model and its shuffle in <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a>; its key limitation is that it demands determinism and re-readable inputs, which a long stateful training loop does not naturally provide.</p>
+<p><strong>Lineage-based recovery</strong> generalizes re-execution to a graph of transformations. Instead of remembering the data, the system remembers the <em>recipe</em>: the sequence of deterministic operations that produced each partition from durable source data. When a partition is lost, the system recomputes only that partition by replaying its slice of the recipe, not the whole job. This is exactly how Spark's Resilient Distributed Datasets recover; the lineage graph is the fault-tolerance mechanism, letting Spark avoid replicating intermediate data while still surviving the loss of any partition, as <a href="../../part-2-distributed-data/module-07-spark-dataframes/index.html">Chapter 7</a> details. Lineage is elegant precisely when the computation is a deep chain of deterministic transforms; it degrades when the chain is long and recomputation gets expensive, which is why Spark also offers optional checkpointing to truncate lineage.</p>
+<p><strong>Replication</strong> takes the opposite stance: rather than rebuild lost state, keep more than one copy of it so that a failure of one copy is invisible. A parameter shard held on three nodes survives the loss of two; a storage block written to three disks survives two disk failures. Replication trades storage and write bandwidth for instant recovery and continued availability during a failure, which is why it dominates the storage and serving tiers (the replicated parameter servers of <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a> are a clean example) even as checkpointing and lineage dominate the compute tier. Table 2.4.2 places the four mechanisms side by side.</p>
+<div class="table-caption"><strong>Table 2.4.2:</strong> The four recovery mechanisms, what each one stores in order to recover, and the distributed-AI system that exemplifies it. Real systems mix them: training checkpoints its compute state while replicating its storage.</div>
+<table>
+<thead>
+<tr><th scope="col">Mechanism</th><th scope="col">What it saves to recover</th><th scope="col">Recovers by</th><th scope="col">Exemplar</th></tr>
+</thead>
+<tbody>
+<tr><td>Checkpoint/restart</td><td>Full periodic snapshot of job state</td><td>Rewinding all workers to the last snapshot</td><td>Deep-learning training (Ch 18)</td></tr>
+<tr><td>Re-execution</td><td>Nothing; relies on durable inputs</td><td>Rerunning the deterministic failed task</td><td>MapReduce (Ch 6)</td></tr>
+<tr><td>Lineage</td><td>The recipe (graph of transforms)</td><td>Replaying only the lost partition's slice</td><td>Spark RDDs (Ch 7)</td></tr>
+<tr><td>Replication</td><td>Multiple live copies of the state</td><td>Reading from a surviving copy</td><td>Storage tiers, parameter servers (Ch 11)</td></tr>
+</tbody>
+</table>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Pretraining Run That Lost a Node Every Few Hours</div>
+<p><strong>Who:</strong> A systems engineer on a team pretraining a large language model on a 512-GPU cluster of preemptible cloud instances.</p>
+<p><strong>Situation:</strong> The full run was budgeted at three weeks of wall-clock time across all 512 workers, all data-parallel replicas of one model.</p>
+<p><strong>Problem:</strong> Preemptions and hardware faults killed a worker every few hours on average, and the original loop restarted the entire job from scratch on each death, so the run never progressed past two days before a failure reset it.</p>
+<p><strong>Dilemma:</strong> Checkpoint very often (paying a heavy write tax on every interval) to keep the lost-work small, or checkpoint rarely (cheap writes) and risk discarding many hours of compute on each crash; neither extreme finished in budget.</p>
+<p><strong>Decision:</strong> They adopted periodic checkpoint/restart with the interval set by the optimization in Section 4, and made restart elastic so a single dead worker no longer reset the others.</p>
+<p><strong>How:</strong> Every worker's parameters, optimizer state, and data-loader cursor were snapshotted to object storage; on a preemption, the launcher rebuilt the process group at the surviving size and resumed all workers from the latest snapshot rather than from step zero.</p>
+<p><strong>Result:</strong> The wasted-work overhead settled near five percent, each preemption cost minutes instead of days, and the run finished inside its three-week budget despite losing dozens of workers along the way.</p>
+<p><strong>Lesson:</strong> At a scale where failure is certain, the right question is never "how do we avoid it" but "how cheaply can we recover," and the answer is a checkpoint interval tuned to the failure rate, not the most frequent checkpointing you can afford.</p>
+</div>
+
+<h2>4. Tuning the Checkpoint Interval <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Checkpointing has a sweet spot. Checkpoint too often and you spend the run writing snapshots you will never read; checkpoint too rarely and each crash discards a large block of work. We can find the optimum with a short model, due in its first-order form to Young and refined by Daly. Let $C$ be the time to write one checkpoint, let the job's mean time to failure be $M$, and suppose we checkpoint every $T$ seconds. The overhead has two parts: a checkpoint tax of $C/T$ (the fraction of time spent writing) and an expected re-do cost of $T/(2M)$ (a failure lands on average halfway through an interval, so we lose about $T/2$ of work, scaled by the failure rate $1/M$). The total wasted-time fraction is</p>
+$$f(T) = \frac{C}{T} + \frac{T}{2M}.$$
+<p>Minimizing over $T$ by setting $f'(T) = -C/T^2 + 1/(2M) = 0$ gives the classic result that the optimal interval is the geometric balance of the two costs,</p>
+$$T^{\star} = \sqrt{2\,C\,M}, \qquad f(T^{\star}) = \sqrt{\frac{2C}{M}}.$$
+<p>The optimum is intuitive: checkpoint more often when writes are cheap or failures are frequent (small $M$), and less often when writes are expensive or the system is reliable. The code below evaluates this for a job that writes a checkpoint in 30 seconds and has a 6-hour mean time to failure.</p>
+<pre><code class="language-python"># Optimal checkpoint interval (Young/Daly first-order model).
+# Overhead f(T) = C/T + T/(2M): checkpoint tax + expected re-done work.
+# Minimized at T* = sqrt(2*C*M), giving min overhead sqrt(2C/M).
+C = 30.0          # seconds to write one checkpoint
+M = 6 * 3600.0    # job mean time to failure = 6 hours, in seconds
+T_opt = math.sqrt(2.0 * C * M)
+print(f"Checkpoint write cost C = {C:.0f} s, job MTTF M = {M/3600:.0f} h")
+print(f"Optimal interval T* = sqrt(2*C*M) = {T_opt:.0f} s (~{T_opt/60:.1f} min)")
+
+def overhead(T):
+    return C / T + T / (2.0 * M)
+
+print(f"\n{'T (s)':&gt;8} | {'overhead %':&gt;10}")
+print("-" * 24)
+for T in [120, 300, T_opt, 1200, 3600]:
+    print(f"{T:&gt;8.0f} | {overhead(T)*100:&gt;10.3f}")
+print(f"\nMinimum overhead at T* = {overhead(T_opt)*100:.3f} %")
+</code></pre>
+<div class="code-caption"><strong>Code 2.4.2:</strong> Solving for the optimal checkpoint interval and sweeping nearby intervals to show the overhead is minimized at $T^{\star} = \sqrt{2CM}$. The sweep makes the flatness of the optimum visible: being a little off is cheap, being far off is not.</div>
+<pre><code class="language-text">Checkpoint write cost C = 30 s, job MTTF M = 6 h
+Optimal interval T* = sqrt(2*C*M) = 1138 s (~19.0 min)
+
+   T (s) | overhead %
+------------------------
+     120 |     25.278
+     300 |     10.694
+    1138 |      5.270
+    1200 |      5.278
+    3600 |      9.167
+
+Minimum overhead at T* = 5.270 %
+</code></pre>
+<div class="code-caption"><strong>Output 2.4.2:</strong> For a 30-second checkpoint and a 6-hour MTTF, the optimal interval is about 19 minutes and the unavoidable overhead is roughly five percent. Checkpointing every two minutes wastes five times as much time as the optimum, all of it in writes nobody reads.</div>
+<p>Two lessons sit inside Output 2.4.2. First, the cost of over-checkpointing is real and large: dropping from the optimal 19-minute interval to a nervous 2-minute interval quintuples the overhead, because the write tax $C/T$ explodes as $T$ shrinks. Second, the optimum is broad and forgiving; intervals of 19 and 20 minutes differ by a hundredth of a percent, so you do not need $M$ precisely, only its order of magnitude. As clusters grow, $M$ falls (more nodes, more failures, exactly the math of Section 2), which pulls $T^{\star}$ down and pushes the floor overhead $\sqrt{2C/M}$ up. That rising floor is precisely the pressure behind the research on cheaper checkpoints below.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Asynchronous Checkpointing and Large-Job Resilience (2024 to 2026)</div>
+<p>Because the checkpoint tax $C/T$ grows as jobs scale and $M$ shrinks, an active research line attacks the cost $C$ itself. <em>Asynchronous and in-memory checkpointing</em> systems such as PyTorch's Distributed Checkpoint with asynchronous staging, CheckFreq, and Gemini (Wang et al., 2023) snapshot to a fast tier (host memory or a peer's memory) and flush to durable storage in the background, so the worker barely pauses; this drives the effective $C$ toward zero and lets jobs checkpoint far more often almost for free. A complementary thread targets <em>large-job resilience</em> directly: Meta's reporting on training Llama 3 on 16,000 GPUs documented a mean time between failures of only hours and motivated fast-restart and redundancy tooling, while Oobleck and Bamboo pursue <em>redundant pipeline replicas</em> that let a job continue through a failure without any restart at all, blending replication into the training tier. The common goal is to keep the floor overhead $\sqrt{2C/M}$ small even as $M$ collapses at extreme scale; we return to these elastic and redundant training methods with the machinery to evaluate them in <a href="../../part-4-parallel-deep-learning/module-18-elastic-fault-tolerant-training/index.html">Chapter 18</a>.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: torch.distributed.checkpoint Does the Snapshot for You</div>
+<p>In Code 2.4.2 we reasoned about the checkpoint interval but said nothing about the considerable work of actually snapshotting a sharded model spread across hundreds of workers: gathering each shard, writing it durably, and reloading it onto a possibly different number of workers after a restart. PyTorch's Distributed Checkpoint (DCP) handles all of that, including the asynchronous staging from the research frontier above, behind two calls:</p>
+<pre><code class="language-python">import torch.distributed.checkpoint as dcp
+
+# Save: each rank writes only its own shards in parallel to durable storage.
+dcp.save(state_dict, checkpoint_id="ckpt/step_5000")
+
+# Restart (possibly at a DIFFERENT world size): load reshards automatically.
+dcp.load(state_dict, checkpoint_id="ckpt/step_5000")
+</code></pre>
+<div class="code-caption"><strong>Code 2.4.3:</strong> Sharded, restart-safe checkpointing in two calls. The roughly hundred lines of gather, serialize, write, and reshard-on-load that a hand-rolled checkpointer needs collapse into <code>dcp.save</code> and <code>dcp.load</code>, which also handle parallel per-rank writes and the resharding that makes elastic restart (Chapter 18) possible.</div>
+</div>
+<p>We now have the full picture: the failure models that describe how a component can break, the independent-failure math that proves at least one will, and the four recovery mechanisms (with checkpoint/restart tuned by $T^{\star} = \sqrt{2CM}$) that turn a certain death into a survivable one. What we have quietly assumed throughout is that a survivor can always tell a dead node from a slow one and always agree with its peers on what state to recover to. A network partition breaks both assumptions, forcing a choice between staying consistent and staying available. That choice, and the staleness it produces in distributed training, is the subject of the next section.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.4.1: Read the Crossover Off the Curve <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the approximation $P(\text{at least one fails}) \approx 1 - e^{-pK}$ from Section 2, derive the cluster size $K$ at which disruption becomes more likely than not (set the expression equal to $\tfrac{1}{2}$ and solve for $K$). Evaluate it for $p = 0.01$ and confirm it lands near the crossover marked in Figure 2.4.1. Then explain in one sentence why halving $p$ roughly doubles that crossover size, and why that is weak comfort for someone trying to run on ten thousand nodes.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.4.2: Sweep the Checkpoint Interval Against Failure Rate <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 2.4.2 into a function <code>best_interval(C, M)</code> that returns $T^{\star}$ and the resulting overhead. Call it for a fixed $C = 30$ seconds across mean-time-to-failure values $M \in \{30\text{ min}, 1\text{ h}, 6\text{ h}, 24\text{ h}\}$, and tabulate $T^{\star}$ and the floor overhead $\sqrt{2C/M}$. Confirm numerically that as $M$ falls (more nodes, more failures), the optimal interval shrinks and the unavoidable overhead rises, and state what that implies for whether a 50,000-GPU job can afford a 30-second synchronous checkpoint at all.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.4.3: Match the Mechanism to the Workload <span class="exercise-type analysis">Analysis</span></div>
+<p>For each workload, name which of the four recovery mechanisms from Section 3 (checkpoint/restart, re-execution, lineage, replication) you would choose first, and argue why the other three fit worse: (a) a stateless batch job that tokenizes a 40-terabyte web crawl with deterministic per-shard tasks; (b) a stateful 1,000-GPU training loop whose optimizer state cannot be re-derived; (c) a chain of fifteen deterministic Spark transforms over durable source data; (d) an online parameter server that must keep serving reads during a node failure. Identify which workload could reasonably combine two mechanisms and say which two.</p>
+</div>
+
+<p>The next section turns the partition ambiguity we kept setting aside, the inability to tell a dead node from an unreachable one, into a precise statement about what a distributed system can and cannot guarantee, and connects it to the staleness that distributed training tolerates on purpose. Continue to <a href="section-2.5.html">Section 2.5: Consistency Models: From Parameter Staleness to the CAP Trade-off</a>.</p>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-2.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 2.3</span><span class="nav-title">Partitioning, Sharding, and Replication</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 2</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Systems Concepts for AI</span></a>
+<a class="next" href="section-2.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 2.5</span><span class="nav-title">Consistency Models: From Parameter Staleness to the CAP Trade-off</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

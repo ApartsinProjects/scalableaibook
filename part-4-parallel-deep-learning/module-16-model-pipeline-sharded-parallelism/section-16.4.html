@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 16.4: Sharded Data Parallelism: ZeRO Stages 1-3. How ZeRO removes the redundant copies of optimizer state, gradients, and parameters that every data-parallel worker stores, cutting per-device memory roughly like 1/K while keeping data parallelism's simplicity." name="description"/>
+<title>Section 16.4: Sharded Data Parallelism: ZeRO Stages 1-3 | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 16: Model, Pipeline, and Sharded Parallelism</a></div>
+<h1>Sharded Data Parallelism: ZeRO Stages 1-3</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I kept a full copy of the optimizer state, just like all 511 of my colleagues. Between us we stored the same numbers 512 times, and then we wondered why we ran out of memory."</p>
+<cite>A Data-Parallel Worker, Hoarding Redundantly</cite>
+</blockquote>
+<figure class="mental-model">
+<img src="images/mm-sharded-parallel.png" alt="Mental model: Sharded Data Parallelism (ZeRO/FSDP)" loading="lazy">
+<figcaption><strong>Mental model.</strong> Instead of replicating the whole model on every device, sharded data parallelism splits parameters, gradients, and optimizer state into disjoint shards, gathering each just in time and scattering it back to keep memory low.</figcaption>
+</figure>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Plain data parallelism is simple because every worker holds a full copy of the model, its gradients, and its optimizer state; that same redundancy is exactly why it runs out of memory on large models.</strong> The Zero Redundancy Optimizer (ZeRO) keeps the programming model of data parallelism but deletes the redundancy: each worker stores only a $1/K$ slice of the model state and re-assembles the full tensors on demand, just before they are needed, then frees them again. Three stages remove the redundancy in increasing measure: Stage 1 shards the optimizer state, Stage 2 also shards the gradients, Stage 3 also shards the parameters. Per-device memory falls roughly like $1/K$, so a model that could never fit on one accelerator suddenly fits across many, and the price is extra communication that turns out to be a familiar pair of collectives. This section shows what is sharded, what it costs to move, and why the trade-off is worth paying.</p>
+</div>
+<p>The previous section split a single model across devices by cutting it into tensor and pipeline stages, which changes the structure of the computation and demands that the model be carved up by hand. That works, but it gives up the great virtue of data parallelism from <a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a>: every worker runs the identical program on its own shard of the data, and the framework needs to know nothing about the model's internal structure. Sharded data parallelism asks whether we can keep that virtue and still fit a model far larger than one device, by attacking memory rather than computation. The answer is yes, and the idea is almost embarrassingly simple once stated: stop storing the same numbers on every worker.</p>
+<p>Recall the memory bill from training. For a model with $\Phi$ parameters trained with mixed-precision Adam, each worker in plain data parallelism holds an fp16 copy of the parameters ($2\Phi$ bytes), an fp16 copy of the gradients ($2\Phi$ bytes), and the optimizer state, which for Adam is an fp32 master copy of the weights plus the first and second moments ($4\Phi + 4\Phi + 4\Phi = 12\Phi$ bytes). That is $16\Phi$ bytes per worker, and the $12\Phi$ of optimizer state dominates. With $K$ workers, the cluster stores the same $16\Phi$ bytes $K$ times over. Every worker needs its own slice at any given instant, but no worker needs the whole thing all the time. ZeRO exploits exactly that gap.</p>
+
+<h2>1. The Redundancy in Plain Data Parallelism <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>In data-parallel training each of the $K$ workers processes a different micro-batch, computes a local gradient, and the workers combine those gradients with an all-reduce so that all of them apply the identical update and stay in lockstep. Because they stay in lockstep, every worker's parameters are identical, every worker's averaged gradient is identical, and after the optimizer step every worker's optimizer state is identical too. The workers are running $K$ exact replicas of the same state. That replication is what makes the method trivial to reason about, and it is pure waste: of the $16\Phi$ bytes a worker stores, only $16\Phi / K$ of it is information unique to that worker. The rest is a copy of what its neighbors already hold.</p>
+<p>The Zero Redundancy Optimizer, introduced by Rajbhandari and colleagues at Microsoft for the DeepSpeed library, observes that we can partition this replicated state across the workers so that worker $k$ is the sole owner of slice $k$, and reconstruct any full tensor only at the moment it is required for computation. The partition is purely a memory-placement decision; the arithmetic each worker performs on its own data is unchanged, which is why ZeRO preserves the data-parallel programming model exactly. The cost is that reconstructing a tensor that lives in pieces across the cluster requires moving those pieces, and freeing it afterward means moving them again next time. The whole design is a trade of memory for communication, and ZeRO offers it in three stages of increasing aggressiveness.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Each Worker Needs Its Shard, Not the Whole Replica</div>
+<p>Plain data parallelism keeps $K$ identical copies of the parameters, gradients, and optimizer state because that is convenient, not because it is necessary. At any single instant a worker needs only the slice of state relevant to the tensor it is currently touching. ZeRO turns "store everything everywhere, always" into "store your $1/K$ slice, and borrow the rest from your neighbors exactly when you need it." Memory drops toward $16\Phi / K$ per device; what you give back is the network traffic of borrowing.</p>
+</div>
+
+<h2>2. Three Stages: Sharding Optimizer State, Gradients, Parameters <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The three model-state components differ in how much memory they occupy and how often they are touched, so ZeRO shards them in order of payoff. Let $K$ be the number of data-parallel workers and write the per-device model-state memory at each stage. Plain data parallelism stores</p>
+$$M_{\text{DP}} = \underbrace{2\Phi}_{\text{params}} + \underbrace{2\Phi}_{\text{grads}} + \underbrace{12\Phi}_{\text{Adam state}} = 16\Phi \text{ bytes}.$$
+<p><strong>Stage 1 (ZeRO-1)</strong> shards the optimizer state, the largest term, leaving the parameters and gradients replicated:</p>
+$$M_1 = 2\Phi + 2\Phi + \frac{12\Phi}{K} = 4\Phi + \frac{12\Phi}{K}.$$
+<p><strong>Stage 2 (ZeRO-2)</strong> additionally shards the gradients, since each worker only needs the gradient slice corresponding to the optimizer slice it owns:</p>
+$$M_2 = 2\Phi + \frac{2\Phi}{K} + \frac{12\Phi}{K} = 2\Phi + \frac{14\Phi}{K}.$$
+<p><strong>Stage 3 (ZeRO-3)</strong> finally shards the parameters themselves, so that no full tensor is resident anywhere except transiently during its own computation:</p>
+$$M_3 = \frac{2\Phi}{K} + \frac{2\Phi}{K} + \frac{12\Phi}{K} = \frac{16\Phi}{K}.$$
+<p>The pattern is clean: each stage moves one more term from "replicated" to "divided by $K$." Stage 3 divides everything, so per-device memory falls like $1/K$ without bound, which is what makes trillion-parameter training possible on accelerators that individually hold only tens of gigabytes. Figure 16.4.1 shows the same progression as a picture: shaded blocks owned by one worker, faint blocks owned by neighbors.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Four columns showing how plain data parallelism and ZeRO stages 1, 2, and 3 partition optimizer state, gradients, and parameters across four workers. Solid blocks are owned by the highlighted worker; faint blocks are owned by other workers.">
+<defs>
+<marker id="arr164" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.hdr164 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.sub164 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.lab164 { font:11px sans-serif; fill:#5a626c; text-anchor:end; }
+.own164 { stroke:#14385c; stroke-width:1.2; }
+.opt164 { fill:#cfe0f0; }
+.grd164 { fill:#f7d9b8; }
+.par164 { fill:#cde8d4; }
+.faint164 { fill:#eef1f5; stroke:#c3cad3; stroke-width:1; }
+.tk164 { font:10px sans-serif; fill:#14385c; text-anchor:middle; }
+</style>
+<!-- legend -->
+<rect class="own164 opt164" x="40" y="14" width="16" height="14"/>
+<text class="sub164" x="62" y="25" text-anchor="start">optimizer state (12&#934;)</text>
+<rect class="own164 grd164" x="220" y="14" width="16" height="14"/>
+<text class="sub164" x="242" y="25" text-anchor="start">gradients (2&#934;)</text>
+<rect class="own164 par164" x="360" y="14" width="16" height="14"/>
+<text class="sub164" x="382" y="25" text-anchor="start">parameters (2&#934;)</text>
+<rect class="faint164" x="500" y="14" width="16" height="14"/>
+<text class="sub164" x="522" y="25" text-anchor="start">owned by another worker</text>
+
+<!-- row labels -->
+<text class="lab164" x="60" y="150">params</text>
+<text class="lab164" x="60" y="250">grads</text>
+<text class="lab164" x="60" y="350">opt</text>
+
+<!-- helper: each column has 4 cells per row across workers; the highlighted worker owns cell 1 -->
+<!-- Column 1: plain DP, everything replicated (highlighted worker holds full of each) -->
+<text class="hdr164" x="170" y="58">Plain DP</text>
+<text class="sub164" x="170" y="74">16&#934; per device</text>
+<rect class="own164 par164" x="80" y="120" width="180" height="40"/>
+<rect class="own164 grd164" x="80" y="220" width="180" height="40"/>
+<rect class="own164 opt164" x="80" y="320" width="180" height="40"/>
+<text class="tk164" x="170" y="145">full</text>
+<text class="tk164" x="170" y="245">full</text>
+<text class="tk164" x="170" y="345">full</text>
+
+<!-- Column 2: ZeRO-1, opt sharded -->
+<text class="hdr164" x="370" y="58">ZeRO-1</text>
+<text class="sub164" x="370" y="74">4&#934; + 12&#934;/K</text>
+<rect class="own164 par164" x="280" y="120" width="180" height="40"/>
+<rect class="own164 grd164" x="280" y="220" width="180" height="40"/>
+<rect class="own164 opt164" x="280" y="320" width="45" height="40"/>
+<rect class="faint164" x="325" y="320" width="45" height="40"/>
+<rect class="faint164" x="370" y="320" width="45" height="40"/>
+<rect class="faint164" x="415" y="320" width="45" height="40"/>
+<text class="tk164" x="302" y="345">1/K</text>
+
+<!-- Column 3: ZeRO-2, opt + grad sharded -->
+<text class="hdr164" x="570" y="58">ZeRO-2</text>
+<text class="sub164" x="570" y="74">2&#934; + 14&#934;/K</text>
+<rect class="own164 par164" x="480" y="120" width="180" height="40"/>
+<rect class="own164 grd164" x="480" y="220" width="45" height="40"/>
+<rect class="faint164" x="525" y="220" width="45" height="40"/>
+<rect class="faint164" x="570" y="220" width="45" height="40"/>
+<rect class="faint164" x="615" y="220" width="45" height="40"/>
+<rect class="own164 opt164" x="480" y="320" width="45" height="40"/>
+<rect class="faint164" x="525" y="320" width="45" height="40"/>
+<rect class="faint164" x="570" y="320" width="45" height="40"/>
+<rect class="faint164" x="615" y="320" width="45" height="40"/>
+<text class="tk164" x="502" y="245">1/K</text>
+<text class="tk164" x="502" y="345">1/K</text>
+
+<!-- Column 4: ZeRO-3, everything sharded -->
+<text class="hdr164" x="770" y="58">ZeRO-3</text>
+<text class="sub164" x="770" y="74">16&#934;/K</text>
+<rect class="own164 par164" x="680" y="120" width="45" height="40"/>
+<rect class="faint164" x="725" y="120" width="45" height="40"/>
+<rect class="faint164" x="770" y="120" width="45" height="40"/>
+<rect class="faint164" x="815" y="120" width="45" height="40"/>
+<rect class="own164 grd164" x="680" y="220" width="45" height="40"/>
+<rect class="faint164" x="725" y="220" width="45" height="40"/>
+<rect class="faint164" x="770" y="220" width="45" height="40"/>
+<rect class="faint164" x="815" y="220" width="45" height="40"/>
+<rect class="own164 opt164" x="680" y="320" width="45" height="40"/>
+<rect class="faint164" x="725" y="320" width="45" height="40"/>
+<rect class="faint164" x="770" y="320" width="45" height="40"/>
+<rect class="faint164" x="815" y="320" width="45" height="40"/>
+<text class="tk164" x="702" y="145">1/K</text>
+<text class="tk164" x="702" y="245">1/K</text>
+<text class="tk164" x="702" y="345">1/K</text>
+
+<line x1="80" y1="395" x2="860" y2="395" stroke="#c3cad3" stroke-width="1"/>
+<text class="sub164" x="470" y="416">left to right: each stage moves one more component from replicated (full) to sharded (1/K of it owned here)</text>
+</svg>
+<figcaption><strong>Figure 16.4.1:</strong> What each ZeRO stage shards, drawn for one highlighted worker out of $K$. Solid blocks are the slice this worker owns; faint blocks live on other workers. Plain data parallelism keeps every component full on every worker. ZeRO-1 splits the optimizer state, ZeRO-2 adds the gradients, and ZeRO-3 adds the parameters, so that by Stage 3 every component is divided by $K$ and per-device memory follows $16\Phi / K$.</figcaption>
+</figure>
+
+<h2>3. The Communication: All-Gather to Borrow, Reduce-Scatter to Return <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Sharding the parameters means no worker holds a full layer's weights at rest, yet computing that layer's output needs all of its weights. ZeRO-3 resolves this with a just-in-time dance. Right before a layer runs in the forward pass, the workers <strong>all-gather</strong> its parameter shards so that every worker briefly holds the complete layer; the layer computes; then each worker frees the parts it does not own, dropping back to its $1/K$ slice. The backward pass all-gathers the same parameters again to compute gradients, then the freshly computed gradients are combined and partitioned in one step with a <strong>reduce-scatter</strong>, so that worker $k$ ends up holding exactly the summed gradient slice for the parameters it owns and can apply its slice of the optimizer step locally.</p>
+<p>This is the moment the thesis thread of the whole book reappears. In <a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a> plain data parallelism combined gradients with a single all-reduce. A ring all-reduce is internally exactly a reduce-scatter followed by an all-gather, as built in <a href="../../part-1-foundations/module-04-communication-primitives/section-4.5.html">Section 4.5</a>. ZeRO does not invent a new collective; it splits the all-reduce back into its two halves and uses each half where the sharded layout needs it: reduce-scatter to land each gradient slice on its owner, all-gather to reconstruct parameters on demand. The same primitive from Section 1.3 of Chapter 1, scaled out one more way.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: All-Reduce, Taken Apart and Reused</div>
+<p>The gradient all-reduce of data-parallel training is not a single irreducible operation; it is a reduce-scatter (sum partial gradients, leaving each worker one slice) followed by an all-gather (broadcast the slices back into a full vector). ZeRO keeps the reduce-scatter half to deposit each gradient slice on its owner, and re-spends the all-gather half on the parameters instead, gathering them just before they are used. The identity <em>reduce-scatter + all-gather = all-reduce</em> from <a href="../../part-1-foundations/module-04-communication-primitives/section-4.5.html">Section 4.5</a> is the hinge that lets sharded data parallelism cost the same communication as plain data parallelism for Stages 1 and 2, and only $1.5\times$ for Stage 3. The next section shows PyTorch FSDP building its API directly on this pair.</p>
+</div>
+<p>The communication bill follows directly. Stages 1 and 2 still move a reduce-scatter plus an all-gather worth of gradient data per step, which is the same $2\Phi$ of traffic as a plain all-reduce, so they shrink memory for free in communication terms. Stage 3 adds the parameter all-gathers: one in the forward pass and one in the backward pass, each moving $\Phi$, on top of the gradient reduce-scatter of $\Phi$. That is $3\Phi$ versus the $2\Phi$ of plain data parallelism, a $1.5\times$ increase. The trade is summarized in Table 16.4.1 and made concrete by the demo that follows.</p>
+<div class="table-caption"><strong>Table 16.4.1:</strong> Memory and communication per stage, in bytes per device for memory and in units of the fp16 parameter size $\Phi$ for communication. Each stage shards one more component; only Stage 3 pays extra communication.</div>
+<table>
+<thead>
+<tr><th scope="col">Method</th><th scope="col">Per-device memory</th><th scope="col">Sharded</th><th scope="col">Comm. per step</th></tr>
+</thead>
+<tbody>
+<tr><td>Plain DP</td><td>$16\Phi$</td><td>nothing</td><td>$2\Phi$ (all-reduce)</td></tr>
+<tr><td>ZeRO-1</td><td>$4\Phi + 12\Phi/K$</td><td>optimizer state</td><td>$2\Phi$</td></tr>
+<tr><td>ZeRO-2</td><td>$2\Phi + 14\Phi/K$</td><td>+ gradients</td><td>$2\Phi$</td></tr>
+<tr><td>ZeRO-3</td><td>$16\Phi/K$</td><td>+ parameters</td><td>$3\Phi$</td></tr>
+</tbody>
+</table>
+
+<h2>4. Watching Memory Fall Like 1/K <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The accounting above is easy to state and easy to get wrong, so the code below computes it directly. It models a 1.5-billion-parameter network (GPT-2 XL scale) trained with mixed-precision Adam and reports the per-device model-state memory for plain data parallelism and ZeRO Stages 1 through 3 as the worker count $K$ grows, then the communication volume each method moves per step. There are no deep-learning libraries here, only the byte arithmetic of Section 2 and Section 3, so the numbers are exactly the formulas made visible.</p>
+<pre><code class="language-python">import numpy as np
+
+P = 1_500_000_000            # 1.5B parameters (GPT-2 XL scale)
+b_fp16_param = 2             # fp16 parameter copy, bytes/param
+b_fp16_grad  = 2             # fp16 gradient
+b_opt        = 12            # Adam fp32 master + m + v = 4+4+4 bytes/param
+GB = 1024**3
+
+def per_device_gb(K, stage):
+    param = b_fp16_param * P
+    grad  = b_fp16_grad  * P
+    opt   = b_opt * P
+    if stage >= 1: opt   /= K     # ZeRO-1: shard optimizer state
+    if stage >= 2: grad  /= K     # ZeRO-2: also shard gradients
+    if stage >= 3: param /= K     # ZeRO-3: also shard parameters
+    return (param + grad + opt) / GB
+
+print("Per-device model-state memory (GB), P = 1.5e9 params, Adam mixed precision")
+print(f"{'K':&gt;4} | {'plain DP':&gt;9} | {'ZeRO-1':&gt;8} | {'ZeRO-2':&gt;8} | {'ZeRO-3':&gt;8}")
+print("-" * 52)
+for K in (1, 2, 8, 32, 128, 512):
+    row = [per_device_gb(K, s) for s in (0, 1, 2, 3)]
+    print(f"{K:&gt;4} | {row[0]:&gt;9.2f} | {row[1]:&gt;8.2f} | {row[2]:&gt;8.2f} | {row[3]:&gt;8.2f}")
+
+# Communication per step in units of Phi (one fp16 copy of all params).
+# Plain DP / ZeRO-1 / ZeRO-2: gradient all-reduce = reduce-scatter + all-gather = 2*Phi.
+# ZeRO-3: forward all-gather (Phi) + backward all-gather (Phi) + grad reduce-scatter (Phi).
+Phi = b_fp16_param * P / GB
+print("\nCommunication volume per step (GB moved per device, fp16 params)")
+print(f"{'method':&gt;10} | {'all-gather':&gt;11} | {'reduce-scatter':&gt;15} | {'total':&gt;7}")
+print("-" * 52)
+for name, ag, rs in [("plain DP", Phi, Phi), ("ZeRO-1", Phi, Phi),
+                     ("ZeRO-2", Phi, Phi), ("ZeRO-3", 2*Phi, Phi)]:
+    print(f"{name:&gt;10} | {ag:&gt;11.2f} | {rs:&gt;15.2f} | {ag+rs:&gt;7.2f}")
+</code></pre>
+<div class="code-caption"><strong>Code 16.4.1:</strong> Pure-Python accounting of ZeRO memory and communication. The <code>per_device_gb</code> function applies one extra division by $K$ per stage exactly as the formulas in Section 2 prescribe; the communication block encodes the all-gather and reduce-scatter counts from Section 3.</div>
+<pre><code class="language-text">Per-device model-state memory (GB), P = 1.5e9 params, Adam mixed precision
+   K |  plain DP |   ZeRO-1 |   ZeRO-2 |   ZeRO-3
+----------------------------------------------------
+   1 |     22.35 |    22.35 |    22.35 |    22.35
+   2 |     22.35 |    13.97 |    12.57 |    11.18
+   8 |     22.35 |     7.68 |     5.24 |     2.79
+  32 |     22.35 |     6.11 |     3.41 |     0.70
+ 128 |     22.35 |     5.72 |     2.95 |     0.17
+ 512 |     22.35 |     5.62 |     2.83 |     0.04
+
+Communication volume per step (GB moved per device, fp16 params)
+    method |  all-gather |  reduce-scatter |   total
+----------------------------------------------------
+  plain DP |        2.79 |            2.79 |    5.59
+    ZeRO-1 |        2.79 |            2.79 |    5.59
+    ZeRO-2 |        2.79 |            2.79 |    5.59
+    ZeRO-3 |        5.59 |            2.79 |    8.38</code></pre>
+<div class="code-caption"><strong>Output 16.4.1:</strong> Plain data parallelism is flat at 22.35 GB no matter how many workers join, because the redundancy never shrinks. ZeRO-3 falls from 22.35 GB to 0.04 GB at $K = 512$, the clean $1/K$ decay, while paying $8.38$ GB of communication per step against plain data parallelism's $5.59$ GB, the $1.5\times$ tax of re-gathering parameters.</div>
+<p>Two facts jump out of Output 16.4.1. First, plain data parallelism never benefits from more workers in memory terms: the 22.35 GB line is constant, which is precisely why a 1.5-billion-parameter model with Adam will not train on a 16 GB accelerator under plain data parallelism no matter how large the cluster. Second, the stages separate by how much they help and how much they cost. ZeRO-1 and ZeRO-2 reduce memory substantially at no extra communication, so they are nearly free wins; ZeRO-3 reduces memory without bound but adds the $1.5\times$ communication seen in the lower table. The choice of stage is therefore a memory-versus-bandwidth decision: use the lowest stage that makes the model fit, because each higher stage trades away some communication headroom you might prefer to spend on bigger batches.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Optimizer State Was the Elephant</div>
+<p>It surprises people that the parameters are the <em>small</em> part of the memory bill. For Adam in mixed precision, the $12\Phi$ of optimizer state is six times the $2\Phi$ of fp16 parameters. This is why ZeRO-1, which only shards that one elephant and leaves everything else replicated, already drops per-device memory from 22.35 GB to 7.68 GB at eight workers in Output 16.4.1. The cheapest stage attacks the biggest term first, which is just good triage.</p>
+</div>
+
+<h2>5. Choosing a Stage, and Where It Breaks Down <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The stages form a ladder you climb only as far as you must. If the model fits under ZeRO-1, stop there and keep the bandwidth. If it does not, ZeRO-2 costs nothing more in communication and frees the gradient memory. Only when the parameters themselves will not fit do you reach for ZeRO-3 and accept the parameter all-gathers. The practical complication is that ZeRO-3's all-gathers happen layer by layer during the forward and backward passes, so they sit on the critical path in a way the single end-of-step all-reduce of plain data parallelism does not. Implementations hide this by prefetching the next layer's parameters while the current layer computes, overlapping communication with computation, but on a slow interconnect the overlap is imperfect and ZeRO-3 can leave accelerators idling on the network. This is the same communication-versus-computation tension quantified by the cost models of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>, now applied per layer rather than per step.</p>
+<p>There is also a scaling subtlety. As $K$ grows the sharded terms vanish but the replicated terms do not. Under ZeRO-1 the per-device memory tends to $4\Phi$ as $K \to \infty$, the floor set by the still-replicated parameters and gradients; you can see it in Output 16.4.1 flattening near 5.6 GB. Only ZeRO-3, with nothing replicated, keeps falling. This is why frameworks pair ZeRO-3 with the tensor and pipeline parallelism of the previous section for the very largest models: ZeRO-3 handles the data-parallel dimension, and the other axes cut the per-layer activation and compute that sharding alone does not touch. Combining all three is the 3D-parallelism whose trade-offs <a href="../module-17-expert-parallelism-moe/index.html">Chapter 17</a> and the foundation-model training of this part assemble in full.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Fitting a 13B Model on 24 GB Cards</div>
+<p><strong>Who:</strong> An applied-research team fine-tuning a 13-billion-parameter language model for a domain assistant.</p>
+<p><strong>Situation:</strong> They had a rented cluster of consumer-grade 24 GB accelerators, eight of them, connected by ordinary data-center Ethernet rather than a fast GPU fabric.</p>
+<p><strong>Problem:</strong> A 13B model with Adam needs roughly $16 \times 13 = 208$ GB of model state, so plain data parallelism would require 208 GB on every single card. The model did not fit even once.</p>
+<p><strong>Dilemma:</strong> Reach straight for ZeRO-3 to shrink memory the most, accepting its $1.5\times$ communication on a slow interconnect, or try a lower stage and risk still overflowing.</p>
+<p><strong>Decision:</strong> They first tried ZeRO-2, which at eight workers leaves $2\Phi + 14\Phi/K$, about $26 + 23 = 49$ GB, still over the 24 GB budget. So they moved to ZeRO-3, whose $16\Phi/K$ gives roughly 26 GB, and combined it with activation checkpointing to claw back the last few gigabytes.</p>
+<p><strong>How:</strong> They enabled ZeRO-3 with parameter prefetching turned on to overlap the layer-wise all-gathers with compute, and reduced the micro-batch size to keep activations small on the slow link.</p>
+<p><strong>Result:</strong> The model trained, with each step about 30 percent slower than a fast-fabric cluster would have been, the visible cost of ZeRO-3's parameter gathers on Ethernet. The job finished overnight rather than not at all.</p>
+<p><strong>Lesson:</strong> Climb the ZeRO ladder only as far as the memory ceiling forces you, and budget for ZeRO-3's extra communication when the interconnect is slow. The stage that makes the model fit is the right one, even when a lower stage would have been faster had it fit.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: DeepSpeed Turns On ZeRO with a Config Block</div>
+<p>The byte accounting in Code 16.4.1 is the whole idea, but you never implement the gathers and scatters yourself. DeepSpeed, the library where ZeRO originated, selects the stage with a single integer in a JSON config and wraps your existing training loop, handling the parameter partitioning, the layer-wise all-gathers, the gradient reduce-scatter, and the prefetch scheduling internally:</p>
+<pre><code class="language-python"># ds_config.json: {"zero_optimization": {"stage": 3,
+#                  "overlap_comm": true, "contiguous_gradients": true}}
+import deepspeed
+
+model_engine, optimizer, _, _ = deepspeed.initialize(
+    model=model, model_parameters=model.parameters(),
+    config="ds_config.json")          # stage 1, 2, or 3 chosen here
+
+for batch in dataloader:
+    loss = model_engine(batch)        # forward; params all-gathered per layer
+    model_engine.backward(loss)       # backward + gradient reduce-scatter
+    model_engine.step()               # each worker updates only its shard
+</code></pre>
+<div class="code-caption"><strong>Code 16.4.2:</strong> The same sharded data parallelism as Output 16.4.1, now one <code>stage</code> field plus three method calls. The hundreds of lines of partition bookkeeping, collective scheduling, and prefetch overlap that ZeRO-3 needs collapse into <code>deepspeed.initialize</code>; switching stages is editing a single number.</div>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Squeezing the Communication Back Out (2024 to 2026)</div>
+<p>ZeRO-3's $1.5\times$ communication is the obvious target for current work. ZeRO++ (Wang et al., 2023, with production hardening through 2024) attacks all three of its collectives: it quantizes the parameter all-gather to 8 bits, keeps a secondary full-precision parameter replica within each node so cross-node gathers shrink, and quantizes the gradient reduce-scatter, reporting up to a $4\times$ reduction in ZeRO-3 communication on bandwidth-limited clusters. On the framework side, PyTorch's FSDP2 (the per-parameter-sharding redesign stabilized across 2024 to 2025) reworks the sharded-tensor representation built on the same all-gather and reduce-scatter pair, improving composability with tensor parallelism and lowering memory fragmentation; it is the subject of the next section. A parallel line pushes sharded data parallelism toward heterogeneous and offloaded memory, gathering parameter shards from CPU or NVMe just in time, so that model size is bounded by aggregate host memory rather than aggregate accelerator memory. The throughline is unchanged from this section: shard to save memory, then engineer the gather traffic back down.</p>
+</div>
+<p>Sharded data parallelism gives us model-scale memory savings while keeping the one-program-per-worker simplicity that makes data parallelism a joy to operate. We have seen what each stage shards, that the collectives are the familiar reduce-scatter and all-gather, and that the memory falls like $1/K$ while ZeRO-3 alone pays a $1.5\times$ communication tax. The next section, <a href="section-16.5.html">Section 16.5</a>, turns this design into running PyTorch code with FSDP, which builds its public API directly on the all-gather and reduce-scatter pair the thesis thread keeps returning to.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.4.1: Read the Memory Ladder <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the per-stage formulas in Section 2, explain in words why ZeRO-1 and ZeRO-2 both flatten to a nonzero floor as $K \to \infty$ while ZeRO-3 tends to zero. State the floor for each of the three stages as a multiple of $\Phi$. Then argue why, for a fixed model that already fits under ZeRO-1, choosing ZeRO-3 anyway would be a mistake on a bandwidth-limited cluster, referencing the communication column of Table 16.4.1.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.4.2: Extend the Accounting to Offload <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 16.4.1 to add a fifth column, "ZeRO-3 + CPU offload," that moves the entire sharded optimizer state to host memory and counts only the parameters and gradients toward per-device accelerator memory (that is, $4\Phi / K$ bytes on the device). Print the new table and identify the smallest $K$ at which the 1.5B model's accelerator memory drops below 1 GB under this scheme. Then add a short comment explaining what new communication cost offload introduces that the on-device stages do not pay.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.4.3: When Does ZeRO-3 Lose to Tensor Parallelism? <span class="exercise-type analysis">Analysis</span></div>
+<p>Suppose a layer's parameters total $\Phi_\ell$ and a step moves $3\Phi_\ell$ under ZeRO-3 (forward gather, backward gather, gradient reduce-scatter). Tensor parallelism from the previous section instead keeps the parameters sharded and communicates activations, whose size scales with the batch and sequence length rather than with $\Phi_\ell$. Sketch the regime, in terms of batch size, sequence length, and $\Phi_\ell$, where ZeRO-3's parameter traffic exceeds tensor parallelism's activation traffic, and conclude which axis you would shard a very wide feed-forward layer along. Tie your reasoning to the cost model of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-16.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 16.3</span><span class="nav-title">Pipeline Parallelism</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 16</span><span class="nav-num">Contents</span><span class="nav-title">Model, Pipeline, and Sharded Parallelism</span></a>
+<a class="next" href="section-16.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 16.5</span><span class="nav-title">PyTorch FSDP</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

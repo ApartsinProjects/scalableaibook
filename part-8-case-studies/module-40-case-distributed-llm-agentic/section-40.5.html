@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 40.5: RAG at Scale. The agentic retrieval layer as a multi-step distributed loop: query transformation, retrieve-and-rerank, context assembly under the window budget, multi-hop and GraphRAG, grounding, and caching." name="description"/>
+<title>Section 40.5: RAG at Scale | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Case Studies and Capstone Projects</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 40: Distributed LLM and Agentic Applications</a></div>
+<h1>RAG at Scale</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I am a retrieved passage, one of twenty, fighting for space in the context window. The reranker promised me a place near the top. The token budget had other ideas."</p>
+<cite>A Retrieved Passage, One of Twenty</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>For an agent, retrieval is not a single lookup that precedes generation; it is a distributed, multi-step loop the agent drives, deciding what to ask, where to ask it, what to keep, and whether to ask again.</strong> The web-RAG case in <a href="../module-36-case-web-scale-text-rag/index.html">Chapter 36</a> built the corpus, the embedding pipeline, and the serving path that turn a query into a handful of grounded passages. This section assumes that machinery and asks the harder question the agentic setting forces: when one retrieval is not enough, how does the system transform the query, rerank candidates from a sharded index, pack the survivors into a finite window, retrieve again across several hops, and ground the final answer in citations rather than in the model's memory? Each of those steps is a distributed call with its own latency, cost, and failure mode, and the agent orchestrates them in a sequence it chooses at run time rather than one fixed in advance.</p>
+</div>
+<p>The retrieval-augmented generation pipeline a reader meets first is a straight line: embed the user's question, search a vector index, paste the top passages in front of the prompt, and generate. That pipeline, built end to end in <a href="../module-36-case-web-scale-text-rag/index.html">Chapter 36</a> and served at request scale in <a href="../module-36-case-web-scale-text-rag/section-36.7.html">Section 36.7</a>, answers a large fraction of factual questions well. It fails on the questions an agent is actually deployed to handle: the multi-part question whose answer lives in no single passage, the ambiguous question whose best retrieval query is not the user's literal words, the question whose evidence is spread across a structured corpus of entities and relations. Handling those is the difference between a RAG feature and an agentic RAG system, and it is the subject of this section.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of the agentic RAG loop: a query is transformed into sub-queries, each retrieved from a sharded index, reranked by a cross-encoder, assembled into a budgeted context, and passed to the generator, with an iterate-back arrow from the generator to query transformation for multi-hop retrieval.">
+<defs>
+<marker id="arr405" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arrL405" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.b405 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.r405 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.t405 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s405 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l405 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr405); }
+.loop405 { fill:none; stroke:#b86b1f; stroke-width:1.8; stroke-dasharray:6 4; marker-end:url(#arrL405); }
+.lt405 { font:italic 11px sans-serif; fill:#b86b1f; text-anchor:middle; }
+</style>
+<rect class="b405" x="20" y="120" width="130" height="64" rx="9"/>
+<text class="t405" x="85" y="146">Query</text>
+<text class="t405" x="85" y="164">transform</text>
+<text class="s405" x="85" y="100">rewrite + decompose</text>
+<rect class="b405" x="190" y="120" width="130" height="64" rx="9"/>
+<text class="t405" x="255" y="146">Retrieve</text>
+<text class="s405" x="255" y="164">sharded index</text>
+<text class="s405" x="255" y="100">bi-encoder ANN</text>
+<rect class="r405" x="360" y="120" width="130" height="64" rx="9"/>
+<text class="t405" x="425" y="146">Rerank</text>
+<text class="s405" x="425" y="164">cross-encoder</text>
+<text class="s405" x="425" y="100">top-k to top-m</text>
+<rect class="b405" x="530" y="120" width="130" height="64" rx="9"/>
+<text class="t405" x="595" y="146">Assemble</text>
+<text class="s405" x="595" y="164">budget + order</text>
+<text class="s405" x="595" y="100">pack the window</text>
+<rect class="b405" x="700" y="120" width="150" height="64" rx="9"/>
+<text class="t405" x="775" y="146">Generate</text>
+<text class="s405" x="775" y="164">grounded + cited</text>
+<text class="s405" x="775" y="100">the generator (Ch 24)</text>
+<line x1="150" y1="152" x2="186" y2="152" class="l405"/>
+<line x1="320" y1="152" x2="356" y2="152" class="l405"/>
+<line x1="490" y1="152" x2="526" y2="152" class="l405"/>
+<line x1="660" y1="152" x2="696" y2="152" class="l405"/>
+<path class="loop405" d="M 775 184 L 775 300 L 85 300 L 85 188"/>
+<text class="lt405" x="430" y="292">multi-hop: the agent retrieves again with a rewritten sub-query</text>
+<text class="lt405" x="430" y="320">until the answer is grounded or the hop budget is spent</text>
+</svg>
+<figcaption><strong>Figure 40.5.1:</strong> The agentic RAG loop. A query is transformed into one or more sub-queries (Section 1), each retrieved from a sharded vector index and reranked by a cross-encoder (Section 2), the survivors are packed into the context window under a token budget and ordered (Section 3), and the generator produces a grounded, cited answer (Section 5). The dashed orange arrow is what makes the loop agentic: when the answer is not yet grounded, the agent rewrites a sub-query from what it has learned and retrieves again, the multi-hop pattern of Section 4. The agent orchestration that decides when to take that loop is the subject of <a href="section-40.6.html">Section 40.6</a>.</figcaption>
+</figure>
+
+<h2>1. Query Transformation: Asking the Right Question <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The user's literal words are rarely the best retrieval query. A conversational follow-up ("and what about its latency?") is meaningless to a vector index without the antecedent; a question phrased in one vocabulary may miss documents written in another; a compound question packs two retrieval needs into one embedding that sits, unhelpfully, halfway between them. Query transformation is the first stage of the loop in Figure 40.5.1, and it has two workhorse forms. Rewriting resolves references and normalizes phrasing, turning a context-dependent utterance into a standalone query, often by a cheap call to the generator itself. Decomposition splits a compound question into sub-queries that each have a clean, retrievable answer, so that "Where did the leader of Project Helios earn their PhD?" becomes "who leads Project Helios" followed by "where did that person earn their PhD". Decomposition is what turns a single shot into the multi-step loop this section is about.</p>
+<p>Each transformed sub-query is an independent retrieval, and the sub-queries can be issued concurrently when they do not depend on one another, or in sequence when a later query needs an entity from an earlier answer. That dependency structure is exactly the distributed-execution question the agent faces everywhere: which calls can fan out in parallel, which must serialize. The retrieval backend that answers each sub-query is the distributed vector search of <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a>, sharded across nodes so that no single machine holds the whole index.</p>
+
+<h2>2. Retrieve and Rerank <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Retrieval over a large corpus is a two-stage funnel, and the funnel exists because the two stages have opposite cost profiles. The first stage is a bi-encoder: the query and every document are embedded independently, so document vectors are precomputed once and stored in the index, and retrieval is an approximate-nearest-neighbor search that returns a few dozen candidates in milliseconds even over billions of vectors. The price of that speed is that the query and document never interact during scoring, so subtle relevance signals are lost. The second stage repairs this with a cross-encoder reranker, the technique introduced in <a href="../module-36-case-web-scale-text-rag/section-36.6.html">Section 36.6</a>: it feeds the query and a candidate document jointly through a model that can attend across both, producing a far sharper relevance score, but at a cost linear in the number of candidates, which is why it is run only over the bi-encoder's short list and never over the whole corpus.</p>
+<p>The two stages compose into a cost the agent must budget. If the index returns $k$ candidates per sub-query and the cross-encoder scores each at unit cost, reranking one sub-query costs</p>
+$$C_{\text{rerank}} = k \cdot c_{\text{ce}}, \qquad \text{kept } m \le k \text{ after sorting by cross-encoder score},$$
+<p>where $c_{\text{ce}}$ is the per-pair cross-encoder cost and $m$ is the number of survivors that proceed to context assembly. Pushing $k$ up improves recall but pays more reranker passes; pushing $m$ down sharpens the context but risks dropping the one passage that held the answer. The reranker is itself a served model, replicated across the fleet exactly like the generator it feeds, so its throughput is a fleet-sizing problem of the kind <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a> treats for the generator.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Recall Is the Bi-Encoder's Job, Precision Is the Cross-Encoder's</div>
+<p>The bi-encoder is tuned to never lose the right document from a wide net of candidates; the cross-encoder is tuned to float that document to the very top of a narrow short list. Asking either to do the other's job is the classic RAG quality bug. A bi-encoder that tries to be precise (by returning only its top three) drops answers; a cross-encoder asked to be the first-stage retriever cannot run over a billion documents in the latency budget. The funnel works because each stage is held to one metric, and the agent's quality ceiling is set by the recall of the first stage: the reranker cannot promote a passage the retriever never returned.</p>
+</div>
+
+<h2>3. Context Assembly Under the Window Budget <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Reranking produces an ordered list of passages; the context window holds only so many tokens. Assembly is the step that decides which of the survivors actually reach the generator and in what order. The budget constraint is a packing problem: if the prompt scaffold and the user's question consume $T_{\text{fixed}}$ tokens of a window of size $W$, and chunk $i$ costs $t_i$ tokens, the selected set $S$ must satisfy</p>
+$$\sum_{i \in S} t_i \;\le\; W - T_{\text{fixed}} - T_{\text{out}},$$
+<p>where $T_{\text{out}}$ reserves room for the generated answer. The greedy solution, take reranked chunks in order until the next one would overflow, is what production systems use, because the chunks arrive already sorted by relevance and a true knapsack optimization buys little once the list is ranked. Order matters beyond the budget: models attend unevenly across a long context, so the strongest evidence is placed where the model reads it most reliably, typically near the start and the end of the assembled block rather than buried in the middle. The demonstration below packs reranked chunks under an explicit token budget and shows what gets left out.</p>
+<p>This budget is also where the multi-hop cost compounds. A single-hop answer pays one retrieve-rerank-assemble-generate pass; an $H$-hop answer pays</p>
+$$C_{\text{total}} \;=\; \sum_{h=1}^{H} \big( C_{\text{retrieve}}^{(h)} + C_{\text{rerank}}^{(h)} + C_{\text{gen}}^{(h)} \big) \;\approx\; H \cdot \big( C_{\text{retrieve}} + C_{\text{rerank}} + C_{\text{gen}} \big),$$
+<p>so every additional hop multiplies the latency and the dollar cost. The agent's hop budget is therefore a hard economic ceiling, not a stylistic choice, and Section 4 shows what that spend buys.</p>
+
+<h2>4. Advanced Patterns: Multi-Hop, Fusion, and GraphRAG <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The patterns that distinguish agentic RAG all relax the assumption that one retrieval suffices. Multi-hop (or iterative) RAG is the loop made explicit: the agent retrieves, reads what it found, and uses an entity or fact from that result to formulate the next retrieval, chaining hops until the answer is grounded or the hop budget of Section 3 is spent. This is the pattern that answers questions no single passage contains, and the runnable demonstration below shows a concrete case where the single-hop pipeline returns "insufficient context" while a two-hop agent recovers the answer. Fusion-in-decoder takes a complementary route: rather than concatenating passages into one prompt, it encodes each retrieved passage separately and lets the decoder attend across all of them at generation time, which sidesteps the window-packing constraint of Section 3 at the price of a custom generation architecture.</p>
+<p>GraphRAG addresses corpora that are not a flat bag of text but a structure of entities and relations. Instead of (or alongside) a vector index, it retrieves over a knowledge graph, traversing edges to gather a connected subgraph of evidence, which is precisely the multi-hop question expressed in graph terms: a path query rather than a sequence of independent lookups. Building and querying that graph at scale is the distributed graph machine learning of <a href="../../part-3-distributed-ml/module-13-distributed-graph-ml/index.html">Chapter 13</a>; the graph is partitioned across machines, and a multi-hop traversal becomes a distributed graph walk whose cost is governed by how often a hop crosses a partition boundary. For a structured corpus, GraphRAG often answers in one principled traversal what flat multi-hop RAG would approximate with several noisy vector searches.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Support Bot That Could Not Answer "Who Owns This?"</div>
+<p><strong>Who:</strong> A platform engineer building an internal support agent over an engineering wiki and an org chart.</p>
+<p><strong>Situation:</strong> The single-hop RAG bot answered "what does service X do?" perfectly but failed on "who is on call for the team that owns service X?".</p>
+<p><strong>Problem:</strong> No single wiki page held both the service-to-team mapping and the team-to-on-call mapping; the answer required joining two documents.</p>
+<p><strong>Dilemma:</strong> Stuff ever-larger blocks of loosely related context into one prompt and hope the model joins them, or make the bot retrieve twice with a rewritten second query.</p>
+<p><strong>Decision:</strong> They added a decomposition step and a two-hop loop: hop one resolved the owning team, hop two retrieved that team's on-call rotation using the team name extracted from hop one.</p>
+<p><strong>How:</strong> The agent rewrote the second sub-query with the entity from the first, exactly the state-carrying rewrite in the demonstration below, and capped the loop at three hops to bound cost.</p>
+<p><strong>Result:</strong> Join-style questions went from near-zero to reliably answered, at roughly double the per-query retrieval cost, which the hop cap kept bounded.</p>
+<p><strong>Lesson:</strong> When the answer lives in the relationship between documents rather than in any one of them, the fix is another hop, not a bigger window.</p>
+</div>
+<p>The demonstration ties the section together: it decomposes a composite question, retrieves with a bi-encoder-style similarity, reranks the candidates the way a cross-encoder would by scoring the query and document jointly, assembles a context under a token budget, and contrasts a single-hop attempt that misses the answer with a two-hop agent that carries the entity from the first hop into the second and succeeds.</p>
+<pre><code class="language-python">import re
+from collections import Counter
+import math
+
+DOCS = {
+    "d1": "Project Helios is the company's distributed RAG platform for agents.",
+    "d2": "Project Helios is led by the staff engineer Mara Quinn since 2024.",
+    "d3": "Mara Quinn previously built the vector-search index at the search team.",
+    "d4": "Mara Quinn holds a PhD in distributed systems from Yale.",
+    "d5": "The billing service is unrelated and led by Tom Ng.",
+    "d6": "Project Atlas is a separate recommendation system, not RAG.",
+    "d7": "The vector-search index uses HNSW graphs sharded across eight nodes.",
+}
+STOP = set("a an the is of in to since for and not from at it the".split())
+def toks(s):
+    return [w for w in re.findall(r"[a-z0-9]+", s.lower()) if w not in STOP]
+
+def decompose(question):                      # query transformation (Section 1)
+    return ["who leads Project Helios", "where did that person earn their PhD"]
+
+def tf_vec(s):                                # bi-encoder-style vector (Section 2)
+    c = Counter(toks(s)); n = math.sqrt(sum(v*v for v in c.values())) or 1.0
+    return {k: v/n for k, v in c.items()}
+def cos(a, b): return sum(a[k]*b.get(k, 0.0) for k in a)
+def retrieve(query, k=3):
+    qv = tf_vec(query)
+    scored = sorted(((cos(qv, tf_vec(t)), d) for d, t in DOCS.items()), reverse=True)
+    return [d for _, d in scored[:k]]
+
+def rerank(query, cand):                      # cross-encoder-style joint scoring (Section 2)
+    qset = set(toks(query)); out = []
+    for d in cand:
+        dset = set(toks(DOCS[d])); overlap = len(qset & dset)
+        rare = sorted(qset, key=lambda w: sum(w in toks(t) for t in DOCS.values()))
+        bonus = 2.0 if rare and rare[0] in dset else 0.0     # reward the rarest shared term
+        out.append((overlap + bonus, d))
+    out.sort(reverse=True); return [d for _, d in out]
+
+def assemble(ranked, budget_tokens):          # pack under the window budget (Section 3)
+    ctx, used = [], 0
+    for d in ranked:
+        cost = len(toks(DOCS[d]))
+        if used + cost > budget_tokens: continue
+        ctx.append(d); used += cost
+    return ctx, used
+
+def generate(needed_facts, ctx_text):         # toy grounded generator (Section 5)
+    return "Yale" if all(f in ctx_text.lower() for f in needed_facts) else "INSUFFICIENT CONTEXT"
+
+QUESTION = "Where did the leader of Project Helios earn their PhD?"
+NEEDED = ["mara quinn", "phd", "yale"]
+
+ranked = rerank(QUESTION, retrieve(QUESTION, k=3))      # single hop over the raw question
+ctx, used = assemble(ranked, budget_tokens=12)
+print("SINGLE-HOP context:", ctx, f"[{used} tok] ->",
+      generate(NEEDED, " ".join(DOCS[d] for d in ctx)))
+
+carried, entity = [], None                             # multi-hop with carried state
+for i, sq in enumerate(decompose(QUESTION), 1):
+    q = sq if entity is None else sq.replace("that person", entity)   # query rewrite
+    top = rerank(q, retrieve(q, k=3))[0]; carried.append(top)
+    if entity is None:
+        m = re.search(r"(Mara Quinn|Tom Ng)", DOCS[top]); entity = m.group(1) if m else None
+    print(f"  hop {i}: {q!r} -> {top}")
+print("MULTI-HOP context :", carried, "->",
+      generate(NEEDED, " ".join(DOCS[d] for d in carried)))
+</code></pre>
+<div class="code-caption"><strong>Code 40.5.1:</strong> Agentic RAG end to end on a toy corpus: query decomposition, bi-encoder retrieval, cross-encoder-style joint reranking, budgeted context assembly, and a multi-hop loop whose second sub-query is rewritten with the entity grounded in the first. The single-hop path and the multi-hop path are run on the same question for direct comparison.</div>
+<pre><code class="language-text">SINGLE-HOP context: ['d2'] [9 tok] -> INSUFFICIENT CONTEXT
+  hop 1: 'who leads Project Helios' -> d2
+  hop 2: 'where did Mara Quinn earn their PhD' -> d4
+MULTI-HOP context : ['d2', 'd4'] -> Yale</code></pre>
+<div class="code-caption"><strong>Output 40.5.1:</strong> The single-hop pipeline retrieves only the leadership fact (d2) and stalls with insufficient context, because no single passage holds both the leader and the PhD. The two-hop agent grounds the entity "Mara Quinn" on hop one, rewrites hop two with it, retrieves the PhD fact (d4), and answers "Yale". Multi-hop recovers an answer single-hop structurally cannot reach.</div>
+
+<h2>5. Grounding, Citation, and Hallucination Control <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Retrieval exists to make the generator answer from evidence rather than from its parameters, and grounding is the discipline that enforces it. The generator, the served LLM of <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>, is prompted to answer only from the assembled context and to attach a citation, a chunk identifier, to each claim. Citations are not cosmetic: they make the answer auditable and give the system a cheap post-hoc check, since a claim that cites no retrieved chunk, or cites one whose text does not support it, is a hallucination the system can flag or suppress before the user sees it. When the assembled context genuinely lacks the answer, the correct behavior is the "insufficient context" abstention the demonstration above produced, not a confident guess, and a well-tuned agent treats that abstention as a signal to take another hop rather than as a dead end.</p>
+<p>Grounding also bounds the multi-hop loop. Each hop ends with a grounding check: does the context now support the answer? If yes, the loop terminates; if no, and the hop budget remains, the agent rewrites and retrieves again. This makes grounding the loop's stopping condition, the test on the iterate-back arrow of Figure 40.5.1, and it is what keeps the cost formula of Section 3 from running unbounded.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: LlamaIndex Wires the Whole Loop</div>
+<p>Code 40.5.1 builds the retrieve-rerank-assemble loop by hand to expose every stage. In production you compose it from framework primitives. LlamaIndex offers a query engine with a built-in cross-encoder reranker and a sub-question engine that performs the decomposition and multi-hop fan-out of Sections 1 and 4 for you:</p>
+<pre><code class="language-python"># pip install llama-index llama-index-postprocessor-sbert-rerank
+from llama_index.core import VectorStoreIndex
+from llama_index.core.query_engine import SubQuestionQueryEngine
+from llama_index.core.tools import QueryEngineTool, ToolMetadata
+from llama_index.postprocessor.sbert_rerank import SentenceTransformerRerank
+
+reranker = SentenceTransformerRerank(top_n=4, model="cross-encoder/ms-marco-MiniLM-L-6-v2")
+base = index.as_query_engine(similarity_top_k=20, node_postprocessors=[reranker])  # retrieve 20, rerank to 4
+
+# decompose a compound question into sub-queries and fan them out (multi-hop)
+engine = SubQuestionQueryEngine.from_defaults(
+    query_engine_tools=[QueryEngineTool(query_engine=base,
+        metadata=ToolMetadata(name="kb", description="company knowledge base"))])
+answer = engine.query("Where did the leader of Project Helios earn their PhD?")
+</code></pre>
+<div class="code-caption"><strong>Code 40.5.2:</strong> The roughly forty lines of Code 40.5.1 collapse to a configured query engine. LlamaIndex (or the equivalent LangChain retriever chain) handles the bi-encoder search, the cross-encoder rerank, the sub-question decomposition, and the context assembly; you supply the index and the reranker model. LangChain exposes the same loop through its <code>MultiQueryRetriever</code> and <code>ContextualCompressionRetriever</code>.</div>
+</div>
+
+<h2>6. Caching the Loop <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Every hop in Figure 40.5.1 is a network round trip, and many of them repeat across queries, which makes caching the cheapest large win in a RAG system. Three layers cache independently. An embedding cache stores the vector for a query or document so a repeated or near-repeated query skips the encoder entirely. A retrieval cache stores the candidate set for a query, so identical sub-queries (common in multi-hop, where decomposition produces recurring building-block questions) skip the index search. A generation cache, the prefix and KV reuse of <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>, reuses the work of encoding a context block that recurs across answers. The decomposition step makes caching unusually effective here: a compound question varies, but its sub-questions are drawn from a far smaller and more repetitive set, so the retrieval cache hit rate on sub-queries is typically much higher than on raw user questions.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Retrieval Is a Distributed Loop, Not a Lookup</div>
+<p>The single-shot RAG of Chapter 36 distributes one thing: the index, sharded across machines so the corpus does not fit on one. Agentic RAG distributes the control flow as well. The query fans out into sub-queries that run on different shards, the reranker is a replicated served model, the multi-hop loop serializes calls whose later inputs depend on earlier outputs, and caching exploits the repetition that the loop's structure creates. The retrieval primitive introduced in <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a> returns here not as a function call but as a distributed multi-step computation the agent drives, which is exactly the move the book makes everywhere: a primitive, scaled out, becomes a system.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Self-Reflective and Adaptive Retrieval (2024 to 2026)</div>
+<p>The active research question is no longer how to retrieve once but when and how often to retrieve. Self-reflective RAG in the lineage of Self-RAG (Asai et al., 2024) trains the model to emit retrieval and critique tokens, deciding for itself whether a given step needs evidence and whether what it retrieved is relevant, which turns the fixed loop of Figure 40.5.1 into a learned policy. Adaptive and corrective schemes such as CRAG add a lightweight evaluator that grades retrieved passages and triggers a web search or a query rewrite when the local corpus comes up short. GraphRAG (Edge et al., 2024) has moved from research to practice for structured and global-summary questions, building entity-relation graphs and community summaries over a corpus so that questions about a whole collection, which flat retrieval answers poorly, become graph traversals of the kind <a href="../../part-3-distributed-ml/module-13-distributed-graph-ml/index.html">Chapter 13</a> scales. The common thread is making the retrieval loop a decision the system reasons about, which is precisely the agent's job in <a href="section-40.6.html">Section 40.6</a>.</p>
+</div>
+<p>The retrieval layer is now complete: the agent can transform a query, retrieve and rerank from a sharded index, pack a budgeted context, loop across hops to reach answers no single passage holds, ground and cite what it generates, and cache the repetition the loop creates. What it cannot yet do is decide, on its own, when to take the iterate-back arrow, when to abstain, and how to interleave retrieval with the other tools at its disposal. That decision is the agent's, and the orchestration that drives this whole loop is the subject of <a href="section-40.6.html">Section 40.6</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 40.5.1: When Does a Hop Pay for Itself? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the multi-hop cost model of Section 3, $C_{\text{total}} \approx H \cdot (C_{\text{retrieve}} + C_{\text{rerank}} + C_{\text{gen}})$, argue for each of the following whether a second hop is justified, and state what signal the agent should use to decide at run time rather than fixing $H$ in advance: (a) "What is the capital of France?"; (b) "Who manages the person who owns the billing service?"; (c) "Summarize every incident our team handled last quarter." For (c), explain why GraphRAG's global-summary approach from Section 4 may answer in one traversal what flat multi-hop RAG would approximate with many.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 40.5.2: Break and Fix the Budget <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 40.5.1 so the token budget in <code>assemble</code> is large enough to hold every reranked chunk, then deliberately corrupt the ranking by reversing the reranker's output before assembly. Show that the single-hop generator now receives the right chunks but in an order that, under a realistic "lost in the middle" penalty you add to <code>generate</code> (count an answer as found only if its supporting chunk is in the first or last assembled position), still fails. Then restore the correct ranking and confirm the fix. Explain in two sentences why ordering matters independently of the budget, connecting your result to the placement rule in Section 3.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 40.5.3: Cache Hit Rate Across Hops <span class="exercise-type analysis">Analysis</span></div>
+<p>Suppose your agent answers 10,000 compound questions, each decomposed into 3 sub-queries, and that sub-queries are drawn from a vocabulary of 500 distinct building-block questions while raw user questions are essentially all unique. Estimate the retrieval-cache hit rate at the raw-question layer versus the sub-query layer, and use the cost model of Section 3 to estimate the fraction of total retrieve-plus-rerank cost the sub-query cache eliminates. Explain why decomposition (Section 1) is what makes the sub-query cache so much more effective than caching raw questions, and what this implies for where to place the cache in the distributed loop of Figure 40.5.1.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-40.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 40.4</span><span class="nav-title">Sharded Vector Search</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 40</span><span class="nav-num">Contents</span><span class="nav-title">Distributed LLM and Agentic Applications</span></a>
+<a class="next" href="section-40.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 40.6</span><span class="nav-title">Distributed Agent Orchestration</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

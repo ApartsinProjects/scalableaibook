@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 38.4: Distributed Ranking Models. The heavy ranking stage that scores a few thousand candidates precisely with deep models, trained data-parallel over click logs and served as one batched low-latency forward pass." name="description"/>
+<title>Section 38.4: Distributed Ranking Models | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Case Studies and Capstone Projects</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 38: Distributed Recommendation at Scale</a></div>
+<h1>Distributed Ranking Models</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They hand me a thousand candidates and a deadline measured in milliseconds. I score every one of them precisely, in a single breath, before the user finishes blinking."</p>
+<cite>A Ranking Model, Scoring a Thousand Candidates Before the User Blinks</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Ranking is where a recommender spends its real compute: a deep model runs one forward pass per candidate per request, so the few thousand candidates that survived retrieval each get scored precisely instead of approximately.</strong> That single design choice forces two distributed problems at once. The model must be <em>trained</em> across many workers on click logs too large for one machine, with embedding tables too large for one accelerator, which makes the ranker a hybrid of the data parallelism of <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a> and the sharded embeddings of <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a>. And it must be <em>served</em> under a strict latency budget, scoring an entire candidate set in one batched forward across a serving fleet, which is the distributed inference of <a href="../../part-5-distributed-inference/module-23-distributed-inference-systems/index.html">Chapter 23</a>. This section builds the ranking stage end to end, from its loss to its FLOP budget to a runnable scorer, and shows why both training and serving are distributed for the same reason: the work no longer fits on one box.</p>
+</div>
+<p>The retrieval stage of <a href="section-38.3.html">Section 38.3</a> did its job by being cheap: it reduced a catalog of millions to a candidate set of a few thousand using approximate nearest-neighbor lookups over sharded embedding tables, spending almost nothing per item. Ranking now does the opposite. It takes those few thousand survivors and scores each one with a heavy deep model that reads dense features, sparse categorical features, and the user's interaction history, producing a calibrated probability that the user will engage. The retrieval stage could afford to be approximate because it only had to avoid discarding good items; the ranking stage cannot, because its scores decide the exact order the user sees. Precision here is bought with compute, and compute at this volume is distributed compute.</p>
+<p>This division of labor, a cheap recall-oriented retriever feeding a precise compute-heavy ranker, is the spine of every large-scale recommender, and it is why the two stages have such different distributed footprints. Retrieval distributes an index; ranking distributes a model and its training. We spend this section on the second half, because the ranking model is where the recommender's accuracy is won and where most of its serving cost is paid.</p>
+
+<h2>1. Why Ranking Is Compute-Heavy <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The defining cost of ranking is structural: the model evaluates one forward pass per candidate per request. If retrieval delivers $C$ candidates and the ranking network costs $F$ floating-point operations for a single scored item, then the per-request ranking cost is</p>
+$$\text{FLOPs}_{\text{request}} = C \cdot F,$$
+<p>and the fleet must sustain this for every request that arrives. With $C$ in the low thousands and $F$ in the tens of millions for a realistic deep ranker, a single request already costs tens of billions of operations, and a feed serving tens of thousands of requests per second multiplies that into the petaFLOP-per-second regime. No single accelerator delivers that throughput under a latency budget, so the scoring work is replicated across a serving fleet exactly as the throughput pressure of <a href="../../part-1-foundations/module-01-scale-out-ai/index.html">Chapter 1</a> predicts. Ranking is not compute-heavy by accident; it is compute-heavy by contract, because precision per candidate is the product it sells.</p>
+<p>This is the cleanest contrast with retrieval in the whole pipeline. Retrieval's cost grows with the catalog but is sublinear in it, because an approximate index touches only a tiny fraction of items per query. Ranking's cost grows linearly with the candidate set and with the model's depth, and there is no approximation to hide behind, because every candidate must be scored to be ordered. The lever a system designer pulls is therefore the product $C \cdot F$: shrink the candidate set, shrink the model, or buy more machines. Most production systems tune all three at once.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Ranking Cost Is the Product of Candidate Count and Model Size</div>
+<p>A recommender's serving bill is dominated by $C \cdot F$, the candidate count times the per-item model cost, because ranking runs a full forward pass for every candidate on every request. Retrieval is cheap because it is sublinear in the catalog; ranking is expensive because it is linear in the candidates and grows with model depth. Every serving-cost decision (how many candidates to admit, how deep a ranker to deploy, how large a fleet to provision) is a negotiation over this one product, and the latency SLO is the constraint that keeps it honest.</p>
+</div>
+
+<h2>2. The Anatomy of a Deep Ranking Model <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Deep rankers have converged on a recognizable shape. The wide-and-deep design pairs a linear "wide" component that memorizes feature crosses with a deep component that generalizes; the DLRM family (Deep Learning Recommendation Model) makes the split explicit by routing sparse categorical features through embedding tables and dense numerical features through a multilayer perceptron, then combining them through an explicit feature-interaction layer before a final scoring head. Deep and Cross Networks (DCN) add a cross layer that learns bounded-degree feature interactions efficiently, and attention layers let the model weigh a user's interaction history so that a recent purchase counts more than a stale one. What unites these designs is the two-track structure: an embedding track for high-cardinality sparse features and a dense track for continuous features, fused and scored.</p>
+<p>That two-track structure is exactly what makes the ranker a hybrid distributed model, and it is why the architecture diagram and the parallelism diagram are the same picture. The embedding tables hold one learned vector per category value, and with billions of category values (user identifiers, item identifiers, fine-grained context) these tables reach hundreds of gigabytes, far past the memory of one accelerator, so they are sharded across machines as in <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a> and as the retrieval embeddings of <a href="section-38.2.html">Section 38.2</a> already were. The dense MLP, by contrast, is small enough to replicate on every worker. Figure 38.4.1 shows the resulting DLRM-style flow and labels which part is model-parallel and which is data-parallel.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A DLRM-style ranking model: sparse categorical features pass through model-parallel sharded embedding tables, dense features pass through a replicated data-parallel multilayer perceptron, the two tracks meet at a feature-interaction layer, and a top multilayer perceptron emits one click probability per candidate.">
+<defs>
+<marker id="arr384" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b384 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.e384 { fill:#eef6ee; stroke:#2f7d39; stroke-width:1.6; }
+.d384 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.s384 { fill:#f0eefb; stroke:#5b3fa0; stroke-width:1.6; }
+.t384 { font:600 13.5px sans-serif; fill:#14385c; text-anchor:middle; }
+.x384 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.lab384 { font:600 12px sans-serif; text-anchor:middle; }
+.l384 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr384); }
+</style>
+<text class="lab384" x="220" y="24" fill="#2f7d39">Sparse track: model-parallel (sharded embeddings)</text>
+<text class="lab384" x="690" y="24" fill="#b86b1f">Dense track: data-parallel (replicated MLP)</text>
+<rect class="e384" x="60" y="44" width="120" height="44" rx="8"/>
+<text class="t384" x="120" y="63">user id</text>
+<text class="x384" x="120" y="79">sparse</text>
+<rect class="e384" x="200" y="44" width="120" height="44" rx="8"/>
+<text class="t384" x="260" y="63">item id</text>
+<text class="x384" x="260" y="79">sparse</text>
+<rect class="e384" x="80" y="120" width="100" height="56" rx="8"/>
+<text class="t384" x="130" y="144">Embedding</text>
+<text class="x384" x="130" y="162">shard A</text>
+<rect class="e384" x="200" y="120" width="100" height="56" rx="8"/>
+<text class="t384" x="250" y="144">Embedding</text>
+<text class="x384" x="250" y="162">shard B</text>
+<rect class="d384" x="560" y="44" width="180" height="44" rx="8"/>
+<text class="t384" x="650" y="63">dense features</text>
+<text class="x384" x="650" y="79">price, recency, counts</text>
+<rect class="d384" x="585" y="120" width="130" height="56" rx="8"/>
+<text class="t384" x="650" y="144">Bottom MLP</text>
+<text class="x384" x="650" y="162">replicated</text>
+<rect class="s384" x="300" y="232" width="280" height="56" rx="9"/>
+<text class="t384" x="440" y="256">Feature interaction</text>
+<text class="x384" x="440" y="274">pairwise dot products + attention over history</text>
+<rect class="b384" x="350" y="324" width="180" height="50" rx="9"/>
+<text class="t384" x="440" y="346">Top MLP</text>
+<text class="x384" x="440" y="363">click probability</text>
+<line class="l384" x1="120" y1="88" x2="128" y2="118"/>
+<line class="l384" x1="260" y1="88" x2="252" y2="118"/>
+<line class="l384" x1="650" y1="88" x2="650" y2="118"/>
+<path class="l384" d="M 130 176 L 130 210 L 360 210 L 380 230"/>
+<path class="l384" d="M 250 176 L 250 205 L 410 205 L 425 230"/>
+<path class="l384" d="M 650 176 L 650 210 L 520 210 L 500 230"/>
+<line class="l384" x1="440" y1="288" x2="440" y2="322"/>
+<text class="x384" x="440" y="398">one forward pass per candidate; the batch is the whole candidate set</text>
+</svg>
+<figcaption><strong>Figure 38.4.1:</strong> A DLRM-style ranking model and its hybrid parallelism. Sparse categorical features (left) index into embedding tables sharded across machines (model-parallel, as in <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a>); dense numerical features (right) flow through a small multilayer perceptron replicated on every worker (data-parallel, as in <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>). The two tracks meet at a feature-interaction layer, and a top MLP emits one click probability per candidate. The same picture describes both how the model is built and how it is split across machines.</figcaption>
+</figure>
+
+<h2>3. Training the Ranker: Hybrid Parallelism Over Click Logs <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The ranker learns from click logs: a stream of impressions, each labeled by whether the user engaged. The natural objective is the logistic (binary cross-entropy) loss over $N$ logged impressions, where $\hat{p}_i = \sigma(z_i)$ is the model's predicted click probability and $y_i \in \{0,1\}$ the observed label,</p>
+$$L(\theta) = -\frac{1}{N} \sum_{i=1}^{N} \Big[\, y_i \log \hat{p}_i + (1 - y_i) \log (1 - \hat{p}_i)\,\Big], \qquad \hat{p}_i = \frac{1}{1 + e^{-z_i}}.$$
+<p>This is an average over examples, and as the gradient identity of <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a> established, an average decomposes exactly across workers. That is what licenses data-parallel training of the dense part of the ranker: shard the click logs across $K$ workers, let each compute the gradient of the loss on its shard, and all-reduce the gradients so every replica takes the same step. The optimization machinery for this synchronization, including the staleness and communication trade-offs, is the subject of <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a>.</p>
+<p>The embedding tables complicate the clean picture, and this is the heart of why a recommender ranker is a hybrid. The dense MLP is replicated and updated by all-reduce, but the embedding tables are too large to replicate, so they are sharded and updated where they live. A single training step therefore mixes two collectives: an all-to-all that routes each worker's batch of sparse lookups to the shard that holds them and routes the resulting vectors back (the embedding exchange), and an all-reduce that synchronizes the replicated dense gradients (the parameter exchange). This combination, model-parallel embeddings plus data-parallel dense layers, is precisely the DLRM training pattern, and it draws on the sharded-parameter machinery of <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a> for the embedding half and the gradient all-reduce of <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a> for the dense half.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: One Model, Two Axes of Distribution at Once</div>
+<p>The ranker is the book's clearest example of a single model distributed along two axes simultaneously. Its embedding tables live on the model-parallel axis, sharded because they exceed one device's memory; its dense layers live on the data-parallel axis, replicated and synchronized by all-reduce. Neither axis alone suffices, and the two collectives (all-to-all for embeddings, all-reduce for dense gradients) run in the same training step. When <a href="../../part-1-foundations/module-01-scale-out-ai/index.html">Chapter 1</a> promised that real systems live where several axes of distribution meet, the deep ranker is the promise made concrete.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: TorchRec Shards the Embedding Tables for You</div>
+<p>Writing the embedding all-to-all and the dense all-reduce by hand is error-prone. TorchRec, PyTorch's recommendation library, expresses a DLRM-style ranker and shards its embedding tables across devices automatically, choosing per-table sharding (table-wise, row-wise, or column-wise) from a cost model, while ordinary <code>DistributedDataParallel</code> handles the dense layers:</p>
+<pre><code class="language-python"># pip install torchrec ; launch with torchrun --nproc_per_node=K
+import torch
+from torchrec import EmbeddingBagCollection
+from torchrec.distributed import DistributedModelParallel
+from torchrec.distributed.planner import EmbeddingShardingPlanner
+
+ebc = EmbeddingBagCollection(tables=ranking_tables, device=torch.device("meta"))
+plan = EmbeddingShardingPlanner().plan(ebc, [sharder])   # cost-based shard choice
+model = DistributedModelParallel(module=ranking_model, plan=plan)  # embeddings sharded,
+                                                                   # dense replicated
+</code></pre>
+<div class="code-caption"><strong>Code 38.4.1:</strong> A DLRM-style ranker sharded with TorchRec. The planner picks a sharding scheme per embedding table and <code>DistributedModelParallel</code> wires up the all-to-all for sparse features automatically; the hundreds of lines of manual collective scheduling collapse to a planner call and a wrapper, and the library owns the all-to-all and all-reduce overlap.</div>
+</div>
+
+<h2>4. Serving: Score the Whole Candidate Set in One Batched Pass <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>At serving time the ranker faces the latency SLO. A request arrives with its $C$ candidates, and the model must score all of them and return an order within a budget often well under a hundred milliseconds. The decisive optimization is batching: rather than score candidates one at a time, the serving node stacks the entire candidate set into a single tensor and runs one forward pass, turning $C$ small matrix-vector products into one large matrix-matrix product that saturates the accelerator. Because every candidate for a given request shares the same user features, this batch is natural and tight, and it is the per-request analogue of the throughput-oriented batching that <a href="../../part-5-distributed-inference/module-23-distributed-inference-systems/index.html">Chapter 23</a> develops for inference fleets and that <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a> pushes to its limit for LLM serving.</p>
+<p>The fleet dimension is the same throughput story as everywhere else in the book. One serving node sustains some number of requests per second within the SLO; the offered load exceeds that; therefore the ranker is replicated across a fleet behind a load balancer, each replica holding the dense model and reaching a sharded embedding service for the sparse lookups. The embedding lookup is itself a distributed call, which is why serving latency couples the ranker to the same sharded tables that <a href="section-38.2.html">Section 38.2</a> introduced and that <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a> built. The code below trains a tiny logistic CTR ranker on synthetic click data, measures held-out ranking quality, and then performs the key serving move: scoring an entire candidate set in one batched forward pass.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+
+# ---- Synthetic click logs -------------------------------------------------
+# Each impression has d dense features; a hidden linear scorer plus noise
+# decides whether the user clicked (label 1) or not (label 0). The base CTR
+# is deliberately low, as it is in production feeds.
+N, d = 40_000, 16
+X = rng.standard_normal((N, d))
+w_star = rng.standard_normal(d) * 0.6
+bias_star = -2.2                                  # pushes the base rate down
+logits = X @ w_star + bias_star
+p = 1.0 / (1.0 + np.exp(-logits))
+y = (rng.random(N) < p).astype(np.float64)
+
+# Train / held-out split.
+n_tr = 32_000
+Xtr, ytr = X[:n_tr], y[:n_tr]
+Xte, yte = X[n_tr:], y[n_tr:]
+
+# ---- Tiny logistic CTR ranker, trained by mini-batch SGD ------------------
+w = np.zeros(d)
+b = 0.0
+lr, epochs, bs = 0.3, 8, 256
+for _ in range(epochs):
+    perm = rng.permutation(n_tr)
+    for i in range(0, n_tr, bs):
+        idx = perm[i:i + bs]
+        xb, yb = Xtr[idx], ytr[idx]
+        pb = 1.0 / (1.0 + np.exp(-(xb @ w + b)))   # forward pass
+        g = pb - yb                                # logistic gradient
+        w -= lr * (xb.T @ g) / len(idx)
+        b -= lr * g.mean()
+
+def predict(Xm):
+    return 1.0 / (1.0 + np.exp(-(Xm @ w + b)))
+
+# ---- Held-out ranking metrics: AUC and normalized entropy -----------------
+def auc(scores, labels):
+    order = np.argsort(scores)
+    ranks = np.empty_like(order, dtype=np.float64)
+    ranks[order] = np.arange(1, len(scores) + 1)
+    n_pos = labels.sum()
+    n_neg = len(labels) - n_pos
+    return (ranks[labels == 1].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+
+def normalized_entropy(scores, labels):
+    eps = 1e-12
+    scores = np.clip(scores, eps, 1 - eps)
+    ll = -(labels * np.log(scores) + (1 - labels) * np.log(1 - scores)).mean()
+    base = labels.mean()
+    base_ll = -(base * np.log(base) + (1 - base) * np.log(1 - base))
+    return ll / base_ll                            # &lt; 1 means better than base rate
+
+pte = predict(Xte)
+print("held-out base CTR    :", f"{yte.mean():.4f}")
+print("held-out AUC         :", f"{auc(pte, yte):.4f}")
+print("normalized entropy   :", f"{normalized_entropy(pte, yte):.4f}")
+
+# ---- Batched scoring: rank one user's candidate set in ONE forward pass ----
+n_cand = 2000
+Xc = rng.standard_normal((n_cand, d))
+scores = predict(Xc)                               # single matmul over all candidates
+top = np.argsort(-scores)[:5]
+print("candidates scored    :", n_cand)
+print("top-5 candidate ids  :", top.tolist())
+print("top-5 scores         :", [f"{scores[j]:.3f}" for j in top])
+</code></pre>
+<div class="code-caption"><strong>Code 38.4.2:</strong> A logistic CTR ranker trained by mini-batch SGD on synthetic click logs, evaluated by AUC and normalized entropy on a held-out set, then used to score a 2000-candidate set in one batched forward pass. The <code>predict</code> call on <code>Xc</code> is a single matrix multiply over the whole candidate set, the serving move that turns $C$ separate scorings into one accelerator-friendly batch.</div>
+<pre><code class="language-text">held-out base CTR    : 0.2305
+held-out AUC         : 0.8942
+normalized entropy   : 0.6114
+candidates scored    : 2000
+top-5 candidate ids  : [1664, 961, 213, 218, 1209]
+top-5 scores         : ['0.999', '0.994', '0.990', '0.990', '0.989']
+</code></pre>
+<div class="code-caption"><strong>Output 38.4.2:</strong> The trained ranker reaches an AUC of $0.894$ on the held-out logs, well above the $0.5$ of random ordering, and a normalized entropy of $0.611$, comfortably below $1.0$, meaning it predicts clicks far better than always guessing the base rate. The final lines show the serving move: 2000 candidates scored in one batched pass, with the top five surfaced in rank order.</div>
+
+<h2>5. Measuring a Ranker: AUC and Normalized Entropy <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A ranker is judged on two distinct questions, and the metrics of <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/index.html">Chapter 5</a> give one for each. The first is ordering quality: does the model place items the user will click above items the user will not? Area under the ROC curve (AUC) answers this directly, as the probability that a randomly chosen clicked item is scored above a randomly chosen non-clicked item,</p>
+$$\text{AUC} = \Pr\big(\hat{p}(x^{+}) > \hat{p}(x^{-})\big),$$
+<p>so $0.5$ is random ordering and $1.0$ is perfect ranking. AUC is the right top-line metric for ranking precisely because it ignores the absolute scale of the scores and cares only about their order, which is what determines the feed the user sees. The held-out AUC of $0.894$ in Output 38.4.2 confirms the tiny ranker has learned a useful order.</p>
+<p>The second question is calibration: are the predicted probabilities themselves trustworthy, so that a score of $0.1$ really means a one-in-ten chance of a click? This matters because downstream decisions (ad pricing, blending multiple objectives, capping low-value impressions) consume the probabilities, not just the order. Normalized entropy (NE), the standard recommender calibration metric, divides the model's average logistic loss by the loss of a constant predictor that always outputs the empirical base CTR $\bar{p}$,</p>
+$$\text{NE} = \frac{-\frac{1}{N}\sum_{i}\big[y_i \log \hat{p}_i + (1-y_i)\log(1-\hat{p}_i)\big]}{-\big[\bar{p}\log\bar{p} + (1-\bar{p})\log(1-\bar{p})\big]},$$
+<p>so $\text{NE} = 1$ means the model is no better than predicting the base rate and $\text{NE} < 1$ means it adds genuine predictive value. The normalized entropy of $0.611$ in Output 38.4.2 says the ranker cuts the base-rate loss by nearly forty percent. AUC and NE are complementary: a model can order well yet be poorly calibrated, and a deployed ranker is expected to win on both.</p>
+
+<h2>6. Multi-Objective Ranking <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Real feeds do not optimize click-through rate alone. A click is a weak signal of value: it can be earned by clickbait, and maximizing it can hollow out the experience. Production rankers therefore predict several objectives at once (the probability of a click, the expected dwell time, the chance of a meaningful interaction such as a share or purchase) and a diversity term that discourages a monotonous feed of near-identical items. A common formulation scores each candidate by a weighted combination of the per-objective predictions,</p>
+$$\text{score}(x) = \sum_{j} \alpha_j \cdot \hat{p}_j(x) + \beta \cdot \text{diversity}(x),$$
+<p>where the $\alpha_j$ weight the engagement objectives and $\beta$ rewards adding variety to the slate already assembled. Architecturally this is cheap to add, because the heads share the expensive embedding and interaction layers and only the small top of the network forks per objective, so the dominant $C \cdot F$ cost is paid once and amortized across all objectives. The distributed footprint is unchanged: the same sharded embeddings, the same data-parallel dense layers, the same batched serving pass, now emitting a vector of predictions per candidate instead of a scalar.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Feed That Optimized Clicks and Lost Its Users</div>
+<p><strong>Who:</strong> A ranking team at a content-feed company.</p>
+<p><strong>Situation:</strong> Their single-objective CTR ranker had been tuned for months and click-through rate was at an all-time high.</p>
+<p><strong>Problem:</strong> Daily active users and average session length were quietly declining even as clicks rose; the model had learned to surface high-CTR clickbait that users regretted opening.</p>
+<p><strong>Dilemma:</strong> Keep the clean, well-calibrated single objective that the whole pipeline was built around, or add dwell-time and diversity objectives that complicate training, evaluation, and the weighting policy.</p>
+<p><strong>Decision:</strong> They moved to a multi-objective ranker, adding a dwell-time head and a slate-diversity term while keeping the CTR head as one signal among several.</p>
+<p><strong>How:</strong> The shared embedding and interaction layers stayed; they forked a small per-objective top MLP for each head and tuned the blend weights $\alpha_j$ and $\beta$ on held-out engagement, leaving the sharded-embedding plus data-parallel-dense training and the batched serving pass untouched.</p>
+<p><strong>Result:</strong> Raw click-through rate dipped slightly, but dwell time, session length, and seven-day retention all rose, and the diversity term ended the runs of near-duplicate items.</p>
+<p><strong>Lesson:</strong> A ranker optimizes what you measure. Clicks are a proxy; when the proxy and the goal diverge, add the objectives that capture the goal, and note that multi-objective ranking costs almost nothing extra to serve because the heavy layers are shared.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Generative and Sequence-Native Ranking (2024 to 2026)</div>
+<p>The pointwise score-each-candidate ranker is being challenged by sequence-native and generative designs. Meta's HSTU and the broader "generative recommenders" line (Zhai et al., 2024) recast ranking and retrieval as autoregressive sequence modeling over a user's interaction history, reporting large gains and, notably, compute that scales with model size in the way that has driven progress in language models, which reframes the recommender as a scaling-law system rather than a feature-engineering one. In parallel, semantic-ID and generative-retrieval methods (the TIGER lineage) blur the retrieval and ranking stages by decoding item identifiers directly. These designs intensify the distributed problem this section described: the models are larger, the embedding and sequence tables are heavier, and the training is more compute-bound, which pushes recommenders further onto the hybrid model-parallel and data-parallel infrastructure of <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a> rather than away from it.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: A Forward Pass Per Candidate, Every Time</div>
+<p>It is worth pausing on the arithmetic of indifference. The ranker runs its full deep model on the item you will scroll past without a glance, with exactly the same effort it spends on the one you will tap. It cannot know which is which until it has scored both, so it scores everything precisely and then throws almost all of that work away. The candidate that placed sixth got the same careful forward pass as the candidate that placed first; ranking is the art of doing a great deal of compute to discover what to ignore.</p>
+</div>
+<p>The ranking stage hands its ordered slate back to the pipeline, where the next section assembles the final feed under business rules and serving constraints. We have seen the ranker as the recommender's compute center: a deep model trained with hybrid model-parallel and data-parallel collectives over click logs, and served as one batched forward pass per request under a latency SLO. The thread that ties it to the rest of the book is that none of this distribution was chosen for elegance; each piece was forced by a ceiling, the embedding tables by memory, the training by data volume, the serving by throughput, exactly as <a href="../../part-1-foundations/module-01-scale-out-ai/index.html">Chapter 1</a> promised every distributed AI system would be.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 38.4.1: Where the Ranking FLOPs Go <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A feed admits $C = 2000$ candidates per request, the ranking network costs $F = 4 \times 10^{7}$ FLOPs per scored candidate, and the service handles $20{,}000$ requests per second. Using $\text{FLOPs}_{\text{request}} = C \cdot F$, compute the per-request and aggregate per-second FLOP load. Then explain, in terms of the product $C \cdot F$, two qualitatively different ways to halve the serving cost and one reason a team might prefer shrinking $C$ over shrinking $F$ even though both cut the bill equally.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 38.4.2: AUC Up, Calibration Down <span class="exercise-type coding">Coding</span></div>
+<p>Starting from Code 38.4.2, multiply the trained weight vector and bias by a constant factor of $3$ before predicting on the held-out set (a monotone rescaling of the logits). Recompute AUC and normalized entropy. Explain why AUC is unchanged while normalized entropy worsens, and connect this to Section 5's claim that ordering quality and calibration are distinct properties a deployed ranker must satisfy together.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 38.4.3: Which Collective for Which Parameter <span class="exercise-type analysis">Analysis</span></div>
+<p>A DLRM-style ranker has $300$ GB of embedding tables and a $200$ MB dense MLP, trained on $K = 32$ workers. State which part is updated by all-to-all and which by all-reduce, and why replicating the embeddings (as the dense layers are replicated) is infeasible while sharding the dense MLP would be pointless. Estimate, to an order of magnitude, the per-step bytes moved by the dense all-reduce, and argue whether the embedding exchange or the dense synchronization is more likely to dominate communication time. Tie your reasoning to the hybrid parallelism of <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-38.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 38.3</span><span class="nav-title">Sharded Candidate Generation</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 38</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Recommendation at Scale</span></a>
+<a class="next" href="section-38.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 38.5</span><span class="nav-title">Feature Stores</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

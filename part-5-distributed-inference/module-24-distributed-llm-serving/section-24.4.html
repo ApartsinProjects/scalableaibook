@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 24.4: Distributed and Paged KV Cache. How a serving fleet manages the KV cache as a tiered, shareable, sometimes-transferred resource, why it is the binding throughput constraint, and what it costs to move a cache between machines." name="description"/>
+<title>Section 24.4: Distributed and Paged KV Cache | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 24: Distributed LLM Serving</a></div>
+<h1>Distributed and Paged KV Cache</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I do not run out of math to do. I run out of places to remember. Give me one more block of memory and I will gladly hold one more conversation."</p>
+<cite>A KV Cache Manager Counting Free Blocks</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>At serving time the throughput lever is not how fast a GPU multiplies matrices; it is how the fleet manages the KV cache, because the cache, not the FLOPs, decides how many sequences can run at once.</strong> A single GPU can issue far more arithmetic than its memory can keep sequences resident for, so the binding question is always "how many KV-cache blocks are free?" This section scales the single-node KV cache and PagedAttention of <a href="../module-22-per-node-inference-efficiency/section-22.5.html">Chapter 22</a> up to a fleet. We treat GPU memory blocks as a managed, sometimes shared resource: we page cold blocks down to CPU memory to fit more sequences, we build a tiered store (GPU HBM, CPU DRAM, remote or SSD) for very long contexts and prefix reuse, we shard each cache across the tensor-parallel GPUs that already hold the model, and we transfer a cache between machines when prefill and decode live on different nodes. Throughput is won and lost in this memory accounting.</p>
+</div>
+<p>In the previous sections of this chapter we split one model across machines: tensor-parallel inference (<a href="section-24.2.html">Section 24.2</a>) cut each weight matrix across GPUs, and pipeline-parallel inference (<a href="section-24.3.html">Section 24.3</a>) cut the layer stack across nodes. Those splits answer "how do we hold a model too large for one device?" This section answers a different and, at serving time, more pressing question: "how do we hold the <em>state of every in-flight conversation</em> when that state grows with every token and every concurrent user?" The model weights are a fixed cost paid once; the KV cache is a variable cost that scales with load, and on a busy server it is what actually runs out. Recall from <a href="../module-22-per-node-inference-efficiency/section-22.5.html">Section 22.5</a> that PagedAttention manages that cache like virtual memory on one GPU. We now multiply that idea across the fleet.</p>
+
+<h2>1. The KV Cache Is the Binding Capacity Constraint <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>To size a serving fleet you first need the unit economics of one node, exactly the discipline <a href="../module-23-distributed-inference-systems/index.html">Chapter 23</a> built into fleet sizing. The unit that matters is not peak FLOPs; it is concurrency, the number of sequences a node can keep decoding at the same time. Each active sequence holds a KV cache whose size grows linearly with its context length, and the sum of all those caches must fit in the memory left over after the weights. When that memory fills, the server cannot admit another sequence no matter how idle its arithmetic units are. The cache is the throughput valve.</p>
+<p>The footprint follows directly from the attention structure of <a href="../module-22-per-node-inference-efficiency/section-22.5.html">Section 22.5</a>. For a model with $L$ layers, $H_{kv}$ key/value heads (fewer than the query heads under grouped-query attention), head dimension $d_\text{head}$, and $b$ bytes per element, the cache for a single sequence of $t$ tokens is</p>
+$$M_\text{seq}(t) \;=\; 2 \, L \, H_{kv} \, d_\text{head} \, b \, t,$$
+<p>where the leading $2$ counts keys and values. The number of sequences a node can hold concurrently is then the memory budget divided by the per-sequence cost,</p>
+$$N_\text{concurrent} \;=\; \left\lfloor \frac{M_\text{HBM} - M_\text{weights}}{M_\text{seq}(t_\text{ctx})} \right\rfloor ,$$
+<p>with $t_\text{ctx}$ the context each sequence is allowed to grow to. Two facts make this the central equation of serving. First, $M_\text{seq}$ scales with context length, so a few very long conversations can crowd out many short ones. Second, $M_\text{weights}$ is fixed, so every gigabyte not spent on weights is a gigabyte of concurrency. Everything in this section is a strategy for making the numerator larger or the denominator effectively smaller.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: KV-Cache Management, Not FLOPs, Is the Serving Throughput Lever</div>
+<p>Decode is memory-bound, not compute-bound: each step reads the entire cache and does a small amount of arithmetic. A serving node therefore exhausts KV memory long before it exhausts compute, so the quantity to engineer is bytes of cache per concurrent sequence, not floating-point operations per second. Paging cold blocks to CPU memory, tiering the cache across HBM, DRAM, and remote storage, and sharing blocks across requests are all moves that raise concurrency without touching the model. Treat GPU KV blocks the way an operating system treats physical page frames: a scarce, managed, reclaimable resource.</p>
+</div>
+
+<h2>2. A Tiered, Shared KV Store Across the Fleet <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Once the cache is the constraint, the natural response is the same one operating systems reached for decades ago: a memory hierarchy. The hottest blocks, those of sequences decoding right now, stay in GPU HBM. Blocks of paused or backgrounded sequences page down to CPU DRAM, which is an order of magnitude larger and one bus away (KV offloading). Blocks worth keeping for reuse across requests, but too cold for DRAM, spill to a remote store on SSD or a dedicated cache service. The tiers trade capacity against latency, and a sequence's blocks move up the hierarchy on demand, exactly as virtual-memory pages fault back into RAM. Figure 24.4.1 shows the hierarchy together with the cross-machine transfer that disaggregated serving forces.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left: a three-tier KV-cache hierarchy with GPU HBM at the top holding hot blocks, CPU DRAM in the middle holding warm offloaded blocks, and a remote SSD store at the bottom holding cold and shared-prefix blocks, connected by page-in and page-out arrows. Right: a prefill node computing a KV cache and transferring it over a fast link to a separate decode node.">
+<defs>
+<marker id="arr244" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr244o" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.hot244 { fill:#fdeede; stroke:#b86b1f; stroke-width:1.8; }
+.warm244 { fill:#eef4fb; stroke:#14385c; stroke-width:1.6; }
+.cold244 { fill:#f4f7fb; stroke:#5a626c; stroke-width:1.5; }
+.node244 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.t244 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.tw244 { font:600 14px sans-serif; fill:#b86b1f; text-anchor:middle; }
+.s244 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l244 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr244); }
+.lo244 { fill:none; stroke:#b86b1f; stroke-width:1.8; marker-end:url(#arr244o); }
+.hd244 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+</style>
+<text class="hd244" x="220" y="26">Tiered KV cache on one node</text>
+<rect class="hot244" x="90" y="44" width="260" height="64" rx="10"/>
+<text class="tw244" x="220" y="70">GPU HBM &#183; hot blocks</text>
+<text class="s244" x="220" y="90">sequences decoding now &#183; fastest, smallest</text>
+<rect class="warm244" x="90" y="150" width="260" height="64" rx="10"/>
+<text class="t244" x="220" y="176">CPU DRAM &#183; warm offloaded blocks</text>
+<text class="s244" x="220" y="196">paused sequences &#183; ~10x larger, one bus away</text>
+<rect class="cold244" x="90" y="256" width="260" height="64" rx="10"/>
+<text class="t244" x="220" y="282">Remote / SSD &#183; cold &amp; shared blocks</text>
+<text class="s244" x="220" y="302">long-context tails &#183; reusable prefixes</text>
+<path class="l244" d="M 150 150 L 150 110"/>
+<text class="s244" x="120" y="134">page in</text>
+<path class="lo244" d="M 290 108 L 290 148"/>
+<text class="s244" x="318" y="134">page out</text>
+<path class="l244" d="M 150 256 L 150 216"/>
+<text class="s244" x="120" y="240">fetch</text>
+<path class="lo244" d="M 290 214 L 290 254"/>
+<text class="s244" x="318" y="240">spill</text>
+<text class="s244" x="220" y="350">hotter &#8593; faster, smaller &#160;&#160; colder &#8595; larger, cheaper</text>
+<line x1="430" y1="44" x2="430" y2="360" stroke="#cdd5df" stroke-width="1.4" stroke-dasharray="4 4"/>
+<text class="hd244" x="660" y="26">KV transfer in prefill / decode disaggregation</text>
+<rect class="node244" x="500" y="60" width="150" height="96" rx="10"/>
+<text class="t244" x="575" y="92">Prefill node</text>
+<text class="s244" x="575" y="114">ingest prompt,</text>
+<text class="s244" x="575" y="132">build KV cache</text>
+<rect class="node244" x="710" y="60" width="150" height="96" rx="10"/>
+<text class="t244" x="785" y="92">Decode node</text>
+<text class="s244" x="785" y="114">receive cache,</text>
+<text class="s244" x="785" y="132">emit tokens</text>
+<path class="l244" d="M 650 108 L 710 108"/>
+<text class="tw244" x="680" y="98">KV</text>
+<text class="s244" x="680" y="176">move full cache over</text>
+<text class="s244" x="680" y="194">NVLink / RDMA / IB</text>
+<text class="s244" x="680" y="212">a real cross-machine</text>
+<text class="s244" x="680" y="230">data movement (Section 24.5)</text>
+</svg>
+<figcaption><strong>Figure 24.4.1:</strong> Left, the tiered KV cache on a single node: hot blocks live in GPU HBM, warm blocks page out to CPU DRAM (KV offloading), and cold or reusable blocks spill to a remote SSD store, with page-in and page-out arrows mirroring virtual memory. Right, the cross-machine case: when prefill and decode run on different nodes (<a href="section-24.5.html">Section 24.5</a>), the prefill node's KV cache must be transferred in full to the decode node, a significant data movement whose cost we measure in Code 24.4.1.</figcaption>
+</figure>
+<p>Two of these tiers do more than enlarge capacity. CPU offload lets a node admit more <em>active</em> sequences than HBM alone would allow, because paused turns of a multi-turn chat can wait in DRAM and page back in only when the user replies. The remote tier enables sharing: a prompt prefix common to thousands of requests, a long system prompt, a shared document, a few-shot preamble, can be stored once and reused, which we develop next and carry into the prefix-caching fleets of <a href="section-24.7.html">Section 24.7</a>.</p>
+
+<h2>3. Sharding the Cache, and Sharing It <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The cache is partitioned along two independent axes, and it helps to keep them separate. The first is <em>within a model replica</em>. When tensor-parallel inference (<a href="section-24.2.html">Section 24.2</a>) splits the attention heads across $P$ GPUs, each GPU naturally holds the KV cache only for its own heads. The cache is sharded for free along the same axis as the weights, so no head's keys and values are duplicated and the per-GPU footprint of $M_\text{seq}$ drops by roughly $P$. This is partitioning and sharding (<a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>) reappearing on the inference side: the same tensor cut that distributes computation distributes the cache.</p>
+<p>The second axis is <em>across requests</em>. Distinct sequences that begin with identical tokens produce identical keys and values for that shared span, because attention over a prefix depends only on the prefix. A paged cache can therefore point several sequences at the same physical blocks for their common prefix and allocate private blocks only where the sequences diverge, the same copy-on-write trick a process fork uses. With thousands of requests sharing a long system prompt, this turns a per-request cost into a paid-once cost and can multiply effective concurrency well beyond what either offload or sharding alone delivers.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Per-Node Memory Economics, Multiplied Across the Fleet</div>
+<p>Chapter 22 taught the KV cache and PagedAttention as a scale-up technique: one GPU, managed like virtual memory, serving more sequences. This section is where that scale-up substrate becomes a scale-out resource. The same blocks are now sharded across tensor-parallel GPUs, tiered down to CPU and remote memory, shared across requests, and transferred between machines. The book's recurring move, a primitive returns scaled out, applies even to a data structure: the cache that one node managed for itself becomes a fleet-wide, sometimes shared, sometimes shipped resource, and the throughput of the whole serving system rests on how well it is managed.</p>
+</div>
+
+<h2>4. Measuring Capacity, Sharing, and Transfer Cost <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The capacity model and the transfer cost are concrete enough to compute. The program below sizes one serving node for a representative grouped-query-attention model, then reports how many concurrent sequences fit under three policies: GPU memory only, GPU plus CPU offload, and paged sharing of a common prefix on top of offload. It then estimates what it costs to move one prompt's KV cache between two machines over three classes of interconnect, the data movement that prefill/decode disaggregation (<a href="section-24.5.html">Section 24.5</a>) pays on every request.</p>
+<pre><code class="language-python">import math
+
+# --- Per-sequence KV-cache footprint (bytes) ---------------------------------
+# bytes = 2 (K and V) * L layers * H_kv heads * d_head * dtype_bytes * tokens
+L, H_kv, d_head, dtype = 32, 8, 128, 2          # ~ a 7-8B model, GQA, fp16
+per_token = 2 * L * H_kv * d_head * dtype       # bytes per token, one sequence
+ctx = 8192                                      # tokens held per active sequence
+per_seq = per_token * ctx                        # bytes per full-context sequence
+
+GB = 1024 ** 3
+print("KV bytes / token / sequence :", per_token, "B")
+print("KV bytes / sequence (8k ctx):", f"{per_seq / GB:.3f} GiB")
+
+# --- Capacity model: how many concurrent sequences fit? ----------------------
+# A node has HBM; weights take a fixed slice; the rest is the KV-cache budget.
+hbm = 80 * GB                                    # one 80 GB accelerator
+weights = 16 * GB                                # fp16 weights resident on device
+gpu_budget = hbm - weights                       # HBM left for KV blocks
+
+def fits(budget):
+    return int(budget // per_seq)
+
+gpu_only = fits(gpu_budget)
+
+# GPU + CPU offload: cold blocks page out to host DRAM, freeing HBM for more
+# *active* sequences. Effective budget = HBM-KV + a slice of CPU DRAM.
+cpu_dram = 256 * GB
+offload_budget = gpu_budget + 0.5 * cpu_dram     # half the host RAM lent to KV
+gpu_plus_offload = fits(offload_budget)
+
+# Paged + prefix sharing: many sequences share a common system-prompt prefix,
+# so the shared blocks are stored once instead of per sequence.
+shared_prefix = 2048                             # tokens of shared system prompt
+unique_tokens = ctx - shared_prefix
+shared_cost = per_token * shared_prefix          # paid once for the whole group
+paged_budget = offload_budget
+# solve: shared_cost + n * per_token * unique_tokens <= budget
+paged_share = int((paged_budget - shared_cost) // (per_token * unique_tokens))
+
+print()
+print("concurrent sequences that fit on one node")
+print("  GPU-only (HBM)            :", gpu_only)
+print("  GPU + CPU offload         :", gpu_plus_offload)
+print("  + paged prefix sharing    :", paged_share)
+print("  offload gain              :", f"{gpu_plus_offload / gpu_only:.2f}x")
+print("  sharing gain over offload :", f"{paged_share / gpu_plus_offload:.2f}x")
+
+# --- Cross-node KV transfer cost (prefill -> decode disaggregation) -----------
+# A prefill node fills the cache for a prompt, then ships it to a decode node.
+prompt = 4096
+kv_to_move = per_token * prompt                  # bytes of KV for this prompt
+for name, gbps in [("PCIe/TCP 16 GB/s", 16), ("NVLink/RDMA 100 GB/s", 100),
+                   ("InfiniBand 400 Gb/s", 400 / 8)]:
+    secs = kv_to_move / (gbps * 1e9)
+    print(f"  move {kv_to_move/GB:.3f} GiB over {name:&lt;22}: {secs*1e3:7.2f} ms")
+</code></pre>
+<div class="code-caption"><strong>Code 24.4.1:</strong> A pure-Python KV-cache capacity and transfer model. It computes per-sequence footprint, then concurrency under three policies (GPU-only, GPU+offload, paged prefix sharing), and finally the wall-clock cost of shipping one prompt's cache across three interconnect classes. No GPU or model is loaded; the arithmetic is the serving capacity equation of Section 1.</div>
+<pre><code class="language-text">KV bytes / token / sequence : 131072 B
+KV bytes / sequence (8k ctx): 1.000 GiB
+
+concurrent sequences that fit on one node
+  GPU-only (HBM)            : 64
+  GPU + CPU offload         : 192
+  + paged prefix sharing    : 255
+  offload gain              : 3.00x
+  sharing gain over offload : 1.33x
+  move 0.500 GiB over PCIe/TCP 16 GB/s      :   33.55 ms
+  move 0.500 GiB over NVLink/RDMA 100 GB/s  :    5.37 ms
+  move 0.500 GiB over InfiniBand 400 Gb/s   :   10.74 ms</code></pre>
+<div class="code-caption"><strong>Output 24.4.1:</strong> One 80 GiB node holds 64 full-context sequences on HBM alone; lending half of a 256 GiB host to offloaded blocks triples that to 192, and sharing a 2048-token prefix lifts it to 255. The same node's cache for a 4096-token prompt is half a gibibyte, costing 34 ms to ship over a commodity link but only about 5 ms over NVLink-class RDMA, which is why disaggregation lives or dies on interconnect speed.</div>
+<p>Three readings matter. Offload raised concurrency threefold by spending host DRAM the node already had. Prefix sharing added a further third on top, and it grows with how many requests share the prefix and how long that prefix is. The transfer numbers explain the design tension of the next section: half a gibibyte is cheap on a fast fabric and painful on a slow one, so where prefill and decode sit relative to each other, and what links them, is a first-order serving decision, not a deployment afterthought.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Chat Service That Doubled Users Without a New GPU</div>
+<p><strong>Who:</strong> An inference platform engineer running a customer-support chat assistant on a fixed pool of 80 GB accelerators.</p>
+<p><strong>Situation:</strong> Every conversation began with the same 1800-token system prompt and policy preamble, and multi-turn sessions sat idle between user replies while still holding full KV caches.</p>
+<p><strong>Problem:</strong> The fleet hit an admission ceiling at roughly 60 concurrent sessions per GPU and started queueing during business hours, even though GPU utilization sat near 40 percent.</p>
+<p><strong>Dilemma:</strong> Buy more accelerators to add HBM, the obvious scale-up move, or change how the existing KV memory was managed before spending capital.</p>
+<p><strong>Decision:</strong> They changed management first: enable prefix sharing for the common preamble and offload idle-turn caches to host DRAM, reserving HBM for sequences actively decoding.</p>
+<p><strong>How:</strong> They turned on automatic prefix caching and CPU KV offload in their inference engine, paged idle sessions out on a short timeout, and paged them back in on the next user message, no model or weight change.</p>
+<p><strong>Result:</strong> Sustained concurrency per GPU rose past 150 sessions, the daytime queue vanished, and the planned hardware purchase was deferred, matching the threefold and further gains in Output 24.4.1.</p>
+<p><strong>Lesson:</strong> When the cache is the constraint, the cheapest capacity is the memory you already own, reclaimed by tiering and sharing rather than bought as more HBM.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: vLLM and LMCache Do the Tiering and Sharing for You</div>
+<p>The capacity accounting in Code 24.4.1 is something production engines manage automatically. In vLLM, the paged KV cache, automatic prefix sharing, and CPU offload are configuration, not code you write: the engine allocates blocks, deduplicates shared prefixes by hashing them, and pages cold blocks to host memory on its own.</p>
+<pre><code class="language-python"># pip install vllm lmcache
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    enable_prefix_caching=True,        # share identical prefix blocks across requests
+    swap_space=64,                     # GiB of host DRAM for paged-out (offloaded) KV
+    gpu_memory_utilization=0.92,       # fraction of HBM the KV-block pool may use
+)
+# Thousands of requests that share a system prompt now reuse its KV blocks,
+# and idle sequences page to host memory, exactly the policies modeled above.
+out = llm.generate(["<system prompt> ... user turn ..."], SamplingParams(max_tokens=256))
+</code></pre>
+<div class="code-caption"><strong>Code 24.4.2:</strong> The roughly forty lines of capacity logic in Code 24.4.1 collapse to three constructor flags. The engine handles block allocation, prefix deduplication, offload paging, and admission control; a tiered KV layer such as LMCache extends the same idea to a shared cross-node store. You supply the policy, not the bookkeeping.</div>
+</div>
+
+<h2>5. Why the Cache Decides Fleet Throughput <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Stepping back to the fleet, the per-node capacity equation propagates straight into the sizing arithmetic of <a href="../module-23-distributed-inference-systems/index.html">Chapter 23</a>. If each node holds $N_\text{concurrent}$ sequences and a replica sustains some tokens per second per sequence, total fleet throughput is the per-node concurrency times the number of replicas, minus whatever the cache movements cost. Tiering and sharing raise the multiplicand on every node at once; a poorly managed cache lowers it on every node at once. This is why two clusters with identical GPUs and identical models can differ by more than twofold in sustained throughput: the difference is cache management, not silicon.</p>
+<p>The transfer cost is the term that distinguishes a single-node optimization from a distributed one. Inside a node the hierarchy moves blocks over PCIe and the memory bus; across nodes it moves them over the network, and that movement competes with the very requests it serves. The disaggregated design of <a href="section-24.5.html">Section 24.5</a> accepts this cost deliberately, separating the compute-heavy prefill phase from the memory-heavy decode phase so each can scale independently, and pays for it with the KV transfer in Figure 24.4.1. Whether that trade is worth it is exactly the kind of interconnect-versus-recompute calculation Output 24.4.1 makes concrete.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Cache Ate the Weights</div>
+<p>For a long-context model serving many users, the keys and values quietly outweigh the parameters that produced them. A 7-billion-parameter model is about 14 GiB in fp16, yet 64 sequences at 8k context, as in Output 24.4.1, are also about 64 GiB of cache. The server spends more memory remembering the conversation than it does on the model that holds the conversation. The model is the smaller resident; the memory of what everyone said is the larger one.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Tiered and Disaggregated KV Stores (2024 to 2026)</div>
+<p>Treating the KV cache as a first-class distributed store is one of the most active areas in serving systems. Mooncake (Qin et al., 2024), the architecture behind the Kimi service, is built around a disaggregated, KV-cache-centric design: a pooled KV store spanning GPU, CPU, and SSD across the cluster, with prefill and decode separated and the cache treated as the scheduling unit. LMCache (2024 to 2025) is an open-source KV layer that caches and reuses blocks across a tiered hierarchy and shares them across vLLM instances, reporting large reductions in time-to-first-token for reused contexts. The broader KV-offloading and prefix-aware-routing literature pushes blocks down to host and remote memory and routes requests to the node that already holds the matching prefix, so cache locality, not load alone, drives placement. The throughline is the thesis of this section taken to its conclusion: the KV cache is not a per-GPU implementation detail but a managed, shared, fleet-wide resource, and the next wave of serving gains comes from managing it better rather than from faster matrix units.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.4.1: Read the Capacity Equation <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the per-sequence footprint formula $M_\text{seq}(t) = 2 L H_{kv} d_\text{head} b\, t$ from Section 1, explain in words why a model that switches from multi-head attention ($H_{kv}$ equal to the number of query heads) to grouped-query attention with eight key/value heads can quadruple or more its concurrent-sequence capacity without changing context length or HBM. Then state which two terms in $N_\text{concurrent}$ a serving operator can influence at deployment time and which are fixed by the model architecture, and connect each lever to one policy from Section 2 (tiering) or Section 3 (sharding/sharing).</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.4.2: Extend the Capacity Model <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 24.4.1 so that context length is not fixed at 8192 but drawn from a mix: 80 percent of sequences hold 2k tokens and 20 percent hold 32k tokens. Compute the expected per-sequence footprint and the resulting GPU-only concurrency, and compare it to the uniform-8k case. Then add a fourth policy, "paged sharing plus offload with a 4096-token shared prefix," and report its concurrency. Explain why a heavy tail of long contexts hurts concurrency more than the average context length alone would suggest, and how prefix sharing partially offsets it.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.4.3: Is Disaggregation Worth the Transfer? <span class="exercise-type analysis">Analysis</span></div>
+<p>From the transfer figures in Output 24.4.1, a 4096-token prompt's cache is half a gibibyte and costs about 5 ms over a 100 GB/s link and about 34 ms over a 16 GB/s link. Suppose the decode phase that follows produces 256 tokens at 20 ms per token, and that disaggregation (<a href="section-24.5.html">Section 24.5</a>) lets the decode node run at 1.5 times the throughput it would reach if it also had to do prefill. Estimate the end-to-end latency with and without the transfer on each link, and determine the interconnect bandwidth below which moving the KV cache erases the disaggregation benefit. State the general rule your numbers imply for when prefill/decode separation pays off.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-24.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 24.3</span><span class="nav-title">Pipeline-Parallel and Multi-Node Inference</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 24</span><span class="nav-num">Contents</span><span class="nav-title">Distributed LLM Serving</span></a>
+<a class="next" href="section-24.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 24.5</span><span class="nav-title">Prefill/Decode Disaggregation</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

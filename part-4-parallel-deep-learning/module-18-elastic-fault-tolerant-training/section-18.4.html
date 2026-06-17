@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 18.4: Elastic Training. How a training job survives a changing set of workers by re-forming its process group and rebalancing data instead of restarting, and what changing the world size does to the global batch and learning rate." name="description"/>
+<title>Section 18.4: Elastic Training | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 18: Elastic and Fault-Tolerant Distributed Training</a></div>
+<h1>Elastic Training</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I went to sleep with eight peers and woke up with four. Nobody asked me. We counted heads, agreed on a number, and got back to work before the gradient cooled."</p>
+<cite>A Worker That Survived a Preemption</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Elastic training lets a job continue with a dynamic set of workers: it shrinks when nodes fail or are preempted and grows when capacity returns, by re-forming the process group and rebalancing the data rather than dying and restarting from scratch.</strong> A rigid job picks a world size once and treats any deviation as a fatal error; lose one rank out of a thousand and the whole run aborts. An elastic job treats the worker count as a variable. When membership changes, the survivors rendezvous through a coordination service, agree on the new world size, reload the last checkpoint, and keep going. The price of this resilience is not free: changing the world size changes the global batch, which ripples into the learning rate and the optimization dynamics. This section shows the mechanism, the consequence, and when the resilience is worth the bookkeeping.</p>
+</div>
+<p>The previous sections of this chapter built the parts an elastic job stands on. Section 18.2 made checkpoints sharded and cheap to write, and <a href="section-18.3.html">Section 18.3</a> made a restart replay deterministically from one. Those give you a job that can <em>recover</em> from a failure by stopping and starting again at fixed size. Elastic training asks for something stronger: do not stop. When a node disappears, the remaining workers should notice, regroup, and continue within seconds, and when a node returns, they should absorb it without a human relaunching the job. The job's identity persists across membership changes; only its size fluctuates. That shift, from a fixed-size run that survives failure by restarting to a variable-size run that survives failure by reconfiguring, is what this section is about.</p>
+<p>Two questions organize the material. First, how do the survivors agree on who is still present and resume coherently? That is a control-plane consensus problem, and it reuses machinery you met in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.6.html">Section 2.6</a>. Second, what does changing the number of workers do to the math of the optimizer, given that the global batch is the sum of the per-worker batches? That ties directly to the large-batch scaling rules of <a href="../../part-3-distributed-ml/module-10-distributed-optimization/section-10.8.html">Section 10.8</a>. We take them in turn, then run a job through a real membership storm.</p>
+
+<h2>1. From Fixed Membership to a Variable World Size <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>In every data-parallel job so far, the number of workers, called the world size, was a constant fixed at launch. Each rank held an identical copy of the model and processed its own shard of every batch; the all-reduce after the backward pass averaged their gradients into one. That design has a brittle assumption baked in: the all-reduce expects exactly $K$ participants. If one of them dies mid-step, the collective hangs waiting for a tensor that will never arrive, and the standard remedy is a timeout that kills the entire job. At a thousand GPUs, where Section 18.1 showed that something is almost always broken, this turns routine hardware faults into full-run failures.</p>
+<p>Elastic training removes the assumption. It treats the world size as a quantity that can change between steps, written $K_t$ for the number of live workers at step $t$. The model replica on each surviving worker is unchanged; what changes is how many replicas participate in the next all-reduce and how the data is divided among them. The job keeps a single logical state, the model weights and optimizer state, and that state is portable across any $K_t$ because it lives in the checkpoint, not in the membership. When the set of workers changes, the job does not lose its place; it reloads from the most recent checkpoint (the cheap sharded one from Section 18.2) and resumes with whatever workers are present.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The World Size Is a Variable, Not a Constant</div>
+<p>A rigid job hard-codes the number of workers into its correctness: lose a rank and the collective deadlocks. An elastic job makes the worker count $K_t$ a value that is re-agreed at each membership change. The model state is deliberately kept independent of $K_t$ (it is just weights plus optimizer moments), so any surviving subset of workers can reconstitute the full job from a checkpoint. Resilience comes from refusing to let the count of machines be part of what "the job" means.</p>
+</div>
+
+<h2>2. Rendezvous: Agreeing on Who Is Here <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The hard part of "continue with whoever is present" is the word <em>agree</em>. The survivors must reach a single, consistent answer to three questions at the same instant: who is in the group, how big is the group, and what rank does each member hold. If two workers disagreed about the world size, their all-reduce would mismatch and corrupt the gradient; if two claimed rank $0$, the collective would be malformed. Reaching one consistent view of membership among machines that are themselves unreliable is exactly the consensus problem on the cluster control plane that <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.6.html">Section 2.6</a> framed: a set of nodes electing a configuration through a coordination service that tolerates faults.</p>
+<p>This agreement step is called <strong>rendezvous</strong>. Workers register their presence with a shared coordination service (an etcd or ZooKeeper-style store, or a built-in store keyed by a job id), and the rendezvous protocol periodically takes a census. When it detects that the membership has changed (a worker stopped heartbeating, or a new worker joined and is waiting), it closes the current round, counts the participants, assigns each a fresh contiguous rank from $0$ to $K_t - 1$, and signals everyone to re-form the process group. Each worker then rebuilds its communicator for the new world size, reloads the latest checkpoint so all replicas start from identical weights, and the training loop continues. Figure 18.4.1 traces this cycle for a worker that is preempted and a new worker that joins.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of the elastic training cycle: four workers train under a rendezvous service, one is preempted, the survivors re-form a smaller process group and resume from checkpoint, then a new worker joins and the group re-forms larger.">
+<defs>
+<marker id="arr184" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b184 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w184 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g184 { fill:#eef7ee; stroke:#2f7d32; stroke-width:1.6; }
+.x184 { fill:#fbeaea; stroke:#b03030; stroke-width:1.6; }
+.t184 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s184 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l184 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr184); }
+.d184 { fill:none; stroke:#b03030; stroke-width:1.6; stroke-dasharray:4 3; }
+</style>
+<!-- rendezvous service -->
+<rect class="b184" x="330" y="14" width="200" height="44" rx="10"/>
+<text class="t184" x="430" y="34">Rendezvous service</text>
+<text class="s184" x="430" y="50">census, world size, rank assignment</text>
+<!-- stage 1 -->
+<text class="t184" x="120" y="92">1. Training, K=4</text>
+<rect class="g184" x="40" y="106" width="70" height="40" rx="7"/><text class="s184" x="75" y="131">rank 0</text>
+<rect class="g184" x="120" y="106" width="70" height="40" rx="7"/><text class="s184" x="155" y="131">rank 1</text>
+<rect class="g184" x="40" y="156" width="70" height="40" rx="7"/><text class="s184" x="75" y="181">rank 2</text>
+<rect class="x184" x="120" y="156" width="70" height="40" rx="7"/><text class="s184" x="155" y="177">rank 3</text>
+<text class="s184" x="155" y="190" style="fill:#b03030">preempted</text>
+<line x1="200" y1="150" x2="280" y2="150" class="l184"/>
+<text class="s184" x="240" y="142">detect</text>
+<!-- stage 2 -->
+<text class="t184" x="370" y="92">2. Re-form, K=3</text>
+<rect class="g184" x="300" y="106" width="70" height="40" rx="7"/><text class="s184" x="335" y="131">rank 0</text>
+<rect class="g184" x="380" y="106" width="70" height="40" rx="7"/><text class="s184" x="415" y="131">rank 1</text>
+<rect class="g184" x="300" y="156" width="70" height="40" rx="7"/><text class="s184" x="335" y="181">rank 2</text>
+<text class="s184" x="375" y="222">reload checkpoint,</text>
+<text class="s184" x="375" y="237">rebuild communicator</text>
+<line x1="460" y1="150" x2="540" y2="150" class="l184"/>
+<text class="s184" x="500" y="142">join</text>
+<!-- stage 3 -->
+<text class="t184" x="690" y="92">3. Re-form, K=4</text>
+<rect class="g184" x="620" y="106" width="70" height="40" rx="7"/><text class="s184" x="655" y="131">rank 0</text>
+<rect class="g184" x="700" y="106" width="70" height="40" rx="7"/><text class="s184" x="735" y="131">rank 1</text>
+<rect class="g184" x="620" y="156" width="70" height="40" rx="7"/><text class="s184" x="655" y="181">rank 2</text>
+<rect class="w184" x="700" y="156" width="70" height="40" rx="7"/><text class="s184" x="735" y="177">rank 3</text>
+<text class="s184" x="735" y="190" style="fill:#b86b1f">new node</text>
+<!-- service links -->
+<path class="d184" d="M 330 40 C 200 60, 120 80, 120 104"/>
+<path class="l184" d="M 430 58 L 410 104"/>
+<path class="l184" d="M 530 40 C 660 60, 700 80, 700 104"/>
+<text class="s184" x="430" y="300">Each membership change is one consensus round: census, agree on K, assign ranks, resume from the last checkpoint.</text>
+<text class="s184" x="430" y="340" style="font-weight:600; fill:#14385c">The model state survives every reconfiguration; only the world size changes.</text>
+</svg>
+<figcaption><strong>Figure 18.4.1:</strong> The elastic training cycle. Four workers train under a rendezvous service (top). When rank 3 is preempted, the survivors detect the loss, run a consensus round to agree on the new world size $K=3$, reassign contiguous ranks, reload the latest sharded checkpoint, and resume. When a new node later joins, the same protocol re-forms the group at $K=4$. The weights and optimizer state ride through unchanged because they live in the checkpoint, not in the membership.</figcaption>
+</figure>
+<p>The rendezvous in Figure 18.4.1 is deliberately the same shape as a leader-election or configuration-change round on a control plane: a fault-tolerant store holds the authoritative membership, and a protocol drives all participants to one agreed view before any of them proceeds. This is why elastic training is a distributed-systems problem before it is a deep-learning one. The deep-learning part, reloading weights and resuming the optimizer, is straightforward once everyone agrees on $K_t$; getting that agreement reliably, without split-brain or duplicate ranks, is the engineering that the rendezvous backend exists to provide.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: TorchElastic and torchrun Run the Rendezvous for You</div>
+<p>You do not implement the census, the rank assignment, or the restart loop by hand. PyTorch ships TorchElastic, exposed through the <code>torchrun</code> launcher, which wraps your existing training script and supplies the rendezvous backend, the worker supervision, and the automatic restart on membership change. You write an ordinary single-program multiple-data script that reads its rank and world size from the environment; <code>torchrun</code> makes those values elastic:</p>
+<pre><code class="language-bash"># A FIXED job pins the world size; losing a node aborts the run.
+torchrun --nnodes=8 --nproc_per_node=8 train.py
+
+# An ELASTIC job accepts a RANGE of nodes and a rendezvous backend.
+# It runs with 4 to 8 nodes, shrinking on preemption and growing as capacity returns.
+torchrun \
+  --nnodes=4:8 \
+  --nproc_per_node=8 \
+  --max-restarts=100 \
+  --rdzv-backend=c10d \
+  --rdzv-endpoint=$HEAD_NODE:29400 \
+  --rdzv-id=my-elastic-job \
+  train.py
+</code></pre>
+<div class="code-caption"><strong>Code 18.4.1:</strong> The only difference between a rigid and an elastic launch is a few launcher flags. The <code>--nnodes=4:8</code> range and the <code>--rdzv-backend</code> turn a fixed-size job into one that re-forms its process group automatically; your <code>train.py</code> only needs to re-read <code>WORLD_SIZE</code> after each restart and reload the latest checkpoint. The dozens of lines of census, rank-assignment, and supervision logic that a hand-rolled elastic job would need collapse into those flags.</div>
+</div>
+
+<h2>3. The Consequence: Changing World Size Moves the Global Batch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Elasticity is not free even when the rendezvous works perfectly, because the world size is not just an operational number; it is an optimization hyperparameter in disguise. In synchronous data-parallel training, every worker processes a per-worker batch of size $b$, and the all-reduce averages their gradients, so the effective batch the optimizer sees, the global batch, is</p>
+$$B_t = K_t \cdot b.$$
+<p>When $K_t$ drops from $8$ to $4$ because four nodes were preempted, $B_t$ halves if you keep $b$ fixed. A smaller global batch means a noisier gradient estimate and, under the linear scaling rule from <a href="../../part-3-distributed-ml/module-10-distributed-optimization/section-10.8.html">Section 10.8</a>, a learning rate that is now too large for the batch it is paired with. Left uncorrected, an elastic shrink can destabilize a run that was tuned for the larger batch. So elasticity inherits the entire large-batch scaling discussion: every time membership changes, you have implicitly changed the batch, and you must decide what to hold constant.</p>
+<p>There are two clean strategies, and real systems pick one deliberately. The first holds the per-worker batch $b$ fixed and lets $B_t = K_t b$ float; then you must rescale the learning rate with $B_t$, typically linearly, so $\eta_t = \eta_0 \cdot (B_t / B_0)$. The second holds the global batch $B$ fixed and rebalances the per-worker batch to $b_t = B / K_t$; then the optimizer sees a constant batch and the learning rate needs no adjustment, at the cost of each surviving worker doing proportionally more work per step. Table 18.4.1 contrasts the two.</p>
+<div class="table-caption"><strong>Table 18.4.1:</strong> Two strategies for handling a world-size change. Either the global batch floats and the learning rate tracks it, or the global batch is held fixed by giving the survivors larger per-worker batches.</div>
+<table>
+<thead>
+<tr><th scope="col">Strategy</th><th scope="col">Held fixed</th><th scope="col">What floats with $K_t$</th><th scope="col">Required adjustment</th></tr>
+</thead>
+<tbody>
+<tr><td>Float the batch</td><td>per-worker batch $b$</td><td>global batch $B_t = K_t b$</td><td>rescale learning rate $\eta_t \propto B_t$</td></tr>
+<tr><td>Fix the batch</td><td>global batch $B$</td><td>per-worker batch $b_t = B / K_t$</td><td>none (optimizer sees constant $B$); survivors do more work</td></tr>
+</tbody>
+</table>
+<p>The fix-the-batch strategy is usually the safer default for a run whose accuracy was tuned at a target batch, because it keeps the optimizer's view invariant under membership changes; the cost is that a shrunk job runs slower per step but mathematically identical. The float-the-batch strategy is simpler to implement and fine when the run is robust to batch changes, provided you actually rescale the learning rate. The demo below takes the fix-the-batch route so that the loss curve is comparable across world sizes.</p>
+
+<h2>4. A Job That Rides Out a Membership Storm <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The code below simulates both jobs on one synthetic regression problem so the difference is visible in a single run. A scripted timeline drives the available worker count through $8 \to 4 \to 2 \to 8$, modelling a preemption wave followed by a recovery. The elastic job re-forms at each change and holds the global batch fixed at $512$ by rebalancing the per-worker batch ($64$ at $K=8$, $256$ at $K=2$), so the optimizer sees a constant batch and the loss falls monotonically across every membership change. The rigid job pins the world size at $8$ and aborts the instant a rank goes missing. No deep-learning framework is used; the all-reduce is a plain sum of per-shard partial gradients, exactly as in <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+N, d = 20_000, 16
+X = rng.standard_normal((N, d))
+w_true = rng.standard_normal(d)
+y = X @ w_true + 0.05 * rng.standard_normal(N)
+
+GLOBAL_BATCH = 512          # the batch size the run was tuned for
+BASE_LR = 0.05              # learning rate tuned for GLOBAL_BATCH
+STEPS = 12
+
+# Scripted membership timeline: live world size per step (nodes fail, then recover).
+world_timeline = [8, 8, 8, 4, 4, 4, 4, 2, 4, 8, 8, 8]   # preempt at step 3, regrow by step 9
+
+def mse_loss(w):
+    r = X @ w - y
+    return float(r @ r / N)
+
+def grad_on_indices(w, idx):
+    Xs, ys = X[idx], y[idx]
+    return (2.0 / len(idx)) * (Xs.T @ (Xs @ w - ys))
+
+def run_elastic():
+    """Re-form each step; hold GLOBAL_BATCH fixed by rebalancing the per-worker batch."""
+    w = np.zeros(d)
+    print("=== ELASTIC job: membership changes, run continues ===")
+    print(f"{'step':&gt;4}  {'world':&gt;5}  {'per-worker':&gt;10}  {'global':&gt;6}     {'loss':&gt;6}")
+    for t in range(STEPS):
+        world = world_timeline[t]                       # rendezvous agrees on K_t
+        per_worker = GLOBAL_BATCH // world              # rebalance so K_t * b = GLOBAL_BATCH
+        global_batch = per_worker * world
+        idx_all = rng.integers(0, N, size=global_batch)
+        shards = np.array_split(idx_all, world)         # one shard per surviving worker
+        partials = [per_worker * grad_on_indices(w, s) for s in shards]   # unnormalized
+        g = np.sum(partials, axis=0) / global_batch     # all-reduce SUM, then mean
+        w = w - BASE_LR * g                             # constant batch => constant LR
+        print(f"{t:&gt;4}  {world:&gt;5}  {per_worker:&gt;10}  {global_batch:&gt;6}  {mse_loss(w):&gt;9.4f}")
+    print(f"elastic final loss   : {mse_loss(w):.4f}  (survived 8 -&gt; 4 -&gt; 2 -&gt; 8)")
+    return mse_loss(w)
+
+def run_rigid():
+    """Fixed world size 8; if any rank is missing the process group cannot form."""
+    w = np.zeros(d)
+    FIXED, per_worker = 8, GLOBAL_BATCH // 8
+    print("\n=== RIGID job: fixed world size of 8 ===")
+    print(f"{'step':&gt;4}  {'world':&gt;5}               status")
+    for t in range(STEPS):
+        if world_timeline[t] &lt; FIXED:                    # cannot form the group: abort
+            print(f"{t:&gt;4}  {world_timeline[t]:&gt;5}  CRASH: need 8 ranks")
+            print("rigid job aborted: process group could not be formed")
+            return None
+        idx_all = rng.integers(0, N, size=GLOBAL_BATCH)
+        shards = np.array_split(idx_all, FIXED)
+        partials = [per_worker * grad_on_indices(w, s) for s in shards]
+        g = np.sum(partials, axis=0) / GLOBAL_BATCH
+        w = w - BASE_LR * g
+        print(f"{t:&gt;4}  {world_timeline[t]:&gt;5}      ok loss={mse_loss(w):.4f}")
+    return mse_loss(w)
+
+run_elastic()       # rides the 8 -&gt; 4 -&gt; 2 -&gt; 8 storm to completion
+run_rigid()         # aborts the moment the first node is lost
+</code></pre>
+<div class="code-caption"><strong>Code 18.4.2:</strong> An elastic job and a rigid job on the same problem and timeline. The elastic loop re-reads the world size each step and rebalances the per-worker batch so the global batch (and thus the learning rate) is invariant; the rigid loop aborts as soon as the live worker count falls below its fixed size.</div>
+<pre><code class="language-text">=== ELASTIC job: membership changes, run continues ===
+step  world  per-worker  global       loss
+   0      8          64     512    15.8416
+   1      8          64     512    12.8740
+   2      8          64     512    10.4142
+   3      4         128     512     8.5130
+   4      4         128     512     6.9097
+   5      4         128     512     5.5668
+   6      4         128     512     4.4785
+   7      2         256     512     3.6760
+   8      4         128     512     2.9728
+   9      8          64     512     2.4372
+  10      8          64     512     1.9335
+  11      8          64     512     1.5450
+elastic final loss   : 1.5450  (survived 8 -> 4 -> 2 -> 8)
+
+=== RIGID job: fixed world size of 8 ===
+step  world               status
+   0      8      ok loss=15.4426
+   1      8      ok loss=12.8529
+   2      8      ok loss=10.3900
+   3      4  CRASH: need 8 ranks
+rigid job aborted: process group could not be formed</code></pre>
+<div class="code-caption"><strong>Output 18.4.2:</strong> The elastic job's loss falls smoothly through the entire $8 \to 4 \to 2 \to 8$ storm because the global batch stays at $512$ at every world size; the per-worker batch column shows the rebalancing ($64$, then $128$, then $256$). The rigid job trains identically for three steps, then aborts at step 3 the moment four nodes vanish. Same hardware events, opposite outcomes.</div>
+<p>The contrast in Output 18.4.2 is the whole argument in miniature. The two jobs face the identical sequence of node losses. The rigid job treats the first loss as fatal and throws away three steps of progress plus the cost of a human relaunch; the elastic job treats each loss as a reconfiguration, holds its optimization invariant by rebalancing the batch, and reaches a final loss of $1.5450$ without interruption. Notice that the elastic job's rebalancing is what kept the learning rate valid: had it left the per-worker batch at $64$, the global batch would have collapsed to $128$ at $K=2$ and the fixed learning rate would have been four times too large for that batch, exactly the failure mode Section 10.8 warns about.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Pretraining Run on a Preemptible Pool</div>
+<p><strong>Who:</strong> An ML infrastructure engineer running a multi-day language-model pretraining job on a cloud provider's spot GPU pool.</p>
+<p><strong>Situation:</strong> Spot capacity was about a third the price of on-demand, but the provider reclaimed instances with two minutes of notice, several times a day, at unpredictable hours.</p>
+<p><strong>Problem:</strong> The first attempt used a fixed 64-GPU job; each reclamation aborted the run, and a human had to relaunch from the last checkpoint, losing hours and sleep.</p>
+<p><strong>Dilemma:</strong> Pay for on-demand instances and triple the bill to get a stable world size, or stay on spot and make the job tolerate a world size that changes several times a day on its own.</p>
+<p><strong>Decision:</strong> They stayed on spot and made the job elastic with <code>torchrun --nnodes=32:64</code> and a c10d rendezvous, holding the global batch fixed so the optimizer was invariant to the count of live GPUs.</p>
+<p><strong>How:</strong> On each preemption the survivors rendezvoused, reloaded the latest sharded checkpoint from Section 18.2, rebalanced the per-worker batch to keep the global batch at target, and resumed within seconds; reclaimed capacity rejoined automatically when it returned.</p>
+<p><strong>Result:</strong> The run completed across dozens of reclamation events with no human relaunches, at roughly a third the compute cost of the on-demand equivalent, and the final model matched a fixed-size control run because the global batch never changed.</p>
+<p><strong>Lesson:</strong> Elasticity converts a volatile, cheap resource into a usable one. The bookkeeping that keeps the batch invariant is what makes the cheaper resource safe to train on.</p>
+</div>
+
+<h2>5. When Elasticity Earns Its Complexity <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Elastic training is not the right default for every job, because it adds real complexity: a rendezvous backend to operate, a checkpoint cadence frequent enough that a restart loses little, and the batch-and-learning-rate bookkeeping of Section 3. That overhead pays off precisely when the worker set is genuinely volatile or shared. The two clearest cases are spot and preemptible instances, where the provider reclaims capacity on its own schedule, and shared multi-tenant clusters, where a scheduler may preempt your low-priority job to make room for a higher-priority one. In both, the world size will change whether or not you planned for it, so a job that cannot tolerate change will spend its life restarting.</p>
+<p>The alternative is a fixed-size, gang-scheduled run: the scheduler reserves all $K$ workers at once and runs the job to completion without preemption, so the world size never changes and elasticity buys nothing. Gang scheduling is the right choice on a dedicated reservation or a capacity block where you own the nodes for the duration, and it avoids both the rendezvous machinery and the batch bookkeeping. The decision is therefore about the resource, not the model: is your capacity stable and reserved, or volatile and shared? That scheduling question is the subject of <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/index.html">Chapter 33</a>, which develops gang scheduling and preemption policies in full; elastic training is the job-side counterpart to the cluster-side policies described there.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Job That Outlived Its Machines</div>
+<p>A long-running elastic job is a kind of ship of Theseus. Over a multi-week run on spot capacity, every physical GPU it started on may be reclaimed and replaced, sometimes several times over. The set of machines at the end can share not one node with the set at the start, yet it is unambiguously the same job: same weights, same optimizer state, same loss curve, carried forward through every rendezvous. The job is the state, not the silicon.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Elastic and Fault-Tolerant Training Systems (2024 to 2026)</div>
+<p>Plain TorchElastic restarts every surviving worker from a checkpoint on each membership change, which wastes the work in flight and stalls the whole job during the reconfiguration. A research line on resilient pipeline-parallel training attacks this directly. Bamboo (Thorpe et al., 2023) trains on preemptible spot instances by having each pipeline stage redundantly compute its neighbor's work, so a preemption is masked without a full restart. Oobleck (Jang et al., 2023) precomputes a set of heterogeneous pipeline templates so that when nodes are lost the job instantly re-plans onto a surviving template instead of reloading from disk. Gemini (Wang et al., 2023) checkpoints model state into the memory of peer machines rather than to remote storage, cutting recovery from minutes to near-instant and pushing the failure-free overhead toward zero. Newer systems extend these ideas to elastic 3D-parallel and mixture-of-expert training, where a membership change must re-plan data, pipeline, and expert placement together. The common thread is to make reconfiguration incremental and in-memory rather than a stop-the-world reload, so that elasticity costs seconds, not minutes, per event.</p>
+</div>
+<p>With elasticity in hand, the job survives the planned and unplanned arrival and departure of whole workers. But a worker need not leave to hurt the run: one that merely runs slow, a straggler, can stall a synchronous all-reduce just as effectively as a missing rank stalls a rigid one, without ever triggering a rendezvous. Detecting and mitigating those slow-but-present workers is the subject of the next section.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.4.1: Why the Rebalance Matters <span class="exercise-type conceptual">Conceptual</span></div>
+<p>In Output 18.4.2 the elastic job holds the global batch at $512$ by rebalancing the per-worker batch. Suppose instead it left the per-worker batch fixed at $64$ and let the global batch float with $K_t$. Using the linear scaling rule from <a href="../../part-3-distributed-ml/module-10-distributed-optimization/section-10.8.html">Section 10.8</a>, state the global batch and the correct learning rate at $K=8$, $K=4$, and $K=2$. Explain what goes wrong if the learning rate is left at its $K=8$ value when the world shrinks to $K=2$, and why the fix-the-batch strategy sidesteps the problem entirely.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.4.2: Add a Reconfiguration Cost <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 18.4.2 so that each membership change (any step where <code>world_timeline[t]</code> differs from the previous step) costs a fixed number of "lost" steps, modelling the time to rendezvous and reload a checkpoint. Count the total reconfiguration overhead across the $8 \to 4 \to 2 \to 8$ timeline for two checkpoint cadences. Then implement a Gemini-style in-memory recovery by making the per-event cost much smaller, and report how much wall-clock the cheaper recovery saves over the full run. State which research system from the frontier callout your cheaper-recovery variant approximates.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.4.3: Elastic or Gang-Schedule? <span class="exercise-type analysis">Analysis</span></div>
+<p>For each scenario, decide whether you would run elastic training or a fixed-size gang-scheduled job, and justify it from the resource volatility rather than the model: (a) a 30-minute fine-tuning run on a dedicated 8-GPU reservation you own for the day; (b) a two-week pretraining run on a spot pool that reclaims nodes several times daily; (c) a nightly job on a shared research cluster where a higher-priority team can preempt you at any time. For the cases where you chose elastic, name what you would hold fixed (per-worker batch or global batch) and why, referencing the trade-off in Table 18.4.1.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-18.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 18.3</span><span class="nav-title">Restart, Replay, and Determinism</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 18</span><span class="nav-num">Contents</span><span class="nav-title">Elastic and Fault-Tolerant Distributed Training</span></a>
+<a class="next" href="section-18.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 18.5</span><span class="nav-title">Straggler Detection and Mitigation</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

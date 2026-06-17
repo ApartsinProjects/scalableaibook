@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 10.5: Gradient Aggregation and All-Reduce SGD. How partial gradients are combined (sum vs mean), why decentralized ring all-reduce displaced the parameter server, how gradient accumulation simulates a larger batch, and where the all-reduce overlaps with backpropagation." name="description"/>
+<title>Section 10.5: Gradient Aggregation and All-Reduce SGD | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Distributed Machine Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 10: Distributed Optimization</a></div>
+<h1>Gradient Aggregation and All-Reduce SGD</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They asked the central server to hold everyone's gradient. The central server, being one machine, politely explained that it had a bandwidth, and that bandwidth had a breaking point."</p>
+<cite>An All-Reduce That Has Seen Some Gradients</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Synchronous SGD computes the same update on every worker only if their partial gradients are combined correctly, and the way that combination is wired into the network decides whether training scales to thousands of accelerators or chokes on a single bottleneck.</strong> The previous sections established that the data-parallel gradient is an exact sum of per-shard pieces. This section is about the combine step itself: whether you sum or average the pieces (and what that does to the learning rate), whether the pieces flow through one central server or through a symmetric all-reduce with no center at all, and how a single all-reduce can be made to cost almost nothing by hiding it behind the backward pass. It also shows how gradient accumulation lets one worker pretend to hold a much larger batch than its memory allows, while cutting how often the network has to run.</p>
+</div>
+<p>By the time a distributed training step reaches its combine phase, every worker is holding a vector of the same shape: its local gradient, computed on its own shard of the mini-batch. The arithmetic that fuses these vectors into one shared update is simple, but the systems question hiding behind it is not. Who adds the vectors together? Does the result pass through a coordinator, or do the workers exchange directly? How many bytes cross the network, and can any of that traffic happen while the accelerators are still busy computing? Those questions separate a training run that doubles its throughput when you double the workers from one that adds workers and gets slower. This section answers them for the pattern that became the default for deep learning: all-reduce SGD.</p>
+
+<h2>1. Sum or Mean, and the Learning Rate That Comes With It <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Each worker $k$ holds a partial gradient computed on its local batch $\mathcal{B}_k$ of size $b_k$. There are two natural ways to define what the workers compute and then how to fuse the results, and confusing them is the most common source of a learning rate that is silently off by a factor of $K$. The first convention has each worker return an unnormalized <em>sum</em> of per-example gradients, and the combine step adds those sums and divides once by the global batch size $B = \sum_k b_k$:</p>
+$$g_{\text{sum}} = \sum_{k=1}^{K} \sum_{i \in \mathcal{B}_k} \nabla \ell(w; x_i, y_i), \qquad \bar{g} = \frac{1}{B}\, g_{\text{sum}}.$$
+<p>The second convention has each worker return its local <em>mean</em> gradient, and the combine step averages those means. When every worker has the same batch size $b_k = B/K$, the average of the means equals the global mean, so the two conventions agree:</p>
+$$\bar{g} = \frac{1}{K} \sum_{k=1}^{K} \left( \frac{1}{b_k} \sum_{i \in \mathcal{B}_k} \nabla \ell(w; x_i, y_i) \right) \quad \text{(equal-size case only)}.$$
+<p>The practical rule is that the update $w \leftarrow w - \eta\, \bar{g}$ should always be driven by the mean gradient $\bar{g}$ over the global batch, because the learning rate $\eta$ you tuned was tuned against a mean. If you accidentally feed it the <em>sum</em> $g_{\text{sum}}$, you have multiplied your effective learning rate by $B$, and training will diverge on the first step. The collective that frameworks expose, $\texttt{all\_reduce}$ with a SUM reduction, returns the sum; turning it into a mean is your one extra division, and forgetting it is a rite of passage. The unequal-size case matters too: the mean-of-means in the second equation is wrong when workers receive different batch sizes, exactly the failure that <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> warns about for weighted collectives, and only the sum-then-divide-by-$B$ form stays correct.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Collective Returns a Sum; You Own the Division</div>
+<p>Hardware collectives reduce with SUM because addition is associative and order-free, which is what lets a ring or tree combine partial results without a coordinator. The mean that your optimizer actually wants is your responsibility: divide the all-reduced sum by the global batch size $B$, not by the worker count $K$, unless every worker carries an identical batch. Tie the learning rate to the mean gradient and the sum-versus-mean ambiguity disappears; ignore it and you have a hidden factor of $K$ (or $B$) waiting to blow up the first step.</p>
+</div>
+
+<h2>2. All-Reduce SGD versus the Parameter Server <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>There are two ways to wire the combine step across machines, and they have opposite shapes. The <em>parameter-server</em> pattern is centralized and asymmetric: every worker pushes its local gradient to one or more dedicated server nodes, the servers add the gradients, apply the update, and the workers pull back the fresh weights. The all-reduce pattern is decentralized and symmetric: there is no server, every worker plays the identical role, and the same collective leaves every worker holding the full summed gradient simultaneously. We treat the parameter-server design in depth in <a href="../module-11-parameter-servers-embeddings/index.html">Chapter 11</a>; here we contrast it with all-reduce to explain why all-reduce became the default for dense deep-learning models. Figure 10.5.1 shows the two topologies side by side.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left: a parameter-server topology where four workers all push gradients to and pull weights from one central server, whose link carries the combined traffic. Right: a ring all-reduce topology where four workers form a circle and each sends only to its neighbor.">
+<defs>
+<marker id="arr105" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr105b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.bx105 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.sv105 { fill:#fdeaea; stroke:#a33; stroke-width:1.8; }
+.wk105 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.t105 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s105 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l105 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr105); }
+.r105 { fill:none; stroke:#b86b1f; stroke-width:1.8; marker-end:url(#arr105b); }
+</style>
+<text class="t105" x="215" y="24">Parameter server (centralized)</text>
+<rect class="sv105" x="160" y="48" width="110" height="46" rx="8"/>
+<text class="t105" x="215" y="68">Server</text>
+<text class="s105" x="215" y="84">sum + update</text>
+<rect class="wk105" x="40" y="200" width="92" height="44" rx="7"/><text class="t105" x="86" y="227">Worker 1</text>
+<rect class="wk105" x="150" y="200" width="92" height="44" rx="7"/><text class="t105" x="196" y="227">Worker 2</text>
+<rect class="wk105" x="260" y="200" width="92" height="44" rx="7"/><text class="t105" x="306" y="227">Worker 3</text>
+<rect class="wk105" x="370" y="200" width="60" height="44" rx="7"/><text class="t105" x="400" y="227">W4</text>
+<path class="l105" d="M 86 200 L 190 96"/>
+<path class="l105" d="M 196 200 L 208 96"/>
+<path class="l105" d="M 306 200 L 240 96"/>
+<path class="l105" d="M 400 200 L 262 96"/>
+<text class="s105" x="215" y="300">central link carries all</text>
+<text class="s105" x="215" y="316">K gradients: a bottleneck</text>
+<line x1="470" y1="40" x2="470" y2="320" stroke="#ccd3db" stroke-width="1.4" stroke-dasharray="4 4"/>
+<text class="t105" x="665" y="24">Ring all-reduce (decentralized)</text>
+<rect class="wk105" x="600" y="60" width="92" height="44" rx="7"/><text class="t105" x="646" y="87">Worker 1</text>
+<rect class="wk105" x="755" y="150" width="92" height="44" rx="7"/><text class="t105" x="801" y="177">Worker 2</text>
+<rect class="wk105" x="600" y="250" width="92" height="44" rx="7"/><text class="t105" x="646" y="277">Worker 3</text>
+<rect class="wk105" x="490" y="150" width="92" height="44" rx="7"/><text class="t105" x="536" y="177">Worker 4</text>
+<path class="r105" d="M 692 90 Q 760 110 758 150"/>
+<path class="r105" d="M 801 194 Q 800 240 692 262"/>
+<path class="r105" d="M 600 272 Q 540 250 536 194"/>
+<path class="r105" d="M 536 150 Q 545 110 600 88"/>
+<text class="s105" x="665" y="328">each link carries one chunk; no center</text>
+</svg>
+<figcaption><strong>Figure 10.5.1:</strong> Two ways to combine gradients. On the left, the parameter-server pattern routes every worker's gradient through one central server, whose single link must carry traffic proportional to $K$ workers and becomes the bottleneck as the cluster grows. On the right, ring all-reduce arranges the workers in a circle where each worker sends to exactly one neighbor; no node sees more than a constant share of the traffic, which is the property that lets it scale to thousands of accelerators.</figcaption>
+</figure>
+<p>The decisive difference is bandwidth at the center. In the parameter-server picture, the server's network link must absorb a gradient from every worker on each step, so the traffic into the center grows with $K$ and the central link saturates first. Ring all-reduce, the algorithm built in <a href="../../part-1-foundations/module-04-communication-primitives/section-4.4.html">Section 4.4</a>, has no center: the $P$-element gradient is split into $K$ chunks that circulate around the ring, and each worker sends and receives only $\frac{P}{K}$ elements per hop. Over the full reduce-scatter-then-all-gather schedule, every worker moves about $2\frac{K-1}{K}P$ elements regardless of $K$, so the per-worker bandwidth cost is essentially constant in the cluster size. That bandwidth optimality, not any change in the math, is why dense deep-learning training abandoned the central server for symmetric all-reduce. The same arc is flagged in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>: the all-reduce you perform by hand returns, scaled out, as the engine of every data-parallel trainer.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Center That Could Not Hold</div>
+<p>A parameter server is the office printer of distributed training: perfectly fine when three people use it, a riot when three hundred queue up at 9 a.m. Ring all-reduce is the realization that nobody actually needs a printer in the middle if everyone just hands their page to the person on their left.</p>
+</div>
+
+<h2>3. Gradient Accumulation: A Bigger Batch Than Memory Allows <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Suppose the batch size you want will not fit in accelerator memory, because the activations for that many examples overflow the device. Gradient accumulation buys you the larger batch without the memory: split the per-worker batch into $m$ smaller <em>micro-batches</em>, run forward and backward on each one in turn, and add its gradient into an accumulator buffer instead of stepping the optimizer. After $m$ micro-batches the accumulator holds the sum of all of them, which is exactly the gradient you would have computed had the full batch fit at once. Only then do you run the all-reduce and the optimizer update. Because activations for one micro-batch are freed before the next begins, peak memory is set by the micro-batch, not by the effective batch.</p>
+<p>There is a second payoff that is squarely a scale-out concern: the all-reduce now runs once per $m$ micro-batches instead of once per micro-batch, so the communication frequency drops by a factor of $m$. You are amortizing one fixed-cost network exchange over $m$ local computations, which is the same lever that local-update methods pull (and that <a href="section-10.7.html">Section 10.7</a> develops into full communication-efficient optimization). Figure 10.5.2 lays the timeline out.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A timeline showing four micro-batch forward-backward computations in sequence, each adding into a gradient accumulator, followed by a single all-reduce and a single optimizer update at the end.">
+<style>
+.cap105 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.lab105 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.mb105 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.5; }
+.ar105 { fill:#e8f0e8; stroke:#3a7d44; stroke-width:1.6; }
+.up105 { fill:#eae6f7; stroke:#5a4a9c; stroke-width:1.6; }
+.ax105 { stroke:#9aa3ad; stroke-width:1.3; }
+</style>
+<text class="cap105" x="430" y="26">One optimizer step = m micro-batches, then one all-reduce, then one update</text>
+<line x1="40" y1="170" x2="820" y2="170" class="ax105"/>
+<text class="lab105" x="40" y="196" text-anchor="start">time &#8594;</text>
+<rect class="mb105" x="50" y="80" width="130" height="70" rx="6"/><text class="cap105" x="115" y="110">micro 1</text><text class="lab105" x="115" y="130">fwd + bwd</text>
+<rect class="mb105" x="190" y="80" width="130" height="70" rx="6"/><text class="cap105" x="255" y="110">micro 2</text><text class="lab105" x="255" y="130">fwd + bwd</text>
+<rect class="mb105" x="330" y="80" width="130" height="70" rx="6"/><text class="cap105" x="395" y="110">micro 3</text><text class="lab105" x="395" y="130">fwd + bwd</text>
+<rect class="mb105" x="470" y="80" width="130" height="70" rx="6"/><text class="cap105" x="535" y="110">micro 4</text><text class="lab105" x="535" y="130">fwd + bwd</text>
+<text class="lab105" x="325" y="66">accumulate gradient into one buffer (no step yet)</text>
+<rect class="ar105" x="615" y="80" width="100" height="70" rx="6"/><text class="cap105" x="665" y="110">all-</text><text class="cap105" x="665" y="128">reduce</text>
+<rect class="up105" x="725" y="80" width="90" height="70" rx="6"/><text class="cap105" x="770" y="112">update</text><text class="lab105" x="770" y="130">w &#8592; w &#8722; &#951;g&#772;</text>
+<text class="lab105" x="665" y="196">runs once per m, not per micro-batch</text>
+</svg>
+<figcaption><strong>Figure 10.5.2:</strong> The gradient-accumulation timeline for one optimizer step. Four micro-batches run forward and backward in sequence (orange), each adding its gradient into a single accumulator so peak memory is set by one micro-batch. Only after the last micro-batch does the single all-reduce (green) combine across workers, followed by one optimizer update (purple). Communication runs once per $m$ micro-batches, cutting network frequency by the factor $m$.</figcaption>
+</figure>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Hitting the Target Batch on Yesterday's GPUs</div>
+<p><strong>Who:</strong> A research engineer fine-tuning a vision-language model on a four-GPU workstation with modest per-card memory.</p>
+<p><strong>Situation:</strong> The recipe from the model's authors specified an effective batch of 512, but each GPU could fit only 16 examples before running out of memory on activations.</p>
+<p><strong>Problem:</strong> Four GPUs at 16 examples each give a batch of 64, eight times too small; the learning-rate schedule tuned for 512 was unstable at 64, and a bigger machine was not in budget.</p>
+<p><strong>Dilemma:</strong> Retune the entire schedule for the small batch (slow, and it drifts from the published result), rent larger accelerators (over budget), or simulate the large batch with gradient accumulation (free, but the loop must be written so the optimizer steps only after accumulation).</p>
+<p><strong>Decision:</strong> They used gradient accumulation with $m = 8$ micro-batches per GPU, recovering the effective batch of $4 \times 16 \times 8 = 512$ without new hardware.</p>
+<p><strong>How:</strong> They divided each step into eight micro-batches, summed the gradients locally, ran a single all-reduce after the eighth, then stepped the optimizer; the only subtlety was dividing by the true global count $512$, not by the micro-batch count.</p>
+<p><strong>Result:</strong> Loss curves matched the published run, and because the all-reduce fired once per eight micro-batches, network time per effective step dropped by roughly eight times, making the small cluster competitive.</p>
+<p><strong>Lesson:</strong> Gradient accumulation converts a memory ceiling into extra sequential compute and, as a bonus, cuts communication frequency; it is the first thing to reach for when the target batch will not fit.</p>
+</div>
+
+<h2>4. The Combine Step in Code, and Why It Equals One Big Batch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The claim that ties this section together is that mean-aggregated all-reduce SGD with gradient accumulation over $m$ micro-batches produces the identical update to a single step over one large batch, up to floating-point rounding. The code below verifies it directly. It performs one big-batch step over all $N$ examples as the reference, then reconstructs the same step the distributed way: $K$ workers, each splitting its rows into $m$ micro-batches, summing the micro-batch gradients locally, all-reducing the per-worker sums, dividing by the global count $B = N$, and taking one update. It also confirms the sum-then-divide form and the mean-of-means form agree when shards are equal.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+N, d = 4096, 12
+X = rng.standard_normal((N, d))
+w_true = rng.standard_normal(d)
+y = X @ w_true + 0.1 * rng.standard_normal(N)
+w0 = np.zeros(d)
+lr = 0.05
+
+def grad_sum(w, idx):
+    # SUM (not mean) of per-example gradients on a subset of rows
+    r = X[idx] @ w - y[idx]
+    return 2.0 * (X[idx].T @ r)
+
+# Reference: one big-batch step over ALL N examples, mean gradient.
+big = w0 - lr * (grad_sum(w0, np.arange(N)) / N)
+
+# All-reduce SGD with gradient accumulation: K workers, each with B rows;
+# every worker splits its B rows into m micro-batches, SUMS them locally,
+# then ONE all-reduce (SUM) over workers, divide by total count, one update.
+K, m = 8, 4
+worker_rows = np.array_split(np.arange(N), K)
+partials = []
+for rows in worker_rows:
+    micro = np.array_split(rows, m)
+    local = sum(grad_sum(w0, mb) for mb in micro)   # accumulate m micro-batches
+    partials.append(local)
+allreduced = np.sum(partials, axis=0)               # all-reduce SUM across workers
+acc = w0 - lr * (allreduced / N)                    # mean-normalize, one update
+
+print("examples N              :", N)
+print("workers K, micro m      :", K, m)
+print("max |w_acc - w_big|     :", f"{np.max(np.abs(acc - big)):.2e}")
+print("rel error of the step   :", f"{np.linalg.norm(acc - big) / np.linalg.norm(big):.2e}")
+
+# sum-then-divide vs mean-of-means: identical only because shards are equal-size.
+sum_step  = w0 - (lr / N) * allreduced
+mean_step = w0 - lr * np.mean(partials, axis=0) / (N // K)
+print("sum/N vs mean-of-means  :", f"{np.max(np.abs(sum_step - mean_step)):.2e}")
+</code></pre>
+<div class="code-caption"><strong>Code 10.5.1:</strong> All-reduce SGD with gradient accumulation rebuilt from first principles. The big-batch reference <code>big</code> and the accumulate-then-all-reduce update <code>acc</code> are compared element by element; the final line checks the sum-then-divide and mean-of-means conventions against each other.</div>
+<pre><code class="language-text">examples N              : 4096
+workers K, micro m      : 8 4
+max |w_acc - w_big|     : 2.50e-16
+rel error of the step   : 1.56e-15
+sum/N vs mean-of-means  : 0.00e+00
+</code></pre>
+<div class="code-caption"><strong>Output 10.5.1:</strong> Eight workers, each accumulating four micro-batches, reproduce the single large-batch step to within $3 \times 10^{-16}$, the floating-point floor. The last line confirms the two aggregation conventions coincide exactly when every shard is the same size, which is why the sum-then-divide-by-$B$ form is the one to trust when they are not.</div>
+<p>The relative error of $1.56 \times 10^{-15}$ is rounding, not approximation. Splitting one batch across eight workers, and each worker's work across four micro-batches, changed the resulting weight update by nothing that matters. That exactness is what licenses the entire engineering effort around all-reduce: the systems work goes into making the combine step <em>cheap and reliable</em>, never into recovering accuracy that the partitioning supposedly lost. The zero on the final line is a reminder that the sum-versus-mean conventions are interchangeable only under equal shards; treat them as identical on an unbalanced cluster and the learning rate drifts.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: One Combine Step, Wired for Scale</div>
+<p>This section advances the book's spine by separating the math of the combine step (an exact, order-free sum) from its wiring (centralized server versus symmetric all-reduce). The math is settled and never changes; the wiring is where scale-out lives or dies. Ring all-reduce wins because it keeps per-worker bandwidth constant in the cluster size, the same reasoning that returns in <a href="../../part-1-foundations/module-04-communication-primitives/section-4.4.html">Section 4.4</a> for the collective itself and reappears as reduce-scatter and all-gather inside sharded training. Whenever a later method combines gradients, ask the two questions from here: sum or mean, and through a center or around a ring.</p>
+</div>
+
+<h2>5. Where the All-Reduce Sits, and Hiding It Behind Backprop <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Naively, the all-reduce happens after the entire backward pass finishes: compute all gradients, then combine, then step. That ordering leaves the network idle during backprop and the accelerators idle during the all-reduce, so the two costs add. The structure of backpropagation offers a better schedule. Backprop produces gradients layer by layer, from the output toward the input, and the gradient of a layer is final the moment that layer's backward computation completes; it does not depend on the layers still being processed. So the all-reduce for an early-finishing layer (one near the output) can start while the backward pass is still grinding through the layers nearer the input. The communication of one bucket of gradients overlaps with the computation of the next, and a large fraction of the all-reduce cost disappears behind work the accelerator was doing anyway.</p>
+<p>This overlap is the reason production data-parallel trainers group gradients into buckets and launch each bucket's all-reduce as soon as it is ready, rather than waiting for the whole backward pass. The mechanism, and the conditions under which the overlap is near-perfect or only partial, are exactly the communication-computation overlap analyzed in <a href="../../part-1-foundations/module-04-communication-primitives/section-4.10.html">Section 4.10</a>; with gradient accumulation, the overlap applies to the single all-reduce that fires after the last micro-batch, while the accumulation micro-batches run with no communication at all. The payoff is that a well-scheduled step can hide most of its communication, which is what makes data parallelism scale even when the gradient vectors are billions of numbers long.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Squeezing and Hiding the All-Reduce (2024 to 2026)</div>
+<p>Because the combine step is the tax on data parallelism, recent work attacks it from both ends. On the squeezing side, low-bit and structured gradient compression in the lineage of PowerSGD and 1-bit Adam shrink the bytes per all-reduce, and 2024 to 2025 systems push fp8 and even lower-precision gradient reductions into the collective itself. On the hiding side, local-update methods such as DiLoCo (Douillard et al., 2024) and its descendants let workers take many steps between communications, turning the per-step all-reduce into a far rarer event and enabling training over slow or geo-distributed links; this is the same amortization that gradient accumulation performs, taken to its limit. A third thread fuses the all-reduce schedule with the compiler so that bucket boundaries and overlap windows are chosen automatically for a given model and interconnect. We give these methods their full treatment, with the cost models to compare them, in <a href="section-10.7.html">Section 10.7</a>; for now, note that the field treats Output 10.5.1's exactness as fixed and spends all its ingenuity on making the combine step cheaper to move.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: DDP Aggregates, Accumulates, and Overlaps for You</div>
+<p>Code 10.5.1 spelled out the accumulate-then-all-reduce-then-divide loop by hand. In PyTorch, <code>DistributedDataParallel</code> buckets the gradients, launches each bucket's all-reduce during the backward pass for the overlap of Section 5, and averages by the world size automatically. Gradient accumulation is a one-line guard that skips the all-reduce until the last micro-batch:</p>
+<pre><code class="language-python"># Run with: torchrun --nproc_per_node=8 thisfile.py
+import torch, torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+dist.init_process_group("nccl")
+model = DDP(model)                                  # buckets + overlapped all-reduce
+ACCUM = 4                                            # micro-batches per optimizer step
+
+for step, micro_batches in enumerate(loader):       # loader yields ACCUM micro-batches
+    for j, (x, y) in enumerate(micro_batches):
+        last = (j == ACCUM - 1)
+        ctx = model.no_sync() if not last else nullcontext()
+        with ctx:                                    # skip all-reduce until the last micro-batch
+            loss = model(x, y) / ACCUM               # scale so the SUM becomes the right mean
+            loss.backward()                          # gradients accumulate in .grad
+    optimizer.step(); optimizer.zero_grad()          # one update per ACCUM micro-batches
+</code></pre>
+<div class="code-caption"><strong>Code 10.5.2:</strong> The same accumulate-and-combine logic as Output 10.5.1, now a dozen lines instead of a hand-rolled loop. <code>no_sync()</code> suppresses the all-reduce on all but the last micro-batch, the division by <code>ACCUM</code> turns the accumulated sum into the correct mean, and DDP handles bucketing, the world-size average, and the backprop overlap internally.</div>
+</div>
+
+<h2>6. Putting the Pieces Together <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>All-reduce SGD is one tight loop: each worker computes a local gradient (optionally accumulated over several micro-batches), the workers combine their gradients with a symmetric all-reduce that runs once per step and overlaps with the backward pass, each worker divides by the global batch size to recover the mean, and each worker applies the identical optimizer update. No node is special, no central link saturates, and the result is bit-for-bit the large-batch step you would have taken on one impossibly large machine. The remaining question is what happens when a worker is slow or its gradient arrives late, because the synchronous all-reduce above waits for the slowest participant. That straggler problem, and the asynchronous and stale-gradient methods that trade exactness for the freedom not to wait, are the subject of <a href="section-10.6.html">Section 10.6</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.5.1: The Factor-of-K Bug <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A colleague reports that their data-parallel run diverges on the very first step, but the single-GPU version of the same code trains fine. Their combine step calls an all-reduce with a SUM reduction and then applies the optimizer directly to the result with the learning rate they tuned on one GPU. State exactly what is wrong, what factor their effective learning rate is off by in terms of the worker count $K$ and the per-worker batch size, and the single line of code that fixes it. Then explain why the bug would have stayed hidden if they had used a MEAN-reducing collective instead.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.5.2: Break It with Unequal Shards <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 10.5.1 so the workers receive very different batch sizes (for example, one worker gets half the rows and the rest split the remainder). Combine the per-worker gradients two ways: (a) the mean-of-means form, dividing each worker's sum by its own row count and averaging over workers; and (b) the sum-then-divide-by-$B$ form. Measure each against the big-batch reference <code>big</code>. Report which one stays exact, by how much the other is off, and explain why unequal shards break the average of means but not the sum-then-divide form. State what this implies for a real cluster where a straggler is handed a smaller batch to catch up.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.5.3: Bandwidth, Center versus Ring <span class="exercise-type analysis">Analysis</span></div>
+<p>A gradient has $P = 2 \times 10^{9}$ elements at 2 bytes each, and you train with $K$ workers on links of 25 gigabytes per second. For the parameter-server pattern, the central server's inbound link must carry one gradient from each of the $K$ workers per step; estimate that ingress time as a function of $K$. For ring all-reduce, each worker moves about $2\frac{K-1}{K}P$ elements regardless of $K$; estimate that time. Plot or tabulate both for $K \in \{8, 64, 512\}$ and identify the cluster size beyond which the central link is the clear bottleneck. Explain in one sentence why the ring time barely moves while the server time grows, and connect your answer to the alpha-beta cost model of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-10.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 10.4</span><span class="nav-title">Asynchronous Distributed SGD</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 10</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Optimization</span></a>
+<a class="next" href="section-10.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 10.6</span><span class="nav-title">Stale and Delayed Gradients</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

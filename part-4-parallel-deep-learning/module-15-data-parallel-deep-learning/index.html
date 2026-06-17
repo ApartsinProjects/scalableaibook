@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 15: Data-Parallel Deep Learning. How to train one deep network fast across many accelerators: single-GPU to multi-node training, data parallelism, gradient synchronization with all-reduce, gradient bucketing and communication/computation overlap, PyTorch Distributed Data Parallel, Horovod and the broader ecosystem, mixed precision as a per-node enabler, and the bottlenecks that cap scaling efficiency." name="description"/>
+<title>Chapter 15: Data-Parallel Deep Learning | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Data-Parallel Deep Learning</a></div>
+<h1>Data-Parallel Deep Learning</h1>
+<p class="chapter-subtitle">Part III trained models where the data lived, on shards the scheduler scattered or on phones you were not allowed to touch. Part IV changes the question. The data is yours again, co-located on a cluster you own, and the new pressure is the model: a deep network whose single pass over a batch is so expensive that one accelerator cannot finish an epoch in any reasonable time. This chapter takes the simplest and most widely deployed answer, replicate the whole model on every accelerator, split the batch across them, and sum the gradients, and turns it from a one-line idea into a system that scales from one GPU to a multi-node cluster without leaving the accelerators idle on every step.</p>
+</header>
+<main class="content" id="main-content">
+<figure class="chapter-hero">
+<img src="images/hero.png" alt="Conceptual illustration for Chapter 15: Data-Parallel Deep Learning" loading="lazy">
+</figure>
+<blockquote class="epigraph">
+<p>"Eight of us hold the exact same weights and never speak about anything except gradients. Once per step we shout our sums into the ring, agree on the average, and pretend we each trained the whole batch alone."</p>
+<cite>A Replica Who Has Made Peace With All-Reduce</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Data-parallel training replicates the entire model on every accelerator, splits each mini-batch across them, and uses an all-reduce to sum the per-replica gradients into the exact gradient of the full batch, so that the only thing standing between you and near-linear speedup is hiding that all-reduce behind the backward pass.</strong> The idea rests on a single identity you met in Part I: the gradient of a sum is the sum of the gradients, so the average of the gradients each replica computes on its slice of the batch equals the gradient a single machine would compute on the whole batch. That exactness is what makes data parallelism the seed of the entire book, and it is why this chapter opens Part IV. But the identity is free only on paper. In practice every replica must, on every step, exchange a full copy of the model's gradients with every other replica, and a modern network has hundreds of millions to billions of parameters, so the communication can easily cost more than the computation it is meant to accelerate. The chapter is the engineering of making that exchange disappear. It begins with why deep learning needs more than one device at all, then climbs the ladder from a single GPU to many GPUs in one box to many boxes across a network, naming what changes at each rung. On that footing it develops data parallelism proper, the replicate-split-average pattern, then the all-reduce that synchronizes the gradients and the ring algorithm that makes its cost independent of the number of workers. The heart of the chapter is the systems trick that turns a correct-but-slow scheme into a fast one: bucketing gradients into chunks and launching their all-reduce the moment each chunk is ready, so communication overlaps the still-running backward pass instead of waiting for it. It then grounds all of this in the two frameworks that dominate practice, PyTorch Distributed Data Parallel and Horovod, adds mixed precision as the per-node enabler that halves both the compute and the bytes on the wire, and closes by confronting the bottlenecks, stragglers, network limits, and large-batch optimization difficulties, that separate the linear speedup on the slide from the sublinear one on the cluster.</p>
+</div>
+
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+This is the first chapter of Part IV, and it marks a turn in the book's argument. Part III asked how to learn from data spread across machines you did not fully control; Part IV asks how to train one very large model fast on a cluster you do. The binding constraint flips. There the difficulty was that the data could not move, was not identically distributed, and had to stay private. Here the data is yours to scatter and reshuffle freely, and the difficulty is that a single forward and backward pass over a deep network is too slow on one accelerator, so the model, the batch, or both must be spread across many. Data parallelism is the first and simplest way to spread the work, and it is the foundation the rest of the part builds on: model and pipeline parallelism in Chapter 16 enter only when the model itself no longer fits on one device, and the sharded optimizers of that chapter are data parallelism with the redundant state removed.
+</p>
+<p>
+The nine sections fall into three groups. The first sets the scene and the hardware: Section 15.1 argues why deep learning outgrew a single device, and Section 15.2 climbs the ladder from one GPU to multi-GPU to multi-node, because the bottleneck and the available interconnect change at every rung. The second group builds the core mechanism: Section 15.3 develops data parallelism as replicate-split-average, Section 15.4 develops the all-reduce that synchronizes the gradients and the ring algorithm behind it, and Section 15.5 develops the bucketing and overlap that hide the all-reduce behind the backward pass and recover most of the lost speedup. The third group makes it real: Section 15.6 grounds the pattern in PyTorch Distributed Data Parallel, Section 15.7 in Horovod and the wider ecosystem, Section 15.8 adds mixed precision as the per-node enabler that shrinks both compute and communication, and Section 15.9 confronts the practical bottlenecks that cap how close you get to linear scaling.
+</p>
+<p>
+Read in order, the nine sections take you from "one GPU cannot finish the epoch" to "a multi-node cluster trains the same model at near-linear speedup, with the communication tucked invisibly behind the computation." The thread to watch is the exact-gradient identity of Part I made practical: data parallelism is correct because the summed gradients are exact, but it is fast only because the summation is overlapped, compressed, and scheduled with care. Every later parallelism strategy in the part, pipeline, tensor, expert, and sharded, is measured against the simplicity and the limits of the data-parallel baseline this chapter establishes.
+</p>
+</div>
+
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>This chapter assumes the communication and optimization background built earlier in the book. From <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4: Communication Primitives for Distributed Training</a> you carry the single most important tool, all-reduce, and the ring algorithm that makes its bandwidth cost independent of the number of workers, because gradient synchronization in Sections 15.4 and 15.5 is an all-reduce on every step and the whole chapter turns on hiding its cost. From <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10: Distributed Optimization</a> you carry the data-parallel gradient itself, the identity that the average of per-worker gradients equals the full-batch gradient, the synchronous-versus-asynchronous tradeoff, and the large-batch convergence difficulties that return in Section 15.9 as the reason scaling efficiency is not free. The chapter assumes comfortable Python and PyTorch, a working understanding of mini-batch SGD and of training a neural network through forward and backward passes, and a basic picture of GPU memory and floating-point formats, since mixed precision in Section 15.8 is a statement about numerical range and storage. No prior multi-GPU or cluster experience is required; Section 15.2 builds the hardware picture from a single device upward.</p>
+</div>
+
+<div class="objectives">
+<h3>Learning Objectives</h3>
+<ul>
+<li>Explain why a single accelerator cannot keep pace with modern deep learning, naming the dataset-size, model-size, and epoch-time pressures that force training across many devices.</li>
+<li>Distinguish single-GPU, multi-GPU single-node, and multi-node training, and identify how the dominant bottleneck and the available interconnect (NVLink, PCIe, InfiniBand) change at each rung.</li>
+<li>Derive data parallelism as replicate-split-average, and show why summing the per-replica gradients yields the exact gradient of the full mini-batch.</li>
+<li>Describe gradient synchronization with all-reduce, and explain why the ring all-reduce makes the per-step communication cost independent of the worker count.</li>
+<li>Explain gradient bucketing and communication/computation overlap, and reason about how launching all-reduce on ready buckets during the backward pass recovers most of the speedup a naive implementation loses.</li>
+<li>Implement and configure PyTorch Distributed Data Parallel, including process-group setup, device placement, and the DistributedSampler, and state what the wrapper handles internally.</li>
+<li>Contrast Horovod's all-reduce-centric API with native framework parallelism, and place both within the broader distributed-training ecosystem.</li>
+<li>Explain mixed precision as a per-node enabler, how reduced-precision storage and compute shrink both memory and communicated bytes while loss scaling preserves convergence.</li>
+<li>Diagnose the practical bottlenecks, stragglers, network bandwidth, input pipeline limits, and large-batch optimization, that separate near-linear from sublinear scaling efficiency.</li>
+</ul>
+</div>
+
+<div class="callout key-takeaway">
+<div class="callout-title">Remember the Chapter as One Sentence</div>
+<p>If you keep one thing from this chapter, keep this: <strong>data-parallel training replicates the model on every accelerator and averages their gradients with an all-reduce, which is correct because the summed gradients are exact and fast only because that all-reduce is bucketed and overlapped with the backward pass</strong>. Read forward, the sections build the craft in layers: first why one device is not enough and how the hardware ladder runs from one GPU to a multi-node cluster, then data parallelism itself, the all-reduce that synchronizes it, and the bucketing-and-overlap trick that hides the communication; then the frameworks that ship it, PyTorch DDP and Horovod, mixed precision as the per-node enabler, and the bottlenecks that cap scaling efficiency. Read as a question, the chapter asks of any model whose epoch is too slow on one accelerator: how do you spread its training across many without letting the gradient exchange eat the speedup you came for. The roadmap below walks the nine sections that answer it.</p>
+</div>
+
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num">15.1</span>
+<a class="section-title" href="section-15.1.html">Why Deep Learning Needs Distributed Training</a>
+<span class="section-desc">Lays out the dataset-size, model-size, and epoch-time pressures that make a single accelerator insufficient, and frames distributed training as the response that keeps wall-clock time tractable as models and data grow.</span>
+</li>
+<li>
+<span class="section-num">15.2</span>
+<a class="section-title" href="section-15.2.html">Single-GPU, Multi-GPU, and Multi-Node Training</a>
+<span class="section-desc">Climbs the hardware ladder from one GPU to many GPUs in a box to many boxes across a network, naming how the dominant bottleneck and the interconnect, NVLink, PCIe, and InfiniBand, change at each rung.</span>
+</li>
+<li>
+<span class="section-num">15.3</span>
+<a class="section-title" href="section-15.3.html">Data Parallelism</a>
+<span class="section-desc">Develops the replicate-split-average pattern at the heart of the chapter, and shows why summing the gradient each replica computes on its slice of the batch yields the exact gradient of the full mini-batch.</span>
+</li>
+<li>
+<span class="section-num">15.4</span>
+<a class="section-title" href="section-15.4.html">Gradient Synchronization and All-Reduce</a>
+<span class="section-desc">Develops the all-reduce that combines the per-replica gradients on every step, and explains why the ring algorithm makes its bandwidth cost independent of the number of workers.</span>
+</li>
+<li>
+<span class="section-num">15.5</span>
+<a class="section-title" href="section-15.5.html">Gradient Bucketing and Communication/Computation Overlap</a>
+<span class="section-desc">Develops the systems trick that turns a correct scheme into a fast one, grouping gradients into buckets and launching their all-reduce as each bucket fills so communication overlaps the still-running backward pass.</span>
+</li>
+<li>
+<span class="section-num">15.6</span>
+<a class="section-title" href="section-15.6.html">PyTorch Distributed Data Parallel</a>
+<span class="section-desc">Grounds the pattern in the production framework, walking through process-group setup, device placement, the DistributedSampler, and what the DDP wrapper handles for you internally.</span>
+</li>
+<li>
+<span class="section-num">15.7</span>
+<a class="section-title" href="section-15.7.html">Horovod and the Broader Ecosystem</a>
+<span class="section-desc">Surveys Horovod's all-reduce-centric, framework-agnostic API and places it alongside native parallelism and the wider tooling that automates distributed training.</span>
+</li>
+<li>
+<span class="section-num">15.8</span>
+<a class="section-title" href="section-15.8.html">Mixed Precision as a Per-Node Enabler</a>
+<span class="section-desc">Adds the per-node efficiency layer that halves both compute and communicated bytes, explaining how reduced-precision storage and loss scaling shrink the footprint without sacrificing convergence.</span>
+</li>
+<li>
+<span class="section-num">15.9</span>
+<a class="section-title" href="section-15.9.html">Practical Bottlenecks and Scaling Efficiency</a>
+<span class="section-desc">Confronts the gap between linear and real-world scaling, diagnosing stragglers, network limits, input-pipeline stalls, and large-batch optimization as the forces that cap how many devices actually help.</span>
+</li>
+</ul>
+
+<p>Read the nine sections in order and you will hold a working blueprint for training one large model fast across many accelerators: <a href="section-15.1.html">Section 15.1</a> and <a href="section-15.2.html">Section 15.2</a> establish why one device is not enough and how the hardware ladder is built, <a href="section-15.3.html">Sections 15.3</a> through <a href="section-15.5.html">15.5</a> build data parallelism, the all-reduce that synchronizes it, and the bucketing-and-overlap that hides the communication, and <a href="section-15.6.html">Sections 15.6</a> through <a href="section-15.9.html">15.9</a> ground it in PyTorch DDP and Horovod, add mixed precision, and confront the scaling bottlenecks. The thread to watch is the all-reduce of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> returning as the per-step engine of training, and the data-parallel gradient of <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a> turning from a convergence identity into a systems-engineering problem.</p>
+
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>This chapter establishes the data-parallel baseline: every accelerator holds a full copy of the model, and the only thing crossing the wire is gradients. That baseline has one breaking point, which the next chapter is built around. Data parallelism assumes the model fits on a single device, and the largest models do not. <a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16: Model, Pipeline, and Sharded Parallelism</a> takes up training when the model itself must be split: tensor parallelism that shards individual layers across devices, pipeline parallelism that assigns consecutive layers to different devices and streams micro-batches through them, and the sharded data parallelism of ZeRO and FSDP that keeps the data-parallel structure of this chapter but partitions the redundant optimizer state, gradients, and parameters across the replicas rather than copying them. The all-reduce you mastered here reappears there decomposed into the reduce-scatter and all-gather of Chapter 4, and the gradient synchronization you learned to hide behind the backward pass becomes one collective among several that must be scheduled together. Read it next, and watch the single full replica of this chapter fracture into shards that each hold only their slice of a model too large for any one device.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+<h3 class="bib-category">Foundations of Data-Parallel Training</h3>
+<div class="bib-entry-card">
+<p class="bib-ref">Goyal, P., Dollar, P., Girshick, R., Noordhuis, P., Wesolowski, L., Kyrola, A., Tulloch, A., Jia, Y., He, K. "Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour." arXiv:1706.02677, 2017. <a href="https://arxiv.org/abs/1706.02677" target="_blank" rel="noopener">arxiv.org/abs/1706.02677</a></p>
+<p class="bib-annotation">The work that showed data-parallel training scales to large batches with a linear learning-rate scaling rule and warmup, the empirical foundation for the scaling-efficiency discussion of Section 15.9.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Li, S., Zhao, Y., Varma, R., Salpekar, O., Noordhuis, P., Li, T., Paszke, A., Smith, J., Vaughan, B., Damania, P., Chintala, S. "PyTorch Distributed: Experiences on Accelerating Data Parallel Training." Proc. VLDB Endowment, arXiv:2006.15704, 2020. <a href="https://arxiv.org/abs/2006.15704" target="_blank" rel="noopener">arxiv.org/abs/2006.15704</a></p>
+<p class="bib-annotation">The system paper behind PyTorch DistributedDataParallel, detailing gradient bucketing and computation/communication overlap, the direct reference for Sections 15.5 and 15.6.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Sergeev, A., Del Balso, M. "Horovod: Fast and Easy Distributed Deep Learning in TensorFlow." arXiv:1802.05799, 2018. <a href="https://arxiv.org/abs/1802.05799" target="_blank" rel="noopener">arxiv.org/abs/1802.05799</a></p>
+<p class="bib-annotation">The paper introducing Horovod's ring-all-reduce-based, framework-agnostic approach to distributed training, the basis of Section 15.7.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<h3 class="bib-category">Large-Batch Optimization</h3>
+<div class="bib-entry-card">
+<p class="bib-ref">You, Y., Gitman, I., Ginsburg, B. "Large Batch Training of Convolutional Networks (LARS)." arXiv:1708.03888, 2017. <a href="https://arxiv.org/abs/1708.03888" target="_blank" rel="noopener">arxiv.org/abs/1708.03888</a></p>
+<p class="bib-annotation">The layer-wise adaptive rate scaling optimizer that keeps large-batch data-parallel training stable, one answer to the convergence difficulties of Section 15.9.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">You, Y., Li, J., Reddi, S., Hseu, J., Kumar, S., Bhojanapalli, S., Song, X., Demmel, J., Keutzer, K., Hsieh, C.-J. "Large Batch Optimization for Deep Learning: Training BERT in 76 Minutes (LAMB)." arXiv:1904.00962, 2019. <a href="https://arxiv.org/abs/1904.00962" target="_blank" rel="noopener">arxiv.org/abs/1904.00962</a></p>
+<p class="bib-annotation">The adaptive large-batch optimizer that extended LARS to transformer training, the method behind the very-large-batch scaling that Section 15.9 treats as the frontier of data parallelism.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<h3 class="bib-category">Mixed Precision</h3>
+<div class="bib-entry-card">
+<p class="bib-ref">Micikevicius, P., Narang, S., Alben, J., Diamos, G., Elsen, E., Garcia, D., Ginsburg, B., Houston, M., Kuchaiev, O., Venkatesh, G., Wu, H. "Mixed Precision Training." arXiv:1710.03740, 2017. <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener">arxiv.org/abs/1710.03740</a></p>
+<p class="bib-annotation">The paper that introduced FP16 training with loss scaling and an FP32 master copy of the weights, the technical core of the mixed-precision enabler in Section 15.8.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">PyTorch. "Automatic Mixed Precision Package (torch.amp)." Official documentation. <a href="https://pytorch.org/docs/stable/amp.html" target="_blank" rel="noopener">pytorch.org/docs/stable/amp.html</a></p>
+<p class="bib-annotation">The reference for autocast and GradScaler, the production API that implements the mixed-precision training of Section 15.8 in a few lines.</p>
+<span class="bib-meta">🛠️ Tool</span>
+</div>
+<h3 class="bib-category">Frameworks and Tools</h3>
+<div class="bib-entry-card">
+<p class="bib-ref">PyTorch. "Distributed Data Parallel (DDP) Notes." Official documentation. <a href="https://pytorch.org/docs/stable/notes/ddp.html" target="_blank" rel="noopener">pytorch.org/docs/stable/notes/ddp.html</a></p>
+<p class="bib-annotation">The reference describing DDP internals, gradient bucketing, and the reducer, the implementation companion to Sections 15.5 and 15.6.</p>
+<span class="bib-meta">🛠️ Tool</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">NVIDIA. "NCCL: NVIDIA Collective Communications Library." Official documentation. <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/index.html" target="_blank" rel="noopener">docs.nvidia.com/deeplearning/nccl</a></p>
+<p class="bib-annotation">The GPU collective-communication library that implements the ring all-reduce underneath PyTorch DDP and Horovod, the substrate behind the gradient synchronization of Section 15.4.</p>
+<span class="bib-meta">🛠️ Tool</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Hugging Face. "Accelerate: Run your PyTorch training across any distributed configuration." Official documentation. <a href="https://huggingface.co/docs/accelerate" target="_blank" rel="noopener">huggingface.co/docs/accelerate</a></p>
+<p class="bib-annotation">The library that wraps DDP, mixed precision, and launch configuration behind a thin API, an example of the ecosystem tooling surveyed in Section 15.7.</p>
+<span class="bib-meta">🛠️ Tool</span>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="../index.html"><span class="nav-label">Previous</span><span class="nav-num">Part IV</span><span class="nav-title">Parallel Deep Learning and Large Models</span></a>
+<a class="up" href="../index.html"><span class="nav-label">Part IV</span><span class="nav-num">Contents</span><span class="nav-title">Parallel Deep Learning and Large Models</span></a>
+<a class="next" href="section-15.1.html"><span class="nav-label">Next</span><span class="nav-num">Section 15.1</span><span class="nav-title">Why Deep Learning Needs Distributed Training</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

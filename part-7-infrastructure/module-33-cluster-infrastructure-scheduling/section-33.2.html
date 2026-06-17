@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 33.2: Compute: CPUs, GPUs, TPUs, and Accelerator Instances. The per-node accelerator landscape the fleet multiplies, with roofline reasoning for compute-bound versus memory-bound work." name="description"/>
+<title>Section 33.2: Compute: CPUs, GPUs, TPUs, and Accelerator Instances | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Cluster, Edge, and Reliable Infrastructure</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 33: Cluster Infrastructure and Scheduling</a></div>
+<h1>Compute: CPUs, GPUs, TPUs, and Accelerator Instances</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They gave me sixteen thousand cores and two terabytes a second, and still I sit idle, holding a matrix I cannot use until the host finally decides to feed me the next batch."</p>
+<cite>A GPU, Waiting for the Host to Feed It</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A cluster is not an abstract pool of computation; it is a fleet of physical accelerators, each with a fixed peak compute rate and a fixed memory bandwidth, wired together so that thousands of them act as one machine.</strong> Every distributed-training and distributed-serving method in this book ultimately runs on one of these chips, and the efficiency of the whole fleet is the per-node efficiency multiplied across it. This section surveys the accelerators that fill a modern AI cluster, the CPU host that feeds them, the GPU and TPU that do the arithmetic, and the multi-accelerator instances that vendors package with fast intra-node links, and it gives you the one reasoning tool, the roofline, that predicts whether a given operation will be limited by compute or by memory. Understanding the single node is the prerequisite for understanding why the cluster is wired the way it is.</p>
+</div>
+<p>The earlier sections of this chapter treated the cluster as a resource to be scheduled and the workload as a graph of tasks to be placed. That view is correct, but it abstracts away the object that every task eventually lands on: a single accelerator with hard physical ceilings. Before a scheduler can place work well, before an interconnect can be sized, and before a parallelism strategy can be chosen, the per-node compute device must be understood on its own terms. A cluster of ten thousand accelerators that each run at twenty percent of their peak is, in compute delivered, a cluster of two thousand. The fleet only ever multiplies what one node achieves, so the unit of analysis in this section is deliberately small: one chip, its arithmetic units, and its memory.</p>
+<p>This is the per-node baseline that the rest of the book distributes. The detailed treatment of squeezing a single accelerator, quantization, KV-cache paging, and attention kernels, is the explicit subject of <a href="../../part-5-distributed-inference/module-22-per-node-inference-efficiency/index.html">Chapter 22</a>, which this section assumes as background; here we care only about the device's shape, because that shape dictates how many of them you need and how they must be wired. The wiring itself, the interconnect that turns a rack of accelerators into a single training substrate, is the subject of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>, and this section ends by showing where the per-node story hands off to it.</p>
+
+<h2>1. The Host CPU: Coordinator, Not Calculator <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Every accelerator in a cluster sits behind a host CPU, and the relationship between them is asymmetric in a way that newcomers often misread. The CPU does very little of the arithmetic in a deep-learning workload; its job is to keep the accelerator fed. It reads training shards from storage, decodes and augments images or tokenizes text, assembles batches, copies them across the PCIe or NVLink boundary into accelerator memory, launches the compute kernels, and runs the control logic, the optimizer bookkeeping, the checkpointing, and the communication scheduling, that the accelerator itself does not. A modern host has dozens of cores precisely because data loading and preprocessing for a fast accelerator is itself a parallel problem, and a host that cannot decode images quickly enough leaves the accelerator stalled, exactly the idle state the epigraph complains about.</p>
+<p>The CPU also owns coordination. It is the process that joins the communication group, that talks to the scheduler, that decides when a checkpoint is written and when a failed peer should be replaced. In the data-parallel training loop of <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>, it is the host that issues the collective call even though the accelerator moves the bytes. This division of labor, CPU coordinates and feeds, accelerator computes, is the mental model to carry into every later section: when a cluster underperforms, the bottleneck is as often a starved input pipeline on the host as it is the accelerator itself.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Accelerator Is the Unit, the Fleet Is the Multiplier</div>
+<p>The entire book is about wiring many accelerators together, but the wiring can never recover efficiency that the single node throws away. If one device runs an operation at five percent of its peak, ten thousand devices run it at five percent of ten thousand peaks. This is why per-node efficiency (<a href="../../part-5-distributed-inference/module-22-per-node-inference-efficiency/index.html">Chapter 22</a>) is a prerequisite for scale-out and not a competing concern: the fleet multiplies the per-node number, and a small per-node number multiplied by a large fleet is still a small number times a large cost.</p>
+</div>
+
+<h2>2. The GPU: Streaming Multiprocessors Fed by HBM <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A GPU is best understood as a large array of simple arithmetic units organized into streaming multiprocessors, paired with a pool of high-bandwidth memory. Each streaming multiprocessor contains many scalar lanes for general arithmetic and, on accelerators built for deep learning, dedicated tensor cores that perform a small matrix multiply-accumulate as a single instruction. Tensor cores are why a modern GPU reports hundreds of teraFLOPs for the low-precision matrix multiplications that dominate neural-network training and inference: the chip is built to do one thing, dense matrix arithmetic, at enormous rates. The parameters, activations, and optimizer state that the multiply consumes live in high-bandwidth memory, or HBM, a stack of DRAM bonded close to the compute die to deliver bandwidth measured in terabytes per second.</p>
+<p>The decisive fact about this arrangement is that compute has grown far faster than memory bandwidth. A contemporary data-center GPU can perform thousands of floating-point operations in the time it takes to read a single byte from HBM. The arithmetic units are therefore frequently idle, not because the chip is slow, but because the data cannot arrive fast enough. Memory bandwidth, not raw compute, is the binding ceiling for a large fraction of deep-learning operations, and recognizing which operations are limited by which resource is the single most useful per-node skill. Figure 33.2.1 shows the hierarchy that every byte must traverse, from slow remote storage up to the registers feeding the tensor cores.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A pyramid of the accelerator memory hierarchy, from large slow host and remote storage at the base up through HBM and on-chip cache to the registers and tensor cores at the apex, with capacity falling and bandwidth rising toward the top.">
+<defs>
+<marker id="arr332" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.box332 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.hot332 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.t332 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s332 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.lab332 { font:600 12px sans-serif; fill:#b86b1f; text-anchor:start; }
+.l332 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr332); }
+</style>
+<rect class="hot332" x="330" y="24" width="200" height="44" rx="8"/>
+<text class="t332" x="430" y="44">Tensor cores + registers</text>
+<text class="s332" x="430" y="60">~tens of KB, fastest</text>
+<rect class="box332" x="280" y="92" width="300" height="44" rx="8"/>
+<text class="t332" x="430" y="112">On-chip SRAM (L2 / shared)</text>
+<text class="s332" x="430" y="128">~tens of MB, ~10s of TB/s</text>
+<rect class="box332" x="220" y="160" width="420" height="48" rx="8"/>
+<text class="t332" x="430" y="181">HBM (device memory)</text>
+<text class="s332" x="430" y="198">tens of GB, ~1 to 4 TB/s; the working set lives here</text>
+<rect class="box332" x="150" y="232" width="560" height="44" rx="8"/>
+<text class="t332" x="430" y="252">Host DRAM (over PCIe / NVLink-C2C)</text>
+<text class="s332" x="430" y="268">hundreds of GB, ~tens to low-100s GB/s</text>
+<rect class="box332" x="90" y="300" width="680" height="44" rx="8"/>
+<text class="t332" x="430" y="320">Remote / networked storage</text>
+<text class="s332" x="430" y="336">TB to PB, slowest, streamed in shards by the host</text>
+<line x1="60" y1="322" x2="60" y2="46" class="l332"/>
+<text class="lab332" x="20" y="190" transform="rotate(-90 20 190)">bandwidth rises, capacity falls</text>
+</svg>
+<figcaption><strong>Figure 33.2.1:</strong> The accelerator memory hierarchy. Capacity is largest at the base and smallest at the apex; bandwidth runs the other way. A training step streams shards from networked storage through host DRAM into HBM, and the tensor cores can only run at full rate when the bytes they need are already resident in HBM and on-chip SRAM.</figcaption>
+</figure>
+<p>The notation we need to make this precise is small. An operation performs some number of floating-point operations, its FLOPs, and moves some number of bytes between HBM and the compute units. Their ratio is the operation's arithmetic intensity,</p>
+$$I \;=\; \frac{\text{FLOPs}}{\text{bytes moved}} \qquad [\text{FLOP/byte}],$$
+<p>and it is the quantity that decides whether compute or memory is the binding constraint. A device is characterized by two peaks: its peak compute rate $\pi$ in FLOP/s and its peak memory bandwidth $\beta$ in byte/s. The roofline model states that the attainable rate on an operation of intensity $I$ is</p>
+$$P(I) \;=\; \min\bigl(\pi,\; \beta \cdot I\bigr).$$
+<p>When $I$ is small the term $\beta I$ dominates and the operation is memory-bound, running far below the chip's compute peak no matter how many tensor cores it has. When $I$ is large the operation saturates $\pi$ and is compute-bound. The crossover, the ridge point, sits at $I^{\star} = \pi / \beta$; operations with intensity below it are starved for bandwidth, and operations above it are limited only by the arithmetic units. This one inequality is the per-node efficiency frame that the whole fleet multiplies.</p>
+
+<h2>3. Roofline Reasoning, Computed <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The roofline is most convincing as a calculation. The program in Code 33.2.1 models a single accelerator by its two peaks, computes the ridge point, and then evaluates two operations of identical shape but very different reuse: a large square matrix multiply, which reuses each loaded value across a whole row and column, and a single-token matrix-vector product, which reuses almost nothing. The contrast is the difference between a training step that saturates the chip and a latency-bound decode step that wastes it.</p>
+<pre><code class="language-python"># Roofline reasoning: arithmetic intensity decides compute-bound vs memory-bound.
+# Model an accelerator by its peak compute and peak memory bandwidth.
+peak_flops = 312e12      # 312 TFLOP/s (representative dense bf16 throughput)
+peak_bw    = 2.0e12      # 2.0 TB/s HBM bandwidth
+
+ridge = peak_flops / peak_bw   # ridge-point intensity in FLOP/byte
+print(f"peak compute        : {peak_flops/1e12:.0f} TFLOP/s")
+print(f"peak HBM bandwidth  : {peak_bw/1e12:.1f} TB/s")
+print(f"ridge intensity     : {ridge:.0f} FLOP/byte")
+print()
+
+def report(name, flops, bytes_moved):
+    I = flops / bytes_moved
+    attainable = min(peak_flops, I * peak_bw)   # the roofline P(I) = min(pi, beta*I)
+    regime = "compute-bound" if I >= ridge else "memory-bound"
+    print(f"{name}")
+    print(f"  intensity I       : {I:7.1f} FLOP/byte  ({regime})")
+    print(f"  attainable        : {attainable/1e12:7.1f} TFLOP/s")
+    print(f"  fraction of peak  : {100*attainable/peak_flops:6.1f}%")
+
+# GEMM C = A B, A:[m,k] B:[k,n], bf16 (2 bytes). FLOPs = 2*m*n*k.
+m = n = k = 8192
+report("large square GEMM 8192^3", 2*m*n*k, 2*(m*k + k*n + m*n))
+
+# GEMV: one token through a weight matrix, almost no reuse.
+m2, k2 = 8192, 8192
+report("GEMV 8192x8192 (batch 1)", 2*m2*k2, 2*(m2*k2 + k2 + m2))
+</code></pre>
+<div class="code-caption"><strong>Code 33.2.1:</strong> A roofline evaluator. The same arithmetic shape, scaled to a full matrix versus a single vector, lands on opposite sides of the ridge point, which is why batching is the central lever for accelerator efficiency.</div>
+<pre><code class="language-text">peak compute        : 312 TFLOP/s
+peak HBM bandwidth  : 2.0 TB/s
+ridge intensity     : 156 FLOP/byte
+
+large square GEMM 8192^3
+  intensity I       :  2730.7 FLOP/byte  (compute-bound)
+  attainable        :   312.0 TFLOP/s
+  fraction of peak  :  100.0%
+GEMV 8192x8192 (batch 1)
+  intensity I       :     1.0 FLOP/byte  (memory-bound)
+  attainable        :     2.0 TFLOP/s
+  fraction of peak  :    0.6%
+</code></pre>
+<div class="code-caption"><strong>Output 33.2.1:</strong> The large matrix multiply reaches the full 312 TFLOP/s because its intensity of 2731 FLOP/byte sits far above the ridge of 156; the batch-one matrix-vector product reaches 0.6 percent of peak because its intensity of 1 FLOP/byte leaves it starved for bandwidth.</div>
+<p>The numbers are stark. The same chip, on two operations built from the same kind of arithmetic, delivers its full compute on one and less than one percent on the other, and the only difference is reuse. This is why batching, packing many tokens or examples into one matrix multiply, is the dominant lever for accelerator efficiency, and why latency-bound single-request inference is so expensive per token. It is also why the roofline travels with us into the fleet: a parallelism strategy that lowers per-device intensity below the ridge can leave a ten-thousand-GPU cluster running at a fraction of its paper peak. Figure 33.2.2 plots the roofline and places the two operations on it.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A roofline plot with arithmetic intensity on the horizontal log axis and attainable compute rate on the vertical log axis. A rising memory-bound line meets a flat compute-bound ceiling at the ridge point. A batch-one point sits low on the memory-bound slope and a large-matmul point sits on the flat ceiling.">
+<style>
+.axis332 { stroke:#5a626c; stroke-width:1.4; }
+.grid332 { stroke:#d7dde5; stroke-width:1; }
+.roof332 { fill:none; stroke:#14385c; stroke-width:2.6; }
+.ridge332 { stroke:#b86b1f; stroke-width:1.4; stroke-dasharray:5 4; }
+.pt332 { fill:#b86b1f; stroke:#7a4612; stroke-width:1.2; }
+.at332 { font:600 13px sans-serif; fill:#14385c; }
+.al332 { font:11px sans-serif; fill:#5a626c; }
+.ah332 { font:600 12px sans-serif; fill:#b86b1f; }
+</style>
+<line x1="90" y1="320" x2="710" y2="320" class="axis332"/>
+<line x1="90" y1="320" x2="90" y2="40" class="axis332"/>
+<line x1="90" y1="120" x2="710" y2="120" class="grid332"/>
+<text class="al332" x="14" y="124">peak &#960;</text>
+<text class="at332" x="300" y="360">arithmetic intensity I (FLOP/byte, log)</text>
+<text class="at332" x="22" y="34" transform="rotate(0)">rate P</text>
+<path class="roof332" d="M 110 300 L 380 120 L 690 120"/>
+<line x1="380" y1="320" x2="380" y2="120" class="ridge332"/>
+<text class="ah332" x="330" y="338">ridge I* = &#960;/&#946;</text>
+<circle class="pt332" cx="150" cy="280" r="6"/>
+<text class="al332" x="160" y="276">GEMV, batch 1 (memory-bound, ~0.6% of peak)</text>
+<circle class="pt332" cx="600" cy="120" r="6"/>
+<text class="al332" x="430" y="108">large GEMM (compute-bound, ~100% of peak)</text>
+<text class="ah332" x="180" y="220" transform="rotate(-31 180 220)">slope = &#946; (bandwidth)</text>
+</svg>
+<figcaption><strong>Figure 33.2.2:</strong> The roofline for the device in Code 33.2.1. The rising line has slope equal to memory bandwidth $\beta$ and governs memory-bound operations; the flat ceiling equals peak compute $\pi$. The batch-one matrix-vector product sits far down the slope at intensity 1, while the large matrix multiply sits on the ceiling. Moving an operation rightward, by batching to raise its intensity past the ridge, is the per-node efficiency move that scale-out then multiplies.</figcaption>
+</figure>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Query the Devices Before You Reason About Them</div>
+<p>Before applying a roofline you need the actual peaks and the device inventory, and you should read them from the hardware rather than trust a datasheet. Each framework exposes a one-line query: PyTorch reports the visible GPUs and their properties, and JAX reports every local accelerator including TPU cores. The command-line companion, <code>nvidia-smi</code>, prints live memory and utilization for the host's GPUs.</p>
+<pre><code class="language-python">import torch
+n = torch.cuda.device_count()                       # GPUs visible to this process
+for i in range(n):
+    p = torch.cuda.get_device_properties(i)
+    print(i, p.name, f"{p.total_memory/1e9:.0f} GB", f"{p.multi_processor_count} SMs")
+
+import jax                                            # works for GPU and TPU backends
+print(jax.devices())                                 # e.g. [TpuDevice(0), TpuDevice(1), ...]
+# shell: nvidia-smi --query-gpu=name,memory.total,utilization.gpu --format=csv
+</code></pre>
+<div class="code-caption"><strong>Code 33.2.2:</strong> Device discovery in three frameworks. What a scheduler tracks as an abstract resource, these calls expose as concrete chips with named memory and compute counts, the numbers a roofline needs.</div>
+</div>
+
+<h2>4. The TPU: A Systolic Array in a Pod <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The tensor processing unit takes the same observation, that deep learning is dominated by dense matrix multiplication, and specializes even harder than a GPU does. Its core is a systolic array: a two-dimensional grid of multiply-accumulate cells through which the operands flow rhythmically, each cell passing its partial result to its neighbor so that a large matrix multiply streams through the grid with very little control overhead and very few trips back to memory. Where a GPU is a flexible array of programmable multiprocessors, a TPU is a near-fixed-function matrix engine; it gives up generality to spend almost all of its silicon and its energy budget on the one operation that matters, and it keeps data moving between cells rather than to and from memory, which raises the effective arithmetic intensity of the operations it is built for.</p>
+<p>The TPU's relevance to a book on scale-out is its packaging. Individual TPU chips are wired into a pod through a dedicated high-speed interconnect arranged as a multi-dimensional torus, so that thousands of chips share a single communication fabric purpose-built for the collective operations of distributed training. The torus topology means each chip talks directly to its neighbors with uniform, predictable latency, which is exactly what the all-reduce of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> wants. The TPU is therefore a clean illustration of the book's central pattern: the vendor has already done the scale-out wiring at the node-and-pod level, exposing not one accelerator but a coherent fabric of them. Table 33.2.1 places the three compute types side by side on the axes that matter for a cluster.</p>
+<div class="table-caption"><strong>Table 33.2.1:</strong> The three compute types in an AI cluster, compared on the role each plays and the per-node property that most constrains the work placed on it.</div>
+<table>
+<thead>
+<tr><th scope="col">Device</th><th scope="col">Role in the cluster</th><th scope="col">Compute style</th><th scope="col">Binding ceiling for AI work</th></tr>
+</thead>
+<tbody>
+<tr><td>CPU (host)</td><td>Feed data, coordinate, run control logic</td><td>Many general cores</td><td>Input-pipeline throughput, PCIe transfer</td></tr>
+<tr><td>GPU</td><td>Train and serve dense models</td><td>SMs plus tensor cores</td><td>HBM bandwidth on low-intensity ops</td></tr>
+<tr><td>TPU</td><td>Train and serve at pod scale</td><td>Systolic matrix array</td><td>Matmul shape fit, pod interconnect</td></tr>
+</tbody>
+</table>
+
+<h2>5. Accelerator Instances: NVLink Inside the Node <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Cloud vendors do not rent bare accelerators; they rent instances, and a high-end AI instance packs four, eight, or sixteen GPUs into a single physical node. The decisive feature of such an instance is not the count of GPUs but how they are connected to each other inside the box. Ordinary host buses such as PCIe move data between GPUs at tens of gigabytes per second, which is far too slow for the constant exchange that sharded training demands. To close that gap, vendors wire the GPUs within a node with a dedicated high-bandwidth link, NVLink, and route it through a switch fabric, NVSwitch, so that every GPU in the node can talk to every other at hundreds of gigabytes per second with uniform bandwidth. The instance is, in effect, a small all-to-all cluster sold as one machine.</p>
+<p>This intra-node fabric is what makes the most communication-intensive parallelism strategies viable. Sharded and tensor parallelism, the subject of <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>, split a single layer's weights and activations across several GPUs and must exchange partial results on every forward and backward pass; that exchange is only affordable when the GPUs sit on the same NVSwitch fabric. The standard design pattern that emerges, and that the scheduler of this chapter must respect, is a memory and bandwidth hierarchy: tensor-parallel shards are kept inside one NVLink-connected node, while the slower, less frequent data-parallel all-reduce crosses the network between nodes. Figure 33.2.3 shows this two-level structure, the per-node fabric that the fleet-level interconnect then ties together.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two accelerator nodes, each containing four GPUs joined by a central NVSwitch with thick fast links. The two NVSwitches are joined to each other by a thinner, slower network link, showing the fast intra-node fabric and the slower inter-node interconnect.">
+<defs>
+<marker id="arr332b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.node332 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.gpu332 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.sw332 { fill:#e7f0f4; stroke:#14385c; stroke-width:1.6; }
+.t332b { font:600 12px sans-serif; fill:#14385c; text-anchor:middle; }
+.s332b { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.fast332 { stroke:#b86b1f; stroke-width:3.2; }
+.slow332 { stroke:#5a626c; stroke-width:1.6; stroke-dasharray:6 4; }
+</style>
+<rect class="node332" x="30" y="40" width="350" height="240" rx="12"/>
+<text class="t332b" x="205" y="64">Node A (one instance)</text>
+<rect class="gpu332" x="55" y="90" width="80" height="44" rx="6"/><text class="t332b" x="95" y="116">GPU 0</text>
+<rect class="gpu332" x="275" y="90" width="80" height="44" rx="6"/><text class="t332b" x="315" y="116">GPU 1</text>
+<rect class="gpu332" x="55" y="200" width="80" height="44" rx="6"/><text class="t332b" x="95" y="226">GPU 2</text>
+<rect class="gpu332" x="275" y="200" width="80" height="44" rx="6"/><text class="t332b" x="315" y="226">GPU 3</text>
+<rect class="sw332" x="160" y="140" width="90" height="54" rx="8"/><text class="t332b" x="205" y="164">NVSwitch</text><text class="s332b" x="205" y="182">~100s GB/s</text>
+<line x1="135" y1="112" x2="160" y2="150" class="fast332"/>
+<line x1="275" y1="112" x2="250" y2="150" class="fast332"/>
+<line x1="135" y1="222" x2="160" y2="184" class="fast332"/>
+<line x1="275" y1="222" x2="250" y2="184" class="fast332"/>
+<rect class="node332" x="480" y="40" width="350" height="240" rx="12"/>
+<text class="t332b" x="655" y="64">Node B (one instance)</text>
+<rect class="gpu332" x="505" y="90" width="80" height="44" rx="6"/><text class="t332b" x="545" y="116">GPU 0</text>
+<rect class="gpu332" x="725" y="90" width="80" height="44" rx="6"/><text class="t332b" x="765" y="116">GPU 1</text>
+<rect class="gpu332" x="505" y="200" width="80" height="44" rx="6"/><text class="t332b" x="545" y="226">GPU 2</text>
+<rect class="gpu332" x="725" y="200" width="80" height="44" rx="6"/><text class="t332b" x="765" y="226">GPU 3</text>
+<rect class="sw332" x="610" y="140" width="90" height="54" rx="8"/><text class="t332b" x="655" y="164">NVSwitch</text><text class="s332b" x="655" y="182">~100s GB/s</text>
+<line x1="585" y1="112" x2="610" y2="150" class="fast332"/>
+<line x1="725" y1="112" x2="700" y2="150" class="fast332"/>
+<line x1="585" y1="222" x2="610" y2="184" class="fast332"/>
+<line x1="725" y1="222" x2="700" y2="184" class="fast332"/>
+<line x1="250" y1="167" x2="610" y2="167" class="slow332"/>
+<text class="s332b" x="430" y="158">network</text>
+<text class="s332b" x="430" y="190">~10s GB/s</text>
+</svg>
+<figcaption><strong>Figure 33.2.3:</strong> The two-level bandwidth hierarchy of a multi-GPU fleet. Inside each node, an NVSwitch connects every GPU to every other at hundreds of gigabytes per second (thick orange links), fast enough for tensor-parallel shards. Between nodes, a slower network link (dashed) carries the less frequent data-parallel all-reduce. Scheduling and parallelism strategy both follow this hierarchy: keep the chattiest communication inside the box.</figcaption>
+</figure>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Vendor Already Scaled Out the Node</div>
+<p>This section's quiet lesson is that scale-out does not begin at the cluster; it begins inside the accelerator instance. A TPU pod and an NVSwitch node are themselves miniature distributed systems, with their own interconnect, their own collectives, and their own placement decisions. The book's central question, how do we split work across machines and recombine it cheaply, is answered first by the hardware vendor at the node level and then again by you at the cluster level. Every parallelism chapter that follows reads this two-level hierarchy off the hardware and maps the chattiest communication onto the fastest link, a discipline that begins with the collectives of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Eight-GPU Node That Ran Like One</div>
+<p><strong>Who:</strong> A platform engineer standing up training infrastructure for a thirteen-billion-parameter language model.</p>
+<p><strong>Situation:</strong> The model did not fit in a single GPU's memory, so the layers were split across the eight GPUs of one instance with tensor parallelism.</p>
+<p><strong>Problem:</strong> The first configuration placed the eight tensor-parallel shards across two four-GPU nodes, and the step time was four times worse than a back-of-envelope estimate predicted.</p>
+<p><strong>Dilemma:</strong> Buy faster network hardware between nodes, an expensive fleet-wide change, or rearrange the placement so the chatty shards stayed on one NVSwitch fabric.</p>
+<p><strong>Decision:</strong> They pinned the entire tensor-parallel group inside one eight-GPU node and reserved the inter-node network for the infrequent data-parallel all-reduce only.</p>
+<p><strong>How:</strong> The scheduler was told to treat the tensor-parallel group as a gang that must land on a single instance, the placement constraint this chapter's scheduler exists to honor.</p>
+<p><strong>Result:</strong> Step time fell back to the predicted range, because the per-pass activation exchange now crossed NVLink at hundreds of gigabytes per second instead of the network at tens.</p>
+<p><strong>Lesson:</strong> The roofline tells you a node's compute ceiling; the intra-node fabric tells you which communications are cheap. Place the chattiest parallelism where the bandwidth is, and the eight-GPU node behaves like one fast machine.</p>
+</div>
+
+<h2>6. From One Node to the Fleet <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The accelerator landscape resolves into a simple layered picture that the rest of Part VII builds on. At the base is the host CPU, feeding and coordinating. Above it is the accelerator, a GPU or TPU, whose tensor cores or systolic array deliver compute that only the roofline can predict will be used. Around several accelerators is the instance, stitched together by an NVLink or torus fabric into a small all-to-all cluster. And around many instances is the fleet, tied by the slower network that the scheduler and the interconnect of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> must use sparingly. Each layer multiplies the one below it, and at every layer the binding constraint may shift from compute to memory bandwidth to communication.</p>
+<p>This is why per-node understanding is not a detour from a scale-out book but its foundation. A scheduler that ignores the roofline will pack work that runs at one percent of peak; a parallelism strategy that ignores the intra-node fabric will drown the network in traffic that NVLink could have absorbed. The accelerator is the unit, and everything this book does is decide how to wire many units together so that the fleet delivers what the chips promise. The next section turns from the compute that fills a cluster to the memory and storage tiers that hold its data, the other half of what a node contributes to the whole.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Disaggregation and Bandwidth-Centric Accelerators (2024 to 2026)</div>
+<p>Two active lines push directly on the ceilings this section named. The first is memory and resource disaggregation: rather than fixing a node's HBM at manufacture, emerging fabrics such as CXL-attached memory and pooled-memory prototypes let an accelerator borrow capacity from a shared pool, loosening the hard per-device memory ceiling that forces model sharding today. The second is the response to the memory-bandwidth wall the roofline exposes: vendors now ship accelerators differentiated chiefly by HBM capacity and bandwidth rather than peak FLOPs, and disaggregated LLM serving, splitting the compute-bound prefill phase and the memory-bound decode phase onto separate, differently-provisioned hardware pools, has moved from research into production stacks. Both trends treat the per-node roofline of Output 33.2.1 as a quantity to be engineered around at the fleet level, which is exactly the move that <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a> develops for serving.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>The most expensive silicon in the building spends much of its life waiting on the cheapest. A data-center GPU costing as much as a car routinely idles because a few host threads cannot decode JPEGs fast enough to fill its input queue. The accelerator in the epigraph is not exaggerating; it really is sitting on a finished matrix, holding terabytes per second of unused bandwidth, while the host catches up.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.2.1: Find the Ridge, Place the Op <span class="exercise-type conceptual">Conceptual</span></div>
+<p>An accelerator advertises a peak of 990 teraFLOP/s in bf16 and 3.35 terabytes per second of HBM bandwidth. (a) Compute its ridge-point arithmetic intensity $I^{\star} = \pi/\beta$ in FLOP/byte. (b) A fused attention kernel achieves an intensity of 220 FLOP/byte and a key-value-cache read during decoding achieves 2 FLOP/byte; state which is compute-bound and which is memory-bound, and give each one's attainable rate from $P(I) = \min(\pi, \beta I)$. (c) Explain in two sentences why raising the decode batch size moves the second operation toward the ridge, and why it cannot move past the attention kernel's regime.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.2.2: Extend the Roofline Evaluator <span class="exercise-type coding">Coding</span></div>
+<p>Starting from Code 33.2.1, add a third workload: a transformer feed-forward block that multiplies a batch of $B$ tokens (each of dimension $d=8192$) by a weight matrix of shape $[d, 4d]$ in bf16. Parameterize the function by $B$ and sweep $B$ over $1, 8, 64, 512, 4096$. For each $B$ print the arithmetic intensity and the fraction of peak attained, and report the smallest $B$ at which the block first becomes compute-bound. Explain how this batch threshold relates to the difference between the two operations already in the code.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.2.3: Place the Parallel Groups on the Hierarchy <span class="exercise-type analysis">Analysis</span></div>
+<p>You must train a model with a tensor-parallel group of size 8 and a data-parallel group of size 4, on nodes that each hold 8 GPUs connected by an NVSwitch fabric at 400 gigabytes per second, with nodes joined by a network at 25 gigabytes per second. (a) Using the hierarchy in Figure 33.2.3, decide which group should be confined to a single node and which should span nodes, and justify the choice from the relative communication frequency of tensor and data parallelism. (b) If a scheduler instead spread each tensor-parallel group across two nodes, estimate qualitatively how the per-pass activation exchange time changes, citing the bandwidth ratio. (c) State the scheduling constraint, in the gang-scheduling language of this chapter, that prevents the bad placement, and connect it to the sharded-parallelism requirements of <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-33.1.html"><span class="nav-label">Previous</span><span class="nav-num">Section 33.1</span><span class="nav-title">Anatomy of an AI Cluster</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 33</span><span class="nav-num">Contents</span><span class="nav-title">Cluster Infrastructure and Scheduling</span></a>
+<a class="next" href="section-33.3.html"><span class="nav-label">Next</span><span class="nav-num">Section 33.3</span><span class="nav-title">Containers and Kubernetes for AI</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

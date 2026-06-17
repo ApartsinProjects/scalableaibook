@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 7.4: Lazy Evaluation and DAG Execution. How Spark records transformations into a DAG, defers all work until an action, and cuts the plan into stages at shuffle boundaries to fuse and optimize the whole job." name="description"/>
+<title>Section 7.4: Lazy Evaluation and DAG Execution | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Distributed Data Processing for AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 7: Spark and Distributed DataFrames</a></div>
+<h1>Lazy Evaluation and DAG Execution</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They kept handing me transformations and I kept saying 'noted.' Only when they finally asked for an answer did I bother to figure out how to get one. Turns out waiting let me skip half the work."</p>
+<cite>A Scheduler That Refuses to Hurry</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Spark does not run your transformations when you write them; it records them into a directed acyclic graph and runs nothing until an action demands a result, at which point it plans the entire job at once, fuses operations that can stream together, and cuts the graph into stages only where data must cross the network.</strong> This deferral is not laziness for its own sake. Seeing the whole computation before executing any of it lets the engine pick a global plan: combine adjacent row-at-a-time operations into a single pass over each partition, push filters earlier, and avoid materializing intermediate datasets that no one will ever read. The price of distribution is the shuffle, and the structure of a Spark job is built entirely around where the shuffles fall. This section shows how a chain of transformations becomes a staged execution plan, and why the boundary between stages is always a shuffle.</p>
+</div>
+<p>In the previous section we built DataFrames and queried them with Spark SQL, and you may have noticed something curious: a line like <code>df.filter(...).select(...)</code> returns instantly even on a terabyte of data, while a later <code>df.count()</code> takes minutes. That gap is the whole subject of this section. The fast calls did almost nothing; they appended a node to a plan. The slow call was an action, and an action is the only thing that makes Spark execute. Understanding this split, and the graph that sits between writing code and running it, is what lets you read a Spark job's behavior instead of being surprised by it.</p>
+<p>Every transformation you chain onto a DataFrame, a <code>filter</code>, a <code>select</code>, a <code>groupBy</code>, a <code>join</code>, produces a new logical node and returns immediately. Spark accumulates these into a directed acyclic graph, a DAG, whose nodes are datasets and whose edges are the transformations that derive one from another. The graph is acyclic because each transformation produces a fresh dataset from existing ones; nothing ever loops back. Nothing in this graph computes a single row until you call an action, an operation that must return a concrete value to your program or write data out: <code>count()</code>, <code>collect()</code>, <code>show()</code>, <code>write.parquet(...)</code>. We separate the two categories formally in <a href="section-7.5.html">Section 7.5</a>; here we focus on what the deferral buys and how the graph is turned into work.</p>
+
+<h2>1. Lazy Evaluation: Record Now, Run Later <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Lazy evaluation means a transformation returns a description of work, not the work's result. When you write <code>df2 = df.filter(cond)</code>, no rows are read and no predicate is tested; <code>df2</code> is simply a handle that says "the rows of <code>df</code> for which <code>cond</code> holds." Chain ten transformations and you have built a ten-node plan while touching zero data. Only an action forces Spark to walk back through the plan, decide how to execute it, and produce the demanded value. This is the opposite of the eager, line-by-line execution of an ordinary Python script, where every statement runs the moment the interpreter reaches it.</p>
+<p>The payoff of waiting is that Spark gets to see the complete computation before committing to any of it. An eager engine that ran each transformation immediately would have to materialize every intermediate dataset, write it somewhere, and read it back for the next step, even when the next step is a filter that throws most of it away. A lazy engine, holding the whole plan, can do something far better: it can rewrite the plan. It can move a filter ahead of a projection so fewer columns are carried, collapse two consecutive maps into one pass, and recognize that an intermediate result is never needed on its own and so never build it. The optimizer that performs these rewrites is Catalyst, which we met through Spark SQL in <a href="section-7.3.html">Section 7.3</a>; laziness is precisely what gives Catalyst a whole plan to optimize rather than one isolated operation at a time.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Laziness Is What Makes Whole-Plan Optimization Possible</div>
+<p>An engine that executes each operation as it is written can only optimize that one operation. An engine that records operations and defers them until an action sees the entire job at once, and a whole-job view is what unlocks the optimizations that matter at scale: fusing row-at-a-time operations into a single streaming pass, pushing filters and projections toward the data source, reordering joins, and skipping intermediate results that nothing consumes. Lazy evaluation is not a convenience feature; it is the precondition for the global plan that lets Spark avoid moving and materializing data it does not need.</p>
+</div>
+
+<h2>2. The DAG and Its Two Kinds of Edges <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The plan Spark accumulates is a DAG of partition-level dependencies, and the single most important property of any edge in that graph is whether it is narrow or wide, the distinction introduced for RDDs in <a href="section-7.2.html">Section 7.2</a>. A dependency is narrow when each output partition draws from exactly one input partition: <code>map</code>, <code>filter</code>, and <code>select</code> are narrow, because a row's fate depends only on that row, and the worker holding input partition $k$ can produce output partition $k$ with no help from any other worker. A dependency is wide when an output partition draws from many input partitions, which is the case for <code>groupBy</code>, <code>reduceByKey</code>, <code>join</code>, and <code>repartition</code>: to gather every record with a given key into one place, records must be redistributed across the cluster by their key. That redistribution is the shuffle, the same all-to-all data movement that powered the reduce phase of MapReduce in <a href="../module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a>.</p>
+<p>This narrow-versus-wide split is what gives the DAG its execution structure. A run of narrow dependencies can be executed entirely locally: worker $k$ takes its input partition and applies every narrow transformation in sequence, one row flowing through the whole chain, never waiting on another machine. A wide dependency cannot, because the data each output partition needs is scattered across every input partition and must be moved over the network first. So Spark draws its execution boundaries exactly at the wide dependencies. The segments of purely narrow work between shuffles are called stages, and the rule is simple and exact: a new stage begins at every shuffle.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A directed acyclic graph of Spark transformations cut into three stages. Stage 0 holds a chain of narrow operations, then a shuffle boundary, then stage 1 performs a group-by, then another boundary, then stage 2 finishes with narrow operations.">
+<defs>
+<marker id="arr74" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr74w" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.n74 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.sh74 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.t74 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.k74 { font:600 12px sans-serif; fill:#b86b1f; text-anchor:middle; }
+.s74 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.box74 { fill:none; stroke:#9bb3cc; stroke-width:1.4; stroke-dasharray:5 4; }
+.ln74 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr74); }
+.lw74 { fill:none; stroke:#b86b1f; stroke-width:2.2; marker-end:url(#arr74w); }
+</style>
+<rect class="box74" x="20" y="60" width="250" height="140" rx="10"/>
+<text class="t74" x="145" y="48">Stage 0 (narrow, fused)</text>
+<rect class="n74" x="44" y="90" width="90" height="40" rx="7"/>
+<text class="t74" x="89" y="114">read</text>
+<rect class="n74" x="44" y="150" width="90" height="40" rx="7"/>
+<text class="t74" x="89" y="174">map</text>
+<rect class="n74" x="160" y="120" width="90" height="40" rx="7"/>
+<text class="t74" x="205" y="144">filter</text>
+<path class="ln74" d="M 89 130 L 89 148"/>
+<path class="ln74" d="M 134 145 L 158 140"/>
+<text class="s74" x="145" y="218">one pass per partition</text>
+<rect class="sh74" x="320" y="120" width="130" height="44" rx="8"/>
+<text class="k74" x="385" y="139">SHUFFLE</text>
+<text class="s74" x="385" y="156">repartition by key</text>
+<path class="lw74" d="M 250 140 L 318 142"/>
+<text class="k74" x="385" y="100">stage boundary</text>
+<text class="s74" x="385" y="186">(wide dependency)</text>
+<rect class="box74" x="490" y="100" width="120" height="120" rx="10"/>
+<text class="t74" x="550" y="88">Stage 1</text>
+<rect class="n74" x="514" y="138" width="72" height="44" rx="7"/>
+<text class="t74" x="550" y="165">groupBy</text>
+<path class="ln74" d="M 450 142 L 512 150"/>
+<rect class="sh74" x="640" y="138" width="44" height="44" rx="8"/>
+<text class="k74" x="662" y="164">↻</text>
+<path class="lw74" d="M 586 160 L 638 160"/>
+<rect class="box74" x="700" y="100" width="140" height="120" rx="10"/>
+<text class="t74" x="770" y="88">Stage 2 (narrow)</text>
+<rect class="n74" x="724" y="118" width="92" height="40" rx="7"/>
+<text class="t74" x="770" y="142">count</text>
+<rect class="n74" x="724" y="170" width="92" height="40" rx="7"/>
+<text class="t74" x="770" y="194">filter</text>
+<path class="ln74" d="M 684 160 L 722 145"/>
+<path class="ln74" d="M 770 158 L 770 168"/>
+<text class="s74" x="430" y="320">Stages run left to right; each stage waits for the shuffle that feeds it to finish writing.</text>
+<text class="s74" x="430" y="340">Within a stage, narrow operations are pipelined into a single streaming pass per partition.</text>
+</svg>
+<figcaption><strong>Figure 7.4.1:</strong> A transformation DAG cut into stages at its shuffle boundaries. The narrow operations <code>read</code>, <code>map</code>, and <code>filter</code> fuse into Stage 0 and run as one pass per partition with no network traffic. The wide dependency (the orange shuffle that repartitions records by key) forces a stage boundary, after which Stage 1's <code>groupBy</code> can see all records for each key. A second shuffle precedes Stage 2's final narrow work. Every stage boundary in the graph is a shuffle, and every shuffle is a stage boundary.</figcaption>
+</figure>
+
+<h2>3. The DAG Scheduler: Stages, Pipelining, and Tasks <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>When an action fires, Spark's DAG scheduler turns the logical plan into a physical one in three moves. First it walks the graph and cuts it into stages at every wide dependency, exactly as in Figure 7.4.1. Second, within each stage, it pipelines the narrow transformations: rather than building the output of the <code>map</code>, then reading it back to run the <code>filter</code>, it composes them into a single function that streams each row through the whole chain in one pass. This fusion is the concrete form of the optimization that laziness enabled in Section 1; the intermediate dataset between <code>map</code> and <code>filter</code> is never materialized because the scheduler can see that nothing else needs it. Third, it schedules the stage as a set of tasks, one task per partition, and ships those tasks to the workers holding the relevant data.</p>
+<p>A task, then, is the unit of execution: one stage applied to one partition, run by one core on one worker. A stage with 200 partitions becomes 200 tasks that run in parallel across the cluster, gated only by the number of available cores. Stages themselves run in dependency order, and a downstream stage cannot start until the shuffle feeding it has finished writing its output, because that stage's tasks read shuffled data that does not exist until the upstream tasks complete. This is why a Spark job's wall-clock time is dominated by its shuffles: they are the synchronization points where the whole cluster must rendezvous before the next wave of local work can begin. We measure and tune that cost in <a href="section-7.7.html">Section 7.7</a>, where data skew turns a single overloaded shuffle partition into a straggler that holds up an entire stage.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Job That Did Nothing for an Hour, Then Everything at Once</div>
+<p>A common rite of passage for new Spark users is the script that "hangs" on the final line. Forty transformations scroll past in under a second, the console looks frozen on <code>df.write.parquet(...)</code>, and panic sets in. Nothing is wrong: those forty fast lines built the DAG, and the last line is the action that finally runs all of it. The deferral that felt like a freeze is the same deferral that let Spark fuse those forty operations into a handful of pipelined stages.</p>
+</div>
+
+<h2>4. Building and Scheduling a DAG from Scratch <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>To make the deferral and the staging concrete, the program below implements the whole idea in pure Python with no Spark installed. A <code>LazyFrame</code> records transformations instead of running them, tagging each as narrow or wide. Calling <code>map</code> or <code>filter</code> just appends a node and returns a new frame; nothing executes. Only the action <code>collect</code> triggers planning: it cuts the recorded plan into stages at every wide (shuffle) operation, prints the resulting stage plan, and then executes, fusing the narrow operations within each stage into a single pass. This is a faithful miniature of the DAG scheduler described in Section 3.</p>
+<pre><code class="language-python">class LazyFrame:
+    def __init__(self, source, plan=None):
+        self.source = source
+        self.plan = plan or []      # list of (op_name, kind, fn)
+
+    def _add(self, name, kind, fn):
+        return LazyFrame(self.source, self.plan + [(name, kind, fn)])
+
+    # Narrow transformations: each output partition depends on ONE input partition.
+    def map(self, fn, label):
+        return self._add(label, "narrow", lambda rows: [fn(r) for r in rows])
+
+    def filter(self, pred, label):
+        return self._add(label, "narrow", lambda rows: [r for r in rows if pred(r)])
+
+    # Wide transformation: output partitions depend on ALL input partitions (shuffle).
+    def group_by_key(self, label):
+        def shuffle(rows):
+            out = {}
+            for k, v in rows:
+                out.setdefault(k, []).append(v)
+            return list(out.items())
+        return self._add(label, "wide", shuffle)
+
+    # DAG SCHEDULER: cut the plan into stages at wide (shuffle) boundaries.
+    def plan_stages(self):
+        stages, current = [], []
+        for op in self.plan:
+            name, kind, _ = op
+            if kind == "wide":
+                if current:
+                    stages.append(current)   # close the narrow pipeline before the shuffle
+                stages.append([op])          # the shuffle is its own stage boundary
+                current = []
+            else:
+                current.append(op)           # pipeline narrow ops into the running stage
+        if current:
+            stages.append(current)
+        return stages
+
+    # ACTION: planning AND execution happen ONLY here.
+    def collect(self, data):
+        stages = self.plan_stages()
+        print("ACTION triggered: collect()  ->  planning the DAG\n")
+        for i, stage in enumerate(stages):
+            kind = "SHUFFLE" if stage[0][1] == "wide" else "fused narrow ops"
+            ops = " -> ".join(n for n, _, _ in stage)
+            print(f"  Stage {i}: [{kind}]  {ops}")
+        print()
+        rows = data
+        for stage in stages:
+            for _, _, fn in stage:          # narrow ops in a stage run as ONE fused pass
+                rows = fn(rows)
+        return rows
+
+
+# Build the pipeline lazily. NOTHING runs during these calls.
+print("Building pipeline (lazy): no computation yet ...")
+words = LazyFrame("lines")
+pipe = (words
+        .map(lambda line: line.strip().lower(), "normalize")
+        .filter(lambda line: len(line) &gt; 0, "drop_empty")
+        .map(lambda line: (line, 1), "to_pairs")
+        .group_by_key("group_by_word")
+        .map(lambda kv: (kv[0], sum(kv[1])), "count")
+        .filter(lambda kv: kv[1] &gt;= 2, "keep_frequent"))
+print(f"Recorded {len(pipe.plan)} transformations, 0 executed.\n")
+
+data = ["Spark", "spark ", "DAG", "spark", "dag", "", "lazy", "DAG"]
+result = pipe.collect(data)
+print("Result:", sorted(result))
+</code></pre>
+<div class="code-caption"><strong>Code 7.4.1:</strong> A from-scratch lazy engine. Transformations append nodes to <code>plan</code> and return new frames without running; the action <code>collect</code> calls <code>plan_stages</code> to cut the DAG at the one wide operation, prints the stage plan, then executes by fusing each stage's narrow operations into a single pass.</div>
+<pre><code class="language-text">Building pipeline (lazy): no computation yet ...
+Recorded 6 transformations, 0 executed.
+
+ACTION triggered: collect()  ->  planning the DAG
+
+  Stage 0: [fused narrow ops]  normalize -> drop_empty -> to_pairs
+  Stage 1: [SHUFFLE]  group_by_word
+  Stage 2: [fused narrow ops]  count -> keep_frequent
+
+Result: [('dag', 3), ('spark', 3)]</code></pre>
+<div class="code-caption"><strong>Output 7.4.1:</strong> Six transformations were recorded with zero execution, then a single action drove the whole job. The scheduler cut the plan into three stages exactly at the one shuffle: the three normalizing operations fused into Stage 0, the <code>group_by_word</code> shuffle stood alone as Stage 1, and the final count-and-threshold pair fused into Stage 2.</div>
+<p>The structure of Output 7.4.1 is the structure of a real Spark job. The first three narrow operations collapsed into one stage that needs no network; the single wide operation became the lone boundary; the trailing narrow operations formed a final stage. If you had added a second <code>group_by_key</code>, a fourth stage would have appeared, because every shuffle adds exactly one boundary. The same plan, run on a cluster, would dispatch one task per partition within each stage and would block the start of Stage 1 until Stage 0's shuffle output was fully written.</p>
+
+<h2>5. Reading the Real Plan with .explain() <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Spark exposes the very plan our toy engine printed. Calling <code>.explain()</code> on a DataFrame shows the physical plan Catalyst chose, and the keyword <code>Exchange</code> in that output marks a shuffle, which is to say a stage boundary. Reading these plans is the practical skill that this section's theory feeds into: the number of <code>Exchange</code> nodes is the number of shuffles, and the number of shuffles plus one is roughly the number of stages your job will run.</p>
+<pre><code class="language-python">from pyspark.sql import SparkSession, functions as F
+
+spark = SparkSession.builder.appName("dag-demo").getOrCreate()
+df = spark.read.parquet("events.parquet")
+
+plan = (df
+        .filter(F.col("value") &gt; 0)          # narrow: pipelined, no shuffle
+        .groupBy("key")                       # wide: forces an Exchange (shuffle)
+        .agg(F.sum("value").alias("total"))   # finishes in the post-shuffle stage
+        .filter(F.col("total") &gt;= 2))         # narrow: fused after the aggregation
+
+plan.explain()        # prints the physical plan; look for 'Exchange' = shuffle = stage cut
+# An abbreviated physical plan looks like:
+#   *(2) Filter (total >= 2)
+#   +- *(2) HashAggregate(keys=[key], functions=[sum(value)])   <- post-shuffle stage
+#      +- Exchange hashpartitioning(key)                        <- the ONE stage boundary
+#         +- *(1) HashAggregate(keys=[key], functions=[partial_sum(value)])
+#            +- *(1) Filter (value > 0)                          <- pre-shuffle stage
+#               +- FileScan parquet [key, value]
+</code></pre>
+<div class="code-caption"><strong>Code 7.4.2:</strong> The same shape as Code 7.4.1, now in PySpark. The single <code>Exchange hashpartitioning(key)</code> node in the plan is the one shuffle; the <code>*(1)</code> and <code>*(2)</code> tags are Spark's whole-stage-codegen markers, naming the two fused narrow stages on either side of it. Note that Catalyst also split the sum into a partial aggregation before the shuffle and a final aggregation after, shrinking what crosses the network.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Spark Builds, Optimizes, and Schedules the DAG for You</div>
+<p>Code 7.4.1 hand-rolled a recorder, a stage cutter, and a fused executor, roughly sixty lines that still ignore partitioning, network transport, partial aggregation, and fault recovery. In PySpark you write only the transformations and one action; the framework records the DAG, hands it to Catalyst for whole-plan optimization (predicate pushdown, projection pruning, join reordering, the partial-then-final aggregation split visible in Code 7.4.2), cuts it into stages at the shuffles, generates fused whole-stage code, and schedules one task per partition with re-execution on failure:</p>
+<pre><code class="language-python">from pyspark.sql import functions as F
+
+result = (df
+          .filter(F.col("value") &gt; 0)
+          .groupBy("key")
+          .agg(F.sum("value").alias("total"))
+          .filter(F.col("total") &gt;= 2)
+          .collect())            # the ONLY action: everything above runs now, optimized
+</code></pre>
+<div class="code-caption"><strong>Code 7.4.3:</strong> The complete job in six lines. Every transformation is lazy and the lone <code>collect()</code> triggers the planning, optimization, staging, and fault-tolerant scheduling that Code 7.4.1 only sketched.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Feature Pipeline That Sped Up by Doing Less</div>
+<p><strong>Who:</strong> A data engineer building a training-feature pipeline for a recommendation model on a Spark cluster.</p>
+<p><strong>Situation:</strong> A nightly job read 4 TB of clickstream Parquet, derived features, joined a user table, and wrote training shards, taking just over three hours.</p>
+<p><strong>Problem:</strong> Profiling in the Spark UI showed five stages and four shuffles, with one <code>Exchange</code> repartitioning the full 4 TB before a filter that discarded 90 percent of rows.</p>
+<p><strong>Dilemma:</strong> Buy more executors to push the same plan through faster, paying linearly for cluster time, or restructure the query so the plan itself moved less data through its shuffles.</p>
+<p><strong>Decision:</strong> They restructured, because <code>.explain()</code> revealed the binding cost was a shuffle on data that a later filter would throw away, not a shortage of compute.</p>
+<p><strong>How:</strong> They moved the selective filter ahead of the wide join so the shuffle carried a tenth of the rows, and let Catalyst's predicate pushdown drop unused columns at the Parquet scan; the action and outputs were unchanged.</p>
+<p><strong>Result:</strong> The job fell from just over three hours to thirty-eight minutes on the same cluster, with one fewer shuffle and far less data crossing the network, at no extra cost.</p>
+<p><strong>Lesson:</strong> The shape of the DAG, especially where the shuffles fall and how much data they carry, sets a job's cost more than raw executor count. Read the plan before you scale the cluster.</p>
+</div>
+
+<h2>6. Why the Whole Plan, Not Each Step <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>It is worth stating plainly why deferral wins, because it is the reasoning that recurs whenever a system chooses to plan before it runs. If $T_i$ is the work of transformation $i$ and an eager engine ran each in isolation, its cost would be the sum of every step plus the cost of writing and reading every intermediate dataset between steps. The intermediate-materialization term is the expensive one at scale: writing a multi-terabyte result to storage only to read it straight back into the next operation can dwarf the operations themselves. A lazy engine pays almost none of it, because fused narrow operations stream a row through the entire chain in memory, and intermediate datasets that no action observes are never built. The savings is not a constant factor on the operations; it is the elimination of a whole class of I/O.</p>
+<p>The same logic explains why Spark plans stages around shuffles specifically. A shuffle is the one unavoidable materialization: its output must be written to disk so that downstream tasks (and re-executed tasks after a failure) can read the right partitions, a property that ties directly to the fault-tolerant re-execution model of <a href="../module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a>. Everything between two shuffles is fair game for fusion and can avoid the disk entirely. So the engine spends its optimization budget exactly where it pays off: collapse the narrow work into streaming passes, and treat each shuffle as a deliberate, costed boundary rather than an accident of how the code was written. This same instinct, see the whole computation, then place the unavoidable communication deliberately, returns when we plan all-reduce schedules for distributed training in <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Adaptive and Learned Query Planning (2024 to 2026)</div>
+<p>A static DAG is planned from estimates that can be wrong, and the live research line is to make the plan react to what actually happens at runtime. Spark's Adaptive Query Execution, now standard and refined through the Spark 3.5 and 4.0 releases, re-optimizes the DAG at each shuffle boundary using the real sizes just measured: it coalesces tiny post-shuffle partitions, switches a sort-merge join to a broadcast join when a side turns out small, and splits skewed partitions so one heavy key no longer strands a stage, the skew problem we quantify in <a href="section-7.7.html">Section 7.7</a>. Beyond Spark, learned cost models and reinforcement-learning query optimizers (the Bao and Balsa lineage, with 2024 to 2025 work extending them to distributed and cloud engines like Photon and Velox-based runtimes) replace hand-tuned cardinality estimates with models trained on past executions. The common thread is that lazy evaluation gives all of these methods the same thing: a whole plan, captured before execution, that they are free to rewrite. We return to data-skew handling, the most consequential of these adaptations for AI feature pipelines, in <a href="section-7.7.html">Section 7.7</a>.</p>
+</div>
+<p>We now have the execution model that the rest of the chapter rests on: transformations are recorded lazily into a DAG, an action triggers planning, the scheduler cuts the DAG into stages at every shuffle, fuses the narrow work within each stage, and dispatches one task per partition. What we have deliberately left informal is the exact catalog of which operations are transformations and which are actions, and what each costs. That catalog is the subject of <a href="section-7.5.html">Section 7.5</a>, which names every transformation and action, marks each narrow or wide, and shows how the choice between them decides where your shuffles, and therefore your stages, fall.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.4.1: Count the Stages <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each pipeline, state how many stages Spark will run and where the boundaries fall, justifying each boundary by naming the wide dependency that causes it. (a) <code>read -&gt; filter -&gt; select -&gt; write</code>. (b) <code>read -&gt; map -&gt; groupBy -&gt; agg -&gt; filter -&gt; write</code>. (c) <code>read -&gt; filter -&gt; join(other) -&gt; groupBy -&gt; agg -&gt; write</code>, where <code>other</code> is large enough that the join shuffles. Then explain why pipeline (a) needs no shuffle at all and what that implies for its wall-clock behavior relative to (b) and (c).</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.4.2: Extend the Lazy Engine <span class="exercise-type coding">Coding</span></div>
+<p>Starting from Code 7.4.1, add a <code>join_by_key</code> wide transformation that takes a second dataset and combines records sharing a key, and a narrow <code>select</code> that keeps only chosen fields. Build a pipeline with two wide operations and confirm from the printed stage plan that it produces exactly three stages with the two shuffles as the boundaries. Then add a counter that increments every time a row-level function actually runs, and use it to demonstrate empirically that no work happens until <code>collect</code> is called and that fused narrow operations make a single pass over each row rather than one pass per operation.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.4.3: Predict, Then Read the Plan <span class="exercise-type analysis">Analysis</span></div>
+<p>Take any Spark query with at least one <code>groupBy</code> and one <code>join</code>. Before running it, predict the number of <code>Exchange</code> nodes and stages from the operations alone. Then call <code>.explain()</code> and compare your prediction to the physical plan, accounting for any difference (a broadcast join avoids a shuffle; a partial-then-final aggregation appears as two HashAggregate nodes around one Exchange). Finally, move a selective filter from after the join to before it, re-run <code>.explain()</code>, and explain in terms of bytes-shuffled why this reordering, which Catalyst often performs for you, lowers the job's cost.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-7.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 7.3</span><span class="nav-title">DataFrames and Spark SQL</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 7</span><span class="nav-num">Contents</span><span class="nav-title">Spark and Distributed DataFrames</span></a>
+<a class="next" href="section-7.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 7.5</span><span class="nav-title">Transformations and Actions</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

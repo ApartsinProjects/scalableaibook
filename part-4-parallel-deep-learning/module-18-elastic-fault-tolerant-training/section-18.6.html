@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 18.6: Preemption and Spot-Instance Training. How to train cheaply on interruptible capacity by combining asynchronous checkpoints, elasticity, and a short preemption-notice handler, and when the economics actually favor spot." name="description"/>
+<title>Section 18.6: Preemption and Spot-Instance Training | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 18: Elastic and Fault-Tolerant Distributed Training</a></div>
+<h1>Preemption and Spot-Instance Training</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They told me I was temporary the day they hired me. I just did not expect the eviction notice to give me thirty seconds and a checkpoint to write."</p>
+<cite>A Spot Instance, Moments Before Preemption</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Interruptible cloud capacity is sold at a deep discount precisely because the provider can reclaim it at any moment, so the fault tolerance built in the rest of this chapter is exactly what turns that cheap-but-fragile capacity into usable training throughput.</strong> Spot and preemptible instances cost a fraction of on-demand, but a preemption can arrive with only seconds of warning and wipe out whatever progress was not yet on durable storage. The playbook that makes them safe is the one we have already assembled: frequent, often asynchronous checkpoints so little work is at risk; elasticity so the job shrinks when nodes vanish and grows when they return; and a short preemption-notice handler that snapshots state before the instance dies. The remaining question is purely economic. Spot can cut cost substantially, but every preemption re-does work, so whether spot actually wins depends on the preemption rate and the cost of a checkpoint. This section makes that trade-off a number you can compute.</p>
+</div>
+<p>The previous section dealt with stragglers, nodes that are slow but still present. This section deals with the harder cousin: nodes that are present one minute and gone the next, by the provider's choice rather than a fault of their own. Cloud platforms maintain pools of spare capacity and rent it out at a steep discount under the standing condition that they may reclaim it whenever they need it back, usually with a brief warning and occasionally with none. The discount is real and large, commonly in the range of a 60 to 90 percent reduction against the on-demand price for the same hardware. The catch is equally real: a training job that assumed its workers were permanent will lose hours of progress the first time a chunk of its fleet is reclaimed. Everything in this chapter, checkpointing in <a href="section-18.2.html">Section 18.2</a> and elastic membership in <a href="section-18.4.html">Section 18.4</a>, was building toward making that loss small enough that the discount is worth taking.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 350" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Timeline diagram of four spot workers training together; one worker is preempted and removed while the others continue, then a replacement worker rejoins from the last checkpoint, with a durable checkpoint store underneath protecting all of them.">
+<defs>
+<marker id="arr186" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b186 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w186 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.d186 { fill:#fce8e8; stroke:#b22; stroke-width:1.6; stroke-dasharray:5 4; }
+.g186 { fill:#e9f5ec; stroke:#1f7a3f; stroke-width:1.6; }
+.t186 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s186 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l186 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr186); }
+.tk186 { fill:none; stroke:#9aa3ad; stroke-width:1.4; }
+</style>
+<text class="t186" x="430" y="22">Training time runs left to right</text>
+<line x1="120" y1="40" x2="120" y2="250" class="tk186"/>
+<text class="s186" x="60" y="44">checkpoint</text>
+<line x1="760" y1="40" x2="760" y2="250" class="tk186"/>
+<!-- worker rows -->
+<rect class="w186" x="130" y="52" width="620" height="34" rx="6"/>
+<text class="t186" x="440" y="73">Worker 1 (spot)  trains continuously</text>
+<rect class="w186" x="130" y="96" width="620" height="34" rx="6"/>
+<text class="t186" x="440" y="117">Worker 2 (spot)  trains continuously</text>
+<!-- worker 3 preempted -->
+<rect class="w186" x="130" y="140" width="300" height="34" rx="6"/>
+<text class="t186" x="280" y="161">Worker 3 (spot)</text>
+<rect class="d186" x="430" y="140" width="120" height="34" rx="6"/>
+<text class="s186" x="490" y="155">PREEMPTED</text>
+<text class="s186" x="490" y="168">30s notice</text>
+<rect class="g186" x="560" y="140" width="190" height="34" rx="6"/>
+<text class="t186" x="655" y="161">Replacement rejoins</text>
+<!-- worker 4 -->
+<rect class="w186" x="130" y="184" width="620" height="34" rx="6"/>
+<text class="t186" x="440" y="205">Worker 4 (spot)  trains continuously</text>
+<!-- preemption handler arrow -->
+<path class="l186" d="M 490 174 L 490 230 L 360 230 L 360 258"/>
+<text class="s186" x="490" y="190" fill="#b22">handler snapshots state</text>
+<!-- durable store -->
+<rect class="b186" x="230" y="262" width="400" height="48" rx="8"/>
+<text class="t186" x="430" y="282">Durable checkpoint store (object storage)</text>
+<text class="s186" x="430" y="300">last good state; survives any preemption</text>
+<path class="l186" d="M 560 157 L 600 157 L 600 250 L 560 250 L 560 264"/>
+<text class="s186" x="650" y="246">restore</text>
+<text class="s186" x="430" y="334">The fleet shrinks by one, keeps training, then grows back; no global restart.</text>
+</svg>
+<figcaption><strong>Figure 18.6.1:</strong> Spot-instance training protected by the chapter's machinery. Four interruptible workers train together; Worker 3 receives a short preemption notice, its handler snapshots state to the durable store, and the job continues elastically on three workers (<a href="section-18.4.html">Section 18.4</a>). A replacement worker later restores from the last checkpoint (<a href="section-18.2.html">Section 18.2</a>) and rejoins. No preemption forces a global restart.</figcaption>
+</figure>
+
+<h2>1. Why Interruptible Capacity Is Cheap, and What It Costs You <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A cloud provider sizes its fleet for peak demand, which means that most of the time a large fraction of its machines sit idle. Rather than let that hardware earn nothing, the provider sells it on a separate market at a steep discount, under one condition: when a paying on-demand customer wants the capacity back, the discounted tenant is evicted. This is the spot market (the names vary by provider, but the mechanism is the same). The eviction is called a preemption, and depending on the provider you get a notice window of roughly thirty seconds to two minutes, sometimes less. The price you pay is whatever the market clears at, often well below the on-demand rate, in exchange for accepting that your instance can disappear at any time.</p>
+<p>For a stateless web server, preemption is a non-event: the load balancer routes around the missing node and a fresh one boots elsewhere. Training is the opposite of stateless. A training job is a tightly coupled computation in which every worker holds a slice of the optimizer state and the model, and the whole group advances in lock-step through synchronized steps. Losing one worker without preparation does not degrade the job gracefully; it deadlocks the collective the surviving workers are waiting on, exactly the failure that <a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a> warned a naive all-reduce loop would hit. The cheap capacity is therefore only usable if the job already knows how to lose a worker safely, which is the entire subject of this chapter.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Spot Capacity Is a Fault-Tolerance Test You Pay To Take</div>
+<p>The discount on interruptible instances is not a free lunch; it is the provider charging you less in exchange for you supplying the fault tolerance they would otherwise have to. Every preemption is an induced fault, arriving far more often than a real hardware failure would. A job that survives spot preemptions cheaply is, by construction, a job that already checkpoints frequently, recovers without a global restart, and reconfigures its world size on the fly. If you have built those three capabilities, spot is nearly free money; if you have not, it is a trap that silently burns money re-doing lost work.</p>
+</div>
+
+<h2>2. The Preemption-Notice Handler <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The single feature that distinguishes spot-aware training from ordinary checkpointing is the preemption-notice handler. Cloud providers expose an imminent preemption through a signal your instance can poll or subscribe to: a metadata endpoint that flips to a "terminating" state, or an operating-system signal delivered to your process. The window is short, but a short window is enough to write a checkpoint if you have prepared for it. The handler's job is narrow and urgent: on notice, finish the current micro-step if it is cheap to do so, snapshot the minimal state needed to resume (model parameters, optimizer moments, the step counter, and the data-loader position), flush it to durable storage, and signal the rendezvous layer that this worker is leaving so the survivors reconfigure instead of blocking on it.</p>
+<p>The handler below sketches the pattern in pure Python. It watches for the preemption signal in a background thread and, when it fires, runs an emergency checkpoint and lowers a flag the training loop checks each step. The point is the structure, not any one cloud's API: a watcher, an emergency snapshot, and a clean handoff to the elastic membership protocol from <a href="section-18.4.html">Section 18.4</a>.</p>
+<pre><code class="language-python">import signal, threading, time
+
+class PreemptionGuard:
+    """Watch for an imminent-preemption signal and snapshot before eviction."""
+    def __init__(self, save_fn, notice_seconds=30):
+        self.save_fn = save_fn            # writes a checkpoint to durable storage
+        self.notice_seconds = notice_seconds
+        self.preempting = threading.Event()
+
+    def _on_notice(self, *_):
+        # Fired by the cloud's preemption signal (here: SIGTERM stands in for it).
+        if not self.preempting.is_set():
+            self.preempting.set()
+            t0 = time.time()
+            self.save_fn(reason="preemption")          # the urgent snapshot
+            print(f"emergency checkpoint written in {time.time()-t0:.2f}s")
+
+    def arm(self):
+        signal.signal(signal.SIGTERM, self._on_notice) # subscribe to the notice
+        return self
+
+    def should_stop(self):
+        return self.preempting.is_set()                # training loop polls this
+</code></pre>
+<div class="code-caption"><strong>Code 18.6.1:</strong> A preemption-notice handler in outline. The background subscription to the cloud's terminating signal triggers one emergency checkpoint and sets a flag; the training loop reads <code>should_stop()</code> each step and exits cleanly so the elastic rendezvous reconfigures the survivors rather than deadlocking on the departing worker.</div>
+<p>The asynchronous checkpoints of <a href="section-18.2.html">Section 18.2</a> matter doubly here. If the periodic checkpoint blocks training for seconds, spot makes that pain frequent, because preemptions arrive often. If instead the periodic checkpoint is asynchronous and cheap, the only synchronous write is the rare emergency one inside the handler, and even that is bounded by the notice window. The combination, frequent cheap background checkpoints plus a fast emergency snapshot on notice, is what keeps the wasted work per preemption down to a fraction of a checkpoint interval.</p>
+
+<h2>3. The Economics: When Does Spot Actually Win? <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Cheap-per-hour is not the same as cheap-per-result. Every preemption forces the job to re-do whatever useful work happened since the last durable checkpoint, and every checkpoint costs a little overhead whether or not a preemption follows. The honest comparison is the effective cost per hour of <em>useful</em> training progress, and that quantity rises with the preemption rate. Let on-demand cost $c_{\text{od}}$ per node-hour and spot cost $c_{\text{sp}}$. Suppose preemptions arrive as a Poisson process at rate $\lambda$ per hour, a checkpoint takes a fraction $f = C/T$ of wall-clock when written every interval $T$ at cost $C$ hours, and a preemption on average re-does half an interval, $T/2$, of work. Solving the self-consistent wall-clock for $H$ useful hours gives an effective spot cost per useful hour</p>
+$$c_{\text{eff}} = c_{\text{sp}} \cdot \frac{1 + C/T}{1 - \lambda\, T/2}, \qquad \text{valid while } \lambda\, T/2 < 1.$$
+<p>The numerator is the checkpoint tax; the denominator is the redo tax, which blows up as the preemption rate approaches the point where the job loses progress as fast as it makes it. Spot wins exactly when $c_{\text{eff}} < c_{\text{od}}$. The break-even preemption rate follows by setting the two equal. Because $T$ is itself a choice, you minimize $c_{\text{eff}}$ over $T$; the optimum balances the two taxes and lands near the classic Young/Daly checkpoint interval $T^\star \approx \sqrt{2C/\lambda}$, the same square-root rule that governs checkpointing on unreliable supercomputers. The demo below computes all of this numerically, sweeping the preemption rate at the optimal checkpoint interval and reporting where spot stops being worth it.</p>
+<pre><code class="language-python">import math
+
+ON_DEMAND_PRICE = 1.00      # $/node-hour
+SPOT_PRICE = 0.70           # $/node-hour (a modest 30% discount, the hard case)
+CKPT_COST_HOURS = 0.05      # wall-clock hours to write one checkpoint (3 min)
+USEFUL_HOURS = 100.0        # good compute hours we must accumulate
+
+def spot_run(pre_rate_per_hr, ckpt_interval_hr):
+    """Return (effective $ per useful hour, wasted-work fraction) on spot."""
+    ckpt_overhead_frac = CKPT_COST_HOURS / ckpt_interval_hr   # checkpoint tax
+    waste_per_pre = ckpt_interval_hr / 2.0                    # avg redo per preemption
+    denom = 1.0 - pre_rate_per_hr * waste_per_pre             # redo tax (Poisson)
+    if denom <= 0:
+        return math.inf, 1.0      # preemptions outrun progress: the job thrashes
+    base = USEFUL_HOURS * (1.0 + ckpt_overhead_frac)
+    W = base / denom              # self-consistent total wall-clock hours
+    redone = pre_rate_per_hr * W * waste_per_pre
+    ckpt_hours = USEFUL_HOURS * ckpt_overhead_frac
+    eff_cost_per_useful = (W * SPOT_PRICE) / USEFUL_HOURS
+    wasted_frac = (redone + ckpt_hours) / W
+    return eff_cost_per_useful, wasted_frac
+
+print(f"On-demand: ${ON_DEMAND_PRICE:.3f} per useful node-hour (baseline)")
+print(f"{'pre/hr':>7} {'ckpt_int':>9} {'eff_$/useful':>13} {'wasted%':>9} {'vs on-demand':>14}")
+for pre_rate in (0.1, 0.5, 2.0, 8.0):
+    opt_int = math.sqrt(2.0 * CKPT_COST_HOURS / pre_rate)   # Young/Daly optimum
+    cost, waste = spot_run(pre_rate, opt_int)
+    verdict = "spot WINS" if cost < ON_DEMAND_PRICE else "spot LOSES"
+    print(f"{pre_rate:>7.2f} {opt_int:>9.3f} {cost:>13.3f} {waste*100:>8.1f}% {verdict:>14}")
+</code></pre>
+<div class="code-caption"><strong>Code 18.6.2:</strong> A from-scratch cost model for spot versus on-demand training. It folds the checkpoint tax and the redo tax into one effective cost per useful node-hour, picks the Young/Daly checkpoint interval for each preemption rate, and reports the verdict. The full script also scans for the break-even preemption rate.</div>
+<pre><code class="language-text">On-demand: $1.000 per useful node-hour (baseline)
+ pre/hr  ckpt_int  eff_$/useful   wasted%   vs on-demand
+   0.10     1.000         0.774      9.5%      spot WINS
+   0.50     0.447         0.876     20.1%      spot WINS
+   2.00     0.224         1.103     36.5%     spot LOSES
+   8.00     0.112         1.833     61.8%     spot LOSES
+
+Break-even search (highest preemption rate where spot still wins):
+  spot wins up to ~1.25 preemptions/hour (mean lifetime ~48.2 min between preemptions)
+</code></pre>
+<div class="code-caption"><strong>Output 18.6.2:</strong> Even at a conservative 30 percent discount, spot wins comfortably while preemptions stay below roughly one per hour, and the optimal checkpoint interval tightens from an hour toward minutes as the rate climbs. Past the break-even near 1.25 preemptions per hour, the redo tax overwhelms the discount and on-demand is cheaper despite its higher list price.</div>
+<p>Two lessons fall out of Output 18.6.2. First, the break-even is governed by the discount depth and the checkpoint cost together: a deeper discount or a cheaper checkpoint pushes the crossover to higher preemption rates, which is precisely why the asynchronous checkpointing of <a href="section-18.2.html">Section 18.2</a> changes the economics, not just the safety. Second, the optimal checkpoint interval is not a fixed policy; it should track the observed preemption rate, tightening when the spot market is volatile and relaxing when it is calm. This is the point where cost-aware training meets the cost-aware scheduling and pricing models developed for clusters; we connect the two ideas in the scaling-efficiency and cost-awareness treatment of <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.9.html">Section 3.9</a>.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Pretraining a Mid-Size Model on a Spot Fleet</div>
+<p><strong>Who:</strong> An ML infrastructure engineer at a startup with a fixed training budget and no reserved-instance commitment.</p>
+<p><strong>Situation:</strong> A two-week pretraining run on 64 GPUs was quoted at on-demand prices that would consume most of the quarter's compute budget.</p>
+<p><strong>Problem:</strong> The same hardware was available on spot at roughly a 70 percent discount, but the team had been burned before by a midnight preemption that lost six hours of progress and an entire on-call engineer's morning.</p>
+<p><strong>Dilemma:</strong> Pay full price for a fleet that never moves, or take the discount and risk that frequent preemptions re-do so much work that the effective cost climbs back above on-demand.</p>
+<p><strong>Decision:</strong> They ran on spot, but only after wiring the chapter's machinery: asynchronous checkpoints every fifteen minutes, an elastic rendezvous that tolerated a shrinking world size, and a preemption-notice handler that snapshotted on the metadata signal.</p>
+<p><strong>How:</strong> They measured the fleet's preemption rate over a pilot day (about 0.4 per hour per node aggregated to a handful of fleet-wide events per hour), then set the checkpoint interval from the Young/Daly rule rather than guessing, exactly as Code 18.6.2 prescribes.</p>
+<p><strong>Result:</strong> The run finished at a measured wasted-work fraction under fifteen percent, for roughly a third of the on-demand cost, and no preemption ever triggered a global restart because the survivors reconfigured automatically.</p>
+<p><strong>Lesson:</strong> Spot is an engineering decision backed by a measurement, not a gamble. Estimate the preemption rate, set the checkpoint interval from it, and the cost model tells you in advance whether the discount survives the redo tax.</p>
+</div>
+
+<h2>4. Redundancy and Replication for Spot Fleets <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Surviving a single preemption is the baseline; a real spot fleet must survive correlated preemptions, because the provider often reclaims many instances of the same type in one region at once. Three strategies reduce that exposure. The first is diversification: spread the fleet across instance types, availability zones, and sometimes regions, so that a reclaim event hits only a slice of the workers rather than all of them. The second is a small on-demand or reserved core: run the rendezvous coordinator, the checkpoint metadata, and perhaps one replica of each critical shard on stable capacity, so the job retains a backbone that no spot reclaim can remove. The third is parameter replication: in sharded training, keep each optimizer-state shard on at least two workers so that losing one does not lose the only copy, the same redundancy idea that parameter servers used in <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a>, now applied to spot survivability rather than load balancing.</p>
+<p>Replication trades capacity for resilience, and the right amount depends on the same preemption rate that drives the checkpoint interval. At low preemption rates, checkpointing alone is enough and replication is wasted capacity. At high rates, the redo tax from Output 18.6.2 grows so fast that holding a redundant copy of critical state, ready to take over instantly without a checkpoint restore, is cheaper than repeatedly re-doing lost work. The decision of where on that spectrum a job sits is itself a scheduling and placement problem, the cost-aware and preemption-aware scheduling that the scaling-efficiency models of <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.9.html">Section 3.9</a> let you reason about quantitatively.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Training Over Volatile and Geo-Distributed Capacity (2024 to 2026)</div>
+<p>The hardest version of spot training drops the assumption of a fast, reliable interconnect entirely. Local-update schemes in the DiLoCo lineage (Douillard et al., 2024) let workers take hundreds of steps between synchronizations, which makes a preemption cost at most one local-update window and tolerates capacity that comes and goes across data centers; follow-on work pushes this toward asynchronous and streaming variants so a returning worker contributes without stalling the group. In parallel, 2024 to 2026 systems work has produced spot-native training frameworks that treat preemption as the common case rather than the exception, combining redundant in-memory model copies with fast peer-to-peer recovery so a reclaimed worker is replaced from a neighbor's RAM in seconds instead of from object storage in minutes (the Oobleck and Bamboo lines of pipeline-parallel resilience). The common thread is that lowering both the communication frequency and the recovery cost moves the break-even of Output 18.6.2 far to the right, turning deeply discounted but highly volatile capacity into viable training fleets. We develop the communication-frequency side of this with the optimization machinery of <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a>.</p>
+</div>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Cheap Scale-Out Is Bought With Fault Tolerance, Not Hardware</div>
+<p>Spot training is the clearest case in the book where the scale-out thesis pays a literal dividend. You do not buy more capability by renting a bigger, more reliable machine; you buy it by spreading the work across many cheap, unreliable machines and engineering the system to not care when some of them vanish. The all-reduce that <a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a> made exact, the elastic rendezvous of <a href="section-18.4.html">Section 18.4</a>, and the checkpoints of <a href="section-18.2.html">Section 18.2</a> compose into a job that treats preemption as routine. The discount is the market's way of pricing the fault tolerance you supply, and a team that has internalized this chapter collects it.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: TorchElastic Plus a Cloud Termination Watcher</div>
+<p>The emergency-checkpoint plumbing of Code 18.6.1 and the elastic reconfiguration it hands off to are almost entirely provided for you. PyTorch's <code>torchrun</code> (TorchElastic) already runs a rendezvous that tolerates workers joining and leaving and restarts only the affected group; you supply a load-and-save hook and a watcher that converts the cloud's preemption signal into a graceful exit:</p>
+<pre><code class="language-python"># Launch: torchrun --nnodes=1:8 --max-restarts=100 --rdzv-backend=c10d train.py
+import torch.distributed as dist
+from torch.distributed.elastic.agent.server.api import WorkerState
+
+def on_cloud_preemption_notice():       # called by your metadata-endpoint watcher
+    save_checkpoint(model, optim, step) # one durable snapshot
+    dist.destroy_process_group()        # leave cleanly; TorchElastic reforms the group
+    raise SystemExit(0)                 # exit before the instance is killed
+</code></pre>
+<div class="code-caption"><strong>Code 18.6.3:</strong> Spot survivability with TorchElastic. The roughly forty lines of handler, rendezvous, and reconfiguration logic from this chapter collapse to a launch flag (<code>--nnodes=1:8</code> for an elastic range) plus a short watcher; TorchElastic handles the membership change and restart-from-checkpoint, and you provide only the save hook and the preemption-signal bridge.</div>
+</div>
+
+<h2>5. Putting the Playbook Together <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The spot playbook is the whole chapter, assembled in one place. Checkpoint frequently and asynchronously so little work is ever at risk and the periodic write does not stall training (<a href="section-18.2.html">Section 18.2</a>). Run elastically so the job shrinks the instant a worker is preempted and grows again when capacity returns, never blocking on a departed member (<a href="section-18.4.html">Section 18.4</a>). Arm a preemption-notice handler so the last seconds before eviction are spent saving rather than computing. Diversify and replicate so correlated reclaims hit only a slice of the fleet. Then, before launching, run the cost model: estimate the preemption rate, set the checkpoint interval from it, and confirm the effective cost actually beats on-demand. Every piece reinforces the others, and the discount is collected only when all of them are present.</p>
+<p>What this leaves open is the other resource ceiling that big-model training keeps hitting: memory. Spot capacity makes compute cheap, but the model, its optimizer state, and its activations still have to fit somewhere, and on commodity spot hardware that somewhere may be smaller than the model demands. The next section attacks that directly, spilling state across the memory hierarchy so that even a modest, interruptible fleet can train a model larger than its aggregate accelerator memory would suggest.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.6.1: Read the Break-Even <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the cost model of Section 3, explain in words why a deeper spot discount and a cheaper checkpoint both push the break-even preemption rate higher, but in different parts of the formula $c_{\text{eff}} = c_{\text{sp}}(1 + C/T)/(1 - \lambda T/2)$. Then argue why, holding everything else fixed, a job that must accumulate more total useful hours $H$ does <em>not</em> change the per-useful-hour break-even, and what that implies about whether spot is more attractive for short jobs or long ones.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.6.2: Add a Recovery Cost <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 18.6.2 so each preemption also pays a fixed restore-and-rejoin cost $R$ (the time to spin up a replacement, restore from the checkpoint store, and re-enter the rendezvous), independent of the checkpoint interval. Add an $R$ term per preemption to the wall-clock and recompute the effective cost and break-even for $R = 0.05$ and $R = 0.2$ hours. Show how the optimal checkpoint interval shifts when restore is expensive, and explain why a large $R$ makes parameter replication (Section 4) more attractive than relying on checkpoint restore alone.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.6.3: Diversification Versus Correlated Preemption <span class="exercise-type analysis">Analysis</span></div>
+<p>Model a fleet of $K$ spot workers split across $z$ availability zones. Suppose a reclaim event hits one entire zone at once with probability $p$ per hour, removing $K/z$ workers simultaneously. Compare the expected number of workers lost per hour, and the variance, for $z = 1$, $z = 2$, and $z = 4$. Using the elastic-training behavior of <a href="section-18.4.html">Section 18.4</a>, argue why higher $z$ lowers the variance of progress even when it does not lower the mean preemption rate, and connect this to the cost-aware placement decisions made by cluster schedulers in <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.9.html">Section 3.9</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-18.5.html"><span class="nav-label">Previous</span><span class="nav-num">Section 18.5</span><span class="nav-title">Straggler Detection and Mitigation</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 18</span><span class="nav-num">Contents</span><span class="nav-title">Elastic and Fault-Tolerant Distributed Training</span></a>
+<a class="next" href="section-18.7.html"><span class="nav-label">Next</span><span class="nav-num">Section 18.7</span><span class="nav-title">Memory Offload Across the Hierarchy</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

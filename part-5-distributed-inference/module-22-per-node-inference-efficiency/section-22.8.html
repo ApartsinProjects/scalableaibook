@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 22.8: Compilation and Kernel Optimization. Why eager-mode inference wastes the GPU, how graph capture plus operator fusion cut HBM traffic, and the tooling (torch.compile, ONNX, TensorRT, CUDA graphs) that turns a traced graph into a fast per-node engine." name="description"/>
+<title>Section 22.8: Compilation and Kernel Optimization | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 22: Per-Node Inference Efficiency: A Prerequisite</a></div>
+<h1>Compilation and Kernel Optimization</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I launched ten thousand tiny kernels last night, one per elementwise op, and each one waited politely for Python to call its name. The GPU spent the evening idle and bored."</p>
+<cite>A Worker That Lost Its Coordinator</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>An eager-mode model leaves most of its accelerator unused: it dispatches a long parade of small kernels one Python call at a time, and each kernel makes its own round trip to high-bandwidth memory instead of sharing data with its neighbors.</strong> Compilation closes that gap. You trace the model into a graph, fuse chains of operations into single kernels that read and write memory once, fold constants, auto-tune the resulting kernels for the exact shapes you serve, and replay the whole sequence with the launch overhead removed. This is a scale-up technique: it makes one node faster without adding a single machine. But because the same node is replicated across the serving fleet, a 1.5x or 2x per-node speedup multiplies into 1.5x or 2x fewer GPUs for the whole deployment, which is why a chapter about distribution spends a section on a compiler. This section shows where the time goes, why fusion attacks the very same memory-bound bottleneck that <a href="section-22.6.html">Section 22.6</a> attacked with FlashAttention, and which tool to reach for.</p>
+</div>
+<p>The previous section made each decoding step do less wasted work through continuous batching and speculative decoding. This section attacks a different waste, the gap between the arithmetic a model needs and the arithmetic the GPU actually performs, and the cause is mostly mechanical. A model written in eager mode runs one operator at a time: the Python interpreter calls into the framework, the framework launches a kernel on the GPU, the kernel runs, control returns to Python, and the next operator begins. For a transformer block with dozens of small elementwise operations between the big matrix multiplies, this means dozens of separate kernel launches, each with its own fixed dispatch cost, and dozens of separate trips to memory to read an input and write an output that the very next operation will immediately read back. The GPU spends much of its time waiting: for Python, for the launch queue, for memory. Compilation removes those waits by turning the model from a sequence of interpreter-driven calls into an optimized, precompiled graph.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Top row shows four separate elementwise kernels, each making a read-from-HBM and write-to-HBM round trip, for eight memory crossings total. Bottom row shows the same four operations fused into one kernel that reads inputs once and writes the output once, for three crossings total.">
+<defs>
+<marker id="arr8" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr8o" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.hbm8 { fill:#eef2f7; stroke:#14385c; stroke-width:1.6; }
+.k8 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.kf8 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.8; }
+.t8 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.tf8 { font:600 13px sans-serif; fill:#8a4f15; text-anchor:middle; }
+.s8 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.rt8 { fill:none; stroke:#14385c; stroke-width:1.5; marker-end:url(#arr8); }
+.rt8o { fill:none; stroke:#b86b1f; stroke-width:1.7; marker-end:url(#arr8o); }
+</style>
+<text class="t8" x="60" y="26" text-anchor="start">Unfused (eager): each op is its own kernel and its own HBM round trip</text>
+<rect class="hbm8" x="40" y="44" width="780" height="34" rx="6"/>
+<text class="t8" x="430" y="66">High-Bandwidth Memory (HBM)</text>
+<rect class="k8" x="70" y="120" width="120" height="48" rx="8"/>
+<text class="t8" x="130" y="149">bias add</text>
+<rect class="k8" x="250" y="120" width="120" height="48" rx="8"/>
+<text class="t8" x="310" y="149">scale</text>
+<rect class="k8" x="430" y="120" width="120" height="48" rx="8"/>
+<text class="t8" x="490" y="149">GELU</text>
+<rect class="k8" x="610" y="120" width="120" height="48" rx="8"/>
+<text class="t8" x="670" y="149">residual add</text>
+<path class="rt8" d="M 105 78 L 105 118"/>
+<path class="rt8" d="M 155 168 L 155 80"/>
+<path class="rt8" d="M 285 78 L 285 118"/>
+<path class="rt8" d="M 335 168 L 335 80"/>
+<path class="rt8" d="M 465 78 L 465 118"/>
+<path class="rt8" d="M 515 168 L 515 80"/>
+<path class="rt8" d="M 645 78 L 645 118"/>
+<path class="rt8" d="M 695 168 L 695 80"/>
+<text class="s8" x="430" y="196">8 memory crossings (read + write per op)</text>
+<line x1="40" y1="220" x2="820" y2="220" stroke="#c9d2dd" stroke-width="1" stroke-dasharray="4 4"/>
+<text class="tf8" x="60" y="250" text-anchor="start">Fused: one kernel, intermediates stay in registers, memory touched once</text>
+<rect class="hbm8" x="40" y="268" width="780" height="34" rx="6"/>
+<text class="t8" x="430" y="290">High-Bandwidth Memory (HBM)</text>
+<rect class="kf8" x="250" y="324" width="360" height="30" rx="8"/>
+<text class="tf8" x="430" y="344">fused kernel: bias add -&gt; scale -&gt; GELU -&gt; residual add</text>
+<path class="rt8o" d="M 320 302 L 320 322"/>
+<path class="rt8o" d="M 380 302 L 380 322"/>
+<path class="rt8o" d="M 480 354 L 480 304"/>
+<text class="s8" x="690" y="342">3 crossings: 2 reads, 1 write</text>
+</svg>
+<figcaption><strong>Figure 22.8.1:</strong> Why fusion is a memory-traffic optimization. In the unfused chain (top) each of the four elementwise operations is a separate kernel that reads its input from HBM and writes its output back, so the small tensor crosses the memory bus eight times. The fused kernel (bottom) reads the inputs once, keeps every intermediate in on-chip registers, and writes the result once, three crossings in total. For a memory-bound chain, runtime is set by these crossings, so cutting them from eight to three is close to a 2.7x reduction in the time this chain costs. The from-scratch model in Code 22.8.1 makes the same count concrete.</figcaption>
+</figure>
+
+<h2>1. Where Eager Mode Wastes the GPU <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Two distinct costs hide inside eager execution, and compilation removes them by different mechanisms, so it pays to separate them. The first is launch overhead. Every kernel dispatch carries a fixed cost, on the order of microseconds, to enqueue the work, and that cost is paid whether the kernel touches a million elements or a thousand. When a model is dominated by large matrix multiplies the overhead is negligible, but a transformer block is full of cheap elementwise operations (bias additions, activation functions, normalizations, residual additions) where the launch can cost as much as the computation. The second cost is memory traffic. Each elementwise kernel reads its input tensor from high-bandwidth memory and writes its output back, and the next kernel immediately reads that output again. The data ping-pongs to HBM and back across the whole chain, even though it never needed to leave the chip.</p>
+<p>That second cost is the one that ties this section to the roofline model of <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.7.html">Section 3.7</a>. An elementwise chain has almost no arithmetic per byte moved, so it sits deep in the memory-bound region of the roofline: its runtime is governed entirely by how many bytes cross the memory bus, not by how many floating-point operations the GPU can do. The GPU's arithmetic units sit nearly idle while the memory system does all the work. This is exactly the diagnosis that <a href="section-22.6.html">Section 22.6</a> gave for naive attention, and it has exactly the same cure: stop moving the data so many times.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Fusion and FlashAttention Solve the Same Problem</div>
+<p>FlashAttention (Section 22.6) and operator fusion are the same idea applied to different chains. Both notice that an operation sequence is memory-bound, that its intermediate results are being written to HBM only to be read straight back, and both keep those intermediates in fast on-chip memory so the bus is crossed a handful of times instead of dozens. FlashAttention is a hand-written fused kernel for the specific softmax-attention chain; a compiler such as TorchInductor or TensorRT is a machine that discovers and emits such fused kernels automatically for whatever chains your model happens to contain. When you understand fusion, FlashAttention stops being a special trick and becomes the canonical example of a general principle.</p>
+</div>
+
+<h2>2. A Memory-Traffic Model for Fusion <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The benefit of fusion is countable, and the count is simple enough to do in closed form before running anything. Consider a chain of $n$ elementwise operations applied to a tensor of $B$ bytes. In eager mode each operation is a kernel that reads $B$ bytes and writes $B$ bytes, so the chain moves</p>
+$$T_{\text{unfused}} = 2 n B \;\text{bytes} \quad (\text{plus any extra input tensors a stage reads}).$$
+<p>A single fused kernel reads each distinct input once and writes the single final output once. For a chain that consumes one streaming tensor plus a constant number $c$ of side inputs (a residual tensor, a bias vector), the fused traffic is the one streaming read, the $c$ side reads, and the single output write,</p>
+$$T_{\text{fused}} = (1 + c + 1)\,B = (2 + c)\,B \;\text{bytes},$$
+<p>independent of $n$, because every intermediate now lives in registers and never reaches HBM. In the memory-bound regime where runtime equals traffic divided by memory bandwidth $\beta$, the speedup is the ratio of the two traffic figures,</p>
+$$\text{speedup} = \frac{T_{\text{unfused}}}{T_{\text{fused}}} = \frac{2 n B + cB}{(2 + c)B} = \frac{2n + c}{2 + c},$$
+<p>which grows with the length $n$ of the fused chain. A longer chain of cheap operations is a better fusion target, because more redundant round trips collapse into the one pass. Code 22.8.1 evaluates this model for a four-op chain with a single residual side input ($n = 4$, $c = 1$) and confirms the arithmetic against an actual NumPy execution of the same operations.</p>
+<pre><code class="language-python">import numpy as np
+
+N = 8_000_000          # elements in the activation tensor
+bytes_per_elem = 2     # fp16/bf16 inference activations
+ops = ["bias_add", "scale", "gelu", "residual_add"]  # 4 elementwise stages
+n_ops = len(ops)
+
+x = np.ones(N, dtype=np.float32)
+res = np.full(N, 0.5, dtype=np.float32)
+
+# Unfused (eager): every op is its own kernel, each a full read + write.
+def unfused(x, res):
+    a = x + 0.1                 # bias_add : read x, write a
+    b = a * 1.2                 # scale    : read a, write b
+    c = 0.5 * b * (1.0 + np.tanh(0.797 * (b + 0.044 * b**3)))  # gelu
+    d = c + res                 # residual_add : read c + res, write d
+    return d
+
+# Fused: same numbers, one logical pass; a real fused kernel keeps a, b, c in
+# registers and never writes them to HBM. NumPy cannot truly fuse, so we model
+# the traffic each version WOULD incur on a GPU.
+out_u = unfused(x, res)
+out_f = unfused(x, res)
+
+elem_bytes = N * bytes_per_elem
+unfused_traffic = (2 * n_ops + 1) * elem_bytes   # 2 per op (R+W) + 1 extra residual read
+fused_traffic   = 3 * elem_bytes                 # read x, read res, write out
+
+hbm_GBs = 2000.0                                  # ~2 TB/s, a modern data-center GPU
+t_unfused_us = unfused_traffic / (hbm_GBs * 1e9) * 1e6
+t_fused_us   = fused_traffic   / (hbm_GBs * 1e9) * 1e6
+
+print("elements per tensor      :", f"{N:,}")
+print("elementwise ops in chain :", n_ops)
+print("max abs result diff      :", f"{np.max(np.abs(out_u - out_f)):.2e}")
+print("unfused HBM traffic (MB) :", f"{unfused_traffic/1e6:.1f}")
+print("fused   HBM traffic (MB) :", f"{fused_traffic/1e6:.1f}")
+print("traffic reduction        :", f"{unfused_traffic/fused_traffic:.2f}x")
+print("unfused time @2TB/s (us) :", f"{t_unfused_us:.1f}")
+print("fused   time @2TB/s (us) :", f"{t_fused_us:.1f}")
+print("memory-bound speedup     :", f"{t_unfused_us/t_fused_us:.2f}x")
+</code></pre>
+<div class="code-caption"><strong>Code 22.8.1:</strong> A pure-NumPy model of the fusion payoff. It runs the four-op chain to show the numbers are identical whether you fuse or not, then counts the HBM bytes each version moves and turns that traffic into a memory-bound runtime estimate. No GPU and no compiler are required to see why fusion wins.</div>
+<pre><code class="language-text">elements per tensor      : 8,000,000
+elementwise ops in chain : 4
+max abs result diff      : 0.00e+00
+unfused HBM traffic (MB) : 144.0
+fused   HBM traffic (MB) : 48.0
+traffic reduction        : 3.00x
+unfused time @2TB/s (us) : 72.0
+fused   time @2TB/s (us) : 24.0
+memory-bound speedup     : 3.00x
+</code></pre>
+<div class="code-caption"><strong>Output 22.8.1:</strong> The fused result is bit-for-bit identical to the unfused one (difference $0$), yet it moves 48 MB instead of 144 MB and would finish in 24 microseconds instead of 72, a 3x memory-bound speedup. Fusion buys a real wall-clock win while changing nothing about the answer, the same bargain that data parallelism offered for gradients in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>.</div>
+<p>The closed-form prediction $(2n + c)/(2 + c) = (8 + 1)/(2 + 1) = 3.0$ matches the executed traffic ratio exactly, which is the point: fusion is not a mysterious compiler benefit but an accounting identity about how many times a tensor crosses the memory bus. A real compiler does this for hundreds of chains across a whole model and stacks the savings.</p>
+
+<h2>3. Graph Capture and the Compilation Pipeline <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>To fuse operations a compiler first needs to see them all at once, which eager execution never allows because it only ever knows about the single operation in front of it. The first stage of every compilation pipeline is therefore graph capture: trace the model with a representative input and record the operations and their data dependencies as a graph rather than executing them immediately. Once the graph exists, a sequence of standard optimizations runs over it. Operator fusion combines adjacent elementwise operations into single kernels, the saving we just modeled. Constant folding precomputes any subgraph whose inputs are all known at compile time, so the work never happens at run time. Layout and precision passes choose memory formats and cast to lower precision where it is safe. Finally kernel auto-tuning searches over implementation choices (tile sizes, thread-block shapes, loop orders) for each kernel and the exact tensor shapes you will serve, keeping the fastest variant. The output is a compiled artifact, an engine, that replays the optimized graph with none of the per-operation interpreter overhead.</p>
+<p>Two further tools attack the launch overhead directly rather than the memory traffic. CUDA graphs record an entire sequence of kernel launches once and then replay the whole sequence with a single submission, so the thousands of tiny dispatches in a decoding step cost one launch instead of thousands. This matters most for the small-batch, latency-sensitive decoding that dominates LLM serving, where launch overhead is a large fraction of step time. And ONNX, the Open Neural Network Exchange format, is the neutral interchange graph: you export a traced model to ONNX once, then any ONNX-aware runtime or compiler can ingest it, which is how a model trained in one framework reaches an optimized engine built by another.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: torch.compile Wraps the Whole Pipeline in One Line</div>
+<p>Code 22.8.1 modeled fusion by hand. In PyTorch you do not write fused kernels or manage graph capture yourself; <code>torch.compile</code> traces the model, hands the graph to the TorchInductor backend, and TorchInductor performs the fusion, layout selection, and kernel generation (emitting Triton kernels on GPU) automatically:</p>
+<pre><code class="language-python">import torch
+
+model = build_model().eval().cuda()
+
+# One wrapper. Tracing + fusion + autotuning happen on the first call(s);
+# afterwards the compiled graph replaces eager dispatch.
+fast_model = torch.compile(model, mode="max-autotune")
+
+with torch.inference_mode():
+    y = fast_model(example_input)   # first call compiles; later calls are fast
+
+# For decode-step launch overhead, capture the replayed graph with CUDA graphs:
+fast_model = torch.compile(model, mode="reduce-overhead")
+</code></pre>
+<div class="code-caption"><strong>Code 22.8.2:</strong> The same fusion that Code 22.8.1 modeled by hand, now obtained from a single <code>torch.compile</code> wrapper. The hundreds of lines a hand-written fused kernel plus its autotuner would take collapse to one call; TorchInductor handles graph capture, fusion grouping, Triton code generation, and the autotuning search, and <code>mode="reduce-overhead"</code> adds CUDA-graph capture to remove launch overhead.</div>
+</div>
+
+<h2>4. Choosing a Tool, and What It Costs You <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The compilation tools form a spectrum from flexible to rigid, and the right choice is governed by how much you are willing to freeze. At the flexible end, <code>torch.compile</code> stays inside PyTorch, recompiles transparently when input shapes change, and falls back to eager execution for anything it cannot trace, so it costs you almost nothing in workflow and typically buys a moderate speedup. At the rigid end, TensorRT (and TensorRT-LLM, its LLM-specialized sibling) compiles an ahead-of-time engine tuned for a specific GPU, specific precision, and a specific range of input shapes, and squeezes out the most performance precisely because it can assume so much. The price of that assumption is flexibility: a TensorRT engine is a hardware-specific binary. Build it for an H100 and it will not run on an A100; change your sequence-length range and you rebuild. ONNX Runtime sits in between, ingesting the neutral ONNX graph and applying its own graph optimizations and execution providers across more hardware backends.</p>
+<p>This is the build-versus-flexibility trade-off, and it is the same shape as every ahead-of-time compilation decision in computing: the more you specialize for one target, the faster you run on that target and the worse you port to any other. Hardware-specific compilation is where the biggest per-node wins live, but it is also where portability goes to die, which is exactly why ONNX exists as a neutral waypoint. A common production pattern is to keep the model in ONNX as the durable, portable source of truth and to compile a disposable, hardware-specific engine from it for each accelerator generation you actually deploy on, rebuilding the engine rather than the model when the fleet's hardware changes.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Engine That Paid for Itself in Fleet Size</div>
+<p><strong>Who:</strong> An inference platform engineer running a fixed-shape image embedding model behind a recommendation service.</p>
+<p><strong>Situation:</strong> The model served a steady stream of 224x224 images at a fixed batch size on a fleet of 40 GPUs, and the bill was the team's largest line item.</p>
+<p><strong>Problem:</strong> Profiling showed the GPUs at roughly 45 percent utilization; the model was a chain of convolutions and elementwise operations dispatched eagerly, drowning in launch overhead and HBM round trips.</p>
+<p><strong>Dilemma:</strong> Stay in eager PyTorch for maximum flexibility and accept the waste, wrap it in <code>torch.compile</code> for an easy moderate win, or export to ONNX and build a rigid TensorRT engine for the largest win at the cost of a per-hardware rebuild.</p>
+<p><strong>Decision:</strong> Because the shapes were genuinely fixed and the hardware fleet was homogeneous, they exported to ONNX and built a TensorRT engine; the rigidity that would hurt a research workflow cost them nothing here.</p>
+<p><strong>How:</strong> They traced the model to ONNX, built a fp16 TensorRT engine for their exact shape and GPU, kept the ONNX file in source control as the portable master, and wired the build step into CI so a hardware change triggers an engine rebuild.</p>
+<p><strong>Result:</strong> Per-node throughput rose about 1.8x with identical embeddings; the same request volume now fit on 23 GPUs instead of 40, and the per-node win multiplied directly into 17 fewer machines across the fleet.</p>
+<p><strong>Lesson:</strong> Specialize only what is genuinely stable. Fixed shapes and homogeneous hardware are exactly the conditions under which the rigid, hardware-specific engine is free money; under churn, the flexible compiler is the safer default.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Compiler That Warms Up Slowly</div>
+<p>The first call to a compiled model is often dramatically slower than eager, sometimes by seconds, because that is when tracing, fusion, and the autotuning search actually happen. Engineers new to <code>torch.compile</code> regularly benchmark the very first inference, conclude the compiler made things worse, and quietly delete the wrapper. The fix is to discard the warm-up calls and measure steady state, the same discipline you would apply to a JIT-compiled language. Compilation pays off across millions of requests, not across the first one.</p>
+</div>
+
+<h2>5. Composing Compilation with Quantization <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Compilation does not compete with the other per-node techniques in this chapter; it composes with them, and the composition with quantization (<a href="section-22.2.html">Section 22.2</a>) is the most important to get right. A quantized model stores its weights and often its activations in low precision, which already cuts the bytes moved per operation. Compiling that quantized graph stacks a second, independent saving on top: the compiler fuses the dequantize, compute, and requantize steps into single kernels so the low-precision data is never expanded to full precision in HBM between operations, and it emits integer or low-precision kernels tuned for the quantized shapes. The order that works in practice is to quantize first and compile second, handing the compiler a graph that already carries the low-precision operators so its fusion and autotuning passes optimize the actual arithmetic you will run. TensorRT-LLM and the int8 and fp8 paths in modern serving stacks are built precisely around this quantize-then-compile composition, which is why production LLM engines reach throughput that neither technique delivers alone.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Compilers Catch Up to Hand-Written Kernels (2024 to 2026)</div>
+<p>Two threads define the current frontier. The first is the maturation of <code>torch.compile</code> and TorchInductor: as of PyTorch 2.x it has moved from an opt-in experiment to the default fast path, with TensorRT-LLM and vendor inference stacks routinely reporting large fp8 and int4 serving gains from quantize-then-compile pipelines on Hopper and Blackwell GPUs. The second is the rise of high-level kernel languages that blur the line between writing a kernel and compiling one. Triton lets researchers express fused kernels in Python and have them lowered to fast GPU code, and it is the backend TorchInductor itself emits; Mojo and the broader MLIR-based compiler ecosystem push toward a single language that spans portable model code and hardware-tuned kernels. The open question the field is chasing is whether an automatic compiler can consistently match a hand-written FlashAttention-class kernel; for an increasing share of memory-bound chains the answer is now yes, which is steadily shrinking the set of operations that still demand hand tuning. We will see these compiled engines multiplied across machines through the fleet-sizing arithmetic of <a href="section-22.9.html">Section 22.9</a>, which turns one node's compiled throughput into a machine count for the whole deployment.</p>
+</div>
+<p>With compilation, this chapter's per-node toolkit is complete: quantization shrinks the bytes, FlashAttention and continuous batching reorganize the heavy operations, and compilation removes the interpreter and the redundant memory traffic that sit between them. Each technique makes one node do more, and every one of those single-node gains is about to be multiplied. <a href="section-22.9.html">Section 22.9</a> takes the per-node throughput and latency numbers these sections produced and turns them into the central economic question of distributed serving: given a request volume and a latency budget, how many of these optimized nodes does the fleet actually need?</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.8.1: Read the Fusion Model <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the traffic model of Section 2, explain why fusing a chain of two elementwise operations buys far less than fusing a chain of ten, even though both remove the same per-op launch overhead. Then argue why fusion gives almost no benefit when the chain is a single large matrix multiply with no neighbors: identify which term in $T_{\text{unfused}} = 2nB$ collapses, and connect your answer to where that operation sits on the roofline of <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.7.html">Section 3.7</a>.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.8.2: Extend the Traffic Counter <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 22.8.1 so the chain length $n$ is a parameter and the side-input count $c$ is configurable. Sweep $n$ from 1 to 16 with $c = 1$, print the predicted memory-bound speedup $(2n + c)/(2 + c)$ for each, and confirm it matches the traffic-ratio computation. Then add a second regime where each op also performs heavy arithmetic (raise the FLOPs per element until the chain becomes compute-bound) and show that once the operation leaves the memory-bound region, the fusion speedup flattens out. Explain what changed.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.8.3: Build versus Flexibility <span class="exercise-type analysis">Analysis</span></div>
+<p>You serve one model on a fleet that mixes two GPU generations and whose request shapes vary widely by hour. Compare three strategies (eager PyTorch, <code>torch.compile</code>, and an ahead-of-time TensorRT engine per GPU generation) along four axes: peak per-node throughput, engineering and rebuild cost when hardware or shapes change, portability across the mixed fleet, and risk of a shape the engine was not built for. Recommend one strategy and state the single fleet condition that, if it changed, would flip your recommendation.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-22.7.html"><span class="nav-label">Previous</span><span class="nav-num">Section 22.7</span><span class="nav-title">Continuous Batching and Speculative Decoding</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 22</span><span class="nav-num">Contents</span><span class="nav-title">Per-Node Inference Efficiency</span></a>
+<a class="next" href="section-22.9.html"><span class="nav-label">Next</span><span class="nav-num">Section 22.9</span><span class="nav-title">From Per-Node Numbers to Fleet Sizing</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

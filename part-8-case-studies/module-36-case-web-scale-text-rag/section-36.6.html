@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 36.6: Sharded Retrieval and Ranking. Serving retrieval over sharded vector and lexical indexes: scatter-gather, per-shard ANN, the retrieve-then-rerank funnel, reciprocal rank fusion, and tail-latency control." name="description"/>
+<title>Section 36.6: Sharded Retrieval and Ranking | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Case Studies and Capstone Projects</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 36: Web-Scale Text Processing and Distributed RAG</a></div>
+<h1>Sharded Retrieval and Ranking</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I was a single query vector, scattered to every shard at once. Each one handed me back its ten proudest documents, and somewhere in the merge I learned which boasts were true."</p>
+<cite>A Query Vector, Gathering the Best of Each Shard</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Once the corpus is too large for one machine's index, every retrieval becomes a small distributed computation: the query is broadcast to all shards, each shard answers from its own slice, and a coordinator reduces the partial answers into one global result.</strong> This is the online read path of the RAG system built across this chapter, and it is a distributed-inference problem in disguise. Correctness has a precise meaning here: the global top-$k$ assembled from per-shard top-$k$ lists must equal the top-$k$ you would have gotten from one giant index. This section shows why that equality holds, how each shard answers cheaply with approximate nearest-neighbor search, how a cheap recall stage feeds an expensive reranker, how lexical and dense rankings are fused, and how the whole fan-out is kept fast when one slow shard can stall the entire query.</p>
+</div>
+<p>The previous section finished the offline half of the system: the corpus has been cleaned, embedded, and partitioned into vector and lexical index shards spread across many machines. Nothing has been served yet. Now a user query arrives, and the system has a few hundred milliseconds to turn it into a ranked list of passages that a language model will read. The corpus no longer fits in one index, so the query cannot be answered by one machine; it must be answered by all of them at once, and their separate answers must be recombined into a single ranking that is correct as if the corpus had never been split. That recombination is the subject of this section, and it is the same reduce pattern that <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> introduced for gradients, now carrying ranked documents instead of partial sums.</p>
+<p>The deep treatment of vector search itself, the index structures and the distributed serving architecture, lives in <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a>. This section assumes that machinery and concentrates on the case-study question: given sharded indexes already built, how does one query become one ranked answer, fast and correct, at web scale.</p>
+
+<h2>1. The Scatter-Gather Pattern <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Partition the corpus of $N$ documents into $S$ disjoint shards, so that document set $\mathcal{D}$ splits into $\mathcal{D}_1, \dots, \mathcal{D}_S$ with $\mathcal{D} = \bigcup_s \mathcal{D}_s$ and $\mathcal{D}_i \cap \mathcal{D}_j = \emptyset$ for $i \neq j$. Each shard holds its own index over its own slice. A query $q$ is sent to all $S$ shards at once (the scatter), each shard scores only its local documents and returns its best $k$, and a coordinator merges the $S$ returned lists into one final top-$k$ (the gather). Figure 36.6.1 traces the full path, from the single query through the fan-out, the per-shard local top-$k$, the merge, and a final rerank.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Scatter-gather retrieval: one query fans out to N shards, each returns a local top-k list, a merge node assembles the global top-k, a reranker reorders the survivors, and a final ranked list is produced.">
+<defs>
+<marker id="arr366" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.q366 { fill:#eaf2fb; stroke:#14385c; stroke-width:1.6; }
+.s366 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.m366 { fill:#eaf6ee; stroke:#1f7a44; stroke-width:1.6; }
+.r366 { fill:#f3eafb; stroke:#5a2f8a; stroke-width:1.6; }
+.t366 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.u366 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l366 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr366); }
+</style>
+<rect class="q366" x="30" y="158" width="120" height="64" rx="10"/>
+<text class="t366" x="90" y="186">Query q</text>
+<text class="u366" x="90" y="204">embed + parse</text>
+<text class="t366" x="300" y="24">Scatter: broadcast to all shards</text>
+<rect class="s366" x="250" y="42" width="170" height="50" rx="8"/>
+<text class="t366" x="335" y="62">Shard 1 (ANN + lexical)</text>
+<text class="u366" x="335" y="80">local top-k</text>
+<rect class="s366" x="250" y="106" width="170" height="50" rx="8"/>
+<text class="t366" x="335" y="126">Shard 2</text>
+<text class="u366" x="335" y="144">local top-k</text>
+<rect class="s366" x="250" y="170" width="170" height="50" rx="8"/>
+<text class="t366" x="335" y="190">Shard 3</text>
+<text class="u366" x="335" y="208">local top-k</text>
+<text class="u366" x="335" y="246">&#8942;</text>
+<rect class="s366" x="250" y="258" width="170" height="50" rx="8"/>
+<text class="t366" x="335" y="278">Shard S</text>
+<text class="u366" x="335" y="296">local top-k</text>
+<path class="l366" d="M 150 182 L 200 182 L 200 67 L 246 67"/>
+<path class="l366" d="M 200 182 L 200 131 L 246 131"/>
+<path class="l366" d="M 200 190 L 246 195"/>
+<path class="l366" d="M 200 182 L 200 283 L 246 283"/>
+<rect class="m366" x="500" y="148" width="150" height="84" rx="10"/>
+<text class="t366" x="575" y="180">Merge (reduce)</text>
+<text class="u366" x="575" y="200">S·k candidates</text>
+<text class="u366" x="575" y="216">global top-k</text>
+<path class="l366" d="M 420 67 L 460 67 L 460 170 L 496 170"/>
+<path class="l366" d="M 420 131 L 460 131 L 460 180 L 496 180"/>
+<path class="l366" d="M 420 195 L 496 195"/>
+<path class="l366" d="M 420 283 L 460 283 L 460 210 L 496 210"/>
+<rect class="r366" x="700" y="148" width="150" height="84" rx="10"/>
+<text class="t366" x="775" y="180">Rerank</text>
+<text class="u366" x="775" y="200">cross-encoder</text>
+<text class="u366" x="775" y="216">final top-n</text>
+<path class="l366" d="M 650 190 L 696 190"/>
+</svg>
+<figcaption><strong>Figure 36.6.1:</strong> The online read path. The query embedding is scattered to all $S$ shards, each of which returns its local top-$k$ from an approximate index. A merge node reduces the $Sk$ candidates to the global top-$k$, and a cross-encoder reranks the survivors into the final ranked list. The fan-out and the reduce are exactly the collective shape of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>, carrying documents instead of gradient vectors.</figcaption>
+</figure>
+<p>The structural claim is that this distributed procedure returns the same answer as a single combined index, and it is worth stating precisely. Let $\mathrm{score}(q, d)$ be the relevance score of document $d$ for query $q$, and let $\mathrm{top}_k(q, \mathcal{D})$ denote the $k$ highest-scoring documents in a set $\mathcal{D}$. The global top-$k$ over the whole corpus equals the global top-$k$ taken over the union of the per-shard top-$k$ lists,</p>
+$$\mathrm{top}_k\!\left(q, \bigcup_{s=1}^{S} \mathcal{D}_s\right) = \mathrm{top}_k\!\left(q, \bigcup_{s=1}^{S} \mathrm{top}_k(q, \mathcal{D}_s)\right),$$
+<p>because any document in the true global top-$k$ outscores at least $N - k$ others overall, so within its own shard it cannot rank below position $k$; it therefore survives that shard's local top-$k$ and reaches the merge. No globally relevant document is dropped by being looked at one shard at a time. This is the retrieval analogue of the gradient identity from <a href="../../part-1-foundations/module-01-scale-out-ai/index.html">Chapter 1</a>: a reduce over partial results reconstructs the answer exactly, provided the partial each shard reports is large enough. Here "large enough" means each shard must return at least $k$ candidates, the same $k$ as the global request.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Local Top-k Is Enough, If You Ask Each Shard for k</div>
+<p>The exactness of scatter-gather rests on one inequality: a document in the global top-$k$ can be beaten by at most $k - 1$ others everywhere, hence by at most $k - 1$ inside its own shard, so it ranks no worse than $k$-th locally and is returned. Ask each shard for fewer than $k$ and the guarantee breaks; ask for exactly $k$ and the merge is exact. This is why correctness in a sharded retriever is defined as "the global top-$k$ assembled from local top-$k$", and why the merge fan-in width, not the shard count, is the parameter to watch.</p>
+</div>
+
+<h2>2. Approximate Nearest Neighbors Inside Each Shard <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The exactness argument above assumed each shard returns its true local top-$k$. In practice a shard does not scan all of its documents; a billion-vector slice scored by brute force would blow the latency budget on its own. Each shard instead holds an approximate nearest-neighbor (ANN) index, a graph-based HNSW structure or an inverted-file IVF partition, that returns the local top-$k$ in sublinear time while occasionally missing a true neighbor. The index families themselves are the deep dive of <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a>; here we need only their effect on correctness.</p>
+<p>Approximation reintroduces error that sharding had removed. The relevant metric is recall at $k$, the fraction of the true top-$k$ neighbors that the approximate search actually returns,</p>
+$$\mathrm{recall@}k = \frac{|\,\mathrm{ANN}_k(q) \cap \mathrm{exact}_k(q)\,|}{k},$$
+<p>where $\mathrm{ANN}_k(q)$ is what the shard returns and $\mathrm{exact}_k(q)$ is the true local top-$k$. A single global recall of, say, $0.95$ is the product of two independent losses: each shard's ANN recall, and the merge, which is lossless when every shard reports $k$ candidates. Because the merge is exact, raising end-to-end recall is entirely a matter of tuning each shard's index, by increasing HNSW's search-time breadth $\mathrm{ef}$ or the number of IVF lists probed, both of which trade latency for recall. The tie to <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a> is exact: the per-shard ANN knobs are the only place recall is lost in a correctly merged scatter-gather.</p>
+<p>A common refinement is to have each shard return $k' > k$ candidates rather than exactly $k$. Over-fetching costs a little network and merge work but buys margin against ANN misses, because a true neighbor that the approximate search ranks slightly too low still survives if the local cutoff is generous. The over-fetch factor $k'/k$ is the cheapest recall knob in the whole pipeline, and it is set at the merge, not inside any index.</p>
+
+<h2>3. The Retrieve-Then-Rerank Funnel <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Dense retrieval scores a query against a document by a single dot product of precomputed embeddings; it is cheap enough to run over millions of vectors per shard, but it judges relevance from two vectors that never saw each other. A cross-encoder reranker, by contrast, feeds the query and a candidate passage jointly through a transformer and reads relevance from their full interaction. It is far more accurate and far too expensive to run over the corpus: scoring a billion passages with a cross-encoder per query is hopeless. The resolution is a funnel, a multi-stage retrieve-then-rerank pipeline in which a cheap, high-recall stage proposes and an expensive, high-precision stage disposes.</p>
+<p>Stage one is the sharded ANN scatter-gather of the previous sections: from $N \approx 10^9$ documents it returns a global candidate set of a few hundred, chosen for recall, not precision. Stage two runs the cross-encoder over only those few hundred survivors and reorders them into the final top-$n$ that the language model will read. The cost arithmetic is the whole point. If the reranker costs $c$ per (query, document) pair and the candidate set has size $m$, the per-query rerank cost is $c \cdot m$ with $m$ in the hundreds, independent of the corpus size $N$. Running the same cross-encoder over the corpus would cost $c \cdot N$, larger by the factor $N/m \approx 10^7$. The funnel converts an impossible $c \cdot N$ into an affordable $c \cdot m$ while keeping cross-encoder precision on the documents that matter.</p>
+<p>This is the same serving discipline that <a href="../../part-5-distributed-inference/module-23-distributed-inference-systems/index.html">Chapter 23</a> and <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a> apply to model inference: spend cheap compute broadly to narrow the field, then spend expensive compute narrowly on the finalists. The reranker is itself a distributed-inference workload, a small transformer replicated across a fleet and load-balanced exactly as those chapters describe, sitting downstream of the merge in Figure 36.6.1.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Reranker That Paid for Itself in Recall</div>
+<p><strong>Who:</strong> A retrieval engineer on the search team behind a documentation-grounded coding assistant.</p>
+<p><strong>Situation:</strong> The RAG system retrieved the top 8 passages by dense ANN alone and fed them straight to the generator; answer quality plateaued and users complained the right snippet was "almost there but not quite".</p>
+<p><strong>Problem:</strong> Dense retrieval at $k = 8$ was missing the single most relevant passage about a third of the time; it usually landed it around rank 20, just outside the window the generator saw.</p>
+<p><strong>Dilemma:</strong> Retrieve a much wider window (say top 50) and pay the generator's context cost on mostly-irrelevant passages, or insert a reranking stage and pay a second model invocation per query.</p>
+<p><strong>Decision:</strong> They widened ANN recall to the top 200 candidates per query (with each shard over-fetching to $k' = 2k$) and added a cross-encoder reranker that cut that 200 down to the final 8.</p>
+<p><strong>How:</strong> Stage one stayed the existing scatter-gather; stage two was a small replicated cross-encoder service placed after the merge, batching the 200 (query, passage) pairs into one forward pass.</p>
+<p><strong>Result:</strong> The correct passage reached the generator's window in the high nineties percent of queries, answer-acceptance rose markedly, and the added latency was a single batched rerank call of a few tens of milliseconds, dwarfed by generation time.</p>
+<p><strong>Lesson:</strong> Recall is bought cheaply at the wide end of the funnel and precision cheaply at the narrow end; the reranker earns its keep precisely because it runs over hundreds, not billions.</p>
+</div>
+
+<h2>4. Hybrid Fusion of Lexical and Dense Rankings <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Dense retrieval understands meaning but stumbles on exact tokens: a rare identifier, an error code, a product SKU, a proper noun that the embedding model never learned. Lexical retrieval, the inverted-index BM25 line, matches those tokens precisely but is blind to paraphrase. A web-scale retriever runs both, over the same sharded corpus, and must fuse their two rankings into one. The two engines produce incomparable scores, a cosine similarity and a BM25 weight live on different scales, so fusing by adding raw scores is fragile and demands per-engine calibration.</p>
+<p>Reciprocal rank fusion (RRF) sidesteps calibration by discarding the scores and fusing the ranks. For a document $d$ appearing at rank $r_e(d)$ in engine $e$'s list (rank 1 is best), its fused score is</p>
+$$\mathrm{RRF}(d) = \sum_{e} \frac{1}{C + r_e(d)},$$
+<p>where $C$ is a small constant (commonly $60$) that damps the influence of the very top ranks so that a document need not win every engine to win overall. Documents are sorted by descending $\mathrm{RRF}(d)$. Because only ranks enter, RRF needs no score normalization, tolerates engines on wildly different scales, and rewards documents that several engines rank well even if none rank them first. In the sharded setting RRF composes cleanly with scatter-gather: each engine, dense and lexical, runs its own scatter-gather to a global ranked list, and RRF fuses the two global lists. Fusion is a final reduce over rankings, sitting between the merge and the rerank of Figure 36.6.1.</p>
+
+<h2>5. A Sharded Retriever in Code <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The code below builds a small corpus of unit vectors, partitions it into eight shards, and runs the full pattern: each shard returns its local top-$k$ by cosine, a merge reduces the $S k$ candidates to a global top-$k$, and the result is checked against the exact top-$k$ computed over the undivided corpus. It then fuses two rankings with RRF. The merge is deliberately written as the concatenate-and-resort reduce of Figure 36.6.1, so the exactness claim of Section 1 can be verified rather than asserted.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+N, d, K, k = 50_000, 64, 8, 10          # docs, dim, shards, top-k
+
+# Build one corpus of unit vectors, then partition the row indices into K shards.
+D = rng.standard_normal((N, d))
+D /= np.linalg.norm(D, axis=1, keepdims=True)
+q = rng.standard_normal(d); q /= np.linalg.norm(q)
+shards = np.array_split(np.arange(N), K)    # disjoint, exhaustive
+
+# Exact global top-k: score the whole corpus at once (the single-machine oracle).
+global_scores = D @ q
+exact = np.argsort(-global_scores)[:k]
+
+# Scatter-gather: each shard returns ONLY its local top-k (id, score) pairs.
+def local_topk(ids):
+    s = D[ids] @ q
+    top = np.argsort(-s)[:k]
+    return ids[top], s[top]
+
+cand_ids, cand_scores = [], []
+for sh in shards:
+    ids, sc = local_topk(sh)        # K independent workers
+    cand_ids.append(ids); cand_scores.append(sc)
+
+# Merge step (a reduce): pool the K local top-k lists, keep the global top-k.
+pool_ids = np.concatenate(cand_ids)
+pool_sc = np.concatenate(cand_scores)
+order = np.argsort(-pool_sc)[:k]
+merged = pool_ids[order]
+
+print("shards K                 :", K)
+print("candidates merged        :", len(pool_ids), "(= K * k)")
+print("merged top-k == exact    :", bool(np.array_equal(merged, exact)))
+print("top-3 merged doc ids     :", merged[:3].tolist())
+print("top-3 exact  doc ids     :", exact[:3].tolist())
+
+# Reciprocal Rank Fusion of two independent rankings over the same ids.
+def rrf(rankings, C=60):
+    score = {}
+    for r in rankings:
+        for rank, doc in enumerate(r):       # rank 0 is best
+            score[doc] = score.get(doc, 0.0) + 1.0 / (C + rank + 1)
+    return sorted(score, key=score.get, reverse=True)
+
+dense_rank = exact.tolist()                  # ranking A: cosine retrieval
+lexical_rank = [exact[2], 999, exact[0], 777, exact[5]] + exact[6:].tolist()  # ranking B: a lexical engine
+fused = rrf([dense_rank, lexical_rank])
+print("RRF top-5 fused ids      :", fused[:5])
+</code></pre>
+<div class="code-caption"><strong>Code 36.6.1:</strong> A sharded retriever from first principles. Each shard computes a local top-$k$ blind to the other shards' documents; the merge concatenates the $Sk$ candidates and resorts. The boolean <code>merged top-k == exact</code> tests the identity of Section 1 directly, and <code>rrf</code> fuses a dense and a lexical ranking by rank alone.</div>
+<pre><code class="language-text">shards K                 : 8
+candidates merged        : 80 (= K * k)
+merged top-k == exact    : True
+top-3 merged doc ids     : [15048, 11437, 41599]
+top-3 exact  doc ids     : [15048, 11437, 41599]
+RRF top-5 fused ids      : [15048, 41599, 725, 13713, 44457]</code></pre>
+<div class="code-caption"><strong>Output 36.6.1:</strong> The merged top-$k$ equals the exact global top-$k$ over the undivided corpus: eight shards, each seeing one eighth of the documents, jointly reconstruct the true ranking. The RRF line shows the fusion promoting documents that both the dense and lexical lists rank highly.</div>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Reduce, Now Carrying Documents</div>
+<p>The merge in Code 36.6.1 is the all-reduce of <a href="../../part-1-foundations/module-01-scale-out-ai/index.html">Chapter 1</a> wearing different clothes. There the partial each worker held was a gradient sum and the reduction was addition; here the partial is a ranked top-$k$ list and the reduction is "resort and truncate". The shape is identical: every worker contributes a partial computed over its own shard, and one combine step reconstructs the answer the single machine would have produced. Whenever a distributed read path claims to be correct, look for this reduce and check that each partial is large enough to make it lossless; in retrieval that condition is "each shard returns $k$".</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: FAISS IndexShards Does the Scatter-Gather for You</div>
+<p>Code 36.6.1 wrote the fan-out and merge by hand to expose the pattern. In production you do not maintain that loop: FAISS ships a sharded index wrapper that broadcasts the query across sub-indexes, collects each one's local top-$k$, and merges to the global top-$k$ in a single <code>search</code> call. The sub-indexes can live on separate GPUs or machines, and the merge runs as part of the call.</p>
+<pre><code class="language-python">import faiss, numpy as np
+
+dim, k = 64, 10
+shard = faiss.IndexShards(dim, threaded=True)   # the scatter-gather coordinator
+for vectors in shard_vector_batches:            # one batch per machine/GPU
+    sub = faiss.IndexFlatIP(dim)                # or IndexHNSWFlat / IndexIVFFlat
+    sub.add(vectors)
+    shard.add_shard(sub)                        # register a shard with the coordinator
+
+scores, ids = shard.search(query[None, :], k)   # broadcasts, gathers local top-k, merges
+</code></pre>
+<div class="code-caption"><strong>Code 36.6.2:</strong> The hand-written fan-out and merge of Code 36.6.1 collapse to <code>IndexShards</code> plus one <code>search</code>. Roughly twenty lines of explicit per-shard scoring and pooling become a single call, with FAISS handling the broadcast, the per-shard ANN, and the global merge; swap <code>IndexFlatIP</code> for <code>IndexHNSWFlat</code> to get approximate per-shard search, the recall knob of Section 2.</div>
+</div>
+
+<h2>6. Tail Latency Across the Fan-Out <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Scatter-gather has a structural latency hazard that grows with the shard count. The coordinator cannot merge until every shard has replied, so the query's latency is the maximum over the shards, not the average. If each shard responds within $t$ with probability $p$, then all $S$ respond within $t$ with probability $p^{S}$, which decays as $S$ grows even when each shard is individually fast. A retriever fanning out to a hundred shards inherits the slowest of a hundred draws on every query, so a per-shard latency that is fine at the median becomes a tail-latency catastrophe at the fan-in. This is the tail-at-scale problem, and the case study inherits the mitigations developed for edge and fleet serving in <a href="../../part-7-infrastructure/module-34-edge-fog-on-device/section-34.7.html">Section 34.7</a>.</p>
+<p>Three remedies apply directly. Hedged requests send a duplicate request to a second replica of a shard after a short delay and take whichever returns first, cutting off the tail of any single replica's latency distribution. Replica-level load balancing keeps no single shard replica hot. And a partial-result deadline lets the coordinator merge from the shards that have answered by a cutoff, accepting a small, bounded recall loss rather than letting one straggler hold the whole query hostage; because the merge is a reduce over whatever partials arrived, dropping a late shard degrades recall gracefully instead of failing the query. The deadline turns a hard correctness guarantee into a tunable one, and at web scale that trade is usually correct: a result that is $99\%$ complete in $80$ milliseconds beats a perfect one in $400$.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Learned Routing and Late-Interaction Retrieval (2024 to 2026)</div>
+<p>Two active lines reshape the sharded read path. The first is learned shard routing: rather than broadcasting every query to all $S$ shards, a lightweight router predicts the few shards likely to hold the answer and queries only those, cutting fan-out cost and tail exposure at some recall risk. Cluster-routed indexes such as SPANN and SPFresh (Chen et al., 2021; Xu et al., 2023) push this idea into billion-scale ANN, and the routing-versus-recall trade is being learned end-to-end. The second is late-interaction retrieval in the ColBERT and PLAID lineage (Santhanam et al., 2022), which keeps per-token embeddings and scores by a MaxSim interaction, blurring the once-sharp line between cheap dense retrieval and expensive cross-encoder reranking, and forcing the funnel of Section 3 to be redesigned around token-level indexes. Both lines treat the scatter-gather of this section not as fixed plumbing but as a learnable, cost-aware component of the serving system.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 36.6.1: When the Merge Stops Being Exact <span class="exercise-type conceptual">Conceptual</span></div>
+<p>The identity in Section 1 requires each shard to return at least $k$ candidates. Suppose a coordinator, to save bandwidth, asks each of $S$ shards for only its local top-$k/2$. Construct a small example (a handful of documents across two shards) where the merged top-$k$ is missing a document that belongs in the true global top-$k$. Then state, in one sentence, the general condition on the per-shard fetch size under which the merge is guaranteed exact, and explain why over-fetching to $k' > k$ can only help, never hurt, recall.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 36.6.2: Measuring the Recall Cost of Approximation <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 36.6.1 so that each shard, instead of its exact local top-$k$, returns an approximate top-$k$ by scoring only a random subset (say $60\%$) of its own documents, simulating an ANN miss. Compute end-to-end recall at $k$ against the exact global top-$k$ over many random queries, and plot how recall rises as you increase the over-fetch factor $k'/k$ from 1 to 4. Confirm that the merge itself never loses a document that a shard returned, so that all recall loss is attributable to the per-shard approximation, exactly as Section 2 claims.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 36.6.3: The Arithmetic of the Tail <span class="exercise-type analysis">Analysis</span></div>
+<p>A retriever fans out to $S$ shards, each of which independently returns within the latency budget with probability $p = 0.99$. Compute the probability that all shards meet the budget for $S \in \{1, 10, 50, 200\}$, and identify the shard count at which more than one query in five overshoots. Then suppose a partial-result deadline lets the coordinator proceed once any $S - 1$ shards have answered; estimate how much that one allowed straggler improves the all-respond probability, and discuss the recall cost of dropping one shard out of $S$. Relate your answer to the hedging and deadline mechanisms of <a href="../../part-7-infrastructure/module-34-edge-fog-on-device/section-34.7.html">Section 34.7</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-36.5.html"><span class="nav-label">Previous</span><span class="nav-num">Section 36.5</span><span class="nav-title">Distributed Embedding Generation</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 36</span><span class="nav-num">Contents</span><span class="nav-title">Web-Scale Text Processing and Distributed RAG</span></a>
+<a class="next" href="section-36.7.html"><span class="nav-label">Next</span><span class="nav-num">Section 36.7</span><span class="nav-title">RAG Integration Across a Fleet</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

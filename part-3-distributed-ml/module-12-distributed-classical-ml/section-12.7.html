@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 12.7: Distributed Approximate Nearest Neighbors. How IVF, HNSW, and product quantization trade a little recall for orders-of-magnitude speed, and how sharding an index across machines turns similarity search into scatter-gather over a fleet." name="description"/>
+<title>Section 12.7: Distributed Approximate Nearest Neighbors | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Distributed Machine Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 12: Distributed Classical Machine Learning</a></div>
+<h1>Distributed Approximate Nearest Neighbors</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They asked me for the closest vector among a billion. I found the eighth-closest in a millisecond and called it close enough. Nobody complained."</p>
+<cite>An Index Shard With a Relaxed Definition of Truth</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Nearest-neighbor search is the operation that turns a learned embedding into a usable system, and at billion-vector scale it can only be done approximately and only by spreading the index across many machines.</strong> Exact nearest-neighbor search compares a query against every stored vector, a cost that grows linearly with the database and becomes hopeless once the database holds billions of vectors and queries arrive thousands per second. Approximate nearest neighbor (ANN) gives back a small, controllable amount of recall in exchange for two or three orders of magnitude in speed, and a distributed ANN index spreads the vectors across a fleet so that no single machine holds, or scans, the whole collection. This section is the bridge from the classical machine learning of this chapter to the retrieval systems that power modern recommendation, search, and retrieval-augmented generation: the same sufficient-statistics and partition-then-merge patterns return one last time, now over learned embeddings.</p>
+</div>
+<p>Every earlier section of this chapter shared one shape: split the data across workers, compute a partial summary on each, and combine the summaries into the exact global answer. Linear models combined gradient sums, decision trees combined histogram counts, k-means combined cluster sums. Nearest-neighbor search breaks that shape in an instructive way. The answer we want, the $k$ stored vectors closest to a query, has no small sufficient statistic; in the worst case you must look at every vector to be certain you have the closest. So the distributed story changes from "combine partial summaries into the exact answer" to "search partitions of the data and merge their best candidates into a very good answer." That shift, from exactness to controlled approximation, is what makes search at scale tractable, and it is the natural close to a chapter about doing classical machine learning on more data than one machine can hold.</p>
+
+<h2>1. Why Exact Nearest Neighbor Does Not Scale <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Given a query vector $q$ and a database of $N$ vectors $\{x_1, \dots, x_N\}$ in $\mathbb{R}^d$, the nearest-neighbor problem asks for the $k$ database vectors with the smallest distance to $q$, usually Euclidean distance or its cosine cousin. The obvious algorithm computes all $N$ distances and keeps the $k$ smallest. Its cost is</p>
+$$ \text{exact search cost} = O(N \cdot d) \text{ per query}, $$
+<p>which is fine when $N$ is a few thousand and ruinous when $N$ is a billion. A single query over a billion 768-dimensional float vectors touches roughly $10^{9} \times 768$ multiply-add operations and reads several terabytes from memory; multiply by thousands of queries per second and no single machine, however large, can keep up. The vectors themselves, at four bytes per dimension, occupy about three terabytes, which already exceeds the memory of one server. Both ceilings from <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Chapter 1</a>, the memory ceiling and the throughput ceiling, bind at once.</p>
+<p>The classical escape, tree structures such as k-d trees that prune away most of the database, works beautifully in low dimensions and collapses in high ones. As $d$ grows past a few dozen, distances concentrate: every pair of points becomes nearly equidistant, the triangle-inequality pruning that trees rely on stops eliminating branches, and an exact tree search degrades to scanning almost everything. This is the curse of dimensionality, and embeddings live squarely inside it at $d$ in the hundreds or thousands. The response is not a better exact structure but a deliberate retreat from exactness.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Recall Is a Tunable Knob, Not a Failure</div>
+<p>An ANN index does not return the guaranteed closest vectors; it returns vectors that are closest with high probability, and the probability is something you set. The quality metric is <strong>recall@$k$</strong>, the fraction of the true top-$k$ neighbors that the approximate search actually found, $\text{recall@}k = \frac{|\,A \cap T\,|}{k}$ where $T$ is the exact top-$k$ set and $A$ is the returned set. Pushing recall from 0.90 to 0.99 costs more search work; dropping it to 0.80 buys more speed. Unlike the exact-gradient identity of earlier sections, there is no free lunch here, only a smooth curve trading recall against latency and memory that you place yourself, per application.</p>
+</div>
+
+<h2>2. The Three Index Families <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Production ANN systems are built from three ideas, often combined. The first is <strong>IVF</strong>, the inverted file. You cluster the database into $\texttt{nlist}$ cells with k-means (the very algorithm of the previous section, reused as a coarse quantizer), and store each vector in the inverted list of its nearest centroid. At query time you find the $\texttt{nprobe}$ centroids closest to $q$ and scan only the vectors in those few cells, ignoring the rest of the database. If a query touches $\texttt{nprobe}$ of $\texttt{nlist}$ cells holding $N/\texttt{nlist}$ vectors each, the work falls from $N$ to roughly $\texttt{nprobe} \cdot N / \texttt{nlist}$, a large constant-factor win whose recall depends on how often the true neighbors live in the probed cells.</p>
+<p>The second idea is <strong>graph-based HNSW</strong>, hierarchical navigable small-world graphs. Each vector becomes a node linked to a handful of nearby vectors, with a few long-range links layered on top, exactly the small-world structure that makes social networks navigable. A search starts at an entry node and greedily walks toward the query, hopping closer at each step, reaching a high-recall neighborhood after a logarithmic number of hops rather than a linear scan. HNSW gives the best recall-versus-latency trade-off in memory and dominates in-RAM benchmarks, at the cost of a graph that can be larger than the vectors themselves and is awkward to update incrementally.</p>
+<p>The third idea attacks memory rather than time: <strong>product quantization (PQ)</strong>. Split each $d$-dimensional vector into $m$ sub-vectors, run k-means on each subspace to learn a small codebook of, say, 256 entries, and store each sub-vector as a single byte naming its nearest codebook entry. A 768-dimensional float vector (3072 bytes) compresses to $m$ bytes, often 96 or fewer, a 30-fold or larger reduction, and distances are approximated by table lookups over the codebooks. PQ rarely stands alone; the workhorse production index is <strong>IVF-PQ</strong>, coarse IVF cells to narrow the search plus PQ codes to make each cell cheap to scan and small enough to keep in memory. Table 12.7.1 summarizes how the three families place themselves on the recall, latency, and memory axes.</p>
+<div class="table-caption"><strong>Table 12.7.1:</strong> The three ANN index families and where each sits on the recall, latency, and memory trade-off. Real systems combine them, most commonly as IVF-PQ.</div>
+<table>
+<thead>
+<tr><th scope="col">Family</th><th scope="col">Core idea</th><th scope="col">Strength</th><th scope="col">Cost</th></tr>
+</thead>
+<tbody>
+<tr><td>IVF (inverted file)</td><td>Cluster into cells; probe only the nearest few</td><td>Simple, shardable, fast to build</td><td>Recall sensitive to <code>nprobe</code> and cell balance</td></tr>
+<tr><td>HNSW (graph)</td><td>Greedy walk over a navigable small-world graph</td><td>Best in-memory recall-vs-latency</td><td>Large graph, hard to update, RAM-bound</td></tr>
+<tr><td>PQ (product quantization)</td><td>Compress sub-vectors to codebook bytes</td><td>Drastic memory reduction</td><td>Lossy distances; usually paired with IVF</td></tr>
+</tbody>
+</table>
+
+<h2>3. Building an IVF Index From Scratch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The cleanest way to feel the recall-versus-speed trade is to build the simplest of the three, an IVF index, in a few lines of NumPy and measure both numbers on the same data. The code below clusters a synthetic database into cells, stores an inverted list per cell, then answers each query by probing only its nearest few cells. It also runs an exhaustive search to get ground truth, so it can report true recall@10 alongside the speedup over scanning everything.</p>
+<pre><code class="language-python">import numpy as np, time
+
+rng = np.random.default_rng(7)
+N, d, Q = 200_000, 64, 500       # database vectors, dimension, queries
+nlist, nprobe, topk = 256, 8, 10 # cells, cells probed per query, neighbors
+
+# A clustered database so neighborhoods are real.
+centers = rng.standard_normal((40, d)) * 6.0
+base    = centers[rng.integers(0, 40, N)] + rng.standard_normal((N, d))
+queries = centers[rng.integers(0, 40, Q)] + rng.standard_normal((Q, d))
+
+# Train the coarse quantizer: k-means lite -> nlist cell centroids.
+cent = base[rng.choice(N, nlist, replace=False)].copy()
+for _ in range(8):
+    cell_of = np.empty(N, np.int64)
+    for s in range(0, N, 20000):                 # chunked nearest-centroid assign
+        e = min(s + 20000, N)
+        cell_of[s:e] = ((base[s:e, None] - cent[None]) ** 2).sum(-1).argmin(1)
+    for c in range(nlist):                        # recompute centroids (cluster means)
+        m = cell_of == c
+        if m.any(): cent[c] = base[m].mean(0)
+inv = [np.where(cell_of == c)[0] for c in range(nlist)]   # inverted lists
+
+# Exact search = ground truth and the cost we want to beat.
+t0 = time.perf_counter()
+exact = np.array([np.argpartition(((base - q) ** 2).sum(1), topk)[:topk] for q in queries])
+t_exact = time.perf_counter() - t0
+
+# IVF search: probe only the nprobe nearest cells.
+t0 = time.perf_counter(); approx = []; scanned = 0
+for q in queries:
+    probe = np.argpartition(((cent - q) ** 2).sum(1), nprobe)[:nprobe]
+    cand  = np.concatenate([inv[c] for c in probe]); scanned += cand.size
+    dd    = ((base[cand] - q) ** 2).sum(1)
+    approx.append(cand[np.argpartition(dd, topk)[:topk]])
+t_ivf = time.perf_counter() - t0
+approx = np.array(approx)
+
+recall = np.mean([len(set(exact[i]) &amp; set(approx[i])) / topk for i in range(Q)])
+print(f"avg vectors scanned  : {scanned/Q:.0f} of {N}  ({100*scanned/Q/N:.2f}%)")
+print(f"recall@{topk}           : {recall:.3f}")
+print(f"speedup over exact   : {t_exact/t_ivf:.1f}x")
+</code></pre>
+<div class="code-caption"><strong>Code 12.7.1:</strong> A complete IVF index in pure NumPy. The coarse quantizer is the k-means of <a href="section-12.6.html">Section 12.6</a> reused; the inverted lists turn a full scan into a probe of a few cells. Recall and speedup are measured against the same exact search on the same queries.</div>
+<pre><code class="language-text">avg vectors scanned  : 6660 of 200000  (3.33%)
+recall@10           : 0.987
+speedup over exact   : 17.0x</code></pre>
+<div class="code-caption"><strong>Output 12.7.1:</strong> Probing 8 of 256 cells touches only 3.33% of the database yet recovers 98.7% of the true ten nearest neighbors, for a 17-fold speedup over exhaustive search on this machine. Raising <code>nprobe</code> would lift recall toward 1.0 and shrink the speedup; that single dial is the recall-versus-latency curve in action.</div>
+<p>The numbers tell the whole story of ANN in three lines: scanning one part in thirty of the data still found almost every true neighbor, because clustering puts a query's real neighbors overwhelmingly in the cells nearest its own centroid. The 1.3% of neighbors missed are the price, and <code>nprobe</code> is the knob that sets that price. Everything more sophisticated, HNSW graphs and PQ compression, is a way to push the same curve further: more recall per unit of latency, or the same recall in far less memory.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Centroid Always Lies a Little</div>
+<p>An IVF index quietly assumes your query's neighbors live in the same cell as your query. Usually true, occasionally not: a neighbor sitting just across a cell boundary is invisible unless you probe its cell too. That is why a few true neighbors slip through in Output 12.7.1, and why <code>nprobe</code> exists. The index is not wrong, it is hedging, and like every good hedge it costs a little to widen.</p>
+</div>
+
+<h2>4. Distributing the Index: Shard, Scatter, Gather <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>One machine holds the whole IVF index in Code 12.7.1, which works at two hundred thousand vectors and fails at two hundred billion. The distribution pattern is the one this book has used since <a href="../../part-1-foundations/module-04-communication-primitives/section-4.7.html">Section 4.7</a>: partition the data across machines, send the query to all of them, and merge their partial answers. Each machine, a <strong>shard</strong>, holds a disjoint slice of the vectors and its own complete index over that slice. A query is broadcast to every shard (scatter), each shard returns its local top-$k$ (a partial answer), and a coordinator merges the $S$ shard results into the global top-$k$ (gather). Because Euclidean and cosine distance are computed independently per vector, the union of every shard's local top-$k$ is guaranteed to contain the global top-$k$: merging cannot lose a true neighbor that some shard found. Figure 12.7.1 shows the full path.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A query is scattered from a coordinator to three index shards, each holding a partition of the vectors and returning its local top-k, which the coordinator merges into a global top-k.">
+<defs>
+<marker id="arr127" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b127 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w127 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.t127 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s127 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l127 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr127); }
+.l127b { fill:none; stroke:#b86b1f; stroke-width:1.8; marker-end:url(#arr127); stroke-dasharray:5 4; }
+</style>
+<text class="t127" x="430" y="26">Query vector q</text>
+<rect class="b127" x="330" y="38" width="200" height="48" rx="9"/>
+<text class="t127" x="430" y="60">Coordinator</text>
+<text class="s127" x="430" y="77">scatter q to all shards</text>
+<rect class="w127" x="40" y="170" width="220" height="80" rx="9"/>
+<text class="t127" x="150" y="196">Shard 1</text>
+<text class="s127" x="150" y="216">vectors 0 .. N/3</text>
+<text class="s127" x="150" y="234">local IVF/HNSW index</text>
+<rect class="w127" x="320" y="170" width="220" height="80" rx="9"/>
+<text class="t127" x="430" y="196">Shard 2</text>
+<text class="s127" x="430" y="216">vectors N/3 .. 2N/3</text>
+<text class="s127" x="430" y="234">local IVF/HNSW index</text>
+<rect class="w127" x="600" y="170" width="220" height="80" rx="9"/>
+<text class="t127" x="710" y="196">Shard 3</text>
+<text class="s127" x="710" y="216">vectors 2N/3 .. N</text>
+<text class="s127" x="710" y="234">local IVF/HNSW index</text>
+<path class="l127" d="M 390 86 L 180 166"/>
+<path class="l127" d="M 430 88 L 430 166"/>
+<path class="l127" d="M 470 86 L 680 166"/>
+<text class="s127" x="250" y="120">scatter</text>
+<path class="l127b" d="M 180 250 L 390 320"/>
+<path class="l127b" d="M 430 252 L 430 318"/>
+<path class="l127b" d="M 680 250 L 470 320"/>
+<text class="s127" x="610" y="300">local top-k each</text>
+<rect class="b127" x="300" y="322" width="260" height="48" rx="9"/>
+<text class="t127" x="430" y="344">Merge -&gt; global top-k</text>
+<text class="s127" x="430" y="361">union of shard results, keep k smallest</text>
+</svg>
+<figcaption><strong>Figure 12.7.1:</strong> Sharded ANN as scatter-gather. The coordinator broadcasts the query to every shard (solid arrows); each shard searches its own partition and returns its local top-$k$ (dashed arrows); the coordinator merges the $S$ partial lists and keeps the $k$ globally smallest distances. The merge is the same top-$k$ reduction used across this book, applied here to per-shard candidate lists rather than per-worker gradients.</figcaption>
+</figure>
+<p>Sharding answers the memory ceiling: each machine indexes only $N/S$ vectors. Throughput is the other ceiling, and it is answered by the orthogonal move of <strong>replication</strong>. Each shard is copied onto several machines, and incoming queries are load-balanced across the replicas, so a system serving ten thousand queries per second simply adds replicas until the rate is met. Sharding and replication compose into a grid: $S$ shards wide for capacity, $R$ replicas deep for throughput, $S \times R$ machines in total. The query latency is set by the slowest shard to respond, which makes ANN serving vulnerable to the stragglers of <a href="../../part-1-foundations/module-04-communication-primitives/section-4.7.html">Section 4.7</a>: one slow replica delays every query routed to it, so the same tail-latency tactics, hedged requests and replica selection, return here.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Searching a Billion Product Images Within the Latency Budget</div>
+<p><strong>Who:</strong> A search-infrastructure engineer at a large e-commerce marketplace.</p>
+<p><strong>Situation:</strong> A visual-search feature embedded 1.2 billion product images as 512-dimensional vectors and had to return visually similar items in under 50 milliseconds.</p>
+<p><strong>Problem:</strong> The raw vectors needed about 2.4 terabytes of memory, far beyond one server, and exact search was thousands of times too slow for the latency budget.</p>
+<p><strong>Dilemma:</strong> A single huge in-memory HNSW host would give the best recall but could not hold the data or the query rate, while naive sharding risked tail latency blowing past 50 milliseconds whenever one shard ran slow.</p>
+<p><strong>Decision:</strong> They built an IVF-PQ index sharded across 16 machines, each holding 75 million PQ-compressed vectors, and replicated every shard three times for throughput and straggler tolerance.</p>
+<p><strong>How:</strong> PQ compressed each vector from 2 kilobytes to 64 bytes so a shard fit comfortably in memory; queries were scattered to all 16 shards in parallel, each returned its local top-100, and a coordinator merged them; hedged requests to a second replica fired whenever the first replica missed a soft deadline.</p>
+<p><strong>Result:</strong> Median latency landed near 18 milliseconds and the 99th percentile stayed under 45, with recall@10 around 0.94, comfortably inside the budget at a fraction of the memory an exact in-RAM index would have demanded.</p>
+<p><strong>Lesson:</strong> Sharding solves capacity and replication solves throughput, but the tail is solved by the same hedging and replica-selection tactics that govern every distributed serving system; ANN is not exempt.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: FAISS Builds and Searches the Index for You</div>
+<p>Code 12.7.1 trained a coarse quantizer, built inverted lists, and ran the probe loop by hand, roughly forty lines. FAISS, the standard ANN library, expresses the same IVF index and an optional PQ compression in a short factory string and a search call, and the GPU build runs the distance math on the accelerator:</p>
+<pre><code class="language-python">import faiss, numpy as np
+# base, queries: float32 arrays of shape (N, d) and (Q, d)
+index = faiss.index_factory(d, "IVF256,Flat")   # IVF with 256 cells; "IVF256,PQ16" to compress
+index.train(base)                               # learns the coarse centroids
+index.add(base)                                 # builds the inverted lists
+index.nprobe = 8                                # the recall-vs-latency knob
+D, I = index.search(queries, 10)                # top-10 neighbor ids per query
+</code></pre>
+<div class="code-caption"><strong>Code 12.7.2:</strong> The same IVF index as Code 12.7.1 in six lines with FAISS, shown illustratively. The library handles centroid training, list construction, SIMD/GPU distance kernels, and the top-$k$ heap; swapping <code>"Flat"</code> for <code>"PQ16"</code> turns on product quantization, and FAISS ships a sharded <code>IndexShards</code> wrapper that fans a query across the partitions of Figure 12.7.1.</div>
+</div>
+
+<h2>5. Where ANN Connects, Backward and Forward <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Approximate nearest neighbor did not appear from nowhere; it is the high-dimensional, learned-embedding descendant of ideas already in this book. <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/section-6.7.html">Section 6.7</a> introduced locality-sensitive hashing (LSH), the original sublinear trick for similarity at scale: hash vectors so that close vectors collide and far ones do not, then search only colliding buckets. IVF is LSH with a learned, data-adaptive partition (k-means cells) in place of random hyperplanes, which is why it achieves higher recall per probe on real embeddings. The vectors being searched are exactly the embeddings whose distributed storage <a href="../module-11-parameter-servers-embeddings/section-11.6.html">Section 11.6</a> built: sharded embedding tables produce the vectors, sharded ANN indexes retrieve over them, and the two sit on opposite ends of the same pipeline.</p>
+<p>Forward, ANN is the engine inside the vector databases and retrieval-augmented generation systems of Part V. <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a> takes the sharded scatter-gather index of Figure 12.7.1 and wraps it in the durability, filtering, incremental-update, and consistency machinery that turns an index into a database, then puts it on the critical path of a language model that retrieves context before it generates. The 1.3% of neighbors an IVF index misses becomes, in that setting, a passage of context the model never sees, which is why recall tuning stops being academic and starts shaping answer quality.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Billion-Scale and Disk-Resident ANN (2024 to 2026)</div>
+<p>Two pressures drive current ANN research: scale past what RAM can hold, and exploit accelerators. <strong>DiskANN</strong> and its successors keep the bulk of the graph on SSD and a compressed copy in memory, serving billion-vector indexes from a single machine at high recall by carefully minimizing random disk reads, and recent variants extend this to streaming inserts and deletes. <strong>SCANN</strong> (Google) sharpens product quantization with an anisotropic loss that weights quantization error by its effect on the inner product, lifting recall at fixed memory and remaining a strong CPU baseline. On the accelerator side, GPU ANN libraries such as NVIDIA's <strong>cuVS / RAFT</strong> and FAISS-GPU build and search IVF and graph indexes with order-of-magnitude throughput gains, and graph-on-GPU methods (in the lineage of CAGRA) rebuild HNSW-style search for massive parallelism. The unifying theme of 2024 to 2026 is serving billion-vector indexes cheaply, whether by spilling to disk, compressing harder, or moving the distance math onto GPUs, precisely because retrieval-augmented generation made web-scale vector search a default workload rather than a specialty.</p>
+</div>
+
+<h2>6. Chapter Summary: One Pattern, Five Algorithms <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>This section closes Chapter 12, and the chapter has a single spine worth stating plainly. Classical machine learning distributes by the same move every time: partition the training data across workers, compute a small <strong>sufficient statistic</strong> on each shard, and combine those statistics with an all-reduce or a histogram merge into a result that is exact, or in the case of search, very nearly so. Linear and logistic regression combined gradient sums. Decision trees and gradient boosting combined per-bin histogram counts to find the best split. K-means combined per-cluster point sums and counts. ANN, the one method whose answer has no compact sufficient statistic, combined per-shard candidate lists by a top-$k$ merge. The collective from <a href="../../part-1-foundations/module-04-communication-primitives/section-4.7.html">Chapter 4</a> is the common engine beneath all five, which is the deeper reason this chapter sits where it does: classical machine learning, distributed, is mostly the art of finding the right small summary and reducing it across the cluster.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Summary-and-Reduce Pattern Scales Out the Classics</div>
+<p>Every algorithm in this chapter became distributed not by a new idea but by the same one the book has carried since Section 1.1: identify a quantity that is additive over examples (a gradient, a histogram, a cluster sum, a candidate list), compute it locally, and reduce it across machines. Regression, trees, boosting, k-means, and ANN are five faces of that single pattern. When you meet a classical method not covered here, the distribution recipe is the first question to ask: what additive summary does it need, and which collective reduces it?</p>
+</div>
+<div class="callout key-takeaway">
+<div class="callout-title">Key Takeaway</div>
+<p>Distributed classical machine learning is the discipline of computing additive sufficient statistics on data shards and reducing them across a cluster. The exact methods (regression, trees, boosting, k-means) recover the single-machine answer through an all-reduce or histogram merge; approximate nearest neighbor relaxes exactness for speed, trading a tunable slice of recall against latency and memory, and distributes by sharding the index and merging per-shard top-$k$ candidates. The collective communication primitives of Chapter 4 are the shared engine, and the embeddings retrieved by ANN here become the retrieval layer of the vector databases and RAG systems in Part V.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 12.7.1: Reading the Recall Curve <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Output 12.7.1 probed 8 of 256 cells for recall@10 of 0.987 while scanning 3.33% of the database. Reason qualitatively about what happens to recall, to the fraction of vectors scanned, and to the speedup as <code>nprobe</code> rises from 8 toward 256. At <code>nprobe = 256</code>, what does IVF search become, and what is its recall? Explain why the recall-versus-speedup relationship is a curve you place yourself rather than a fixed property of the data.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 12.7.2: Sharding and Merging the Index <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 12.7.1 to simulate $S = 4$ shards. Partition the database into four disjoint slices, build an independent IVF index over each slice, and answer every query by searching all four indexes, collecting each shard's local top-10, and merging the four candidate lists into a global top-10. Compare the recall of the sharded system against the single-index recall of Output 12.7.1. Explain why merging per-shard top-$k$ lists cannot miss a neighbor that some shard ranked in its local top-$k$, and identify the one quantity that must grow if you want the sharded recall to match the single-index recall exactly.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 12.7.3: The Cost of a Sharded Query <span class="exercise-type analysis">Analysis</span></div>
+<p>A vector database holds $N = 10^{9}$ embeddings of dimension $d = 768$ (float32), sharded across $S$ machines with each shard holding $N/S$ vectors in an IVF index that probes a fraction $p$ of its local vectors. Write the per-query distance-computation cost on one shard, and the memory one shard must hold. Using the scatter-gather model of Figure 12.7.1, argue why query latency is governed by the slowest shard rather than the average, and use the tail-latency reasoning of <a href="../../part-1-foundations/module-04-communication-primitives/section-4.7.html">Section 4.7</a> to estimate how the 99th-percentile latency moves as $S$ grows. State one concrete tactic that bounds the tail.</p>
+</div>
+
+<div class="callout project-ideas">
+<div class="callout-title">Project Ideas</div>
+<p><strong>1. Build and benchmark a sharded ANN service.</strong> Take a public embedding dataset (for example, SIFT1M or a corpus of sentence embeddings), build an IVF or IVF-PQ index with FAISS, shard it across several processes or machines behind a coordinator that scatters queries and merges results, and report recall@10, median latency, and 99th-percentile latency as you vary the shard count and replica count. Add hedged requests and measure their effect on the tail.</p>
+<p><strong>2. Map the recall-latency-memory frontier.</strong> On one dataset, build three indexes (flat HNSW, IVF-Flat, IVF-PQ) and sweep their key knobs (<code>nprobe</code>, graph degree, PQ code size). Plot the Pareto frontier of recall@10 against query latency and against index memory, and write up which index wins in each regime and why. Connect your findings to the disk-resident and GPU methods in the research frontier above.</p>
+<p><strong>3. From embeddings to retrieval.</strong> Chain <a href="../module-11-parameter-servers-embeddings/section-11.6.html">Section 11.6</a> to this section: train or download embeddings, store them in a sharded ANN index, and build a tiny retrieval-augmented question-answering loop that fetches the top-$k$ passages for a query before generating an answer. Measure how answer quality degrades as you lower <code>nprobe</code> and thereby drop recall, making concrete the link between index tuning and downstream system quality that <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a> develops in full.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-12.6.html"><span class="nav-label">Previous</span><span class="nav-num">Section 12.6</span><span class="nav-title">Distributed Clustering</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 12</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Classical Machine Learning</span></a>
+<a class="next" href="../module-13-distributed-graph-ml/index.html"><span class="nav-label">Next</span><span class="nav-num">Chapter 13</span><span class="nav-title">Distributed Graph Machine Learning</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

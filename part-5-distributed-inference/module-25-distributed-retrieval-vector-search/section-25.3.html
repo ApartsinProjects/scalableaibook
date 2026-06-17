@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 25.3: Vector Databases. What a vector database adds over a raw ANN index, durable CRUD storage, metadata filtering, sharding and replication, and a scatter-gather query coordinator built from scratch in pure Python." name="description"/>
+<title>Section 25.3: Vector Databases | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 25: Distributed Retrieval and Vector Search</a></div>
+<h1>Vector Databases</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"A raw index can tell you which vectors are nearest. A vector database remembers them tomorrow, lets you delete the embarrassing ones, and never serves a stale neighbor without admitting it."</p>
+<cite>An Index Shard That Grew Up Into a Database</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A vector database is the distributed system that turns a similarity index into durable, queryable, evolving infrastructure: it stores vectors permanently, accepts inserts, updates, and deletes, filters by metadata, and spreads the index across many machines that a query coordinator scatters to and gathers from.</strong> An approximate-nearest-neighbor index, on its own, is a data structure: give it vectors, it answers nearest-neighbor queries. The moment that index has to survive a restart, absorb a million new documents an hour, let you search only the French-language subset, scale past one machine's memory, and stay available when a node dies, you no longer have a data structure; you have a database. This section is about what that promotion costs and how it is built. The query path is the scatter-gather pattern you first met combining gradients in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>, now returning to combine search results instead of partial sums.</p>
+</div>
+<p>The previous section built the distributed embedding pipeline that turns a corpus into a stream of vectors. Those vectors have to live somewhere that can be searched at serving time, and "somewhere" is the subject here. It is tempting to reach for a bare nearest-neighbor library, load the vectors into memory, and call it done. That works until the first hard question arrives from production: where do the vectors go when the process restarts, what happens when a document is edited or deleted, how do you search only the items a particular user is allowed to see, and what do you do when the collection outgrows one machine. Each of those questions is the difference between an index and a database, and answering all of them at once across a cluster is what dedicated vector databases exist to do.</p>
+<p>We approach the vector database as a distributed system first and a search engine second. The nearest-neighbor algorithms themselves, the graph and quantization indexes that make a single shard fast, are deepened in <a href="section-25.4.html">Section 25.4</a>; here we treat one shard's index as a black box that answers local queries and ask how to wrap many such boxes into a coherent, durable, filterable service. That framing keeps the distributed-systems content in front: storage, consistency, sharding, replication, and the coordinator that ties them together.</p>
+
+<h2>1. What a Vector Database Adds Over a Raw Index <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A raw approximate-nearest-neighbor (ANN) index, of the kind introduced for classical machine learning in <a href="../../part-3-distributed-ml/module-12-distributed-classical-ml/section-12.7.html">Section 12.7</a>, solves exactly one problem: given a query vector, return the $k$ stored vectors most similar to it, quickly and approximately. That is necessary but far from sufficient for a production retrieval system. Five capabilities separate a vector database from the index it contains, and each one is a distributed-systems problem rather than a search problem.</p>
+<p>The first is <strong>durable storage</strong>. An in-memory index vanishes on restart; a database persists the vectors and the index structure to disk or object storage, and can reload or rebuild after a crash without re-embedding the whole corpus. The second is <strong>CRUD</strong>: create, read, update, and delete. New documents arrive continuously, old ones get edited, and some must be removed outright, for correctness or for compliance. Inserting into and especially deleting from a graph-based ANN index is genuinely hard, because the graph's carefully built neighbor links assume a fixed point set; we return to this tension in Section 6. The third is <strong>metadata filtering</strong>: searching not the whole collection but the subset matching a predicate, such as documents owned by one tenant, written after a date, or tagged with a language. The fourth is <strong>horizontal scaling</strong> through sharding and replication, so the collection can exceed one machine's memory and the query rate can exceed one machine's throughput; this is the focus of <a href="section-25.5.html">Section 25.5</a>. The fifth is <strong>consistency and freshness</strong>: a guarantee about how soon a newly inserted vector becomes searchable, and whether two replicas can disagree.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Index Is the Easy Part</div>
+<p>The nearest-neighbor algorithm is the most studied and least troublesome component of a production retrieval system. The hard, distinctive work of a vector database is everything around the index: persisting it, mutating it under live queries, restricting search to a filtered subset, splitting it across machines, replicating it for availability, and defining what "searchable now" means. When you choose or build a vector store, you are choosing those properties, not an ANN algorithm; the algorithm is a swappable component inside.</p>
+</div>
+
+<h2>2. The Architecture: Coordinator, Shards, Replicas <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A distributed vector database has the same shape as most distributed data stores. The collection of vectors is partitioned into <strong>shards</strong>, each shard holding a slice of the data and its own local ANN index over only that slice. Each shard is <strong>replicated</strong> onto several machines so that queries can be served from any replica and the loss of one machine does not lose the shard; replication for availability and read throughput is the same idea developed for distributed systems in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.3.html">Section 2.3</a>. A <strong>query coordinator</strong> sits in front: it receives a query, scatters it to one replica of every shard, waits for each shard's local top-$k$, and merges those partial results into the global top-$k$ it returns to the client. A separate <strong>write path</strong> routes each new or changed vector to its owning shard and updates that shard's index, propagating the change to the shard's replicas.</p>
+<p>The query side is a scatter-gather, and the merge is a small but exact piece of reasoning. If every shard returns its own top-$k$ by similarity, the true global top-$k$ is guaranteed to be a subset of the $S \times k$ candidates returned, because any vector in the global top-$k$ must also be in the top-$k$ of whichever shard happens to hold it. So the coordinator can merge correctly by sorting the union of the partial results and keeping the best $k$. Writing $s(q, v)$ for the similarity between query $q$ and vector $v$, and $\mathcal{S}_i$ for the set of vectors on shard $i$, each shard returns</p>
+$$T_i = \operatorname{top\text{-}k}_{v \in \mathcal{S}_i} s(q, v), \qquad \text{and the coordinator computes} \qquad \operatorname{top\text{-}k}\Big( \bigcup_{i=1}^{S} T_i \Big),$$
+<p>which equals the single-machine $\operatorname{top\text{-}k}_{v} s(q, v)$ exactly when each shard's local search is exact. With approximate per-shard search the same merge applies; the approximation lives entirely inside each shard, not in the combine step. Figure 25.3.1 shows the full path.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A vector database query path: a client sends a query to a coordinator, which scatters it to three shards each holding a slice of the index, gathers each shard's local top-k, and merges them into a global top-k. Each shard has replicas drawn behind it for throughput and availability.">
+<defs>
+<marker id="arr253" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arrb253" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.b253 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.c253 { fill:#eaf1f8; stroke:#14385c; stroke-width:1.8; }
+.w253 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.r253 { fill:#fbf6ee; stroke:#caa06a; stroke-width:1.2; }
+.t253 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.tw253 { font:600 13px sans-serif; fill:#8a5114; text-anchor:middle; }
+.s253 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l253 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr253); }
+.lb253 { fill:none; stroke:#b86b1f; stroke-width:1.8; marker-end:url(#arrb253); }
+</style>
+<rect class="b253" x="40" y="180" width="110" height="56" rx="10"/>
+<text class="t253" x="95" y="205">Client</text>
+<text class="s253" x="95" y="223">query q, k</text>
+<rect class="c253" x="220" y="168" width="160" height="80" rx="10"/>
+<text class="t253" x="300" y="200">Query</text>
+<text class="t253" x="300" y="220">Coordinator</text>
+<text class="s253" x="300" y="238">scatter / gather / merge</text>
+<line x1="152" y1="208" x2="216" y2="208" class="l253"/>
+<text class="s253" x="184" y="198">q</text>
+<rect class="r253" x="556" y="44" width="120" height="48" rx="8"/>
+<rect class="r253" x="548" y="36" width="120" height="48" rx="8"/>
+<rect class="w253" x="540" y="28" width="120" height="48" rx="8"/>
+<text class="tw253" x="600" y="48">Shard 1</text>
+<text class="s253" x="600" y="65">replicas</text>
+<rect class="r253" x="556" y="190" width="120" height="48" rx="8"/>
+<rect class="r253" x="548" y="182" width="120" height="48" rx="8"/>
+<rect class="w253" x="540" y="174" width="120" height="48" rx="8"/>
+<text class="tw253" x="600" y="194">Shard 2</text>
+<text class="s253" x="600" y="211">replicas</text>
+<rect class="r253" x="556" y="336" width="120" height="48" rx="8"/>
+<rect class="r253" x="548" y="328" width="120" height="48" rx="8"/>
+<rect class="w253" x="540" y="320" width="120" height="48" rx="8"/>
+<text class="tw253" x="600" y="340">Shard 3</text>
+<text class="s253" x="600" y="357">replicas</text>
+<path class="l253" d="M 382 196 L 460 90 L 536 56"/>
+<path class="l253" d="M 384 208 L 536 200"/>
+<path class="l253" d="M 382 220 L 460 326 L 536 348"/>
+<text class="s253" x="455" y="120">scatter q</text>
+<path class="lb253" d="M 540 70 L 462 70 L 462 174 L 384 188"/>
+<path class="lb253" d="M 536 216 L 392 214"/>
+<path class="lb253" d="M 540 360 L 462 360 L 462 240 L 384 230"/>
+<text class="s253" x="455" y="300">gather top-k</text>
+<rect class="b253" x="220" y="312" width="160" height="64" rx="10"/>
+<text class="t253" x="300" y="338">Merge</text>
+<text class="s253" x="300" y="357">global top-k from</text>
+<text class="s253" x="300" y="371">S &#215; k candidates</text>
+<path class="l253" d="M 300 250 L 300 308"/>
+<path class="l253" d="M 218 344 L 95 344 L 95 240" />
+<text class="s253" x="150" y="300">result</text>
+<text class="s253" x="700" y="206">each shard:</text>
+<text class="s253" x="700" y="222">local ANN index</text>
+<text class="s253" x="700" y="238">over its slice</text>
+</svg>
+<figcaption><strong>Figure 25.3.1:</strong> The vector-database query path. The coordinator scatters the query $q$ to one replica of each of the $S$ shards (dark arrows), each shard searches its local index and returns its top-$k$ (orange arrows), and the coordinator merges the $S \times k$ candidates into the global top-$k$. Replicas, drawn stacked behind each shard, serve queries in parallel for throughput and stand in when a machine fails. This is the scatter-gather of <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>, applied to search results rather than gradients.</figcaption>
+</figure>
+
+<h2>3. A Sharded Vector Store From Scratch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>To make the architecture concrete, the code below builds a minimal sharded vector store entirely in pure Python and NumPy. Each shard holds a contiguous slice of the collection, its vectors, and a per-vector metadata tag. A shard's local search is an exact brute-force scan, standing in for the ANN index that <a href="section-25.4.html">Section 25.4</a> develops; the point here is the distributed wrapper, not the index. The coordinator scatters the query to every shard, gathers each shard's local top-$k$, and merges. We time the query two ways, with shards searched sequentially on one core and with shards searched concurrently so that each shard's scan overlaps the others, the difference that real fan-out across machines buys you.</p>
+<pre><code class="language-python">import time
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
+
+rng = np.random.default_rng(7)
+N, D, K = 200_000, 128, 10          # vectors, dimension, top-k returned
+
+# A synthetic collection: unit-normalised vectors plus a categorical "lang" tag.
+data = rng.standard_normal((N, D)).astype(np.float32)
+data /= np.linalg.norm(data, axis=1, keepdims=True)
+langs = rng.integers(0, 5, size=N)   # metadata: 5 language buckets, 0..4
+
+class Shard:
+    """One shard: a contiguous slice of the collection it alone can search."""
+    def __init__(self, ids, vecs, meta):
+        self.ids, self.vecs, self.meta = ids, vecs, meta
+
+    def search(self, q, k, lang=None):
+        v, ids, meta = self.vecs, self.ids, self.meta
+        if lang is not None:                 # metadata filter: search a subset
+            mask = meta == lang
+            v, ids = v[mask], ids[mask]
+        if len(ids) == 0:
+            return np.empty(0), np.empty(0, dtype=np.int64)
+        sims = v @ q                          # cosine similarity (q is unit norm)
+        top = np.argpartition(-sims, min(k, len(sims) - 1))[:k]
+        return sims[top], ids[top]
+
+def build_shards(s):
+    """Partition the collection into s shards by contiguous id ranges."""
+    bounds = np.array_split(np.arange(N), s)
+    return [Shard(b, data[b], langs[b]) for b in bounds]
+
+_POOL = ThreadPoolExecutor(max_workers=20)
+
+def coordinator_search(shards, q, k, lang=None, parallel=False):
+    """Scatter q to every shard, gather local top-k, merge into a global top-k."""
+    if parallel:                              # shards run concurrently (one per worker)
+        results = list(_POOL.map(lambda sh: sh.search(q, k, lang), shards))
+    else:                                     # sequential fan-out on one core
+        results = [sh.search(q, k, lang) for sh in shards]
+    sims = np.concatenate([r[0] for r in results])    # gather
+    ids = np.concatenate([r[1] for r in results])
+    order = np.argsort(-sims)[:k]             # merge: global top-k by similarity
+    return ids[order], sims[order]</code></pre>
+<div class="code-caption"><strong>Code 25.3.1:</strong> A minimal sharded vector store. <code>Shard.search</code> does the local top-$k$ with an optional metadata filter; <code>coordinator_search</code> scatters, gathers, and merges, optionally running the shards concurrently so their scans overlap.</div>
+<p>The driver below builds the store at several shard counts, times sequential versus concurrent fan-out, measures the cost of a metadata-filtered query against an unfiltered one, and checks that the merged top-$k$ equals a single-machine brute-force top-$k$.</p>
+<pre><code class="language-python">q = rng.standard_normal(D).astype(np.float32)
+q /= np.linalg.norm(q)
+REPS = 50
+
+def timed(shards, k, lang=None, parallel=False):
+    coordinator_search(shards, q, k, lang, parallel)    # warm up
+    t0 = time.perf_counter()
+    for _ in range(REPS):
+        coordinator_search(shards, q, k, lang, parallel)
+    return (time.perf_counter() - t0) / REPS * 1e3      # ms/query
+
+print(f"collection: N={N:,} vectors, D={D}, top-k={K}\n")
+print("query latency vs shard count (unfiltered):")
+print(f"{'shards':>7} {'vecs/shard':>12} {'seq ms':>9} {'parallel ms':>13}")
+for s in (1, 2, 5, 10, 20):
+    shards = build_shards(s)
+    print(f"{s:>7} {N // s:>12,} {timed(shards, K):>9.2f} "
+          f"{timed(shards, K, parallel=True):>13.2f}")
+
+shards = build_shards(10)
+unf, flt = timed(shards, K), timed(shards, K, lang=2)
+sel = float((langs == 2).mean())
+print("\ncost of filtered search (10 shards):")
+print(f"  unfiltered           : {unf:6.2f} ms/query (scans all {N:,})")
+print(f"  filtered lang==2      : {flt:6.2f} ms/query (selectivity {sel:.2f})")
+
+sims = data @ q                                          # single-machine ground truth
+brute = set(np.argsort(-sims)[:K].tolist())
+ids, _ = coordinator_search(build_shards(10), q, K)
+print(f"\nmerged top-{K} matches single-machine top-{K}: {set(ids.tolist()) == brute}")</code></pre>
+<div class="code-caption"><strong>Code 25.3.2:</strong> The measurement driver. It sweeps shard count under sequential and concurrent fan-out, prices a filtered query, and verifies the merged result is identical to the single-machine answer.</div>
+<pre><code class="language-text">collection: N=200,000 vectors, D=128, top-k=10
+
+query latency vs shard count (unfiltered):
+ shards   vecs/shard    seq ms   parallel ms
+      1      200,000     42.25         34.42
+      2      100,000     35.56         21.67
+      5       40,000     36.97         10.44
+     10       20,000     37.91          8.92
+     20       10,000     37.94          6.99
+
+cost of filtered search (10 shards):
+  unfiltered           :  36.33 ms/query (scans all 200,000)
+  filtered lang==2      :  22.21 ms/query (selectivity 0.20)
+
+merged top-10 matches single-machine top-10: True</code></pre>
+<div class="code-caption"><strong>Output 25.3.1:</strong> Sequential fan-out latency is flat because total work is constant no matter how the vectors are grouped; concurrent fan-out falls from 34 ms toward 7 ms as each shard scans fewer vectors and the scans overlap. Filtering to one language bucket (selectivity 0.20) cuts latency because each shard scans roughly a fifth as many vectors, and the merged top-$k$ matches the single-machine answer exactly.</div>
+<p>Three lessons fall out of Output 25.3.1, and all three carry over to real vector databases. First, <strong>sharding alone does not lower single-query latency</strong>; the sequential column barely moves, because partitioning the same vectors into more groups does not change how many similarities must be computed. The latency win comes from running the shards <strong>in parallel</strong>, which here is threads over a NumPy matmul that releases the interpreter lock, and in production is independent machines. Second, <strong>metadata filtering is cheaper, not more expensive</strong>, when the filter is selective and applied before the distance computation, because each shard scans a smaller candidate set; the subtlety, taken up in Section 6, is that a graph ANN index cannot simply skip filtered-out nodes the way a brute-force scan can. Third, <strong>the merge is exact</strong>: scatter-gather over shards returns precisely what one big machine would have returned, exactly as the equation in Section 2 promised.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Scatter-Gather Returns, Now Over an Index</div>
+<p>The coordinator in Code 25.3.1 scatters a query to every shard and merges their partial answers. That is the same scatter-gather you performed by hand to combine gradient shards in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>, and the same partition-then-recombine reasoning that organizes sharded parameter tables in <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a>. The pattern is the book's spine: split the work across machines, move only the small results between them, and recombine correctly. In data-parallel training the recombine was an exact average; in vector search it is an exact top-$k$ merge. Whenever you meet a new distributed AI component, the first question to ask is what gets scattered and what gets gathered, because the answer is almost always a relative of this coordinator.</p>
+</div>
+
+<h2>4. Metadata Filtering: Search Within a Subset <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Pure similarity is rarely the whole query. Real retrieval asks for the nearest vectors <em>among the documents this user may see</em>, or <em>written in the last week</em>, or <em>belonging to this product category</em>. Combining a similarity search with a metadata predicate is where vector databases earn much of their keep, and there are two honest strategies, each with a failure mode. <strong>Pre-filtering</strong> restricts the candidate set to the rows matching the predicate and then searches only those, which is what Code 25.3.1 does; it is exact and gets cheaper as the filter tightens, but it defeats a graph ANN index, whose neighbor links may all point at filtered-out nodes, forcing a fallback to brute force on the surviving subset. <strong>Post-filtering</strong> runs the ANN search first and then discards results that fail the predicate, which keeps the fast index but can return fewer than $k$ results, or none, when the predicate is selective and the nearest neighbors happen not to satisfy it.</p>
+<p>Production systems navigate between these with techniques such as filtered HNSW traversal, per-filter sub-indexes for common predicates, and over-fetching (retrieve $c \cdot k$ then post-filter, picking $c$ from the filter's selectivity). The right choice depends on selectivity, the fraction of the collection that passes the filter, and on whether that selectivity is known in advance. A filter that keeps 80 percent of the data is best handled by post-filtering; a filter that keeps 0.1 percent is best handled by pre-filtering or a dedicated sub-index. The lesson from Output 25.3.1 holds either way: filtering changes how much work each shard does, so its cost must be modeled per shard, not as an afterthought bolted onto a finished search.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Tenant Who Saw Everyone's Documents</div>
+<p>The single most common, and most alarming, vector-database bug is a metadata filter applied in the wrong place. A team post-filters by tenant id <em>after</em> the ANN search but caches the pre-filter candidate list for speed; under load the cache is shared across requests, and for one unlucky moment tenant A's coordinator merges tenant B's nearest neighbors. The similarity math was flawless. The isolation was not. Metadata filtering is a correctness boundary, not a performance tweak, and the place it is enforced is part of your security model.</p>
+</div>
+
+<h2>5. The Landscape: Libraries, Databases, and Extensions <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The tools that store and serve vectors fall into three families, and choosing among them is the central build-versus-buy decision of a retrieval system. <strong>Libraries</strong> such as FAISS give you a fast in-process ANN index and nothing else: no durability, no CRUD, no metadata filtering, no network service, no sharding. They are ideal when the collection fits in memory, changes rarely, and lives inside a single application that already owns its persistence and scaling. <strong>Dedicated vector databases</strong> such as Milvus, Qdrant, Weaviate, and Pinecone wrap an index in exactly the distributed-systems machinery this section describes: durable storage, CRUD, metadata filtering, sharding, replication, and a query coordinator, exposed as a network service. They are the right tool when the collection is large, mutates continuously, must be filtered, and has to scale and stay available. <strong>Vector extensions to existing databases</strong>, such as pgvector for PostgreSQL or the dense-vector fields in Elasticsearch and OpenSearch, add similarity search to a system you already run, inheriting its transactions, backups, replication, and operational familiarity at the cost of ANN features that lag the dedicated systems.</p>
+<p>The decision is rarely about raw search speed. It is about where the surrounding properties come from. If you already operate PostgreSQL and your vector collection is modest and naturally joins your relational data, pgvector means one fewer system to run and one consistent backup story. If vectors are your primary workload at scale, a dedicated vector database gives you sharding and filtered search that a general-purpose database bolts on awkwardly. If you are inside a tight loop with a fixed, in-memory index, a library skips the network entirely. Table 25.3.1 lays out the trade-off.</p>
+<div class="table-caption"><strong>Table 25.3.1:</strong> The three families of vector storage and the capabilities each brings. The vector-database column is the set of properties Sections 1 through 4 built up; the others trade some of them away for simplicity or integration.</div>
+<table>
+<thead>
+<tr><th scope="col">Capability</th><th scope="col">Library (FAISS)</th><th scope="col">Dedicated vector DB (Milvus, Qdrant, Weaviate, Pinecone)</th><th scope="col">DB extension (pgvector, Elasticsearch)</th></tr>
+</thead>
+<tbody>
+<tr><td>Durable storage</td><td>You build it</td><td>Built in</td><td>Inherited from host DB</td></tr>
+<tr><td>CRUD (insert/update/delete)</td><td>Limited, index-dependent</td><td>First-class</td><td>First-class (host DB)</td></tr>
+<tr><td>Metadata filtering</td><td>You build it</td><td>Built in, optimized</td><td>Built in (SQL / query DSL)</td></tr>
+<tr><td>Sharding &amp; replication</td><td>You build it</td><td>Built in</td><td>Host DB's sharding</td></tr>
+<tr><td>Network service</td><td>No (in-process)</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>ANN feature depth</td><td>Highest (research-grade)</td><td>High</td><td>Moderate, improving</td></tr>
+<tr><td>Best when</td><td>In-memory, static, embedded</td><td>Large, mutating, vectors are the workload</td><td>You already run the host DB</td></tr>
+</tbody>
+</table>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Coordinator You Built, as One Service Call</div>
+<p>Code 25.3.1 hand-rolled shards, a coordinator, and a merge, roughly forty lines that still lack durability, replication, and a network API. A dedicated vector database supplies all of it; the entire scatter-gather collapses into a create-collection plus an insert plus a filtered search. With Qdrant:</p>
+<pre><code class="language-python">from qdrant_client import QdrantClient, models
+
+client = QdrantClient(url="http://localhost:6333")
+client.create_collection(                       # sharding, replication, persistence: configured, not coded
+    "docs",
+    vectors_config=models.VectorParams(size=128, distance=models.Distance.COSINE),
+    shard_number=10, replication_factor=2,
+)
+client.upsert("docs", points=[                  # CRUD: insert/update by id, delete is one call
+    models.PointStruct(id=i, vector=vec.tolist(), payload={"lang": int(lang)})
+    for i, (vec, lang) in enumerate(zip(data, langs))
+])
+hits = client.query_points(                     # scatter-gather + filtered top-k: one call
+    "docs", query=q.tolist(), limit=10,
+    query_filter=models.Filter(must=[models.FieldCondition(
+        key="lang", match=models.MatchValue(value=2))]),
+).points</code></pre>
+<div class="code-caption"><strong>Code 25.3.3:</strong> The same sharded, filtered search as Code 25.3.1, in a few lines against Qdrant. The client handles the coordinator, the per-shard fan-out, the merge, durable storage, and replication; Milvus and Weaviate expose near-identical create-collection / insert / filtered-query shapes, and pgvector does the same in SQL with an <code>ORDER BY embedding &lt;=&gt; query LIMIT k</code> plus a <code>WHERE</code> clause.</div>
+</div>
+
+<h2>6. Freshness Versus Index Quality <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The hardest tension in a vector database is between accepting new vectors quickly and keeping the index high quality. A graph-based ANN index such as HNSW (detailed in <a href="section-25.4.html">Section 25.4</a>) is built by carefully wiring each vector to good neighbors, and that wiring assumes a roughly fixed point set. Inserting a vector means finding its neighbors and patching the graph, which is feasible but degrades graph quality over many insertions; deleting a vector is worse, because the graph's links may route through the deleted node, so most systems only mark it as a tombstone and skip it at query time, leaving the graph progressively riddled with holes. The clean fix is to periodically rebuild the index from scratch, which restores quality but is expensive in both compute and the memory needed to hold two copies during the swap.</p>
+<p>Production systems resolve this with a two-tier design that should feel familiar from log-structured storage. New and changed vectors land first in a small, write-friendly <strong>fresh segment</strong>, often a brute-force or lightly-indexed buffer that is cheap to mutate and is searched in full on every query. Periodically, in the background, that segment is merged into the large, high-quality <strong>base index</strong> and a fresh empty buffer takes its place. A query searches both tiers and merges the results, so a newly inserted vector is findable the instant it hits the fresh segment, while the bulk of the collection stays in a well-built index. The cost is a small per-query overhead for the brute-force buffer and a steady background rebuild load; the benefit is that freshness and index quality stop being mutually exclusive. This is the same compaction pattern that distributed storage engines use, met in <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/index.html">Chapter 8</a>, here adapted to similarity indexes.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Support Bot That Answered From Yesterday's Docs</div>
+<p><strong>Who:</strong> A platform engineer running retrieval for an internal support assistant at a SaaS company.</p>
+<p><strong>Situation:</strong> Product docs changed dozens of times a day, and the assistant retrieved over their embeddings to ground its answers.</p>
+<p><strong>Problem:</strong> The team rebuilt the HNSW index nightly for top search quality, so edits made during the day were invisible until the next morning; the bot confidently cited removed and outdated passages.</p>
+<p><strong>Dilemma:</strong> Rebuild the index more often, paying heavy compute and a memory spike for the double-buffered swap, or insert live into the graph and watch retrieval quality drift as the graph filled with patched links and tombstones.</p>
+<p><strong>Decision:</strong> Neither extreme. They moved to a two-tier store: a small fresh segment absorbed every edit immediately and was searched by brute force, while the nightly-rebuilt base index held the bulk of the corpus.</p>
+<p><strong>How:</strong> They configured their vector database's segment flush and background compaction so new vectors were queryable within seconds, set deletes to tombstone in the base index and apply immediately in the fresh segment, and kept the full nightly rebuild for the base.</p>
+<p><strong>Result:</strong> Freshly edited docs became retrievable in seconds instead of hours, deleted passages stopped surfacing, and search quality held because the base index was still rebuilt clean each night. The per-query cost of also scanning the small fresh segment was a few percent of latency.</p>
+<p><strong>Lesson:</strong> Freshness and index quality are a tunable trade-off, not a binary. A write-friendly fresh tier plus a periodically rebuilt base tier buys most of both, and is the architecture dedicated vector databases implement so you do not have to.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Disk-Based and Streaming Vector Indexes (2024 to 2026)</div>
+<p>Holding every vector in RAM caps a collection at one machine's memory and makes scale-out expensive, so a major research line pushes the index onto SSD. The DiskANN lineage (the Vamana graph, and its streaming and filtered variants such as FreshDiskANN and Filtered-DiskANN) keeps a compressed copy of the vectors in memory for routing and the full-precision vectors and graph on disk, serving billion-scale collections from a single node with a handful of SSD reads per query; these ideas now sit inside Milvus, Weaviate, and managed services. Two active fronts build on it. First, <strong>streaming updates</strong>: indexes that absorb high insert and delete rates without full rebuilds, closing the freshness gap of Section 6 directly. Second, <strong>filtered ANN</strong>: graph constructions that make pre-filtered search efficient even when the predicate is selective, attacking the pre-filter-defeats-the-graph problem of Section 4. A parallel thread studies how vector databases themselves scale, with disaggregated storage and compute, GPU-accelerated coordinators, and elastic shard rebalancing under shifting query load. We return to the index internals these systems optimize in <a href="section-25.4.html">Section 25.4</a> and to their sharding and replication in <a href="section-25.5.html">Section 25.5</a>.</p>
+</div>
+
+<h2>7. Choosing and Operating a Vector Store <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>With the architecture and the landscape in hand, the operating decision becomes a short checklist driven by which properties actually bind. If the collection fits in memory, never changes, and lives inside one application, a library is enough and a database is overhead. If vectors are your workload at scale, mutate continuously, and need filtered, available, durable search, a dedicated vector database earns its operational cost. If you already run a relational or search database and the vector collection is secondary, an extension keeps your system count down. Within whichever family you pick, the knobs that matter most are the ANN parameters that trade recall for latency (deepened in <a href="section-25.4.html">Section 25.4</a>), the shard and replica counts that trade memory and availability for cost (in <a href="section-25.5.html">Section 25.5</a>), the freshness policy from Section 6, and the filter strategy from Section 4.</p>
+<p>The recurring discipline from <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a> applies here too: distribute because a ceiling binds, not for elegance. A single-node FAISS index serving a million static vectors with low query volume needs none of the machinery in this section, and adding a coordinator and replicas would only buy latency and operational burden. Reach for the distributed vector database when the collection outgrows one machine's memory, when the write rate demands live CRUD, when filtered multi-tenant search is a correctness requirement, or when availability targets forbid a single point of failure. Those are the ceilings; everything in this section is the remedy. The next section opens the shard's black box and shows how the local index answers a query fast in the first place.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.3.1: Index Versus Database <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each requirement, state whether a raw ANN library (FAISS), a dedicated vector database, or a database extension (pgvector) is the best fit, and which one capability from Section 1 drives the choice: (a) a research benchmark that loads ten million fixed vectors once and measures recall; (b) a multi-tenant SaaS where each query must return only the requesting tenant's documents and documents are edited continuously; (c) an analytics app already on PostgreSQL that wants "find similar customers" over a few hundred thousand embeddings that join existing relational tables. Explain why the wrong choice fails for each.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.3.2: Pre-Filter Versus Post-Filter <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 25.3.1 with a post-filtering path: search each shard for the top $c \cdot k$ unfiltered, merge, then discard candidates failing the <code>lang</code> predicate and keep the best $k$. Compare its result quality and latency against the pre-filtering path already in the code at two selectivities (a permissive filter keeping 80 percent and a strict one keeping 2 percent of the data, which you can simulate with more <code>lang</code> buckets). Report how often post-filtering returns fewer than $k$ results at each selectivity and choose $c$ to fix it. Explain, from your numbers, why pre-filtering wins at low selectivity and post-filtering wins at high selectivity.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.3.3: The Freshness Tax <span class="exercise-type analysis">Analysis</span></div>
+<p>Model the two-tier store of Section 6. Suppose the base index answers a query in $t_b = 5$ ms and the fresh segment, searched by brute force, answers in $t_f = 0.02 \cdot m$ ms where $m$ is the number of vectors it holds, and a query searches both tiers and merges. If the system ingests $r = 200$ new vectors per second and compacts the fresh segment into the base every $\tau$ seconds, write the per-query latency as a function of $\tau$ (using the worst-case fresh-segment size just before compaction). Find the $\tau$ that keeps the freshness tax (the extra latency over $t_b$ alone) under 20 percent, and state the background compaction rate that $\tau$ implies. Discuss how this trade-off shifts if deletes, handled as tombstones in the base, also accumulate between rebuilds.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-25.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 25.2</span><span class="nav-title">Distributed Embedding Pipelines</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 25</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Retrieval and Vector Search</span></a>
+<a class="next" href="section-25.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 25.4</span><span class="nav-title">Approximate Nearest Neighbor Search</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

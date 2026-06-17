@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 20.4: Distributed Replay Buffers. The shared, sharded experience store between actors and learners: uniform versus prioritized sampling, sum-trees, Ape-X priorities on the actor, lock-free concurrency, and the staleness of old experience." name="description"/>
+<title>Section 20.4: Distributed Replay Buffers | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 20: Distributed Reinforcement Learning Infrastructure</a></div>
+<h1>Distributed Replay Buffers</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"The actors keep handing me memories faster than I can learn from them, and the learner keeps asking for the same ten interesting ones. I am the only adult in this house."</p>
+<cite>A Replay Buffer Between Two Demanding Parties</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>In off-policy distributed reinforcement learning, the replay buffer is the shared data structure where the whole system meets: hundreds of actors write fresh experience into it while one or more learners read minibatches out of it, concurrently and continuously.</strong> Storing past transitions lets the learner reuse each one many times, which is the source of off-policy sample efficiency, and sampling the <em>important</em> transitions more often (prioritized replay) sharpens that further. At scale the buffer stops being an array in the learner's process and becomes a sharded, replicated service with its own throughput, eviction, and consistency problems. This section builds that service from first principles: uniform versus prioritized sampling, the sum-tree that makes prioritization fast, the Ape-X trick of computing priorities on the actors, and the sharding and locking that keep read/write contention from becoming the bottleneck. It is, structurally, a producer-consumer system, and the partitioning and shared-state ideas it relies on were built three parts earlier.</p>
+</div>
+<p>The previous section, <a href="section-20.3.html">Section 20.3</a>, scaled up experience <em>collection</em>: many actors, each running a copy of the policy in its own environment, generating transitions in parallel. That solves production. It says nothing about where those transitions go, how the learner consumes them, or why the learner is allowed to consume each one more than once. Those questions are the subject of this section, and they all route through a single object. In on-policy methods the object barely exists; in off-policy methods at scale it is the most contended piece of infrastructure in the entire system. We start with why a buffer exists at all, then make it shared, then make it sharded, then make it fast.</p>
+
+<h2>1. Why a Buffer at All: Reuse and Decorrelation <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A reinforcement-learning agent generates a stream of transitions, each a tuple $(s_t, a_t, r_t, s_{t+1})$: the state it saw, the action it took, the reward it got, and the state it landed in. The cheapest thing to do is learn from each transition once, the instant it arrives, then throw it away. That is on-policy learning, and it wastes data. Environment interaction is often the most expensive part of the whole pipeline (a robot arm moves in real time, a game simulator burns CPU), so discarding each hard-won transition after a single gradient step is extravagant. A replay buffer stores the last several million transitions and lets the learner sample minibatches from them repeatedly. Each transition now contributes to many gradient updates before it is evicted, and the ratio of gradient steps to environment steps, the <em>replay ratio</em>, becomes a knob you can turn for sample efficiency.</p>
+<p>Reuse is the headline benefit, but the buffer buys a second, subtler one: decorrelation. Consecutive transitions from one episode are highly correlated (the agent is in nearly the same place doing nearly the same thing), and stochastic gradient descent assumes roughly independent samples. Drawing a minibatch from a large buffer mixes transitions from many different times and many different actors, breaking that correlation and stabilizing the gradient. This is why the buffer is large: not only to hold more memories, but to make any given minibatch a broad, low-correlation cross-section of the agent's past. The cost is that a transition produced by an old policy may be sampled long after, a staleness we quantify in Section 5 and correct for in <a href="section-20.5.html">Section 20.5</a>.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Buffer Decouples Production from Consumption</div>
+<p>The replay buffer is a queue with random access and a long memory. Actors produce transitions at one rate; the learner consumes minibatches at another, unrelated rate. The buffer absorbs the mismatch, exactly as a message queue decouples producers from consumers in any distributed system. This decoupling is what lets you scale actors and learners independently: add actors to fill the buffer faster, add learner throughput to drain it faster, and tune the replay ratio to balance the two. The moment you see "shared store between producers and consumers", you are looking at the partitioning and shared-state problem from <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.3.html">Section 2.3</a>, wearing an RL costume.</p>
+</div>
+
+<h2>2. From a Local Array to a Shared, Sharded Service <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>On a single machine the buffer is a ring array of a few million slots: actors append, the oldest entries are overwritten, the learner indexes in at random. Scaling out breaks this picture in two ways. First, a few million transitions of images or stacked frames can exceed the memory of one machine, so the buffer must be partitioned across several. Second, and more pressing, a single in-process array becomes a contention point when hundreds of actors write to it while learners read from it; one lock around one array serializes the entire system. The remedy for both is the same one used everywhere in this book: shard the structure. Split the buffer into $S$ independent shards, each a smaller ring with its own lock, spread across machines. An actor writes to a shard (often the nearest, or a random one); a learner samples a minibatch by drawing from several shards and concatenating.</p>
+<p>This is the same move as a sharded parameter server holding an embedding table, and it is worth seeing the parallel explicitly. In <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a> a giant table of parameters is split across server shards so that many workers can push and pull updates without all funneling through one process; here a giant table of transitions is split across buffer shards so that many actors can write and many learners can read without funneling through one lock. The replay buffer is the parameter server's mirror image: the parameter server is a shared store the workers <em>read from and write to</em> as model state, while the replay buffer is a shared store the actors <em>write to</em> and learners <em>read from</em> as data. Same sharding, same replication choices, opposite dataflow. Figure 20.4.1 lays out the resulting architecture.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A sharded replay buffer in the middle, with three actor processes writing transitions into it on the left and a learner sampling prioritized minibatches out of it on the right. Each shard holds a ring of transitions and a sum-tree of priorities.">
+<defs>
+<marker id="arr204" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr204o" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.b204 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.a204 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g204 { fill:#eaf3ec; stroke:#2f7d4f; stroke-width:1.6; }
+.t204 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.ta204 { font:600 13px sans-serif; fill:#8a4c12; text-anchor:middle; }
+.s204 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.lw204 { fill:none; stroke:#b86b1f; stroke-width:1.7; marker-end:url(#arr204o); }
+.lr204 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr204); }
+</style>
+<text class="ta204" x="80" y="24">Actors (write)</text>
+<rect class="a204" x="20" y="40" width="120" height="44" rx="8"/><text class="ta204" x="80" y="67">Actor 1</text>
+<rect class="a204" x="20" y="98" width="120" height="44" rx="8"/><text class="ta204" x="80" y="125">Actor 2</text>
+<rect class="a204" x="20" y="240" width="120" height="44" rx="8"/><text class="ta204" x="80" y="267">Actor M</text>
+<text class="s204" x="80" y="190">priorities</text><text class="s204" x="80" y="205">computed here</text>
+<text class="t204" x="440" y="24">Sharded replay buffer</text>
+<rect class="b204" x="320" y="44" width="240" height="80" rx="8"/>
+<text class="t204" x="440" y="70">Shard 1</text>
+<text class="s204" x="440" y="90">ring of transitions</text>
+<text class="s204" x="440" y="108">+ sum-tree of priorities</text>
+<rect class="b204" x="320" y="140" width="240" height="80" rx="8"/>
+<text class="t204" x="440" y="166">Shard 2</text>
+<text class="s204" x="440" y="186">ring of transitions</text>
+<text class="s204" x="440" y="204">+ sum-tree of priorities</text>
+<rect class="b204" x="320" y="236" width="240" height="80" rx="8"/>
+<text class="t204" x="440" y="262">Shard S</text>
+<text class="s204" x="440" y="282">ring of transitions</text>
+<text class="s204" x="440" y="300">+ sum-tree of priorities</text>
+<rect class="g204" x="700" y="120" width="150" height="120" rx="8"/>
+<text class="t204" x="775" y="160" fill="#2f7d4f">Learner</text>
+<text class="s204" x="775" y="184">samples a minibatch</text>
+<text class="s204" x="775" y="202">across shards</text>
+<text class="s204" x="775" y="220">updates priorities</text>
+<path class="lw204" d="M 140 62 L 316 70"/>
+<path class="lw204" d="M 140 120 L 316 100"/>
+<path class="lw204" d="M 140 262 L 316 280"/>
+<path class="lr204" d="M 560 84 L 696 150"/>
+<path class="lr204" d="M 560 180 L 696 180"/>
+<path class="lr204" d="M 560 276 L 696 212"/>
+<path class="lr204" d="M 770 240 L 770 300 L 565 300" stroke-dasharray="4 3"/>
+<text class="s204" x="640" y="316">priority updates flow back</text>
+</svg>
+<figcaption><strong>Figure 20.4.1:</strong> The sharded replay buffer as a producer-consumer service. On the left, $M$ actors write transitions, attaching a priority computed on the actor itself (the Ape-X trick of Section 4). The buffer is split into $S$ shards, each a ring of transitions paired with a sum-tree over priorities. On the right, the learner samples a minibatch by drawing from several shards, then writes updated priorities back (dashed). The write dataflow (orange) and read dataflow (blue) are independent, which is what lets actors and learner scale separately.</figcaption>
+</figure>
+
+<h2>3. Uniform Versus Prioritized Sampling <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The simplest sampling rule is uniform: every transition in the buffer is equally likely to be drawn. It is unbiased and trivial to implement, but it spends most of its budget on transitions the agent already predicts well, from which there is little left to learn. Prioritized experience replay (Schaul et al., 2016) fixes this by sampling transitions in proportion to how surprising they are, measured by the magnitude of their temporal-difference (TD) error $\delta_i$, the gap between the predicted value and the bootstrapped target. A transition with a large TD error is one the learner is currently getting wrong, so it carries more gradient signal. Concretely, transition $i$ is assigned priority $p_i = |\delta_i| + \epsilon$ (with a small $\epsilon$ so nothing has zero probability), and the probability of drawing it is</p>
+$$P(i) = \frac{p_i^{\alpha}}{\sum_{j} p_j^{\alpha}},$$
+<p>where the exponent $\alpha \in [0, 1]$ tunes how aggressively priority is followed: $\alpha = 0$ recovers uniform sampling, $\alpha = 1$ samples in strict proportion to priority. Because this skews the sample distribution away from the one the loss assumes, prioritized replay corrects with an importance-sampling weight $w_i = (N \cdot P(i))^{-\beta}$ applied to each transition's gradient, with $\beta$ annealed toward $1$ over training. The demo below builds a sharded buffer, fills it with transitions of which only five percent are flagged high-priority, and measures how often each sampling rule draws one of those important transitions.</p>
+<pre><code class="language-python">import random, time, threading, math
+
+random.seed(0)
+
+class Shard:
+    def __init__(self, capacity, alpha=0.6):
+        self.cap, self.alpha = capacity, alpha
+        self.data = [None] * capacity
+        self.prio = [0.0] * capacity        # priority**alpha per slot
+        self.size, self.pos = 0, 0
+        self.lock = threading.Lock()        # per-shard lock: contention stays local
+
+    def add(self, item, priority):
+        with self.lock:
+            self.data[self.pos] = item
+            self.prio[self.pos] = priority ** self.alpha
+            self.pos = (self.pos + 1) % self.cap     # ring eviction: oldest overwritten
+            self.size = min(self.size + 1, self.cap)
+
+    def sample_uniform(self):
+        with self.lock:
+            return self.data[random.randrange(self.size)]
+
+    def sample_prioritized(self):
+        with self.lock:
+            total = sum(self.prio[:self.size])       # a flat sum-tree query
+            r, c = random.random() * total, 0.0
+            for i in range(self.size):
+                c += self.prio[i]
+                if c >= r:
+                    return self.data[i]
+            return self.data[self.size - 1]
+
+class ShardedReplay:
+    def __init__(self, n_shards, capacity_each):
+        self.shards = [Shard(capacity_each) for _ in range(n_shards)]
+    def add(self, item, priority):
+        self.shards[random.randrange(len(self.shards))].add(item, priority)
+    def sample(self, prioritized):
+        s = self.shards[random.randrange(len(self.shards))]
+        return s.sample_prioritized() if prioritized else s.sample_uniform()
+
+buf = ShardedReplay(n_shards=4, capacity_each=2500)        # 10000 transitions total
+for tid in range(10000):
+    important = (tid % 20 == 0)                            # 5% are high-TD-error
+    buf.add((tid, important), priority=100.0 if important else 1.0)
+
+def hit_rate(prioritized, draws=40000):
+    hits = sum(1 for _ in range(draws) if buf.sample(prioritized)[1])
+    return hits / draws
+
+base = 0.05
+print("high-priority fraction in buffer :", f"{base:.3f}")
+print("uniform sampling     hit-rate    :", f"{hit_rate(False):.3f}")
+print("prioritized sampling hit-rate    :", f"{hit_rate(True):.3f}")
+print("concentration (prioritized/uniform):", f"{hit_rate(True)/base:.1f}x the base rate")
+</code></pre>
+<div class="code-caption"><strong>Code 20.4.1:</strong> A sharded prioritized replay buffer in pure Python. Each shard is a ring with a per-shard lock; <code>sample_prioritized</code> draws a transition with probability proportional to its stored $p_i^{\alpha}$, the discrete form of the sampling probability above. The 5% of transitions flagged <code>important</code> carry priority 100 against the others' priority 1.</div>
+<pre><code class="language-text">high-priority fraction in buffer : 0.050
+uniform sampling     hit-rate    : 0.052
+prioritized sampling hit-rate    : 0.455
+concentration (prioritized/uniform): 9.1x the base rate</code></pre>
+<div class="code-caption"><strong>Output 20.4.1:</strong> Uniform sampling draws a high-priority transition almost exactly at its 5% base rate, as it must. Prioritized sampling draws one 45.5% of the time, roughly nine times more often, concentrating the learner's gradient budget on the transitions it currently gets wrong without ever ignoring the rest.</div>
+<p>The nine-fold concentration in Output 20.4.1 is the entire point of prioritization: with a handful of high-error transitions buried in a sea of well-predicted ones, uniform sampling would touch them only one time in twenty, while the prioritized rule visits them nearly half the time. The flat sum-over-slots inside <code>sample_prioritized</code> is honest but $O(N)$ per draw, which is fine for ten thousand slots and ruinous for ten million. The fix is a data structure, which is the next subsection.</p>
+
+<h2>4. The Sum-Tree, and Computing Priorities on the Actor <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>To sample in proportion to priority quickly, the classic structure is a <em>sum-tree</em>: a binary tree whose leaves hold the per-transition priorities $p_i^{\alpha}$ and whose every internal node holds the sum of its children. The root holds the total. To draw a sample, generate a uniform value in $[0, \text{total})$ and walk from the root down, at each node going left or right depending on whether the value falls in the left child's subtree sum; the leaf you land on is chosen with exactly probability $p_i^{\alpha} / \text{total}$. Both sampling and updating a single priority cost $O(\log N)$ rather than $O(N)$, which is what makes prioritized replay practical at tens of millions of transitions. In a sharded buffer, each shard keeps its own sum-tree, so the cost is $O(\log(N/S))$ per shard and the trees never have to be merged; the learner simply allocates its minibatch across shards in proportion to each shard's root total.</p>
+<p>There is a deeper scaling problem hiding in prioritized replay, and the Ape-X architecture (Horgan et al., 2018) solved it. The naive design computes each transition's TD error on the learner, at insertion time, which forces every transition through the learner's network before it can even be stored, making the learner a bottleneck for a quantity the actors could have produced themselves. Ape-X's insight is to compute the initial priority <em>on the actor</em>, using the actor's own copy of the network during rollout, and ship the priority alongside the transition. The learner then refreshes priorities only for the transitions it actually samples, not for all of them. This single change is what let Ape-X scale to hundreds of actors feeding one learner: the expensive per-transition priority computation is distributed across the actor fleet, exactly as Figure 20.4.1 shows, rather than centralized. It is the same "push work to where the data is produced" principle behind map-side combiners and actor-side preprocessing throughout this book.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Buffer Has Opinions, the Actor Has Hunches</div>
+<p>Before Ape-X, the replay buffer was a passive warehouse: actors dropped off transitions, and the learner alone decided, much later, which were interesting. Ape-X let the actors form a first opinion at delivery time, a hunch about how surprising each memory is, stamped on the box before it ships. The learner is free to revise that hunch when it actually opens the box, but the cheap first guess, made hundreds of times in parallel out at the edge, is what keeps the learner from drowning. Distributed systems improve most when the cleverness moves to where the data already is.</p>
+</div>
+
+<h2>5. Concurrency, Capacity, and the Staleness of Old Memories <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A replay buffer that hundreds of actors write to and learners read from is a textbook concurrency problem, and the textbook trap is a single global lock: every write and every read serializes behind it, and the buffer caps the whole system's throughput no matter how many actors you add. Two remedies, often combined, defeat this. Sharding (already in Code 20.4.1) replaces one lock with $S$ independent locks, so writes and reads to different shards proceed in parallel and contention drops by roughly a factor of $S$. Lock-free or fine-grained designs go further, using atomic operations on the ring indices so that appends rarely block at all. The second part of the demo measures the sharding effect directly, running four writer threads and two reader threads against the buffer and counting total operations per second as the shard count grows.</p>
+<pre><code class="language-python">def bench(n_shards):
+    b = ShardedReplay(n_shards=n_shards, capacity_each=4000)
+    for tid in range(4000 * n_shards):                      # warm-fill every shard
+        b.add((tid, tid % 20 == 0), 1.0)
+    counts, clock, cl = {"w": 0, "r": 0}, {"go": True}, threading.Lock()
+    def writer():
+        n = 0
+        while clock["go"]:
+            b.add((random.randrange(1 << 30), False), 1.0); n += 1
+        with cl: counts["w"] += n
+    def reader():
+        n = 0
+        while clock["go"]:
+            b.sample(prioritized=True); n += 1
+        with cl: counts["r"] += n
+    threads = [threading.Thread(target=writer) for _ in range(4)] + \
+              [threading.Thread(target=reader) for _ in range(2)]
+    t0 = time.perf_counter()
+    for t in threads: t.start()
+    time.sleep(1.0)
+    clock["go"] = False
+    for t in threads: t.join()
+    dt = time.perf_counter() - t0
+    return (counts["w"] + counts["r"]) / dt
+
+for ns in (1, 4, 16):
+    print(f"shards={ns:2d}  ops/sec under 4 writers + 2 readers :", f"{bench(ns):,.0f}")
+</code></pre>
+<div class="code-caption"><strong>Code 20.4.2:</strong> Throughput under concurrent producers and consumers. Four writer threads (actors) and two reader threads (a learner) hammer the buffer for one second each; each <code>add</code> and <code>sample</code> holds its shard's lock through a few microseconds of real critical-section work, so single-lock contention actually serializes threads. We sweep the shard count to isolate the effect of sharding alone.</div>
+<pre><code class="language-text">shards= 1  ops/sec under 4 writers + 2 readers : 145,646
+shards= 4  ops/sec under 4 writers + 2 readers : 180,535
+shards=16  ops/sec under 4 writers + 2 readers : 106,080</code></pre>
+<div class="code-caption"><strong>Output 20.4.2:</strong> Moving from one lock to four lifts throughput by about a quarter, because writers and readers now collide less often. Pushing to sixteen shards reverses the gain: with only six threads, the extra shards add bookkeeping without relieving contention that is no longer the binding cost. The sweet spot is "a few locks per concurrent writer", not "as many shards as possible".</div>
+<p>Output 20.4.2 carries a lesson that recurs whenever you shard for concurrency: more shards help only until the lock is no longer the bottleneck, after which they add pure overhead. The right shard count tracks the number of concurrent writers, not the buffer's size. Two further design choices round out the service. <strong>Capacity and eviction</strong>: the buffer is a fixed-size ring, so when it fills, the oldest transition is overwritten (Code 20.4.1's <code>pos</code> wraps modulo <code>cap</code>). Capacity sets how far into the past the learner can reach, trading memory for the decorrelation benefit of Section 1. <strong>Staleness</strong>: because a transition can be sampled long after the policy that produced it has moved on, old memories are drawn from an increasingly off-policy distribution; too large a buffer (or too high a replay ratio) means the learner spends its budget on experience from a policy it no longer resembles. This off-policy gap is precisely what the V-trace and Retrace corrections of <a href="section-20.5.html">Section 20.5</a> exist to fix, and it ties back to the bounded-staleness trade-off first met for asynchronous parameter updates in <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a>.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Replay Service That Outgrew Its Learner</div>
+<p><strong>Who:</strong> A reinforcement-learning systems engineer at a games-AI lab training an agent on a hard exploration title.</p>
+<p><strong>Situation:</strong> They ran an Ape-X-style setup, 256 actors feeding one GPU learner through a single-process prioritized buffer holding two million transitions.</p>
+<p><strong>Problem:</strong> Adding actors past about 64 stopped helping; profiling showed actors spending more time blocked on the buffer's insert lock than running the environment, and the learner's GPU sitting at 40% utilization waiting on sample calls.</p>
+<p><strong>Dilemma:</strong> Buy a bigger GPU to make the learner faster, which would not help because the learner was already starved, or attack the buffer, which meant rewriting the single hot lock that everything funneled through.</p>
+<p><strong>Decision:</strong> They sharded the buffer into 32 independent rings, each with its own sum-tree and lock, and moved initial priority computation onto the actors so transitions no longer had to wait on the learner before being stored.</p>
+<p><strong>How:</strong> Writes hashed to a random shard; each sampled minibatch drew from all shards in proportion to their root priorities; learner-side priority refreshes touched only sampled leaves, matching the design in Figure 20.4.1.</p>
+<p><strong>Result:</strong> Actor block time on the insert lock fell to near zero, the system scaled cleanly past 256 actors, and learner GPU utilization rose above 90%, the same qualitative jump from one lock to many that Output 20.4.2 shows in miniature.</p>
+<p><strong>Lesson:</strong> In distributed RL the bottleneck is rarely the learner's math; it is the contention on the shared buffer. Shard the buffer and push priority work to the actors before you reach for more compute.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Reverb and RLlib Give You the Buffer Service</div>
+<p>Code 20.4.1 and 20.4.2 build the sharded prioritized buffer by hand to expose its mechanics; in production you stand one up in a few lines. DeepMind's <a href="https://github.com/google-deepmind/reverb">Reverb</a> is a dedicated, networked replay service with built-in prioritized sampling, sharding, rate limiting (to hold the replay ratio in a target band), and a C++ sum-tree, accessed from many actors and learners over gRPC. Ray <a href="https://docs.ray.io/en/latest/rllib/rllib-algorithms.html">RLlib</a> ships a <code>PrioritizedReplayBuffer</code> and a distributed actor-learner stack out of the box:</p>
+<pre><code class="language-python"># pip install dm-reverb  (a distributed replay service in &lt;10 lines)
+import reverb
+
+server = reverb.Server(tables=[reverb.Table(
+    name="prioritized",
+    sampler=reverb.selectors.Prioritized(priority_exponent=0.6),   # the alpha of P(i)
+    remover=reverb.selectors.Fifo(),                               # ring-style eviction
+    max_size=1_000_000,
+    rate_limiter=reverb.rate_limiters.MinSize(10_000))])           # hold the replay ratio
+client = reverb.Client(f"localhost:{server.port}")
+# actors:  client.insert(transition, priorities={"prioritized": td_error})
+# learner: for sample in client.sample("prioritized", num_samples=256): ...
+</code></pre>
+<div class="code-caption"><strong>Code 20.4.3:</strong> The roughly eighty lines of Code 20.4.1 and 20.4.2 collapse to one Reverb table definition. The service handles the sum-tree, sharding, network transport, concurrent access from hundreds of clients, and rate limiting that the hand-rolled version leaves to you.</div>
+</div>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: A Shared Store, Sharded, Returns Again</div>
+<p>The replay buffer is the same shared-state-sharded-across-machines pattern that organizes half this book, pointed in a new direction. Partitioning came from <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.3.html">Chapter 2</a>; the sharded shared store that many workers hit concurrently was the parameter server of <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a>; here it becomes the actor-to-learner experience service, and it will return once more as the shared replay infrastructure behind distributed multi-agent RL in <a href="../../part-6-multi-agent-systems/module-30-multi-agent-reinforcement-learning/index.html">Chapter 30</a>. Whenever a distributed AI system needs many producers and many consumers to meet over a large mutable dataset, the answer is a sharded, replicated store, and the only thing that changes is what flows through it.</p>
+</div>
+
+<h2>6. When You Do Not Need a Buffer: On-Policy Methods <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Everything above assumes off-policy learning, where the learner may train on transitions produced by an older policy. On-policy methods such as PPO and A2C make the opposite assumption: each update must use data collected by the <em>current</em> policy, because their objective is only valid for the policy that generated the samples. There is therefore nothing to store across iterations. The structure they use is a transient rollout buffer: actors collect a fixed batch of fresh transitions under the current policy, the learner consumes that batch for a few epochs of updates, and then the entire buffer is discarded and refilled under the new policy. It is a buffer in name only, with no long memory, no eviction policy, no prioritization, and no cross-iteration concurrency between writers and readers.</p>
+<p>This is not a smaller version of a replay buffer; it is a different object with a different lifecycle, and conflating the two is a common source of subtle bias. A persistent prioritized replay buffer would actively harm a PPO run by feeding it stale, off-policy data its objective cannot handle. The decision tree is short: if your method is off-policy (DQN, SAC, Ape-X, R2D2), invest in a real distributed replay buffer with all the machinery of this section; if it is on-policy (PPO, A2C, IMPALA's policy side), build a transient per-iteration rollout buffer instead and spend your engineering on fast collection and the off-policy <em>correction</em> that lets IMPALA blur the line, which is exactly where <a href="section-20.5.html">Section 20.5</a> picks up.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Replay Ratios and Buffer Design (2024 to 2026)</div>
+<p>The replay buffer is having a research moment, because the ratio of gradient steps to environment steps turns out to control sample efficiency far more than was once thought. Work on high replay-ratio training and periodic network resets to combat the "primacy bias" and the loss of plasticity (Nikishin et al., 2022; D'Oro et al., 2023) showed that pushing the replay ratio an order of magnitude higher, with the right regularization, dramatically improves data efficiency, which puts new throughput pressure squarely on the buffer service. In parallel, large-scale RL for LLM post-training (RLHF and reasoning-model pipelines such as those around DeepSeek-R1, 2025) has revived distributed experience storage at a new scale, where the "transitions" are long generated sequences and the buffer must stream multi-gigabyte rollouts between generation actors and the trainer; frameworks built on Ray (OpenRLHF, veRL) treat the experience store and its rate limiting as a first-class scaling bottleneck. The throughput, sharding, and staleness questions of this section are, if anything, more central in 2026 than when prioritized replay was introduced.</p>
+</div>
+<p>We now have the shared store between actors and learner: why it exists, how it shards, how prioritization concentrates the learner's budget, how the sum-tree and actor-side priorities keep it fast, and when an on-policy method skips it entirely. What we have ignored is the elephant in the buffer: every sampled transition may come from a policy the learner has since left behind. Correcting for that off-policy gap, with V-trace and the IMPALA architecture, is the subject of <a href="section-20.5.html">Section 20.5</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.4.1: When Does Prioritization Stop Paying? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Prioritized replay concentrated sampling on high-error transitions by 9x in Output 20.4.1. Describe two distinct regimes in which this concentration would <em>hurt</em> learning rather than help: one where the priorities themselves are unreliable, and one where the high-priority transitions are genuinely surprising but for the wrong reason (for example, environment noise rather than a learnable structure). For each, name the mechanism in the algorithm ($\alpha$, $\epsilon$, the importance-sampling exponent $\beta$, or buffer capacity) you would adjust, and say which way.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.4.2: Build the Sum-Tree <span class="exercise-type coding">Coding</span></div>
+<p>The <code>sample_prioritized</code> method in Code 20.4.1 is $O(N)$ per draw because it sums every slot. Replace each shard's flat priority array with a proper sum-tree so that both sampling and single-priority updates are $O(\log N)$. Verify it draws from the same distribution as the flat version (the high-priority hit-rate should still land near 0.45), then plot draws-per-second versus buffer capacity for the flat array and the sum-tree as capacity grows from $10^3$ to $10^6$. Confirm the flat version degrades linearly while the tree stays roughly flat.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.4.3: Find the Sharding Sweet Spot <span class="exercise-type analysis">Analysis</span></div>
+<p>Output 20.4.2 showed throughput rising from 1 to 4 shards and falling by 16, with 4 writers and 2 readers. Extend Code 20.4.2 to sweep both the writer count (2, 4, 8, 16) and the shard count (1, 2, 4, 8, 16, 32), and produce a table of ops/sec. From the table, state the empirical relationship between the optimal shard count and the writer count, and explain it in terms of lock contention: why does the best shard count scale with the number of concurrent writers rather than with the buffer's capacity? Relate your finding to the parameter-server sharding choice in <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-20.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 20.3</span><span class="nav-title">Distributed Experience Collection</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 20</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Reinforcement Learning Infrastructure</span></a>
+<a class="next" href="section-20.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 20.5</span><span class="nav-title">Off-Policy Correction at Scale</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 4.9: Topology-Aware Placement. Why where a rank sits decides what its collectives cost, how hierarchical collectives exploit fast intra-node links, and how to map parallelism strategies onto the interconnect." name="description"/>
+<title>Section 4.9: Topology-Aware Placement | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Distributed AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 4: Communication Primitives for Distributed Training</a></div>
+<h1>Topology-Aware Placement</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They gave me rank 5 and put me three switches away from rank 4. Every step, I wait for a packet that has to cross half the building. My neighbors on the same board finished an hour ago."</p>
+<cite>A GPU Idling on a Communication Barrier</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A collective operation has no fixed cost; its cost is decided by which physical links the participating ranks must talk over, and that is decided by where the scheduler placed them.</strong> The previous sections treated all-reduce, all-gather, and all-to-all as if the wires underneath were uniform. They are not. Inside a modern training node, GPUs talk to each other over NVLink at hundreds of gigabytes per second; between nodes they talk over a network an order of magnitude slower. The same eight-way all-reduce can finish in milliseconds when the eight ranks share one node, or take dozens of times longer when they are scattered across the cluster. Topology-aware placement is the discipline of arranging ranks, and structuring collectives, so the heaviest traffic rides the fastest links. This section shows the cost gap with real numbers, explains the hierarchical collectives that exploit it, and gives the rule for mapping a parallelism strategy onto an interconnect.</p>
+</div>
+<p>By now you can name the collectives that distributed training runs on, and in <a href="section-4.8.html">Section 4.8</a> you saw the libraries (NCCL, MPI, Gloo) that implement them. Those libraries are fast, but they cannot change one fact: a collective is only as quick as the slowest link its ranks must cross. A GPU does not care, when it issues an all-reduce, whether its partner is a centimeter away on the same circuit board or a hundred meters away through three network switches. The cost model of <a href="../module-03-scalability-performance-models/index.html">Chapter 3</a> does care, because the bandwidth term changes by more than an order of magnitude between those two cases. So the question this section answers is not "which collective?" but "given the collective, where should its ranks live, and how should the operation be staged across the interconnect's levels?"</p>
+<p>Recall the alpha-beta model from <a href="../module-03-scalability-performance-models/section-3.8.html">Section 3.8</a>: sending $b$ bytes over a link costs roughly $\alpha + b/\beta$, a fixed latency $\alpha$ plus a bandwidth term, where $\beta$ is the link's bandwidth. A ring all-reduce over $n$ ranks runs $2(n-1)$ steps, each moving a $1/n$ share of the buffer, so its total time is</p>
+$$T_{\text{ring}}(n) = 2(n-1)\left(\alpha + \frac{B/n}{\beta}\right),$$
+<p>where $B$ is the buffer size in bytes. The structure of the formula is fixed, but $\alpha$ and $\beta$ are properties of the link, and the link is chosen by placement. Put the ring on NVLink and $\beta$ is hundreds of gigabytes per second; scatter it across nodes and $\beta$ collapses to the network rate. That single substitution is the whole subject of this section.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two compute nodes, each holding four GPUs joined by fast NVLink, the two nodes connected by a slower network link. Below, a three-stage hierarchical reduction: reduce within each node over NVLink, all-reduce across nodes over the network among leaders, then broadcast back down inside each node.">
+<defs>
+<marker id="arr49" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.box49 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.gpu49 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.t49 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s49 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.fast49 { fill:none; stroke:#1f8a4c; stroke-width:3.2; }
+.slow49 { fill:none; stroke:#b3402f; stroke-width:1.8; stroke-dasharray:6 4; }
+.lab49 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr49); }
+</style>
+<text class="t49" x="430" y="22">Two nodes: fast NVLink inside, slow network between</text>
+<rect class="box49" x="40" y="44" width="340" height="120" rx="10"/>
+<text class="s49" x="210" y="62">Node A</text>
+<rect class="gpu49" x="60" y="74" width="64" height="44" rx="6"/><text class="t49" x="92" y="100">G0</text>
+<rect class="gpu49" x="140" y="74" width="64" height="44" rx="6"/><text class="t49" x="172" y="100">G1</text>
+<rect class="gpu49" x="220" y="74" width="64" height="44" rx="6"/><text class="t49" x="252" y="100">G2</text>
+<rect class="gpu49" x="300" y="74" width="64" height="44" rx="6"/><text class="t49" x="332" y="100">G3</text>
+<path class="fast49" d="M 92 124 L 92 140 L 332 140 L 332 124"/>
+<path class="fast49" d="M 172 124 L 172 134 L 252 134 L 252 124"/>
+<text class="s49" x="212" y="156">NVLink ~300 GB/s</text>
+<rect class="box49" x="480" y="44" width="340" height="120" rx="10"/>
+<text class="s49" x="650" y="62">Node B</text>
+<rect class="gpu49" x="500" y="74" width="64" height="44" rx="6"/><text class="t49" x="532" y="100">G4</text>
+<rect class="gpu49" x="580" y="74" width="64" height="44" rx="6"/><text class="t49" x="612" y="100">G5</text>
+<rect class="gpu49" x="660" y="74" width="64" height="44" rx="6"/><text class="t49" x="692" y="100">G6</text>
+<rect class="gpu49" x="740" y="74" width="64" height="44" rx="6"/><text class="t49" x="772" y="100">G7</text>
+<path class="fast49" d="M 532 124 L 532 140 L 772 140 L 772 124"/>
+<path class="fast49" d="M 612 124 L 612 134 L 692 134 L 692 124"/>
+<text class="s49" x="652" y="156">NVLink ~300 GB/s</text>
+<path class="slow49" d="M 380 104 L 480 104"/>
+<text class="s49" x="430" y="96">network</text>
+<text class="s49" x="430" y="120">~12.5 GB/s</text>
+<text class="t49" x="430" y="206">Hierarchical all-reduce in three stages</text>
+<rect class="box49" x="60" y="226" width="220" height="44" rx="8"/>
+<text class="s49" x="170" y="246">1. reduce within node</text>
+<text class="s49" x="170" y="262">over NVLink (parallel)</text>
+<rect class="box49" x="320" y="226" width="220" height="44" rx="8"/>
+<text class="s49" x="430" y="246">2. all-reduce across nodes</text>
+<text class="s49" x="430" y="262">leaders only, over network</text>
+<rect class="box49" x="580" y="226" width="220" height="44" rx="8"/>
+<text class="s49" x="690" y="246">3. broadcast result down</text>
+<text class="s49" x="690" y="262">over NVLink (parallel)</text>
+<path class="lab49" d="M 280 248 L 318 248"/>
+<path class="lab49" d="M 540 248 L 578 248"/>
+<text class="s49" x="430" y="318">The bulk of the bytes never leave NVLink; only a reduced share among leaders crosses the slow link.</text>
+<text class="s49" x="430" y="344">Compare to a flat ring whose every hop rides the network: same math, far slower wires.</text>
+</svg>
+<figcaption><strong>Figure 4.9.1:</strong> Topology and the hierarchical collective. Eight GPUs sit on two nodes; the four on each node share fast NVLink (green), while the two nodes are joined only by a slower network link (dashed red). A hierarchical all-reduce reduces within each node over NVLink, exchanges a reduced buffer across nodes among one leader per node, then broadcasts the result back down. The heavy traffic stays on the fast fabric; only a thin layer crosses the slow one.</figcaption>
+</figure>
+
+<h2>1. The Same Collective, Two Very Different Costs <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The cleanest way to feel topology is to price one fixed operation, an eight-way all-reduce of a one-gigabyte gradient buffer, under two placements. In the first, the scheduler puts all eight ranks on a single node, so the ring lives entirely on NVLink. In the second, the eight ranks land on eight separate nodes, so every hop of the ring crosses the network. Nothing about the algorithm changes; only $\beta$ changes, and with it the elapsed time. The demo below builds both cases from the alpha-beta formula and reports the gap.</p>
+<pre><code class="language-python"># Topology-aware placement: where a rank sits decides what its collective costs.
+# Alpha-beta model: moving b bytes over a link costs alpha + b/bandwidth.
+# A ring all-reduce over n ranks runs 2*(n-1) steps, each moving a (1/n)-sized
+# chunk; the ring is gated by the SLOWEST link it must span.
+
+bytes_per_elem = 4
+P = 256 * 1024 * 1024           # 256M-parameter gradient buffer
+B = P * bytes_per_elem          # total bytes
+
+# Link model: (one-way latency seconds, bandwidth bytes/sec).
+NVLINK  = (1.0e-6, 300e9)       # intra-node NVSwitch fabric, ~300 GB/s
+NETWORK = (5.0e-6, 12.5e9)      # cross-node 100 Gb/s InfiniBand, ~12.5 GB/s
+
+def ring_allreduce_time(n, link, B):
+    alpha, bw = link
+    steps = 2 * (n - 1)
+    chunk = B / n                            # each step moves one (1/n) chunk
+    return steps * (alpha + chunk / bw)
+
+# Same 8-way all-reduce, placed well vs badly.
+good8 = ring_allreduce_time(8, NVLINK, B)    # all 8 ranks share one node
+bad8  = ring_allreduce_time(8, NETWORK, B)   # 8 ranks scattered across 8 nodes
+
+print(f"8 ranks on one node, all NVLink   : {good8*1e3:8.2f} ms")
+print(f"8 ranks scattered, all on network : {bad8*1e3:8.2f} ms")
+print(f"speedup from good placement       : {bad8/good8:8.1f}x")
+</code></pre>
+<div class="code-caption"><strong>Code 4.9.1:</strong> Pricing one fixed eight-way all-reduce under good (single-node NVLink) and bad (scattered, cross-node) placement. Only the link's bandwidth $\beta$ differs between the two calls.</div>
+<p>Running this with <code>C:\Python314\python.exe</code> produced the numbers below, taken verbatim from the run.</p>
+<pre><code class="language-text">8 ranks on one node, all NVLink   :     6.28 ms
+8 ranks scattered, all on network : 150.39 ms
+speedup from good placement       :     24.0x</code></pre>
+<div class="code-caption"><strong>Output 4.9.1:</strong> The identical collective is twenty-four times slower when its ranks are scattered. The algorithm did not change; the wires did.</div>
+<p>Twenty-four times is not a rounding effect; it is the bandwidth ratio between NVLink and the network, amplified slightly by the higher per-step latency of the network. For a training step that issues this all-reduce once per iteration, the difference between $6$ milliseconds and $150$ milliseconds is the difference between communication hiding behind compute and communication dominating the step. The scheduler made that decision when it chose where rank 5 would live, long before the first gradient was computed.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Placement Is a Performance Knob, Not a Detail</div>
+<p>A collective's cost is set by the slowest link its ranks must cross, and that link is chosen by placement. Two runs of the same job, with the same code and the same hardware count, can differ by an order of magnitude purely because one packed the heavy collective onto NVLink and the other spread it across the network. Before tuning algorithms, tune placement: keep the ranks that talk most onto the fastest fabric they can share.</p>
+</div>
+
+<h2>2. Hierarchical Collectives: Reduce Local, Exchange Global <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Most real jobs cannot fit on one node, so some traffic must cross the network. The trick is to cross it as little as possible. A hierarchical collective exploits the two-level structure of the interconnect: it first reduces within each node over the fast link, then exchanges only the reduced result across nodes over the slow link, then broadcasts the final answer back down inside each node. Instead of all $n$ ranks meeting on the network, only one leader per node does, so the slow stage runs over the number of nodes rather than the number of GPUs. Figure 4.9.1 sketches the three stages.</p>
+<p>The demo below extends Code 4.9.1 with a hierarchical variant and prices a thirty-two-GPU all-reduce two ways: a flat ring whose ranks are scattered across thirty-two nodes, and a hierarchical collective on four eight-GPU nodes. Both move the same buffer; they differ only in how they use the topology.</p>
+<pre><code class="language-python">def hierarchical_time(nodes, gpus_per_node, B):
+    # Stage 1: ring-reduce inside every node over NVLink (nodes run in parallel).
+    t_intra = ring_allreduce_time(gpus_per_node, NVLINK, B)
+    # Stage 2: one leader per node all-reduces across nodes over the network.
+    t_inter = ring_allreduce_time(nodes, NETWORK, B)
+    # Stage 3: broadcast the reduced result back down each node over NVLink.
+    a_nv, bw_nv = NVLINK
+    t_bcast = a_nv + B / bw_nv
+    return t_intra + t_inter + t_bcast
+
+nodes, gpus_per_node = 4, 8
+world = nodes * gpus_per_node                       # 32 GPUs
+flat32 = ring_allreduce_time(world, NETWORK, B)     # all 32 ranks on the network
+hier32 = hierarchical_time(nodes, gpus_per_node, B) # NVLink + a thin network layer
+
+print(f"flat ring, scattered (bad)  : {flat32*1e3:8.2f} ms")
+print(f"hierarchical NVLink+network : {hier32*1e3:8.2f} ms")
+print(f"speedup from hierarchy      : {flat32/hier32:8.2f}x")
+</code></pre>
+<div class="code-caption"><strong>Code 4.9.2:</strong> A three-stage hierarchical all-reduce compared with a flat ring over the same thirty-two ranks. The hierarchical version keeps the bulk of the traffic on NVLink and crosses the network among four leaders, not thirty-two ranks.</div>
+<pre><code class="language-text">flat ring, scattered (bad)  :   166.74 ms
+hierarchical NVLink+network :   138.74 ms
+speedup from hierarchy      :     1.20x</code></pre>
+<div class="code-caption"><strong>Output 4.9.2:</strong> For this one-gigabyte buffer the hierarchical collective is about $1.2$ times faster than the flat scattered ring. The gain is real but modest, because at this size the operation is bandwidth-bound and the reduced buffer still has to cross the network once.</div>
+<p>The honest reading of Output 4.9.2 is worth dwelling on. Hierarchy buys a large win when an operation is latency-bound, because it slashes the number of network hops from $2(n-1)$ down to $2(\text{nodes}-1)$; it buys a smaller win when an operation is bandwidth-bound, because a reduced copy of the buffer must still traverse the slow link no matter how the ranks are grouped. The dramatic twenty-four-fold gap in Output 4.9.1 came from keeping the traffic entirely off the network; once any data must cross it, the network's bandwidth sets a floor. Both effects are real, and a good placement chases both: keep what can stay local local, and minimize what must go global.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The All-Reduce That Took the Scenic Route</div>
+<p>A team once debugged a training run that was mysteriously three times slower than an identical run from the week before. Same code, same model, same GPU count. The culprit was the scheduler: a maintenance window had freed up nodes in a different rack, and the placement logic, optimizing for "any free GPU," had spread eight ranks across eight nodes instead of packing them onto one. The gradients were taking the scenic route through the network every step. Pinning the job to a single node restored the speed. The fix was zero lines of model code and one line of scheduler configuration.</p>
+</div>
+
+<h2>3. Mapping Parallelism Onto the Topology <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Large models are trained with several forms of parallelism at once, and each form runs a different collective with a different traffic volume. Tensor parallelism, which splits a single layer across devices, issues an all-reduce on <em>every</em> forward and backward pass and is the heaviest communicator. Data parallelism issues one gradient all-reduce per step. Pipeline parallelism sends only activations between adjacent stages, the lightest of the three. The placement rule follows directly: assign the heaviest collective to the fastest link. Keep tensor-parallel groups inside a node on NVLink; let data-parallel and pipeline groups span nodes over the network, where their lighter traffic can tolerate the slower link.</p>
+<p>Table 4.9.1 states this mapping as a checklist. It is the same logic that the three-dimensional parallelism strategies of <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a> formalize, where tensor, pipeline, and data dimensions are deliberately laid out so that the innermost (most communication-intensive) dimension maps to the innermost (fastest) level of the interconnect.</p>
+<div class="table-caption"><strong>Table 4.9.1:</strong> Mapping parallelism strategies onto the interconnect. The heaviest communicator gets the fastest link; the lightest tolerates the slowest.</div>
+<table>
+<thead>
+<tr><th scope="col">Parallelism</th><th scope="col">Collective and frequency</th><th scope="col">Traffic</th><th scope="col">Preferred link</th></tr>
+</thead>
+<tbody>
+<tr><td>Tensor parallel</td><td>All-reduce, twice per layer per step</td><td>Heaviest</td><td>Intra-node NVLink</td></tr>
+<tr><td>Data parallel</td><td>All-reduce, once per step</td><td>Medium</td><td>Cross-node network</td></tr>
+<tr><td>Pipeline parallel</td><td>Point-to-point activations between stages</td><td>Lightest</td><td>Cross-node network</td></tr>
+<tr><td>Expert parallel</td><td>All-to-all, per MoE layer</td><td>Bursty, large</td><td>Intra-node where possible</td></tr>
+</tbody>
+</table>
+<p>The fourth row, expert parallelism, is the awkward case: its all-to-all (introduced in <a href="section-4.6.html">Section 4.6</a>) moves tokens between every pair of expert shards and is both large and bursty, so it wants the fast link but rarely fits inside one node. That tension is exactly what <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a> and the expert-parallel material that follows it must navigate, and it is one reason rail-optimized network designs (Section 5 below) exist.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The 70B Run That Found Its 30 Percent</div>
+<p><strong>Who:</strong> A systems engineer on a foundation-model team bringing up training for a 70-billion-parameter model on a 256-GPU cluster of eight-GPU nodes.</p>
+<p><strong>Situation:</strong> The job used eight-way tensor parallelism, four-way pipeline parallelism, and eight-way data parallelism, composed into a three-dimensional layout.</p>
+<p><strong>Problem:</strong> Measured throughput sat at roughly 70 percent of the projected number, and profiling showed the GPUs stalling on tensor-parallel all-reduces far longer than the model predicted.</p>
+<p><strong>Dilemma:</strong> Either accept the loss and add more GPUs to brute-force the schedule, or chase the stall and risk days of layout experiments with no guarantee of a win.</p>
+<p><strong>Decision:</strong> They chased the stall, because the all-reduce time on the tensor-parallel groups was an order of magnitude above the NVLink prediction, a signature of cross-node placement.</p>
+<p><strong>How:</strong> Inspecting the rank-to-node map revealed that the tensor-parallel groups of eight had been split across two nodes instead of packed onto one. They re-expressed the layout so each tensor-parallel group of eight occupied exactly one node, keeping that heavy all-reduce on NVLink, and let the data-parallel dimension span nodes instead.</p>
+<p><strong>Result:</strong> Throughput rose by about 30 percent with no new hardware, recovering nearly the full projected number, because the heaviest collective now rode the fastest link exactly as Output 4.9.1 says it should.</p>
+<p><strong>Lesson:</strong> When a composed parallelism strategy underperforms, check the rank-to-link map before touching the model. The most expensive collective belongs on the fastest fabric, and getting that one mapping right is often the single largest free win in a large training job.</p>
+</div>
+
+<h2>4. From Placement to the Scheduler <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Topology awareness is not only a property a job sets for itself; it is a property the cluster scheduler must respect. A job that needs its eight tensor-parallel ranks on one node is useless if the scheduler hands it eight ranks on eight different nodes, and a synchronous training job that runs one straggler-bound collective per step cannot tolerate having even one rank placed far away. This is why schedulers for AI clusters offer gang scheduling (all ranks of a job start together or not at all) and topology-aware placement (ranks of a group are co-located on the same node or rack). Those mechanisms are the cluster-side counterpart of everything in this section, and they get their full treatment in <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/index.html">Chapter 33</a>.</p>
+<p>The contract between job and scheduler is a small piece of information: the job declares its communication groups and how tightly each must be packed, and the scheduler honors that when it assigns ranks to hardware. A tensor-parallel group declares "keep these eight together on one node"; a data-parallel group declares "these can span nodes." When the declaration is missing or ignored, you get the scenic-route all-reduce from the fun note above. When it is honored, the cost model of <a href="../module-03-scalability-performance-models/index.html">Chapter 3</a> becomes predictive rather than aspirational.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: NCCL and torch.distributed Discover the Topology for You</div>
+<p>You do not hand-build the hierarchical collective of Code 4.9.2 in practice. NCCL detects the interconnect at startup (which GPUs share NVLink, which share a PCIe switch, which are reachable only over the network) and automatically constructs hierarchical rings and trees that keep traffic on the fastest available links. Your job is to give it a good rank-to-device mapping; it does the staging. Process subgroups let you declare the communication structure so the library and the launcher can place and route accordingly:</p>
+<pre><code class="language-python">import torch.distributed as dist
+
+dist.init_process_group("nccl")                 # NCCL probes NVLink/PCIe/network here
+# Declare the tensor-parallel group: these ranks should share a node.
+tp_group = dist.new_group(ranks=[0, 1, 2, 3, 4, 5, 6, 7])
+# A data-parallel group whose members may span nodes.
+dp_group = dist.new_group(ranks=[0, 8, 16, 24])
+
+# The same all_reduce call; NCCL routes it hierarchically over the real topology.
+dist.all_reduce(local_grad, group=tp_group)     # stays on NVLink if ranks 0-7 co-locate
+</code></pre>
+<div class="code-caption"><strong>Code 4.9.3:</strong> The roughly fifteen lines of manual three-stage hierarchy in Code 4.9.2 collapse to declaring process groups and issuing ordinary collectives. NCCL handles topology discovery, ring and tree construction, and the choice of which links to use; the launcher (<code>torchrun</code> with a topology-aware scheduler) handles getting rank 0 through 7 onto the same node.</div>
+</div>
+
+<h2>5. The Interconnect Is Getting Smarter <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Placement matters more every year, because the gap between the fastest and slowest links keeps widening and the fabrics keep gaining structure that a placement strategy can exploit. Three current directions are worth naming, all of which a topology-aware job must reason about.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Rails, Switches, and Light (2024 to 2026)</div>
+<p>NVLink and NVSwitch have grown into multi-node domains: NVIDIA's GB200 NVL72 (2024) wires 72 GPUs into a single NVLink fabric, so what used to be a slow cross-node hop now stays on the fast domain, and the "node" boundary that this section reasons about moves outward to 72 GPUs. At the network layer, rail-optimized topologies wire each GPU to a dedicated network rail so that same-rank GPUs across nodes share a low-contention path; this is the placement assumption behind the all-to-all of expert parallelism and is documented in the Llama 3 training infrastructure report (Meta, 2024) and in cluster designs from major operators. Further out, optical circuit switching, used in Google's TPU pods and explored for GPU clusters, reconfigures the physical topology to match a job's communication pattern rather than forcing the job to adapt to a fixed wiring. Across all three, the lesson of this section only sharpens: the interconnect is becoming a structured resource that rewards jobs which map their heaviest collectives onto its fastest, least-contended paths, and penalizes jobs that ignore it.</p>
+</div>
+<p>We now have the placement rule (heaviest collective on the fastest link), the mechanism that exploits topology automatically (hierarchical collectives), and the cluster-side contract that makes placement happen (gang and topology-aware scheduling). One large lever remains unpulled. Even a perfectly placed all-reduce still costs time, and that time is wasted if the GPUs sit idle waiting for it. The next section shows how to hide the collective entirely by overlapping it with the backward pass that produces the gradients, so that communication and computation run at once. That technique, and the gradient bucketing that enables it, is the subject of <a href="section-4.10.html">Section 4.10</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.9.1: Read the Placement From the Numbers <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A colleague reports that an eight-way gradient all-reduce of a $1$ GB buffer is taking about $150$ milliseconds per step, and asks whether the algorithm is buggy. Using Output 4.9.1, diagnose the likely cause without seeing any code. What single piece of cluster information would confirm your diagnosis, and what one change would you propose first? Explain why an algorithmic change (a different all-reduce implementation) is unlikely to close most of the gap.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.9.2: When Does Hierarchy Pay? <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 4.9.2 to sweep the buffer size $P$ from $2^{16}$ to $2^{28}$ parameters and plot the speedup of the hierarchical collective over the flat scattered ring at each size. Confirm from your plot that the speedup is largest for small buffers (latency-bound) and shrinks toward a floor for large buffers (bandwidth-bound). Then explain, using the $2(n-1)$ step count in the formula, exactly why shrinking the number of network hops helps the small-buffer case so much more than the large-buffer case.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.9.3: Lay Out a 3D-Parallel Job <span class="exercise-type analysis">Analysis</span></div>
+<p>You must train on $64$ GPUs arranged as $8$ nodes of $8$ GPUs, using $8$-way tensor parallelism, $2$-way pipeline parallelism, and $4$-way data parallelism ($8 \times 2 \times 4 = 64$). Using Table 4.9.1, assign each of the three parallel dimensions to a level of the interconnect (intra-node NVLink vs cross-node network) and justify each choice from the collective it runs and its traffic. Then estimate, with the alpha-beta intuition from this section, which single misplacement would cost you the most, and argue why. Forward-reference how <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a> would express this layout.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-4.8.html"><span class="nav-label">Previous</span><span class="nav-num">Section 4.8</span><span class="nav-title">Communication Libraries</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 4</span><span class="nav-num">Contents</span><span class="nav-title">Communication Primitives for Distributed Training</span></a>
+<a class="next" href="section-4.10.html"><span class="nav-label">Next</span><span class="nav-num">Section 4.10</span><span class="nav-title">Overlapping Communication with the Backward Pass</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

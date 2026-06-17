@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 4.5: All-Gather and Reduce-Scatter. The two halves of all-reduce, and the primitives that let ZeRO and FSDP keep each rank holding only a shard of the weights, optimizer state, and gradients." name="description"/>
+<title>Section 4.5: All-Gather and Reduce-Scatter | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Distributed AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 4: Communication Primitives for Distributed Training</a></div>
+<h1>All-Gather and Reduce-Scatter: The Primitives Behind ZeRO and FSDP</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I only ever hold one eighth of the weights. Right before the layer runs, I borrow the other seven eighths, do the math, and politely give them back."</p>
+<cite>A Shard That Believes It Is the Whole Model</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>All-reduce hides two simpler collectives inside it, and pulling them apart is what lets a model too big for one accelerator train anyway.</strong> Reduce-scatter sums one vector across all ranks and then hands each rank only its own slice of the result. All-gather does the reverse: each rank contributes its slice and ends up holding the full concatenation. Run reduce-scatter and then all-gather and you have performed an all-reduce, which is exactly how the ring algorithm of <a href="section-4.4.html">Section 4.4</a> works. The same two primitives, used on their own rather than back to back, are the engine of sharded data parallelism (ZeRO and FSDP): each rank stores only a shard of the parameters and optimizer state, all-gathers the full weights just in time to compute a layer, and reduce-scatters the gradients afterward so that it keeps only the shard it owns. This section builds both primitives from scratch, verifies the all-reduce identity in running code, and shows why FSDP trades extra communication for a large cut in memory.</p>
+</div>
+<p>In <a href="section-4.3.html">Section 4.3</a> we used all-reduce as a single indivisible operation: every worker arrives with a gradient vector, and every worker leaves with the elementwise sum. <a href="section-4.4.html">Section 4.4</a> then opened the box and showed that the bandwidth-optimal ring algorithm never moves the whole vector to one place; it works in two passes, a reduce phase and a broadcast phase, each touching only $1/K$ of the data per step. Those two phases are not improvised. Each one is a named collective in its own right, useful far beyond all-reduce, and this section gives them their names and their independent uses. The payoff is immediate: once you can reduce-scatter and all-gather separately, you can hold only a fraction of a model on each device and still train it, which is the central trick of memory-efficient large-model training.</p>
+
+<h2>1. Two Primitives, and the Identity That Links Them <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Fix a group of $K$ ranks. Suppose every rank $k$ holds a vector $g_k$ of length $P$, and we want the elementwise sum $s = \sum_{k=1}^{K} g_k$. All-reduce leaves the full vector $s$ on every rank. The two primitives of this section split that goal cleanly in half by deciding <em>who ends up holding what</em>.</p>
+<p>Reduce-scatter performs the same elementwise reduction but then keeps each rank's appetite small: it partitions the length-$P$ result into $K$ contiguous slices and delivers slice $k$ to rank $k$ only. After a reduce-scatter, no single rank holds the whole sum; rank $k$ holds just $s$ restricted to its slice, a vector of length $P/K$. Writing $s^{(j)}$ for the $j$-th slice of the summed vector,</p>
+$$\text{reduce-scatter:}\quad \text{rank } k \text{ ends with } s^{(k)} = \Big(\sum_{i=1}^{K} g_i\Big)^{(k)}, \qquad k = 1, \dots, K.$$
+<p>All-gather is purely about movement, with no arithmetic. Each rank $k$ starts holding one slice $a_k$ of length $P/K$, and the operation makes every rank end with the full concatenation of all slices in rank order:</p>
+$$\text{all-gather:}\quad \text{every rank ends with } a = \big[\,a_1 \,\Vert\, a_2 \,\Vert\, \cdots \,\Vert\, a_K\,\big].$$
+<p>Now compose them. Start with the vectors $g_k$, reduce-scatter so that rank $k$ holds $s^{(k)}$, then all-gather those owned slices. Each rank contributes its $s^{(k)}$ and receives the concatenation $[s^{(1)} \Vert \cdots \Vert s^{(K)}]$, which is exactly the full sum $s$. Every rank now holds $s$. That is the definition of all-reduce, so</p>
+$$\boxed{\;\text{all-reduce} \;=\; \text{reduce-scatter} \;\to\; \text{all-gather}\;}$$
+<p>This is not a loose analogy; it is an equality of results, and it is precisely the two-phase structure of the ring all-reduce in <a href="section-4.4.html">Section 4.4</a>. The reduce phase of the ring <em>is</em> a reduce-scatter (each rank ends owning the fully reduced value of one chunk), and the broadcast phase <em>is</em> an all-gather (each rank's owned chunk is propagated to everyone). Both phases move $P(K-1)/K$ elements per rank, so an all-reduce costs about twice a single all-gather, a fact we will spend later in the FSDP cost argument.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: All-Reduce Is a Composite, Not an Atom</div>
+<p>Treat all-reduce as reduce-scatter followed by all-gather, and three things fall out at once. First, you understand the bandwidth-optimal ring algorithm, because it literally is those two phases. Second, you gain two reusable primitives that solve different problems: reduce-scatter when each rank needs only its own slice of a sum, all-gather when each rank needs everyone's slice. Third, you can break the composite apart in time, all-gathering weights at one moment and reduce-scattering gradients at another, which is the entire idea behind sharded data parallelism.</p>
+</div>
+
+<h2>2. Verifying the Identity in Code <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The cleanest way to trust the identity is to implement both primitives on simulated shards and check that their composition reproduces a direct all-reduce, number for number. The code below represents the $K$ ranks as rows of a single array (so we can see everything at once on one machine), implements reduce-scatter and all-gather as plain array operations, and compares <code>reduce-scatter then all-gather</code> against a direct sum. It then plays the FSDP cycle in miniature: shard a full weight vector, all-gather it back to compute, and reduce-scatter a batch of per-rank gradients so each rank keeps only its slice.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+K, P = 4, 12                      # workers, parameter-vector length
+g = rng.standard_normal((K, P))   # g[k] = the gradient computed on worker k
+
+# --- reduce-scatter: sum across workers, then each rank keeps only its slice ---
+def reduce_scatter(g):
+    K, P = g.shape
+    assert P % K == 0
+    total = g.sum(axis=0)                       # the summed (reduced) full vector
+    slices = total.reshape(K, P // K)           # slice s belongs to rank s
+    return slices                               # out[k] = rank k's owned shard
+
+# --- all-gather: each rank contributes its shard; everyone ends with the concat ---
+def all_gather(shards):
+    return np.concatenate(shards, axis=0)       # length-P vector, identical on all ranks
+
+# --- the identity: all-reduce == reduce-scatter then all-gather ---
+owned = reduce_scatter(g)                       # K shards, one per rank
+allgathered = all_gather(owned)                 # full summed vector, on every rank
+allreduce_ref = g.sum(axis=0)                   # direct all-reduce (SUM)
+
+print("workers K, params P        :", K, P)
+print("reduce-scatter shard shape :", owned.shape, "(K shards of P/K)")
+print("max abs diff vs all-reduce :", f"{np.max(np.abs(allgathered - allreduce_ref)):.2e}")
+print("identity holds (RS+AG==AR) :", np.allclose(allgathered, allreduce_ref))
+
+# --- FSDP cycle in miniature: shard -> all-gather to compute -> reduce-scatter grads ---
+full_w = rng.standard_normal(P)                 # the layer's true full weight
+w_shards = full_w.reshape(K, P // K)            # each rank stores only its shard
+gathered_w = all_gather([w_shards[k] for k in range(K)])
+print("FSDP all-gather rebuilds w :", np.allclose(gathered_w, full_w))
+per_rank_grad = rng.standard_normal((K, P))     # each rank's grad for the FULL layer
+kept = reduce_scatter(per_rank_grad)            # after backward, keep only your shard
+print("each rank keeps P/K grads  :", kept.shape[1], "of", P)
+</code></pre>
+<div class="code-caption"><strong>Code 4.5.1:</strong> Reduce-scatter and all-gather built from array primitives, with the all-reduce identity checked directly and the FSDP gather-compute-scatter cycle played out on a single weight vector.</div>
+<pre><code class="language-text">workers K, params P        : 4 12
+reduce-scatter shard shape : (4, 3) (K shards of P/K)
+max abs diff vs all-reduce : 0.00e+00
+identity holds (RS+AG==AR) : True
+FSDP all-gather rebuilds w : True
+each rank keeps P/K grads  : 3 of 12
+</code></pre>
+<div class="code-caption"><strong>Output 4.5.1:</strong> The composition of reduce-scatter and all-gather matches the direct all-reduce exactly (zero difference), all-gather rebuilds the full weight from four shards, and after the backward step each rank retains only $P/K = 3$ of the $12$ gradient entries it computed.</div>
+<p>The difference is not merely small; it is exactly zero, because both primitives only add and copy floating-point numbers that the direct all-reduce also adds in the same grouping. The last two lines are the heart of the next part: each rank can store a third of a weight, briefly borrow the rest to compute, and after the backward pass discard everything except its own third of the gradient. Nothing about correctness changed; only the peak memory each rank must hold changed, and dramatically.</p>
+
+<h2>3. Sharded Data Parallelism: ZeRO and FSDP <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Plain data parallelism (<a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>) replicates the entire model on every worker: every rank holds a full copy of the parameters, the gradients, and, expensively, the optimizer state. For an Adam-trained model in mixed precision, the optimizer state and master weights can be several times the size of the parameters themselves, so replication wastes most of the memory on every device holding identical copies. The insight of ZeRO (Zero Redundancy Optimizer) and its PyTorch sibling FSDP (Fully Sharded Data Parallel) is that this redundancy is unnecessary: with $K$ ranks, shard each of those tensors into $K$ pieces and have rank $k$ permanently own only piece $k$. No rank holds a full copy of anything large at rest.</p>
+<p>The cost of holding only a shard is that the full weights of a layer do not exist on any single device when that layer needs to run. The two primitives of this section supply them on demand, and the rhythm is a tight cycle repeated layer by layer:</p>
+<ol>
+<li><strong>All-gather the weights.</strong> Just before a layer's forward pass, the group all-gathers that layer's parameter shards so every rank momentarily holds the full layer weights and can compute the layer's output. The gathered copy is freed as soon as the layer finishes, so only one layer's full weights ever sit in memory at once.</li>
+<li><strong>All-gather again for backward.</strong> The same all-gather reconstructs the layer's full weights during the backward pass so each rank can compute the gradient with respect to the complete weight tensor.</li>
+<li><strong>Reduce-scatter the gradients.</strong> After backward, each rank holds a full-length gradient for the layer (summed contributions from its own microbatch). A reduce-scatter sums these across ranks and leaves rank $k$ holding only slice $k$ of the averaged gradient, exactly the slice whose optimizer state and parameters rank $k$ owns. Rank $k$ then updates its shard locally.</li>
+</ol>
+<p>Figure 4.5.1 draws both halves of the story: the identity on top (reduce-scatter plus all-gather reconstituting an all-reduce) and the FSDP gather-compute-scatter cycle below. Notice that plain data parallelism's single gradient all-reduce per step has been replaced by, per layer, two all-gathers (forward and backward) plus one reduce-scatter. Since an all-reduce already equals one all-gather plus one reduce-scatter, FSDP communicates roughly one-and-a-half times the volume of plain data-parallel training. That extra traffic is the price, and in return each rank's resident memory for parameters, gradients, and optimizer state falls by a factor of about $K$.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 540" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Top panel: four ranks each holding a full gradient vector pass through a reduce-scatter that leaves each rank one summed slice, then an all-gather that gives every rank the full summed vector, equalling an all-reduce. Bottom panel: an FSDP cycle where each rank stores one weight shard, all-gathers the full layer weights to compute forward and backward, then reduce-scatters gradients back to one shard per rank.">
+<defs>
+<marker id="ar45" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.bx45 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.5; }
+.wk45 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.5; }
+.gn45 { fill:#eaf5ec; stroke:#2f7d46; stroke-width:1.5; }
+.t45 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s45 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.op45 { font:600 13px sans-serif; fill:#7a2f12; text-anchor:middle; }
+.ln45 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#ar45); }
+.div45 { stroke:#c8d0da; stroke-width:1.2; stroke-dasharray:5 4; }
+</style>
+<text class="t45" x="440" y="22">Identity: reduce-scatter then all-gather equals all-reduce</text>
+<text class="s45" x="70" y="46">each rank: full g</text>
+<rect class="bx45" x="30" y="56" width="80" height="40" rx="6"/><text class="t45" x="70" y="81">g&#8321;</text>
+<rect class="bx45" x="30" y="100" width="80" height="40" rx="6"/><text class="t45" x="70" y="125">g&#8322;</text>
+<rect class="bx45" x="30" y="144" width="80" height="40" rx="6"/><text class="t45" x="70" y="169">g&#8323;</text>
+<rect class="bx45" x="30" y="188" width="80" height="40" rx="6"/><text class="t45" x="70" y="213">g&#8324;</text>
+<line class="ln45" x1="115" y1="142" x2="195" y2="142"/>
+<text class="op45" x="265" y="120">reduce-</text><text class="op45" x="265" y="136">scatter</text>
+<text class="s45" x="265" y="158">sum, keep</text><text class="s45" x="265" y="172">own slice</text>
+<text class="s45" x="375" y="46">each rank: 1 slice of s</text>
+<rect class="gn45" x="335" y="56" width="80" height="40" rx="6"/><text class="t45" x="375" y="81">s&#8317;&#185;&#8318;</text>
+<rect class="gn45" x="335" y="100" width="80" height="40" rx="6"/><text class="t45" x="375" y="125">s&#8317;&#178;&#8318;</text>
+<rect class="gn45" x="335" y="144" width="80" height="40" rx="6"/><text class="t45" x="375" y="169">s&#8317;&#179;&#8318;</text>
+<rect class="gn45" x="335" y="188" width="80" height="40" rx="6"/><text class="t45" x="375" y="213">s&#8317;&#8308;&#8318;</text>
+<line class="ln45" x1="420" y1="142" x2="500" y2="142"/>
+<text class="op45" x="565" y="128">all-gather</text>
+<text class="s45" x="565" y="150">everyone gets</text><text class="s45" x="565" y="164">full sum s</text>
+<rect class="gn45" x="635" y="56" width="120" height="40" rx="6"/><text class="t45" x="695" y="81">s = &#931; g&#8342;</text>
+<rect class="gn45" x="635" y="100" width="120" height="40" rx="6"/><text class="t45" x="695" y="125">s = &#931; g&#8342;</text>
+<rect class="gn45" x="635" y="144" width="120" height="40" rx="6"/><text class="t45" x="695" y="169">s = &#931; g&#8342;</text>
+<rect class="gn45" x="635" y="188" width="120" height="40" rx="6"/><text class="t45" x="695" y="213">s = &#931; g&#8342;</text>
+<text class="s45" x="695" y="46">each rank: full s (all-reduce)</text>
+<line class="div45" x1="30" y1="262" x2="850" y2="262"/>
+<text class="t45" x="440" y="290">FSDP cycle per layer: gather, compute, scatter</text>
+<rect class="wk45" x="40" y="320" width="150" height="56" rx="8"/>
+<text class="t45" x="115" y="344">rank k stores</text><text class="s45" x="115" y="362">only weight shard k</text>
+<line class="ln45" x1="195" y1="348" x2="265" y2="348"/>
+<text class="op45" x="330" y="330">all-gather</text>
+<rect class="gn45" x="265" y="338" width="130" height="46" rx="8"/>
+<text class="s45" x="330" y="358">full layer</text><text class="s45" x="330" y="374">weights (forward)</text>
+<line class="ln45" x1="400" y1="361" x2="455" y2="361"/>
+<rect class="bx45" x="455" y="338" width="120" height="46" rx="8"/>
+<text class="s45" x="515" y="358">compute fwd</text><text class="s45" x="515" y="374">+ backward</text>
+<line class="ln45" x1="580" y1="361" x2="635" y2="361"/>
+<text class="op45" x="700" y="330">reduce-</text><text class="op45" x="700" y="346">scatter</text>
+<rect class="wk45" x="635" y="354" width="200" height="46" rx="8"/>
+<text class="s45" x="735" y="374">rank k keeps grad shard k,</text><text class="s45" x="735" y="390">updates its own optimizer state</text>
+<path class="ln45" d="M 735 354 L 735 430 L 115 430 L 115 380"/>
+<text class="s45" x="430" y="448">next step: each rank again holds only its shard, peak memory cut by about K</text>
+</svg>
+<figcaption><strong>Figure 4.5.1:</strong> Top, the all-reduce identity: starting from a full gradient on each rank, a reduce-scatter sums and leaves every rank one slice of the result, then an all-gather propagates the slices so every rank holds the full sum, which is exactly an all-reduce. Bottom, the FSDP cycle: each rank stores only its weight shard at rest, all-gathers the full layer weights just in time for the forward and backward passes, then reduce-scatters the gradients so each rank keeps and updates only its own shard. The wrap-around arrow shows the cycle repeating with peak memory reduced by roughly a factor of $K$.</figcaption>
+</figure>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: One All-Reduce, Split Apart in Time</div>
+<p>The all-reduce of <a href="section-4.3.html">Section 4.3</a> synchronized gradients while every machine still held the whole model. Sharded data parallelism keeps the very same primitives but separates the halves in time: all-gather the weights when you need to compute, reduce-scatter the gradients when you are done. That separation is what converts a memory wall into a communication bill, and a communication bill is something the rest of this book knows how to manage. The parameter-server push-and-pull of <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a> sharded parameters across servers for the same reason; FSDP sharded them across the workers themselves and reaches for collectives instead of a central server.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: torch.distributed Gives You Both Primitives, and FSDP Wires Them For You</div>
+<p>Code 4.5.1 implemented the primitives by hand to expose the mechanics. In a real job you call them directly, or, more often, you never call them at all because FSDP inserts the all-gathers and reduce-scatters into the forward and backward passes automatically. The raw collectives are one line each:</p>
+<pre><code class="language-python"># Run with: torchrun --nproc_per_node=4 thisfile.py
+import torch, torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+dist.init_process_group("nccl")
+rank, world = dist.get_rank(), dist.get_world_size()
+
+# --- raw primitives ---
+shard = torch.ones(3, device="cuda") * rank          # this rank's slice
+full  = [torch.empty(3, device="cuda") for _ in range(world)]
+dist.all_gather(full, shard)                          # every rank now has all slices
+
+grad  = torch.randn(3 * world, device="cuda")        # full-length gradient
+out   = torch.empty(3, device="cuda")
+dist.reduce_scatter_tensor(out, grad, op=dist.ReduceOp.SUM)  # keep only my slice
+
+# --- or let FSDP schedule both around every layer ---
+model = FSDP(my_model)                                # shards params/grads/optimizer
+# forward/backward now all-gather weights and reduce-scatter grads under the hood
+</code></pre>
+<div class="code-caption"><strong>Code 4.5.2:</strong> The two collectives as single <code>torch.distributed</code> calls, and the one-line <code>FSDP</code> wrapper that schedules them around every layer. Roughly twenty lines of manual shard bookkeeping per layer collapse into the wrapper, which also overlaps the gathers with computation and frees each gathered weight as soon as its layer finishes.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The 13-Billion-Parameter Model That Refused to Fit</div>
+<p><strong>Who:</strong> A research engineer at a startup fine-tuning a 13-billion-parameter language model on a node of eight 40 GB GPUs.</p>
+<p><strong>Situation:</strong> Plain data-parallel training (one full replica per GPU) ran out of memory before the first step finished; Adam's optimizer state and master weights alone needed far more than 40 GB per device.</p>
+<p><strong>Problem:</strong> A single replica's parameters, gradients, and optimizer state summed to roughly 200 GB in mixed precision, and replication forced all of it onto every one of the eight GPUs.</p>
+<p><strong>Dilemma:</strong> Rent scarce 80 GB GPUs at a steep premium and keep replicating, or shard the model state across the eight 40 GB cards they already had and accept extra communication per step.</p>
+<p><strong>Decision:</strong> They sharded with FSDP, betting that the node's fast intra-node interconnect (<a href="section-4.2.html">Section 4.2</a>) would keep the added all-gather and reduce-scatter traffic cheap relative to the memory it saved.</p>
+<p><strong>How:</strong> They wrapped the transformer blocks in <code>FSDP</code> with per-block wrapping so each block's weights were all-gathered only while that block ran, then freed, keeping at most one block's full weights resident at a time.</p>
+<p><strong>Result:</strong> Resident state per GPU fell from about 200 GB to roughly 25 GB, the model trained on the eight 40 GB cards, and the per-step slowdown from the extra collectives was about 20 percent, far cheaper than renting 80 GB hardware.</p>
+<p><strong>Lesson:</strong> When the binding ceiling is memory rather than throughput, sharding the model state and paying in communication is the move; the all-gather and reduce-scatter are the levers that make a model fit where it otherwise could not.</p>
+</div>
+
+<h2>4. When the Trade Pays, and When It Does Not <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Sharding is not free, and the same cost discipline from <a href="../module-03-scalability-performance-models/index.html">Chapter 3</a> decides whether it helps. FSDP adds about half again the communication of plain data parallelism, so its benefit appears only when memory is the binding constraint. If a model already fits comfortably with room for the optimizer state, plain replication is faster because it communicates less. As the model grows past one device's memory, replication simply stops working, and FSDP's extra traffic becomes the price of training at all rather than a slowdown over a working alternative. The interesting regime is the middle, where the model nearly fits: there, partial sharding (shard the optimizer state but replicate the parameters, the lightest ZeRO stage) often wins by cutting memory enough to fit while adding the least communication.</p>
+<p>Two levers govern the trade. The first is interconnect speed: the all-gathers and reduce-scatters are bandwidth-bound, so a fast intra-node fabric makes sharding nearly free while a slow cross-node link makes it punishing, which is why FSDP shines within a node and is often combined with other parallelism strategies across nodes (<a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>). The second is overlap: because each layer's weight all-gather can be issued before the layer's compute begins, a good implementation prefetches the next layer's weights while the current layer runs, hiding most of the communication behind computation, a theme <a href="section-4.10.html">Section 4.10</a> develops for gradients.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Model That Is Never All in One Place</div>
+<p>Under full sharding there is a strange moment to savor: at rest, the complete model does not exist anywhere. No single GPU, and indeed no single process, holds all the weights at once. The full layer materializes for a few milliseconds inside an all-gather, does its job, and dissolves back into shards. The model is less an object than a recurring agreement among the ranks to briefly assemble, compute, and disband.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: FSDP2, ZeRO++, and Sharding That Hides Its Own Cost (2024 to 2026)</div>
+<p>The sharded-data-parallel line is actively engineered to shrink its communication tax. PyTorch's FSDP2 (the <code>fully_shard</code> API stabilized through 2024 to 2025) rebuilt the original FSDP on per-parameter <code>DTensor</code> sharding, giving cleaner composition with tensor and pipeline parallelism, lower memory fragmentation, and simpler mixed-precision and checkpointing semantics. On the DeepSpeed side, ZeRO++ (Wang et al., 2023, deployed and refined through this window) attacks the bandwidth directly with three changes: quantized weights during the all-gather (sending roughly half the bytes), a hierarchical secondary shard kept within each node to avoid slow cross-node gathers, and quantized gradients during the reduce-scatter, together reporting up to a fourfold cut in communication volume. A complementary thread overlaps and prefetches the collectives so aggressively that, on fast fabrics, the all-gather nearly vanishes behind compute. The common thread is that the primitives of this section stay fixed; the research is about moving fewer bytes through them and hiding the rest. We return to these trade-offs with the full parallelism toolkit in <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>.</p>
+</div>
+<p>We now have all-reduce decomposed into its two working halves and have seen those halves carry the entire weight of memory-efficient large-model training. Reduce-scatter and all-gather move data along the contiguous-slice partition we chose; the next section asks what happens when the destinations are not slices of one vector but entire messages that must each go to a different rank, the all-to-all pattern that routes tokens to experts in a mixture-of-experts model. That is the subject of <a href="section-4.6.html">Section 4.6</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.5.1: Count the Bytes <span class="exercise-type analysis">Analysis</span></div>
+<p>A model has $P = 8 \times 10^{9}$ parameters trained across $K = 8$ GPUs in a single node. Using the ring-style rule that a reduce-scatter and an all-gather each move $P(K-1)/K$ elements per rank, compute the per-rank communication volume of one plain data-parallel step (a single gradient all-reduce) and of one FSDP step (per layer: two all-gathers plus one reduce-scatter, but treat the model as one big layer for the estimate). Express the FSDP volume as a multiple of the data-parallel volume, and state in one sentence the condition on the model's memory footprint under which paying that multiple is worthwhile.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.5.2: Implement a Ring Reduce-Scatter <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 4.5.1 by replacing the one-shot <code>reduce_scatter</code> with a ring version that simulates $K$ ranks passing chunks around a logical ring for $K-1$ steps, accumulating into the chunk each rank will finally own (mirror the reduce phase of the ring all-reduce in <a href="section-4.4.html">Section 4.4</a>). Verify it produces the identical owned slices as the array version, then compose it with your all-gather and confirm the all-reduce identity still holds bit for bit. Print the total number of element-transfers and check it equals $K \cdot P(K-1)/K = P(K-1)$.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.5.3: Replicate, Shard, or Half-Shard? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>You must train three models on a node of eight 80 GB GPUs: (a) a 1-billion-parameter model, (b) a 30-billion-parameter model, (c) a 7-billion-parameter model where the parameters fit replicated but Adam's optimizer state does not. For each, decide among plain data parallelism (replicate everything), full FSDP (shard parameters, gradients, and optimizer state), and optimizer-state-only sharding (the lightest ZeRO stage). Justify each choice in terms of the binding ceiling and the communication each option adds, and explain why choosing full sharding for case (a) would waste bandwidth for no memory benefit.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-4.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 4.4</span><span class="nav-title">All-Reduce Algorithms and Ring All-Reduce</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 4</span><span class="nav-num">Contents</span><span class="nav-title">Communication Primitives for Distributed Training</span></a>
+<a class="next" href="section-4.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 4.6</span><span class="nav-title">All-to-All: Routing Tokens in Mixture-of-Experts</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

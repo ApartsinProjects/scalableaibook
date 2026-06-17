@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 7.5: Transformations and Actions. Spark's lazy transformations versus eager actions, why reduceByKey beats groupByKey, and how a chain of transformations plus one action becomes a single optimized job." name="description"/>
+<title>Section 7.5: Transformations and Actions | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Distributed Data Processing for AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 7: Spark and Distributed DataFrames</a></div>
+<h1>Transformations and Actions</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They kept asking me to map, filter, and join, and I kept nodding and writing it all down. I did not lift a finger until someone finally said count. Then I moved the whole cluster at once."</p>
+<cite>An RDD That Believes in Deadlines</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Every Spark program is built from exactly two kinds of operation: transformations, which are lazy and only record what you want done, and actions, which are eager and force the recorded work to run.</strong> This split is not a syntactic quirk; it is the lever that lets Spark fuse a long pipeline of operations into one optimized distributed job instead of materializing every intermediate result. The same split also exposes the single most consequential choice in distributed data processing for AI: when you aggregate, do you move every record across the network (<code>groupByKey</code>) or do you combine locally first and move only the summaries (<code>reduceByKey</code>)? That choice is the Spark form of the combiner you met in <a href="../module-06-mapreduce-distributed-algorithms/section-6.4.html">Section 6.4</a>, and getting it right can cut the bytes shuffled by thousands of times. This section builds the vocabulary, proves the saving with a runnable demo, and shows how a chain of transformations plus one action becomes a single job.</p>
+</div>
+<p>By now you have seen that a Spark program describes a computation over a distributed collection without saying when any of it happens. <a href="section-7.4.html">Section 7.4</a> explained the mechanism behind that delay: Spark records your operations as a directed acyclic graph and waits before executing it. This section gives the two halves of the API their names and their costs. A <em>transformation</em> takes a distributed collection (an RDD or a DataFrame) and returns a new one, lazily, adding a node to the graph and computing nothing. An <em>action</em> asks for a concrete result, a count, a written file, a list of rows pulled back to the driver, and that request is what finally triggers execution of the whole recorded graph. Learn which operations fall on which side, and learn what each one costs, and you can read the performance of a Spark job off its source code before you ever run it.</p>
+
+<h2>1. Two Kinds of Operation, One Execution Model <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The rule is mechanical and worth stating exactly. If an operation returns another distributed collection, it is a transformation and it is lazy: nothing runs, Spark just extends the lineage graph. If an operation returns something that is not a distributed collection, a number, a Python list, a written-out dataset, it is an action and it is eager: Spark compiles every transformation feeding into it and launches a distributed job. The return type is the tell. <code>filter</code> hands you back another RDD, so it waits; <code>count</code> hands you back an integer, so it runs.</p>
+<p>Transformations themselves come in two flavors that matter enormously for cost. A <em>narrow</em> transformation needs only the records already on a partition to produce that partition's output: <code>map</code> applies a function to each record, <code>filter</code> drops records that fail a predicate, <code>flatMap</code> lets each record expand into zero or more outputs. No data crosses the network, so narrow transformations are nearly free relative to the alternative. A <em>wide</em> transformation needs records from many partitions to land together: <code>groupByKey</code>, <code>reduceByKey</code>, and <code>join</code> all gather every record sharing a key onto one partition, which means moving data across machines. That movement is the <em>shuffle</em>, the same expensive all-to-all redistribution you met as the heart of MapReduce in <a href="../module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a>, and it is the dominant cost in most Spark jobs. Table 7.5.1 lays out the common operations on both axes.</p>
+<div class="table-caption"><strong>Table 7.5.1:</strong> The Spark vocabulary in practice. Transformations are lazy and split into narrow (no network movement) and wide (a shuffle); actions are eager and trigger a job. The cost column is what to fear before you run anything.</div>
+<table>
+<thead>
+<tr><th scope="col">Operation</th><th scope="col">Kind</th><th scope="col">Returns</th><th scope="col">Cost to watch</th></tr>
+</thead>
+<tbody>
+<tr><td><code>map</code>, <code>filter</code>, <code>flatMap</code></td><td>Transformation (narrow)</td><td>New RDD/DataFrame</td><td>Cheap; no shuffle, runs in place</td></tr>
+<tr><td><code>reduceByKey</code></td><td>Transformation (wide)</td><td>New RDD</td><td>Shuffle, but map-side combine shrinks it</td></tr>
+<tr><td><code>groupByKey</code></td><td>Transformation (wide)</td><td>New RDD</td><td>Shuffle of every record; can blow up</td></tr>
+<tr><td><code>join</code></td><td>Transformation (wide)</td><td>New RDD/DataFrame</td><td>Shuffle of both sides unless broadcast</td></tr>
+<tr><td><code>count</code></td><td>Action</td><td>Integer</td><td>Triggers a full job over all partitions</td></tr>
+<tr><td><code>take(n)</code>, <code>first</code></td><td>Action</td><td>List of <code>n</code> rows</td><td>Cheap; may touch only a few partitions</td></tr>
+<tr><td><code>collect</code></td><td>Action</td><td>List of all rows</td><td>Pulls everything to the driver; can OOM it</td></tr>
+<tr><td><code>saveAsTextFile</code>, <code>write</code></td><td>Action</td><td>Nothing (writes output)</td><td>Triggers a job; output stays distributed</td></tr>
+</tbody>
+</table>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Return Type Tells You Whether It Runs</div>
+<p>You never have to memorize a list of which operations are lazy. Ask one question: does this operation give me back another distributed collection, or a concrete value? A new RDD or DataFrame means a transformation, which records intent and runs nothing. Anything else, an <code>int</code>, a Python list, a written file, means an action, which forces every transformation behind it to execute as one distributed job. Performance reading of Spark code starts here: scan for the actions, because those are the only lines that actually move the cluster, and everything between two actions is fused into a single optimized plan.</p>
+</div>
+
+<h2>2. The Aggregation Choice: reduceByKey Versus groupByKey <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Two wide transformations can compute the same per-key aggregate, and choosing between them is the highest-leverage decision in this section. Suppose you have billions of <code>(key, value)</code> pairs and you want one summary per key, a sum, a mean, a count. The naive path is <code>groupByKey</code>: it shuffles every single record so that all values for a key arrive together on one partition, and only then do you reduce them. The efficient path is <code>reduceByKey</code>: it applies your combining function <em>twice</em>, once locally on each partition before the shuffle and once globally after, so each partition ships only one partial result per key instead of every raw record.</p>
+<p>This map-side combine is exactly the combiner optimization from <a href="../module-06-mapreduce-distributed-algorithms/section-6.4.html">Section 6.4</a>, now baked into a single API call. The mathematics that licenses it is that your reduction must be associative and commutative, so that partial reductions can be combined without changing the answer. For a commutative-associative operator $\oplus$ over the values $v_1, \dots, v_m$ of one key spread across partitions $\mathcal{P}_1, \dots, \mathcal{P}_p$,</p>
+$$\bigoplus_{j=1}^{m} v_j \;=\; \bigoplus_{i=1}^{p} \left( \bigoplus_{v_j \in \mathcal{P}_i} v_j \right),$$
+<p>the inner reductions run locally before any network traffic, and only the $p$ partial results per key cross the wire. The reduction in bytes shuffled is dramatic whenever the number of distinct keys is far smaller than the number of records, which is the common case for aggregation. Figure 7.5.1 contrasts the two dataflows.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two dataflows side by side. On the left, groupByKey sends every raw record from each map partition across the shuffle to reducers. On the right, reduceByKey combines records locally on each partition first, then sends only one small partial per key across the shuffle.">
+<defs>
+<marker id="arr75" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr75b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.b75 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w75 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g75 { fill:#eaf5ec; stroke:#2f7d46; stroke-width:1.6; }
+.t75 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.t75o { font:600 13px sans-serif; fill:#b86b1f; text-anchor:middle; }
+.s75 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.h75 { font:700 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.l75 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr75); }
+.l75b { fill:none; stroke:#b86b1f; stroke-width:2.4; marker-end:url(#arr75b); }
+</style>
+<text class="h75" x="220" y="24">groupByKey: shuffle every record</text>
+<text class="h75" x="660" y="24">reduceByKey: combine, then shuffle</text>
+<line x1="440" y1="40" x2="440" y2="340" stroke="#cdd5df" stroke-width="1.4" stroke-dasharray="5 4"/>
+<!-- left: groupByKey -->
+<rect class="b75" x="40" y="48" width="150" height="64" rx="8"/>
+<text class="t75" x="115" y="72">Partition 1</text>
+<text class="s75" x="115" y="92">250k raw records</text>
+<rect class="b75" x="40" y="128" width="150" height="64" rx="8"/>
+<text class="t75" x="115" y="152">Partition 2</text>
+<text class="s75" x="115" y="172">250k raw records</text>
+<rect class="g75" x="290" y="78" width="120" height="100" rx="8"/>
+<text class="t75" x="350" y="118">Reducers</text>
+<text class="s75" x="350" y="138">group by key,</text>
+<text class="s75" x="350" y="154">then reduce</text>
+<path class="l75" d="M 192 80 L 286 110"/>
+<path class="l75" d="M 192 160 L 286 146"/>
+<text class="s75" x="240" y="210">all 500k records</text>
+<text class="s75" x="240" y="226">cross the shuffle</text>
+<!-- right: reduceByKey -->
+<rect class="w75" x="468" y="48" width="150" height="64" rx="8"/>
+<text class="t75o" x="543" y="70">Partition 1</text>
+<text class="s75" x="543" y="88">250k records</text>
+<text class="s75" x="543" y="104">→ 20 partials</text>
+<rect class="w75" x="468" y="128" width="150" height="64" rx="8"/>
+<text class="t75o" x="543" y="150">Partition 2</text>
+<text class="s75" x="543" y="168">250k records</text>
+<text class="s75" x="543" y="184">→ 20 partials</text>
+<rect class="g75" x="720" y="78" width="120" height="100" rx="8"/>
+<text class="t75" x="780" y="118">Reducers</text>
+<text class="s75" x="780" y="138">merge the</text>
+<text class="s75" x="780" y="154">partials</text>
+<path class="l75b" d="M 620 80 L 716 110"/>
+<path class="l75b" d="M 620 160 L 716 146"/>
+<text class="s75" x="668" y="210">only ~40 partials</text>
+<text class="s75" x="668" y="226">cross the shuffle</text>
+<text class="s75" x="440" y="320" font-weight="700">same final per-key result, thousands of times less data moved</text>
+</svg>
+<figcaption><strong>Figure 7.5.1:</strong> Why <code>reduceByKey</code> beats <code>groupByKey</code> for aggregation. On the left, <code>groupByKey</code> ships every raw record across the shuffle before reducing. On the right, <code>reduceByKey</code> reduces each partition locally first (the map-side combine of <a href="../module-06-mapreduce-distributed-algorithms/section-6.4.html">Section 6.4</a>) and ships only one partial per key per partition. With 20 distinct keys over 500,000 records the right path moves a tiny fraction of the bytes, yet both produce an identical answer.</figcaption>
+</figure>
+<p>The demo below makes the saving concrete with no cluster required. It builds a million <code>(key, value)</code> pairs spread across four partitions with only twenty distinct keys, then accounts for the bytes each strategy would push through the shuffle: <code>groupByKey</code> sends every record, while <code>reduceByKey</code> first collapses each partition to one <code>(sum, count)</code> partial per local key and sends only those. It also checks that both paths produce the same per-key mean, so the saving is free of any accuracy cost.</p>
+<pre><code class="language-python">import random
+random.seed(7)
+
+# A dataset of (key, value) pairs spread across P map partitions.
+# Few distinct keys, many records per key: the classic aggregation shape.
+P, N_PER_PART = 4, 250_000
+KEYS = [f"user_{i:02d}" for i in range(20)]          # 20 distinct keys
+partitions = [[(random.choice(KEYS), random.random())
+               for _ in range(N_PER_PART)] for _ in range(P)]
+
+VAL_BYTES = 8                                          # an 8-byte float value
+kbytes = lambda k: len(k.encode("utf-8"))             # key size in bytes
+
+# groupByKey: every raw record is shuffled to the reducer that owns its key.
+group_bytes = sum(kbytes(k) + VAL_BYTES
+                  for part in partitions for k, _ in part)
+
+# reduceByKey: each partition first reduces to ONE (sum, count) partial per
+# local key, then ships only those partials. This is the map-side combine.
+PARTIAL_BYTES = 8 + 8                                  # (sum: float, count: int64)
+reduce_bytes = 0
+for part in partitions:
+    local = {}
+    for k, v in part:                                 # local reduce, no network
+        s, c = local.get(k, (0.0, 0)); local[k] = (s + v, c + 1)
+    reduce_bytes += sum(kbytes(k) + PARTIAL_BYTES for k in local)
+</code></pre>
+<div class="code-caption"><strong>Code 7.5.1:</strong> Accounting for the bytes each aggregation strategy pushes through the shuffle. The <code>groupByKey</code> path charges for every record; the <code>reduceByKey</code> path reduces each partition to one partial per key first, charging only for the partials.</div>
+<pre><code class="language-text">records total          : 1,000,000
+distinct keys          : 20
+map partitions         : 4
+groupByKey  shuffled   :    15.00 MB  (every record)
+reduceByKey shuffled   :   0.0018 MB  (one partial per key per partition)
+shuffle reduction      :     8152x less data moved
+max abs diff in means  : 6.27e-15  (identical result)
+</code></pre>
+<div class="code-caption"><strong>Output 7.5.1:</strong> <code>reduceByKey</code> moves roughly eight thousand times fewer bytes than <code>groupByKey</code> on this workload, and the per-key means agree to floating-point rounding. The saving grows with the ratio of records to distinct keys, which is exactly the regime aggregation lives in.</div>
+<p>The lesson generalizes past these two calls. Whenever an aggregation can be expressed as a commutative-associative reduction, prefer the variant that combines on the map side: <code>reduceByKey</code> over <code>groupByKey</code>, <code>aggregateByKey</code> with a sensible local merge, or in the DataFrame API a <code>groupBy().agg()</code> over built-in functions, which Spark's optimizer compiles into a partial-aggregate-then-final-aggregate plan automatically. The eight-thousand-fold gap in Output 7.5.1 is not an exotic edge case; it is the everyday difference between a job that fits in cluster memory and one that spills, stalls, or dies.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: groupByKey Is the API's Honest Mistake</div>
+<p>Spark keeps <code>groupByKey</code> in the API even though for aggregation it is almost always the wrong choice, a bit like keeping a "send everyone the entire mailing list" button next to "send a summary". It is not useless: when you genuinely need every value for a key in hand at once (say, to feed them to a non-reducible function), you have no choice but to gather them. The trap is reaching for it out of habit to compute a sum. The folklore fix, "if you wrote <code>groupByKey</code> and then immediately reduced, you wanted <code>reduceByKey</code>", has saved more cluster-hours than most tuning flags.</p>
+</div>
+
+<h2>3. Actions and Their Costs <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Actions are where the job actually happens, and they differ wildly in what they cost. The cheapest are the bounded ones. <code>take(n)</code> and <code>first</code> ask for only a handful of rows, and Spark is smart enough to evaluate just enough partitions to satisfy the request rather than scanning everything, so they are the right tools for peeking at data during development. <code>count</code> is more expensive because it must visit every partition, but it returns a single integer, so it is safe for the driver regardless of how large the dataset is.</p>
+<p>The action to respect is <code>collect</code>. It pulls <em>every</em> row of the distributed collection back to the single driver process, which means the entire dataset must fit in the driver's memory at once. On a dataset that lives across a hundred machines precisely because it does not fit on one, <code>collect</code> asks the driver to do the impossible, and the result is an out-of-memory crash that takes down the whole application. The discipline is simple: never call <code>collect</code> on data you have not already shrunk to driver scale, with a filter, an aggregation, or a <code>take</code>. When you want to persist a large result, use a writing action such as <code>write</code> or <code>saveAsTextFile</code>, which keeps the output distributed across the cluster and never funnels it through the driver.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The collect That Killed the Feature Job</div>
+<p><strong>Who:</strong> A data engineer building a training-feature table for a recommendation model on a shared Spark cluster.</p>
+<p><strong>Situation:</strong> A nightly job joined clickstream events to user profiles, aggregated per-user counts, and wrote a feature table for the next morning's training run.</p>
+<p><strong>Problem:</strong> The job crashed intermittently with a driver out-of-memory error, but only on heavy-traffic days, which made it hard to reproduce in a small test.</p>
+<p><strong>Dilemma:</strong> Request a larger driver instance to survive the spikes (more cost, and only postpones the ceiling), or find why a job that writes its output distributed was funneling data through the driver at all.</p>
+<p><strong>Decision:</strong> They audited the actions and found a <code>collect</code> left over from debugging, used to log "a few" example rows, that was actually pulling the entire aggregated table to the driver.</p>
+<p><strong>How:</strong> They replaced <code>df.collect()</code> in the logging line with <code>df.take(5)</code>, and confirmed the real output was written with <code>df.write.parquet(...)</code>, which stays on the cluster.</p>
+<p><strong>Result:</strong> Driver memory dropped from gigabytes to megabytes, the crashes stopped on every traffic level, and the larger driver was never needed.</p>
+<p><strong>Lesson:</strong> The most dangerous line in a Spark job is often a <code>collect</code> that looked harmless on small test data. Bound what reaches the driver with <code>take</code>, and keep large results distributed with a writing action.</p>
+</div>
+
+<h2>4. How a Chain Becomes One Job <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The payoff of laziness is that a long chain of transformations followed by a single action compiles into one optimized job rather than a sequence of materialized steps. Because Spark holds the whole transformation graph before any action fires, it can fuse adjacent narrow operations into a single pass over the data, push filters earlier so less data flows downstream, and choose how to execute each wide operation, all before the first byte moves. The boundaries between the resulting <em>stages</em> fall exactly at the shuffles: a run of narrow transformations becomes one stage that needs no network, and each wide transformation forces a stage boundary because data must be redistributed before the next run of work can begin. <a href="section-7.6.html">Section 7.6</a> shows how to keep an intermediate result in memory so repeated actions do not recompute the chain, and <a href="section-7.4.html">Section 7.4</a> covered the DAG machinery that makes this fusion possible.</p>
+<pre><code class="language-python"># PySpark, shown illustratively. logs is an RDD of raw request-log lines.
+result = (logs
+          .filter(lambda line: "ERROR" in line)        # narrow: no shuffle
+          .map(lambda line: (parse_service(line), 1))  # narrow: no shuffle
+          .reduceByKey(lambda a, b: a + b)             # wide: ONE shuffle here
+          .filter(lambda kv: kv[1] > 100))             # narrow: no shuffle
+
+top = result.take(10)   # the FIRST action: only now does any of the above run
+</code></pre>
+<div class="code-caption"><strong>Code 7.5.2:</strong> A four-transformation pipeline plus one action. The <code>filter</code>, <code>map</code>, and final <code>filter</code> are narrow and fuse with no network movement; the single <code>reduceByKey</code> is the only shuffle, so the job has exactly two stages split at that boundary. Nothing runs until <code>take(10)</code>.</div>
+<p>Read Code 7.5.2 the way Spark does. The first three lines and the last <code>filter</code> add nodes to a graph and compute nothing. The <code>take(10)</code> is the action that compiles the graph into a two-stage job: stage one fuses the <code>filter</code> and <code>map</code> and performs the map-side combine of the <code>reduceByKey</code>, then shuffles the small partials; stage two merges the partials, applies the final <code>filter</code>, and returns ten rows. The single <code>reduceByKey</code> rather than a <code>groupByKey</code> is what keeps that shuffle tiny, by exactly the factor Output 7.5.1 measured.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The DataFrame API Picks reduceByKey for You</div>
+<p>The RDD code above makes the map-side combine explicit. In the DataFrame and Spark SQL API you do not choose between <code>reduceByKey</code> and <code>groupByKey</code> at all; you express the aggregate declaratively and the Catalyst optimizer inserts a partial aggregation before the shuffle automatically, the same two-phase plan, with none of the manual reasoning:</p>
+<pre><code class="language-python">from pyspark.sql import functions as F
+
+errors_per_service = (df
+    .filter(F.col("level") == "ERROR")
+    .groupBy("service")
+    .agg(F.count("*").alias("n"))   # Catalyst plans partial + final aggregate
+    .filter(F.col("n") > 100))
+
+errors_per_service.show()           # the action that triggers the job
+</code></pre>
+<div class="code-caption"><strong>Code 7.5.3:</strong> The same aggregation in the DataFrame API. The explicit map-side combine of Code 7.5.1 becomes a built-in <code>agg</code> over <code>count</code>, and the optimizer guarantees the efficient partial-then-final plan, turning a correctness-and-performance decision into a one-line declaration.</div>
+</div>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Shuffle Is the Tax, and Combining Is How You Lower It</div>
+<p>The combine-before-you-shuffle pattern is not a Spark detail; it is the recurring move of this entire book. It first appeared as the MapReduce combiner in <a href="../module-06-mapreduce-distributed-algorithms/section-6.4.html">Section 6.4</a>, returns here as <code>reduceByKey</code>, and reappears in Part IV as the reason gradient all-reduce is structured to overlap and compress communication rather than ship every raw value (<a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>). The thesis is constant: distributing work across machines is worthwhile only when you keep the cost of moving data between them under control, and the single most reliable way to do that is to reduce locally before you communicate globally. Whenever you see a wide operation, ask whether a commutative-associative combine can shrink it first.</p>
+</div>
+
+<h2>5. Reading the Cost Off the Code <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The vocabulary of this section turns into a habit you can apply to any Spark program before running it. Scan for the actions first: they are the only lines that move the cluster, and counting them tells you how many jobs you are launching (re-running the same chain for several actions without caching recomputes it each time, a waste <a href="section-7.6.html">Section 7.6</a> fixes). Then, between actions, find the wide transformations: each is a shuffle and therefore a stage boundary and a network cost, while the narrow ones in between are nearly free. Finally, audit every aggregation for the <code>reduceByKey</code>-versus-<code>groupByKey</code> choice, and every <code>collect</code> for whether the data has really been shrunk to driver scale. Those three passes, actions, shuffles, and the combine-or-not decision, predict the performance of most Spark jobs without a profiler.</p>
+<p>This way of reading code also explains why the performance models of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a> apply so directly to Spark. The narrow transformations are the parallel computation that scales with more machines; the shuffles are the communication term that does not. A job dominated by narrow work scales out beautifully; a job dominated by a giant <code>groupByKey</code> shuffle is communication-bound, and adding machines helps little until you shrink the shuffle. The cost you read off the code is the cost the model predicts.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Shuffle and Aggregation at Foundation-Model Data Scale (2024 to 2026)</div>
+<p>The aggregate-before-you-shuffle principle is under active engineering as the datasets behind foundation models push into the tens of trillions of tokens. Apache Spark's adaptive query execution, generally available and refined through the Spark 3.4 and 3.5 releases (2023 to 2024), now coalesces shuffle partitions and splits skewed ones at runtime, automating much of the manual tuning this section describes. The disaggregated-shuffle line, exemplified by Apache Celeborn (which graduated to an Apache top-level project in 2024) and by cloud push-based shuffle services, moves shuffle data off executor local disks to a dedicated tier so that large aggregations survive node loss and scale past single-machine disk limits. In parallel, the data-deduplication and quality-filtering pipelines for corpora such as those behind recent open models lean on exactly the <code>reduceByKey</code>-style map-side combine to count and group near-duplicate documents across petabytes; the cost of that combine, not the model code, is often what bounds how much training data a team can afford to clean. We return to these large-scale data pipelines in <a href="../module-08-distributed-storage-data-loading/index.html">Chapter 8</a>.</p>
+</div>
+
+<p>You now have the two halves of the Spark API and their costs: transformations record intent lazily, actions force execution eagerly, and the choice to combine on the map side before a shuffle is the difference between a job that scales and one that chokes. The next question is how to control where data lives across partitions and how to avoid recomputing a chain you need more than once. That is the work of partitioning and caching, which <a href="section-7.6.html">Section 7.6</a> takes up next.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.5.1: Lazy or Eager? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each of the following, state whether it is a transformation or an action, and if it is a transformation, whether it is narrow or wide: (a) <code>rdd.map(f)</code>; (b) <code>rdd.count()</code>; (c) <code>rdd.groupByKey()</code>; (d) <code>rdd.filter(p)</code>; (e) <code>df.write.parquet(path)</code>; (f) <code>rdd.reduceByKey(g)</code>. Then explain, using only the rule from Section 1, how you could classify a Spark operation you have never seen before without consulting the documentation, and why <code>take(3)</code> can be far cheaper than <code>count()</code> even though both are actions.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.5.2: Measure the Combine <span class="exercise-type coding">Coding</span></div>
+<p>Reproduce the accounting in Code 7.5.1, then vary the number of distinct keys from 20 up to 200,000 while holding the total record count fixed at one million. Plot the bytes shuffled by <code>groupByKey</code> and by <code>reduceByKey</code> against the number of distinct keys, and find the point at which the two strategies move roughly the same amount of data. Explain in one paragraph why that crossover happens where it does, and what it says about when the map-side combine stops being worth it. (Hint: <code>reduceByKey</code> ships one partial per distinct key per partition.)</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.5.3: Count the Stages <span class="exercise-type analysis">Analysis</span></div>
+<p>Consider a pipeline that reads a dataset, applies a <code>filter</code>, a <code>map</code>, a <code>reduceByKey</code>, another <code>map</code>, a <code>join</code> with a second dataset, and finally writes the result. Without running anything, determine how many shuffles the job performs, how many stages it splits into, and which transformations fuse together inside each stage. Then argue how the stage count would change if the <code>reduceByKey</code> were replaced by a <code>groupByKey</code> followed by a manual <code>map</code> that sums, and whether the answer would be the same. Tie your reasoning to the communication term in the performance model of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-7.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 7.4</span><span class="nav-title">Lazy Evaluation and DAG Execution</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 7</span><span class="nav-num">Contents</span><span class="nav-title">Spark and Distributed DataFrames</span></a>
+<a class="next" href="section-7.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 7.6</span><span class="nav-title">Partitioning and Caching</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

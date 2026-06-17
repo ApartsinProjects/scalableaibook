@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 8.2: Object Storage and Distributed Filesystems. Where massive AI datasets actually live, the latency-versus-bandwidth trade that governs object stores, and why training reads in large sequential chunks." name="description"/>
+<title>Section 8.2: Object Storage and Distributed Filesystems | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Distributed Data Processing for AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 8: Distributed Storage and Data Loading</a></div>
+<h1>Object Storage and Distributed Filesystems</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They told me I had near-infinite capacity. They did not mention that every single one of my answers would arrive twenty milliseconds late."</p>
+<cite>An Object Store With Excellent Aggregate Throughput</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A petabyte-scale training corpus does not live on a hard drive; it lives in a storage system that is itself distributed across thousands of machines, and the shape of that system dictates how you must read from it.</strong> Two designs dominate. Object storage (Amazon S3, Google Cloud Storage, Azure Blob) is a flat key-to-blob map with effectively unbounded capacity, low cost, and very high aggregate throughput, but it charges a stiff latency toll on every individual request. Parallel POSIX filesystems (Lustre, GPFS, and their cloud cousins) give training jobs low-latency file access at a higher price per byte. The recurring lesson of this section is that object storage rewards a very specific access pattern: a small number of large, sequential reads rather than a flood of small random ones. Get that pattern right and one cheap object store can feed a thousand-GPU cluster; get it wrong and your accelerators starve while waiting on round trips.</p>
+</div>
+<p><a href="section-8.1.html">Section 8.1</a> argued that the storage layer, not the accelerator, often sets the ceiling on how large a training job can grow. This section opens the layer and looks inside. The question is concrete: when a dataset is too large for any single disk, where do its bytes physically reside, what does it cost to fetch them, and what access pattern keeps the cost low? The answer shapes everything that follows in this chapter, because the format choices of <a href="section-8.3.html">Section 8.3</a> and the loader pipelines of later sections all exist to serve one master, the storage system's preference for big sequential reads.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two storage architectures side by side. On the left, an object store shown as a flat bucket of keyed blobs reached only through a request gateway, with high per-request latency labeled. On the right, a parallel filesystem with metadata server and striped data servers giving low-latency POSIX reads. Worker clients read from both in parallel.">
+<defs>
+<marker id="arr82" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b82 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w82 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g82 { fill:#eef6ee; stroke:#2f7a3f; stroke-width:1.6; }
+.t82 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s82 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.m82 { font:11px monospace; fill:#14385c; text-anchor:middle; }
+.l82 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr82); }
+</style>
+<text class="t82" x="220" y="24">Object store (S3 / GCS / Blob)</text>
+<rect class="b82" x="60" y="40" width="320" height="150" rx="10"/>
+<text class="s82" x="220" y="60">flat key &#8594; blob map, near-infinite capacity</text>
+<rect class="w82" x="80" y="74" width="135" height="34" rx="6"/><text class="m82" x="147" y="96">data/shard-0000</text>
+<rect class="w82" x="225" y="74" width="135" height="34" rx="6"/><text class="m82" x="292" y="96">data/shard-0001</text>
+<rect class="w82" x="80" y="118" width="135" height="34" rx="6"/><text class="m82" x="147" y="140">data/shard-0002</text>
+<rect class="w82" x="225" y="118" width="135" height="34" rx="6"/><text class="m82" x="292" y="140">imgs/cat.jpg</text>
+<text class="s82" x="220" y="178">GET / PUT by key &#183; request gateway &#183; ~20 ms latency</text>
+<text class="t82" x="670" y="24">Parallel filesystem (Lustre / GPFS)</text>
+<rect class="g82" x="500" y="40" width="320" height="150" rx="10"/>
+<rect class="b82" x="600" y="54" width="120" height="32" rx="6"/><text class="s82" x="660" y="74">metadata server</text>
+<rect class="g82" x="520" y="104" width="80" height="60" rx="6"/><text class="s82" x="560" y="138">OSS 1</text>
+<rect class="g82" x="620" y="104" width="80" height="60" rx="6"/><text class="s82" x="660" y="138">OSS 2</text>
+<rect class="g82" x="720" y="104" width="80" height="60" rx="6"/><text class="s82" x="760" y="138">OSS 3</text>
+<text class="s82" x="660" y="180">POSIX reads striped across servers &#183; ~0.2 ms latency</text>
+<rect class="b82" x="120" y="288" width="120" height="40" rx="8"/><text class="t82" x="180" y="312">Worker 1</text>
+<rect class="b82" x="380" y="288" width="120" height="40" rx="8"/><text class="t82" x="440" y="312">Worker 2</text>
+<rect class="b82" x="640" y="288" width="120" height="40" rx="8"/><text class="t82" x="700" y="312">Worker K</text>
+<path class="l82" d="M 180 286 L 180 230 L 220 230 L 220 192"/>
+<path class="l82" d="M 440 286 L 440 230 L 240 230 L 240 192"/>
+<path class="l82" d="M 700 286 L 700 230 L 660 230 L 660 192"/>
+<text class="s82" x="430" y="350">many clients read in parallel; aggregate throughput scales with the number of streams</text>
+</svg>
+<figcaption><strong>Figure 8.2.1:</strong> The two homes for AI data. Left: an object store is a flat namespace mapping string keys to immutable blobs, reached only through a request gateway that imposes a fixed per-request latency. Right: a parallel filesystem splits a separate metadata path from striped data servers (object storage servers, OSS) to deliver low-latency POSIX reads. In both, the $K$ workers read in parallel, so the system's <em>aggregate</em> bandwidth is large even when a single request is slow.</figcaption>
+</figure>
+
+<h2>1. Object Storage: A Flat Map From Keys to Blobs <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>An object store presents a deceptively simple model. There is no directory tree, no file handle, no notion of appending a byte to the middle of a file. There is a bucket, and inside it a flat set of objects, each named by a string key and holding an opaque blob of bytes plus a little metadata. You interact with exactly four verbs: PUT an object under a key, GET an object by key (optionally a byte range of it), DELETE a key, and LIST keys that share a prefix. The slashes in a key like <code>data/2026/shard-0007.tar</code> are pure convention; the store sees one flat string, and the apparent folders are an illusion that the LIST-by-prefix operation maintains. This flatness is exactly what lets the design scale: with no tree to lock and no parent directories to update, the system can spread keys across thousands of storage nodes by hashing, and capacity grows by adding nodes rather than by enlarging any single one.</p>
+<p>That scalability is purchased with two concessions the storage layer of <a href="section-8.1.html">Section 8.1</a> warned about. The first is latency. Every GET travels through a request gateway that authenticates the caller, looks up which node holds the key, and only then begins streaming bytes, so the first byte arrives after a fixed delay measured in tens of milliseconds regardless of how small the object is. The second, historically, was consistency: for years the major object stores offered only eventual consistency, meaning a freshly written key might not appear in a LIST or might return a stale blob for a short window. Amazon S3 moved to strong read-after-write consistency for all operations in 2020, and the other major providers offer comparable guarantees today, so the modern worry is far smaller, but any pipeline that writes a shard and immediately re-lists the prefix should still know whether its store promises to show that write at once.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Object Storage Trades Per-Request Latency for Limitless Aggregate Throughput</div>
+<p>A single object GET is slow: a fixed latency floor sits in front of every request no matter how few bytes you ask for. But the store imposes almost no ceiling on how many GETs can run <em>at once</em>, across thousands of parallel streams and thousands of back-end nodes. So the way to extract real bandwidth is never to make one request faster; it is to make each request move many megabytes and to keep many such requests in flight. Latency you hide; aggregate throughput you harvest. Every data-loading decision in this chapter follows from that single asymmetry.</p>
+</div>
+
+<h2>2. The Latency Tax, Measured <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The asymmetry is easy to assert and easy to underestimate, so we make it quantitative. Model the time to read one object as a latency floor plus the bytes divided by the bandwidth of a single stream. If a request pays a fixed latency $\alpha$ seconds and then streams at $\beta$ bytes per second, reading an object of $b$ bytes costs</p>
+$$t_{\text{obj}}(b) = \alpha + \frac{b}{\beta}.$$
+<p>To read a whole dataset of $D$ bytes as $n$ equal objects, you pay the floor $n$ times, so the total is $t(n) = n\alpha + D/\beta$. The second term is fixed: it is the pure bandwidth cost of moving $D$ bytes and cannot be avoided. The first term, $n\alpha$, is the <em>latency tax</em>, and it is entirely under your control through the single choice of how many objects you split the data into. Cut $n$ by reading larger objects and the tax falls in proportion; balloon $n$ by reading millions of tiny files and the tax can dwarf the data itself. The code below sweeps $n$ across five orders of magnitude for a fixed 8 GiB dataset, using a 20 ms latency floor and a 200 MB/s per-stream bandwidth, both representative of a single object-store connection.</p>
+<pre><code class="language-python">import time
+
+# Model object-store access as a latency + bandwidth pipeline.
+# Per request: a fixed latency floor (RTT + auth + lookup), then bytes / bandwidth.
+LATENCY_S = 0.020          # 20 ms per-GET latency floor (typical S3 first-byte)
+BANDWIDTH_BPS = 200e6      # 200 MB/s sustained per stream after first byte
+DATASET_BYTES = 8 * 1024 * 1024 * 1024   # 8 GiB of training shards
+
+
+def transfer_time(n_objects):
+    """Wall-clock to read the whole dataset as n_objects equal GETs, one stream."""
+    bytes_each = DATASET_BYTES / n_objects
+    per_obj = LATENCY_S + bytes_each / BANDWIDTH_BPS
+    return n_objects * per_obj
+
+
+# Floor: pure bandwidth if latency were zero.
+bw_floor = DATASET_BYTES / BANDWIDTH_BPS
+
+print(f"{'objects':>12} {'bytes/obj':>12} {'latency tax':>12} {'total (s)':>10} {'MB/s eff':>9}")
+for n in (2_000_000, 200_000, 20_000, 2_000, 200, 64):
+    t = transfer_time(n)
+    lat = n * LATENCY_S
+    eff = DATASET_BYTES / t / 1e6
+    bpo = DATASET_BYTES / n
+    bpo_s = f"{bpo/1024:.1f} KiB" if bpo < 1024*1024 else f"{bpo/1024/1024:.1f} MiB"
+    print(f"{n:>12,} {bpo_s:>12} {lat:>11.1f}s {t:>9.1f} {eff:>9.1f}")
+
+print()
+print(f"bandwidth floor (zero latency): {bw_floor:.1f}s, {DATASET_BYTES/bw_floor/1e6:.0f} MB/s")
+small = transfer_time(2_000_000)
+large = transfer_time(64)
+print(f"2M tiny GETs vs 64 large reads : {small/large:.0f}x slower")
+</code></pre>
+<div class="code-caption"><strong>Code 8.2.1:</strong> A pure-Python latency-versus-bandwidth model of object-store reads. <code>transfer_time</code> pays the latency floor once per object and adds the unavoidable bandwidth term; sweeping the object count exposes the latency tax directly, with no network or cloud account required.</div>
+<pre><code class="language-text">     objects    bytes/obj  latency tax  total (s)  MB/s eff
+   2,000,000      4.2 KiB     40000.0s   40042.9       0.2
+     200,000     41.9 KiB      4000.0s    4042.9       2.1
+      20,000    419.4 KiB       400.0s     442.9      19.4
+       2,000      4.1 MiB        40.0s      82.9     103.6
+         200     41.0 MiB         4.0s      46.9     183.0
+          64    128.0 MiB         1.3s      44.2     194.2
+
+bandwidth floor (zero latency): 42.9s, 200 MB/s
+2M tiny GETs vs 64 large reads : 905x slower</code></pre>
+<div class="code-caption"><strong>Output 8.2.1:</strong> Reading the same 8 GiB as two million 4 KiB objects takes over eleven hours and yields 0.2 MB/s of useful throughput; reading it as 64 objects of 128 MiB takes 44 seconds and nearly saturates the 200 MB/s bandwidth floor, a 905x speedup from object size alone.</div>
+<p>The lesson is stark. The bottom rows hug the 42.9 second bandwidth floor because their latency tax has shrunk to seconds; the top row is buried under a forty-thousand-second tax that has nothing to do with the data and everything to do with the request count. The same bytes, the same network, the same store: the only thing that changed was whether the data was packed into a few large objects or scattered across millions of small ones. This is why a corpus of ten million individual JPEG files is a performance disaster on an object store, while the same images packed into a few thousand shard files stream at near line rate. The packing is not a micro-optimization; it is the difference between a job that finishes and one that never does.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Bucket of a Billion Tiny Files</div>
+<p>A reliable way to make a cloud bill spike is to store a training set as one object per training example. The bytes are cheap, but most object stores also charge <em>per request</em>, so two million GETs per epoch is two million billable operations, and at a few dollars per million requests an otherwise free dataset quietly grows a monthly serving cost. The tiny-file anti-pattern loses you throughput, latency, and money in a single stroke; consolidating into shards fixes all three at once.</p>
+</div>
+
+<h2>3. Why Training Reads in Large Sequential Chunks <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Output 8.2.1 explains a design choice that pervades every modern training pipeline: data is stored and read in large, sequential shards, not as many small random objects. A training epoch must visit every example, ideally in a shuffled order, and the naive way to shuffle is to fetch examples individually in random key order. On an object store that is the two-million-GET catastrophe from the top row. The standard fix is to pack thousands of examples into each shard (a tar file in the WebDataset convention, or a Parquet file in the lakehouse convention of <a href="section-8.3.html">Section 8.3</a>), read whole shards sequentially with a handful of large GETs, and recover randomness by shuffling the order of shards across workers and shuffling examples within a buffer in memory. The store sees big sequential reads; the model still sees a well-mixed stream. Randomness moves from the storage layer, where it is ruinously expensive, to the loader's memory, where it is nearly free.</p>
+<p>This is the same partitioning-and-sharding idea introduced as a distributed-systems concept in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/index.html">Chapter 2</a>, now applied to bytes on disk: the dataset is split into shards, the shards are assigned to workers, and each worker streams its assigned shards independently and in parallel. Because the workers do not coordinate to read, aggregate bandwidth scales with their number, exactly the parallel-clients picture on the right of Figure 8.2.1. The MapReduce input splits of <a href="../module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a> and the Spark partitions of <a href="../module-07-spark-dataframes/index.html">Chapter 7</a> are the same construct seen from the compute side; a shard is just an input split that a data loader, rather than a mapper, will consume.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: s3fs and fsspec Turn a Bucket Into a Filesystem</div>
+<p>Code 8.2.1 modeled object-store timing; reading real objects from Python is handled by <code>fsspec</code> and its S3 backend <code>s3fs</code>, which expose a bucket through an ordinary file-like API and add transparent read-ahead, byte-range GETs, and local caching. What would be dozens of lines of <code>boto3</code> pagination and multipart bookkeeping becomes a path string:</p>
+<pre><code class="language-python">import fsspec
+
+# Open a 128 MiB shard straight from S3 as if it were a local file.
+fs = fsspec.filesystem("s3", anon=False)
+for key in fs.glob("s3://my-bucket/data/shard-*.tar"):   # LIST by prefix
+    with fs.open(key, "rb", block_size=8 * 1024 * 1024) as f:
+        chunk = f.read()                                 # one large sequential GET
+        # ... hand `chunk` to the loader / tar reader ...
+</code></pre>
+<div class="code-caption"><strong>Code 8.2.2:</strong> The same large-sequential-read pattern from Output 8.2.1, expressed with <code>fsspec</code>/<code>s3fs</code>. The <code>block_size</code> argument controls read-ahead so each underlying GET moves megabytes, not kilobytes; the library handles authentication, retries, and multipart transport that raw <code>boto3</code> would force you to write by hand.</div>
+</div>
+
+<h2>4. Parallel Filesystems: Low-Latency POSIX at a Price <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Object storage is not the only home for AI data. High-performance computing centers, and the large GPU clusters that increasingly resemble them, often place training data on a parallel POSIX filesystem such as Lustre or IBM Spectrum Scale (GPFS), with the older Hadoop Distributed File System (HDFS) playing the same role for an earlier generation of big-data workloads. These systems present a real directory tree with real file handles, so any code that expects <code>open()</code> and <code>read()</code> works unchanged, and crucially they deliver a per-operation latency in the hundreds of microseconds rather than tens of milliseconds, two orders of magnitude below an object store. They achieve this by separating a metadata server, which resolves paths and permissions, from many data servers across which each file is striped, so a single large file is read in parallel from many disks at once (the right side of Figure 8.2.1). For a workload that must do small random reads, or that runs unmodified POSIX code, this low latency is decisive.</p>
+<p>The price is literal and architectural. Parallel filesystems cost substantially more per terabyte than object storage, scale capacity less gracefully (the metadata server can become a bottleneck under millions of small files), and demand more operational care. The common pattern in practice is therefore a two-tier arrangement: the durable, cheap, near-infinite copy of the dataset lives in object storage, and a fast parallel filesystem or local NVMe acts as a cache that holds the working set for the current training run. Table 8.2.1 lays the two designs side by side so the choice rests on which property actually binds for a given job.</p>
+<div class="table-caption"><strong>Table 8.2.1:</strong> Object storage versus parallel filesystems for AI data. The right choice depends on which property binds: capacity and cost, or per-request latency and POSIX semantics.</div>
+<table>
+<thead>
+<tr><th scope="col">Property</th><th scope="col">Object storage (S3 / GCS / Blob)</th><th scope="col">Parallel filesystem (Lustre / GPFS)</th></tr>
+</thead>
+<tbody>
+<tr><td>Access model</td><td>GET/PUT/LIST by key, byte ranges</td><td>Full POSIX: open, read, seek, append</td></tr>
+<tr><td>Namespace</td><td>Flat key-to-blob map</td><td>Directory tree with metadata server</td></tr>
+<tr><td>Per-request latency</td><td>Tens of milliseconds</td><td>Hundreds of microseconds</td></tr>
+<tr><td>Capacity scaling</td><td>Effectively unbounded, add nodes</td><td>Large but bounded; metadata can bottleneck</td></tr>
+<tr><td>Cost per terabyte</td><td>Lowest</td><td>Several times higher</td></tr>
+<tr><td>Best access pattern</td><td>Few large sequential reads</td><td>Tolerates small random reads</td></tr>
+<tr><td>Typical role</td><td>Durable system of record</td><td>Hot cache for the active run</td></tr>
+</tbody>
+</table>
+
+<h2>5. How the Bytes Survive: Replication and Erasure Coding <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A storage system spread across thousands of disks is, at any moment, a system in which some disk has just failed. Durability cannot rest on any single copy, so distributed stores keep redundant encodings, and the two main strategies trade storage overhead against repair cost in a way worth understanding. The simpler is replication, the same recovery mechanism introduced for distributed systems in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.3.html">Section 2.3</a>: keep $r$ identical copies of each object on $r$ distinct machines, and the data survives as long as any one copy remains. Three-way replication ($r = 3$), long the HDFS default, tolerates two simultaneous failures but stores three bytes for every useful byte, a 200% overhead.</p>
+<p>Erasure coding achieves comparable durability at a fraction of that overhead. Split an object into $k$ data fragments, compute $m$ parity fragments with a Reed-Solomon code, and scatter all $k + m$ across distinct machines; any $k$ of the $k + m$ fragments suffice to reconstruct the object, so the system tolerates $m$ failures while storing only a $(k + m)/k$ multiple of the data. A common cloud configuration, $k = 10$ data and $m = 4$ parity fragments, tolerates four failures at just 40% storage overhead, far cheaper than the 200% of triple replication for a stronger failure tolerance. The catch is repair cost: rebuilding one lost fragment requires reading $k$ surviving fragments and recomputing, whereas a lost replica is restored by copying one intact replica, so erasure coding favors cold, rarely-read archival data while replication suits hot data that is reconstructed often. We can state the durability comparison precisely:</p>
+$$\text{overhead}_{\text{rep}} = r, \qquad \text{overhead}_{\text{ec}} = \frac{k + m}{k}, \qquad \text{both tolerate up to } (r-1) \text{ or } m \text{ losses respectively.}$$
+<p>For a training pipeline the practical consequence is reassuring: the object store you read from has already made these durability choices for you, typically erasure coding under the hood, and presents a single reliable GET. Your job is not to replicate the data yourself but to read it in the large sequential chunks that the encoding and the latency model both reward.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Image Loader That Starved a GPU Cluster</div>
+<p><strong>Who:</strong> A computer-vision team training a large image classifier on a 64-GPU cluster.</p>
+<p><strong>Situation:</strong> A 40-million-image dataset sat in an S3 bucket as one JPEG object per image, the way it had arrived from the annotation vendor.</p>
+<p><strong>Problem:</strong> The GPUs sat at under 15% utilization; profiling showed every worker blocked on object-store GETs, each fetching a single small image.</p>
+<p><strong>Dilemma:</strong> Move the whole dataset onto an expensive Lustre filesystem to cut per-request latency, or restructure how the data was packed and leave it on cheap object storage.</p>
+<p><strong>Decision:</strong> They repacked rather than re-homed, because the access pattern, not the storage tier, was the true fault, and Output 8.2.1 made the size effect unambiguous.</p>
+<p><strong>How:</strong> A one-time Spark job grouped the images into 4,000 shards of roughly 10,000 images each (about 100 MiB per shard) in the WebDataset tar layout, written back to the same bucket; the loader switched to streaming whole shards with shuffled order.</p>
+<p><strong>Result:</strong> Per-request latency stopped dominating, effective read throughput rose by more than an order of magnitude, GPU utilization climbed past 90%, and the storage bill fell because per-request charges collapsed from 40 million to a few thousand per epoch.</p>
+<p><strong>Lesson:</strong> When an object store starves your accelerators, suspect the object <em>size</em> before the storage <em>tier</em>. Repacking small files into large shards is cheaper than buying a faster filesystem and usually fixes the same symptom.</p>
+</div>
+
+<h2>6. Choosing the Layer for the Job <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The decision tree is short. If the dataset is enormous, append-mostly, read in large sequential passes, and cost-sensitive, which describes the vast majority of training corpora, object storage is the right system of record, and the work lies in packing the data into shards and hiding latency with prefetching. If the workload genuinely needs small random reads or runs unmodified POSIX code, or if the active working set is small enough to cache, a parallel filesystem or local NVMe earns its higher price as a hot tier in front of the durable object store. The honest answer is usually both, layered, with object storage as the foundation. The sharded, large-read access pattern that object storage demands is also what the columnar file formats of <a href="section-8.3.html">Section 8.3</a> are engineered to provide, and the prefetching loaders that hide the remaining latency are the subject of the sections that follow it. The storage layer sets the rules; the rest of the chapter learns to play by them.</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Closing the Storage-to-GPU Gap (2024 to 2026)</div>
+<p>As clusters grow past thousands of accelerators, the object-store-to-GPU path has become an active systems frontier. The Mountpoint for Amazon S3 client (AWS, 2024) presents a bucket as a POSIX mount tuned for the large sequential reads of training, narrowing the gap between object and file semantics without a separate filesystem. NVIDIA's GPUDirect Storage and the Storage-Next direction push reads from the store into GPU memory while bypassing the CPU and host buffers entirely, attacking the copy overhead that the bandwidth term of Code 8.2.1 hides. On the data side, the WebDataset and MosaicML Streaming (2023 to 2025) formats standardize shard layouts and deterministic, resumable shuffling directly over object storage, so a job can restart mid-epoch without re-reading from the start. The shared thread is unchanged from this section's model: every advance is a new way to feed the accelerator large sequential reads while hiding the latency floor, the quantity Output 8.2.1 makes concrete.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.2.1: Read the Tax Off the Curve <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the model $t(n) = n\alpha + D/\beta$ behind Code 8.2.1, explain in words why the bottom three rows of Output 8.2.1 cluster near 44 seconds while the top row explodes to over 40,000. At what object count does the latency tax $n\alpha$ first exceed the fixed bandwidth term $D/\beta = 42.9$ s, and what does that crossover tell a pipeline designer about the minimum sensible shard size? State the rule of thumb you would give a teammate in one sentence.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.2.2: Shard the Tiny Files <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 8.2.1 with a function <code>repack_time(n_small, examples_per_shard)</code> that models the one-time cost of reading <code>n_small</code> tiny objects once (paying the full latency tax) and writing them back as consolidated shards, then the per-epoch cost of reading those shards. For a dataset of two million 4 KiB examples, compute how many epochs of training are needed before the repack pays for itself versus reading the tiny files every epoch. Plot or print the break-even epoch count and explain why repacking is almost always worth it for any job that trains for more than one pass.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.2.3: Replication Versus Erasure Coding <span class="exercise-type analysis">Analysis</span></div>
+<p>A team must store a 2 PB durable copy of a training corpus that tolerates up to four simultaneous machine failures. Compare three-way replication ($r = 3$, which tolerates two failures, so consider $r = 5$ for four) against a Reed-Solomon $(k = 10, m = 4)$ erasure code using the overhead formulas in Section 5. Compute the raw stored bytes and the relative cost of each, then argue which you would choose given that this archive is read in full only a few times per quarter. Reference the repair-cost trade-off, and connect your reasoning to the durability mechanisms of <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.3.html">Section 2.3</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-8.1.html"><span class="nav-label">Previous</span><span class="nav-num">Section 8.1</span><span class="nav-title">Why the Storage Layer Determines Scale</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 8</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Storage and Data Loading</span></a>
+<a class="next" href="section-8.3.html"><span class="nav-label">Next</span><span class="nav-num">Section 8.3</span><span class="nav-title">Columnar Formats and the Lakehouse</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

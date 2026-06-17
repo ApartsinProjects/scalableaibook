@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 4.10: Overlapping Communication with the Backward Pass, and Gradient Bucketing. How gradients streaming out of the backward pass let all-reduce run behind compute, and how bucketing keeps each all-reduce bandwidth-efficient. Closes Chapter 4 with the collectives catalog and project ideas." name="description"/>
+<title>Section 4.10: Overlapping Communication with the Backward Pass, and Gradient Bucketing | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Distributed AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 4: Communication Primitives for Distributed Training</a></div>
+<h1>Overlapping Communication with the Backward Pass, and Gradient Bucketing</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I used to wait politely for every gradient to finish before saying a word. Then someone taught me to talk while the work was still happening, and the cluster has not been bored since."</p>
+<cite>An All-Reduce That Learned to Multitask</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The cheapest all-reduce is the one you never wait for. Because gradients become available layer by layer as the backward pass runs, the all-reduce of an early-finished layer can travel the network while later layers are still computing, hiding most of the communication behind work the accelerator was going to do anyway.</strong> Two systems tricks make this hiding effective. Overlap schedules each gradient's all-reduce the instant it is ready, so the network and the accelerator run at once instead of taking turns. Gradient bucketing groups many small gradient tensors into a few large ones, so each all-reduce moves enough bytes to be bandwidth-bound rather than latency-bound. Together they turn the communication tax of Section 4.1 from a serial penalty paid after every step into a cost that nearly vanishes behind compute. This is the single most important systems optimization for making data-parallel training scale, and it is exactly what PyTorch <code>DistributedDataParallel</code> does for you automatically.</p>
+</div>
+<p>Every collective in this chapter, all-reduce (<a href="section-4.3.html">Section 4.3</a>), all-gather and reduce-scatter (<a href="section-4.5.html">Section 4.5</a>), all-to-all (<a href="section-4.6.html">Section 4.6</a>), has so far been treated as an operation you call and then wait for. That framing is convenient but pessimistic. In a real training step the gradient all-reduce does not have to be a wall the accelerator stops at; it can run on the interconnect at the same time the accelerator keeps computing. This section is about why that overlap is possible at all, why naive overlap still leaves bandwidth on the table, and how bucketing recovers it. It is the optimization that decides whether adding a second machine makes training faster or merely busier.</p>
+
+<h2>1. Gradients Arrive Early, So Communication Can Start Early <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Backpropagation runs from the output layer back toward the input. The chain rule computes the gradient of the loss with respect to the last layer's parameters first, then the second-to-last, and so on, so a deep network's gradients do not appear all at once at the end of the backward pass; they stream out, one layer's worth at a time, from the top of the network down. By the time the backward pass is a quarter done, the gradients of roughly the last quarter of the layers are already final and will not change.</p>
+<p>This ordering is the whole opportunity. The all-reduce that averages the last layer's gradient across workers can be launched the moment that gradient is ready, while the accelerator is still busy computing the gradients of earlier layers. The network transfer and the remaining backward compute then run concurrently on two different pieces of hardware, the interconnect and the accelerator, neither of which has to idle waiting for the other. If the backward compute takes long enough, almost every all-reduce finishes underneath it, and the step pays for communication only at the very end, for whatever could not be hidden.</p>
+<p>Contrast that with the naive schedule, in which the worker completes the entire backward pass, then calls one all-reduce over all the gradients, then waits. There the accelerator sits idle for the full communication time, and the step costs compute <em>plus</em> communication rather than the maximum of the two. Section 4.1 introduced communication as a tax; overlap is how you avoid paying it in serial.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Overlap Turns a Sum Into a Maximum</div>
+<p>Without overlap, a data-parallel step costs $T_\text{compute} + T_\text{comm}$, because the accelerator and the network take turns. With perfect overlap, gradients that finish early are communicated while later gradients are still being computed, and the step costs only $\max(T_\text{compute},\, T_\text{comm})$ plus the small unavoidable tail of the last bucket. When compute dominates, that tail is all you pay, and communication becomes nearly free. Scaling out stops being a race between adding workers and drowning in their chatter.</p>
+</div>
+<p>Figure 4.10.1 shows the two schedules side by side as a timeline. In the overlapped schedule the all-reduce of each bucket slides underneath the compute of the layers that have not finished yet, so the colored communication bars sit beneath, not after, the compute bars.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A Gantt-style timeline comparing two backward-pass schedules. The top schedule runs all layer-compute blocks first and then a long all-reduce block afterward. The bottom schedule runs the same compute blocks but slides each bucket's all-reduce underneath the later compute blocks, so communication overlaps computation and the step finishes much earlier.">
+<defs>
+<marker id="arr410" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.cmp410 { fill:#dbe6f3; stroke:#14385c; stroke-width:1.2; }
+.com410 { fill:#fbe0c4; stroke:#b86b1f; stroke-width:1.2; }
+.lab410 { font:600 13px sans-serif; fill:#14385c; }
+.sm410  { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.smc410 { font:10px sans-serif; fill:#7a5a2a; text-anchor:middle; }
+.cmt410 { font:600 11px sans-serif; fill:#14385c; text-anchor:middle; }
+.ax410  { stroke:#9aa3ad; stroke-width:1; }
+.tick410{ font:10px sans-serif; fill:#7a808a; text-anchor:middle; }
+</style>
+<!-- top: no overlap -->
+<text class="lab410" x="20" y="40">No overlap</text>
+<text class="sm410" x="60" y="58" style="text-anchor:start">compute, then communicate</text>
+<!-- compute blocks -->
+<rect class="cmp410" x="120" y="68" width="60" height="34"/>
+<rect class="cmp410" x="180" y="68" width="60" height="34"/>
+<rect class="cmp410" x="240" y="68" width="60" height="34"/>
+<rect class="cmp410" x="300" y="68" width="60" height="34"/>
+<text class="cmt410" x="240" y="89">backward compute (all layers)</text>
+<!-- one long allreduce -->
+<rect class="com410" x="360" y="68" width="300" height="34"/>
+<text class="smc410" x="510" y="89">one all-reduce over every gradient</text>
+<line class="ax410" x1="120" y1="116" x2="660" y2="116"/>
+<line class="ax410" x1="660" y1="68" x2="660" y2="124"/>
+<text class="tick410" x="660" y="138">step ends late</text>
+<!-- bottom: overlapped + bucketed -->
+<text class="lab410" x="20" y="208">Overlap + bucketing</text>
+<text class="sm410" x="60" y="226" style="text-anchor:start">each bucket's all-reduce runs under later compute</text>
+<rect class="cmp410" x="120" y="236" width="80" height="34"/>
+<rect class="cmp410" x="200" y="236" width="80" height="34"/>
+<rect class="cmp410" x="280" y="236" width="80" height="34"/>
+<rect class="cmp410" x="360" y="236" width="80" height="34"/>
+<text class="cmt410" x="280" y="257">backward compute (same total)</text>
+<!-- overlapped comm bars underneath -->
+<rect class="com410" x="200" y="278" width="76" height="26"/>
+<text class="smc410" x="238" y="295">bucket A</text>
+<rect class="com410" x="280" y="278" width="76" height="26"/>
+<text class="smc410" x="318" y="295">bucket B</text>
+<rect class="com410" x="360" y="278" width="76" height="26"/>
+<text class="smc410" x="398" y="295">bucket C</text>
+<!-- small exposed tail -->
+<rect class="com410" x="440" y="278" width="40" height="26"/>
+<text class="smc410" x="460" y="295">tail</text>
+<line class="ax410" x1="120" y1="318" x2="480" y2="318"/>
+<line class="ax410" x1="480" y1="236" x2="480" y2="326"/>
+<text class="tick410" x="480" y="340">step ends early</text>
+<path d="M 660 116 L 660 150 L 480 150 L 480 232" fill="none" stroke="#14385c" stroke-width="1.6" stroke-dasharray="5,4" marker-end="url(#arr410)"/>
+<text class="cmt410" x="572" y="170">communication hidden behind compute</text>
+</svg>
+<figcaption><strong>Figure 4.10.1:</strong> Two schedules for the same backward pass. Top: the accelerator finishes all compute, then pays the full all-reduce time in series, so the step ends late. Bottom: each bucket of gradients is all-reduced as soon as its layers finish, so the communication bars (orange) slide beneath the later compute bars (blue) and only a short tail remains exposed at the end. The blue compute total is identical in both rows; only the placement of the orange communication differs.</figcaption>
+</figure>
+
+<h2>2. Why Bucketing: Many Small All-Reduces Are Latency-Bound <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Overlap alone is not enough, because a deep network has many parameter tensors, often hundreds, and most are small. If each tensor triggered its own all-reduce the instant it was ready, the worker would launch hundreds of tiny collectives per step. Recall the alpha-beta cost model from <a href="../module-03-scalability-performance-models/section-3.8.html">Section 3.8</a> and its application to collectives in <a href="section-4.4.html">Section 4.4</a>: moving a message of $n$ bytes costs $\alpha + n/\beta$, where $\alpha$ is a fixed per-message latency and $\beta$ is bandwidth. For a small $n$ the fixed $\alpha$ dominates, so the transfer is latency-bound and the expensive interconnect runs far below its bandwidth.</p>
+<p>Gradient bucketing fixes this by coalescing many small gradient tensors into a few large contiguous buffers, called buckets, and issuing one all-reduce per bucket. A bucket of $B$ tensors totaling $n$ bytes pays the latency $\alpha$ once instead of $B$ times, and because $n$ is now large the term $n/\beta$ dominates: the all-reduce is bandwidth-bound, which is the efficient regime. The bucket fires its all-reduce as soon as the last gradient assigned to it is ready, which is also what makes overlap practical: a handful of bucket-sized collectives are far easier to schedule underneath compute than hundreds of tiny ones.</p>
+<p>Bucket size is a genuine trade-off, not a knob to max out. Tiny buckets give the most overlap, because a bucket can fire as soon as its few layers finish, but they pay $\alpha$ many times and waste bandwidth. One giant bucket is maximally bandwidth-efficient but cannot fire until the entire backward pass is done, which destroys all overlap and reduces to the naive serial schedule. The sweet spot is a few buckets of tens of megabytes each: large enough to be bandwidth-bound, numerous enough that early buckets overlap the rest of the backward pass.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The 25 MB Default Nobody Tunes</div>
+<p>PyTorch's <code>DistributedDataParallel</code> ships with a default bucket size of 25 MB. The number looks suspiciously round because it is: it was chosen empirically to be comfortably past the latency-bound regime on common interconnects while still leaving several buckets to overlap. Most training jobs run for years on that default without anyone touching it, which is the highest compliment a systems heuristic can receive.</p>
+</div>
+
+<h2>3. Measuring How Much Communication Overlap Hides <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The cleanest way to feel the effect is to model a backward pass as a sequence of per-layer compute times and per-layer gradient sizes, then schedule the all-reduces two ways: serially after all compute, and overlapped as each bucket becomes ready. The code below does exactly that. It uses the alpha-beta cost model for each bucket's all-reduce, sweeps the bucket size from one layer per bucket up to one bucket for the whole model, and reports the step time under each schedule, the fraction of communication hidden behind compute, and the speedup.</p>
+<pre><code class="language-python">NUM_LAYERS = 48
+BYTES_PER_LAYER = 25_000_000        # 25 MB of gradients per layer (~6M fp32 params)
+COMPUTE_PER_LAYER_S = 0.0030        # 3.0 ms of backward compute per layer
+ALPHA_S = 0.000200                  # 200 us per-message launch latency
+BETA_BPS = 12e9                     # 12 GB/s effective all-reduce bandwidth
+TOTAL_COMPUTE = NUM_LAYERS * COMPUTE_PER_LAYER_S
+
+def comm_time(num_bytes):
+    return ALPHA_S + num_bytes / BETA_BPS            # alpha-beta cost (Section 4.4)
+
+def make_buckets(bucket_layers):                     # split layers into fixed-size groups
+    out, remaining = [], NUM_LAYERS
+    while remaining &gt; 0:
+        take = min(bucket_layers, remaining)
+        out.append(take); remaining -= take
+    return out
+
+def no_overlap_time(bucket_layers):                  # backward, THEN all communication
+    buckets = make_buckets(bucket_layers)
+    total_comm = sum(comm_time(b * BYTES_PER_LAYER) for b in buckets)
+    return TOTAL_COMPUTE + total_comm, total_comm
+
+def overlapped_time(bucket_layers):                  # each bucket overlaps later compute
+    buckets = make_buckets(bucket_layers)
+    t_compute, net_free_at = 0.0, 0.0                # compute cursor; network-idle time
+    for b in buckets:
+        t_compute += b * COMPUTE_PER_LAYER_S         # compute the layers feeding bucket
+        ct = comm_time(b * BYTES_PER_LAYER)
+        start = max(t_compute, net_free_at)          # wait for layers AND a free channel
+        net_free_at = start + ct
+    return max(t_compute, net_free_at), net_free_at  # step ends when both streams done
+
+serial_one, _ = no_overlap_time(1)
+for bl in (1, 2, 4, 8, 16, 48):
+    no_t, comm_t = no_overlap_time(bl)
+    ov_t, _ = overlapped_time(bl)
+    hidden = 1.0 - (ov_t - TOTAL_COMPUTE) / comm_t   # share of comm hidden under compute
+    print(f"bucket={bl:>2} layers  buckets={len(make_buckets(bl)):>2}  "
+          f"no-overlap={no_t*1000:6.1f}ms  overlap={ov_t*1000:6.1f}ms  "
+          f"hidden={hidden*100:5.1f}%  speedup={no_t/ov_t:.2f}x")
+print(f"\nideal (compute only)        : {TOTAL_COMPUTE*1000:.1f} ms")
+print(f"naive (1-layer, no overlap) : {serial_one*1000:.1f} ms")
+best_t, _ = overlapped_time(8)
+print(f"overlap + 8-layer buckets   : {best_t*1000:.1f} ms "
+      f"-&gt; {serial_one/best_t:.2f}x faster than naive")
+</code></pre>
+<div class="code-caption"><strong>Code 4.10.1:</strong> A discrete-event model of one data-parallel backward pass. <code>overlapped_time</code> advances a compute cursor layer by layer and lets each bucket's all-reduce start as soon as both its layers are done and the single network channel is free, capturing the two real constraints on overlap.</div>
+<pre><code class="language-text">bucket= 1 layers  buckets=48  no-overlap= 253.6ms  overlap= 146.3ms  hidden= 97.9%  speedup=1.73x
+bucket= 2 layers  buckets=24  no-overlap= 248.8ms  overlap= 148.4ms  hidden= 95.8%  speedup=1.68x
+bucket= 4 layers  buckets=12  no-overlap= 246.4ms  overlap= 152.5ms  hidden= 91.7%  speedup=1.62x
+bucket= 8 layers  buckets= 6  no-overlap= 245.2ms  overlap= 160.9ms  hidden= 83.3%  speedup=1.52x
+bucket=16 layers  buckets= 3  no-overlap= 244.6ms  overlap= 177.5ms  hidden= 66.7%  speedup=1.38x
+bucket=48 layers  buckets= 1  no-overlap= 244.2ms  overlap= 244.2ms  hidden=  0.0%  speedup=1.00x
+
+ideal (compute only)        : 144.0 ms
+naive (1-layer, no overlap) : 253.6 ms
+overlap + 8-layer buckets   : 160.9 ms -> 1.58x faster than naive</code></pre>
+<div class="code-caption"><strong>Output 4.10.1:</strong> Two effects in one table. Reading down the no-overlap column, large buckets shave a few milliseconds by paying the latency $\alpha$ fewer times (253.6 ms with 48 tiny all-reduces down to 244.2 ms with one). Reading down the overlap column, small buckets hide far more communication behind compute (97.9% hidden at one layer per bucket, 0% with a single bucket that cannot start until the backward pass ends). The practical winner is a moderate bucket: 8-layer buckets reach 160.9 ms, within 12% of the 144 ms compute-only floor.</div>
+<p>The table makes the tension between the two effects concrete. Overlap wants small buckets so communication starts early; bandwidth efficiency wants large buckets so latency is amortized. Neither extreme is best. The moderate bucket, a few tens of megabytes here, gets most of the overlap and most of the bandwidth, landing close to the ideal floor where the step costs essentially just the compute. That floor, $\max(T_\text{compute}, T_\text{comm})$, is the prize: when compute dominates, well-bucketed overlap makes the all-reduce nearly free.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The 8-GPU Job That Refused to Speed Up</div>
+<p><strong>Who:</strong> An ML platform engineer onboarding a vision team onto a new 8-GPU server.</p>
+<p><strong>Situation:</strong> The team had wrapped their model in <code>DistributedDataParallel</code> and expected close to 8x throughput, but measured only about 5x, with GPUs visibly idle between steps.</p>
+<p><strong>Problem:</strong> A profiler trace showed the backward pass finishing, then a long bar of all-reduce during which every GPU sat waiting, the classic serial communication tail.</p>
+<p><strong>Dilemma:</strong> Buy a faster interconnect, which is slow to procure and costly, or find out why the existing communication was not already overlapping with compute as DDP promises.</p>
+<p><strong>Decision:</strong> Investigate first. The model had been built with <code>find_unused_parameters=True</code> and a custom forward that touched parameters in an order that defeated DDP's bucket-ready detection, so buckets only fired after the whole backward finished.</p>
+<p><strong>How:</strong> They removed the unused-parameter flag, restored a clean module ordering so gradients became ready in reverse-layer order, and left the 25 MB bucket default alone.</p>
+<p><strong>Result:</strong> The all-reduce slid back underneath the backward pass, the idle bar disappeared, and throughput rose from about 5x to 7.4x, matching the overlap-column behavior in Output 4.10.1.</p>
+<p><strong>Lesson:</strong> Overlap is not automatic just because you called the right wrapper; it depends on gradients becoming ready in an order the framework can bucket and fire early. When scaling looks worse than expected, profile for an exposed communication tail before blaming the hardware.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: DistributedDataParallel Buckets and Overlaps for You</div>
+<p>Everything modeled in Code 4.10.1, choosing bucket boundaries, detecting when a bucket's gradients are all ready, firing its all-reduce mid-backward, and averaging the result, is built into PyTorch <code>DistributedDataParallel</code>. You write an ordinary training loop; DDP registers autograd hooks that coalesce gradients into buckets and launch each all-reduce as soon as the bucket fills, all overlapped with the rest of <code>loss.backward()</code>:</p>
+<pre><code class="language-python"># Run with: torchrun --nproc_per_node=8 train.py
+import torch, torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+dist.init_process_group("nccl")                     # join the group of K workers
+model = DDP(build_model().cuda(),                   # wrap once; hooks installed here
+            bucket_cap_mb=25)                        # the bucket size from Section 2
+
+for x, y in data_loader:                            # an ordinary training loop
+    loss = model(x).loss
+    loss.backward()      # gradients bucket + all-reduce + average, overlapped, here
+    optimizer.step(); optimizer.zero_grad()
+</code></pre>
+<div class="code-caption"><strong>Code 4.10.2:</strong> The roughly forty lines of bucketing-and-overlap scheduling in Code 4.10.1 collapse to one <code>DDP</code> wrap with a <code>bucket_cap_mb</code> argument. The framework handles bucket assignment, the autograd hooks that detect bucket readiness, the all-reduce launch during the backward pass, and the division by world size. <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a> turns this into a complete data-parallel training system.</div>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Overlapping Communication Inside the Layer (2024 to 2026)</div>
+<p>Overlapping the gradient all-reduce with the backward pass is now standard; the active frontier pushes overlap into places that used to be strictly serial. In tensor and sequence parallelism the forward and backward passes contain all-gather and reduce-scatter collectives that classically blocked the matrix multiplications around them. Systems such as <strong>Centauri</strong> (Chen et al., 2024) and <strong>FLUX</strong> (Chang et al., 2024) decompose those collectives into fine-grained tiles and fuse them with the GEMM kernels so communication hides inside a single layer's compute, not just across layers. A parallel line on <strong>asynchronous tensor parallelism</strong> reorders the computation so each device can begin its share of the matmul before the full activation has arrived, overlapping the all-gather with the very operation that consumes it. The DiLoCo-style local-update methods from <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a> attack the same tax from the other side, communicating less often rather than hiding each communication better. The common thread is that the boundary between compute and communication, once a hard barrier, is now something to dissolve.</p>
+</div>
+
+<h2>4. Chapter Summary: The Collectives Catalog and What Each Serves <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>This chapter built the vocabulary of distributed training from one observation, that communication and not compute bounds scale-out (Section 4.1), up to the optimization that makes communication cheap (this section). The throughline is a small catalog of collective operations, each matched to a specific AI operation that needs it. Table 4.10.1 collects them, and it is worth committing to memory because every parallel method in Parts III through V is, at its core, a choice of which of these collectives to call and how to schedule it.</p>
+<div class="table-caption"><strong>Table 4.10.1:</strong> The collectives catalog of Chapter 4. Each primitive is the communication backbone of a distinct AI operation; the right-hand column names where the book uses it at scale.</div>
+<table>
+<thead>
+<tr><th scope="col">Collective</th><th scope="col">What it does</th><th scope="col">The AI operation it serves</th></tr>
+</thead>
+<tbody>
+<tr><td>All-reduce</td><td>Sum (or average) one vector per worker; every worker gets the result</td><td>Gradient synchronization in data-parallel SGD (<a href="section-4.3.html">Section 4.3</a>, <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>)</td></tr>
+<tr><td>All-gather</td><td>Each worker collects every worker's shard into the full tensor</td><td>Reassembling sharded parameters before a layer's compute in FSDP/ZeRO (<a href="section-4.5.html">Section 4.5</a>)</td></tr>
+<tr><td>Reduce-scatter</td><td>Sum across workers, then leave each worker only its shard of the result</td><td>Sharded gradient reduction in FSDP/ZeRO; the dual of all-gather (<a href="section-4.5.html">Section 4.5</a>)</td></tr>
+<tr><td>All-to-all</td><td>Every worker sends a distinct piece to every other worker</td><td>Routing tokens to expert devices in mixture-of-experts (<a href="section-4.6.html">Section 4.6</a>)</td></tr>
+<tr><td>Broadcast</td><td>One worker sends the same tensor to all others</td><td>Distributing initial or updated weights from a server or rank 0 (<a href="section-4.7.html">Section 4.7</a>)</td></tr>
+<tr><td>Gather</td><td>One worker collects a distinct piece from every other</td><td>Aggregating experience or results to a learner or coordinator (<a href="section-4.7.html">Section 4.7</a>)</td></tr>
+</tbody>
+</table>
+<p>The cost of each of these is governed by the alpha-beta model of <a href="../module-03-scalability-performance-models/section-3.8.html">Section 3.8</a>, refined into ring and tree algorithms in <a href="section-4.4.html">Section 4.4</a>, carried by libraries such as NCCL (<a href="section-4.8.html">Section 4.8</a>), placed onto the fastest links by topology-aware scheduling (<a href="section-4.9.html">Section 4.9</a>), and finally hidden behind compute by the overlap and bucketing of this section. That is the complete arc of Chapter 4: name the primitive, price it, implement it efficiently, place it well, and overlap it away.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Primitives Are Set; Now They Get Scaled Out</div>
+<p>Chapter 4 closes the foundations of communication. Every collective in Table 4.10.1 returns, transformed, as the engine of a parallel method later in the book: all-reduce becomes the heartbeat of data-parallel training (<a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>), all-gather and reduce-scatter become the memory-saving mechanics of sharded training (<a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>), and all-to-all becomes the router of expert parallelism (<a href="../../part-4-parallel-deep-learning/module-17-expert-parallelism-moe/index.html">Chapter 17</a>). The overlap discipline you just learned is what keeps all of them affordable at thousands of workers. When a later chapter says "and then we synchronize," it is calling one of these six, scheduled to hide behind the compute it serves.</p>
+</div>
+
+<h2>5. Exercises <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.10.1: When Does Overlap Stop Helping? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Overlap turns a step's cost from $T_\text{compute} + T_\text{comm}$ into roughly $\max(T_\text{compute}, T_\text{comm})$. Describe a concrete training regime in which $T_\text{comm} > T_\text{compute}$, so that even perfect overlap leaves communication exposed and the step is communication-bound. Name two things you could change (one about the model or batch, one about the cluster) to move back into the compute-bound regime where overlap hides almost everything. Tie your answer to the alpha-beta parameters of <a href="../module-03-scalability-performance-models/section-3.8.html">Section 3.8</a>.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.10.2: Sweep the Bucket Size <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 4.10.1 to plot step time against bucket size for three interconnects: a fast one ($\alpha = 5\,\mu s$, $\beta = 100$ GB/s), the default in the code, and a slow one ($\alpha = 1$ ms, $\beta = 2$ GB/s). For each, find the bucket size that minimizes the overlapped step time. Explain why the optimal bucket grows as the interconnect gets slower or higher-latency, and connect that to the latency-versus-bandwidth trade-off of Section 2.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.10.3: Measure Real Overlap Efficiency <span class="exercise-type analysis">Analysis</span></div>
+<p>Given a profiler trace of a real data-parallel step (or a synthetic one you construct), define an <em>overlap efficiency</em> metric: the fraction of total all-reduce time that occurred concurrently with backward compute, equal to $1 - T_\text{exposed}/T_\text{comm}$ where $T_\text{exposed}$ is communication time during which the accelerator was idle. Compute it for the 8-layer-bucket row of Output 4.10.1. Then argue what an efficiency well below 1 would tell you to inspect: bucket ordering, gradient-readiness order, or the presence of a stray blocking collective.</p>
+</div>
+
+<div class="callout project-ideas">
+<div class="callout-title">Project Ideas</div>
+<p>These close Chapter 4 by turning its ideas into something you can build and measure. Each is sized for a focused effort and connects directly to the collectives catalog above.</p>
+<ol>
+<li><strong>Overlap-efficiency profiler.</strong> Take a small model in PyTorch <code>DistributedDataParallel</code> on two or more GPUs (or two processes on CPU with the Gloo backend), capture a profiler trace of one training step, and compute the overlap-efficiency metric from Exercise 4.10.3. Sweep <code>bucket_cap_mb</code> across several values and chart how efficiency and step time respond, reproducing the shape of Output 4.10.1 on real hardware. Report where the measured optimum sits relative to the 25 MB default.</li>
+<li><strong>Bucketing from scratch.</strong> Implement your own gradient bucketing on top of raw <code>torch.distributed.all_reduce</code>: register backward hooks, coalesce gradients into fixed-size flat buffers, fire one asynchronous all-reduce per full bucket, and copy results back. Verify your result matches DDP numerically, then compare its step time against per-tensor all-reduce (no bucketing) to quantify the latency you saved by amortizing $\alpha$.</li>
+<li><strong>Cost-model calibrator.</strong> Fit the alpha-beta parameters $\alpha$ and $\beta$ of your actual interconnect by timing all-reduces across a range of message sizes, then plug them into Code 4.10.1 and check how well the model's predicted step times match measured ones. A close fit validates the whole Chapter 4 cost framework on your cluster; a poor fit is a clue about contention, topology, or a slow link worth investigating with the tools of <a href="section-4.9.html">Section 4.9</a>.</li>
+</ol>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-4.9.html"><span class="nav-label">Previous</span><span class="nav-num">Section 4.9</span><span class="nav-title">Topology-Aware Placement</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 4</span><span class="nav-num">Contents</span><span class="nav-title">Communication Primitives for Distributed Training</span></a>
+<a class="next" href="../module-05-evaluating-distributed-ai/index.html"><span class="nav-label">Next</span><span class="nav-num">Chapter 5</span><span class="nav-title">Evaluating Distributed AI Systems</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

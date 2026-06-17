@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 34.6: Federated Edge Learning. How FedAvg from Chapter 14 meets the edge: extreme device heterogeneity, millions of clients with tiny data, stragglers and partial participation, on-device training limits, and hierarchical aggregation through fog nodes." name="description"/>
+<title>Section 34.6: Federated Edge Learning | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Cluster, Edge, and Reliable Infrastructure</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 34: Edge, Fog, and On-Device Distributed AI</a></div>
+<h1>Federated Edge Learning</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I trained while I was charging, on the hotel wifi, for ninety seconds. Then the elevator ate the signal and the server averaged me in anyway."</p>
+<cite>A Phone, Training While It Charges Overnight</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Federated edge learning trains a single shared model across millions of phones, watches, and sensors whose data never leaves the device, by sending models out and averaging updates back in.</strong> Chapter 14 built the algorithm that makes this possible: FedAvg, which replaces centralized gradient descent with rounds of local training plus a weighted average of the results. This section does not re-derive FedAvg; it takes that algorithm to the place it actually runs. The edge is not a tidy datacenter of identical workers. It is a population of devices that differ by orders of magnitude in compute, network, and battery, that hold almost no data each but number in the millions, that vanish and reappear unpredictably, and that will only train when plugged in and on wifi. Making the clean math of Chapter 14 survive that environment, through partial participation, straggler dropping, on-device memory limits, hierarchical aggregation through fog nodes, and aggressive update compression, is the engineering this section teaches.</p>
+</div>
+<p>In <a href="../../part-3-distributed-ml/module-14-federated-decentralized-learning/index.html">Chapter 14</a> we developed federated learning as a method: data stays on the clients, a central server orchestrates rounds, each round broadcasts the current global model, every selected client runs a few epochs of local optimization on its own private data, and the server combines the resulting models by a sample-size-weighted average. That chapter proved why the approach works and analyzed its behavior under non-identically-distributed data. It treated the clients abstractly. This section makes them concrete. When the clients are real edge devices, the abstraction springs several leaks at once, and the cross-device regime introduced in <a href="../../part-3-distributed-ml/module-14-federated-decentralized-learning/section-14.2.html">Section 14.2</a> is where every one of them appears. The result is a distributed training system unlike any other in this book: no shared filesystem, no reliable workers, no two clients alike, and a dataset that, by design, can never be centralized.</p>
+<p>This is scale-out in its most extreme form. A data-parallel training job (<a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>) spreads one gradient across a few thousand cooperative GPUs on a fast interconnect. Federated edge learning spreads one model across potentially hundreds of millions of uncooperative devices on the public internet, each contributing a sliver of computation when it happens to be idle, charged, and connected. The combining step survives, but everything around it changes.</p>
+
+<h2>1. Why the Edge Breaks the Clean FedAvg Picture <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Recall the FedAvg aggregation rule from Chapter 14. After round $t$, the server holds the previous global model $w_t$ and receives a locally updated model $w_t^k$ from each participating client $k$. The new global model is the average of the client models, weighted by how much data each client used,</p>
+$$w_{t+1} = \sum_{k \in S_t} \frac{n_k}{\sum_{j \in S_t} n_j}\, w_t^{k}, \qquad n_k = |\mathcal{D}_k|,$$
+<p>where $S_t$ is the set of clients that participated in round $t$ and $n_k$ is the number of local examples on client $k$. In Chapter 14 the set $S_t$ was a clean random sample and every selected client reliably returned a result. At the edge, neither assumption holds, and the gap between the idealized rule and the messy reality is the whole subject of this section. Four edge-specific pressures bend the picture, and it pays to keep them separate.</p>
+<p><strong>Extreme device heterogeneity.</strong> The clients are not interchangeable workers. A flagship phone runs local training tens of times faster than a five-year-old budget device; one client is on fiber-backed wifi while another is on a congested cellular link; one is plugged in at 80 percent battery while another is at 9 percent and will refuse the job outright. Heterogeneity that a datacenter scheduler smooths away (<a href="../module-33-cluster-infrastructure-scheduling/index.html">Chapter 33</a>) is irreducible here, because the operator does not own the devices.</p>
+<p><strong>Massive client counts with tiny per-client data.</strong> A cross-device deployment can address hundreds of millions of devices, but each holds a handful to a few thousand examples, and they are non-identically distributed: your keyboard sees your vocabulary, not the population's. This is the opposite of the datacenter, where few workers each hold a large shard. The statistics of training over many tiny, skewed shards (developed for the non-IID case in <a href="../../part-3-distributed-ml/module-14-federated-decentralized-learning/section-14.4.html">Section 14.4</a>) dominate everything.</p>
+<p><strong>Stragglers and partial participation.</strong> The server cannot wait for all selected clients. It sets a round deadline, takes whatever arrived, and drops the rest, so $S_t$ is both a random subset of the population and a deadline-biased subset of those invited.</p>
+<p><strong>Intermittent availability.</strong> Devices self-select into eligibility only when charging, idle, and on an unmetered network, conditions that correlate with time zone and lifestyle, so the available population itself drifts through the day.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Algorithm Is From Chapter 14; the Hard Part Is the Population</div>
+<p>Federated edge learning does not need a new aggregation rule. The weighted average above is exactly FedAvg. What the edge demands is a system that keeps that average meaningful when the clients sampling into each round are heterogeneous, tiny, unreliable, and self-selecting. Almost every design choice in a production federated system (how many clients to invite, how long to wait, how to weight late arrivals, how to compress the upload) is a defense of the Chapter 14 average against the realities of the population computing it. Get the population handling wrong and the math is still correct but trains the wrong model.</p>
+</div>
+
+<h2>2. The Cross-Device Federated Round, Step by Step <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>It helps to see one round as the edge actually runs it. Chapter 14 distinguished <em>cross-silo</em> federation (a few dozen reliable, always-on institutions, such as hospitals, each with a large dataset) from <em>cross-device</em> federation (a vast, flaky population of personal devices with tiny datasets). The hospital case study in Chapter 37 lives in the cross-silo world; this section lives squarely in the cross-device world, where the round looks like Figure 34.6.1. The server selects a cohort from the currently available devices, ships them the global model, waits for local updates under a deadline, drops whoever missed it, and averages the survivors.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A cross-device federated round: a server selects a cohort from a large pool of available devices, broadcasts the global model, devices run local training steps, fast ones upload weighted deltas while a straggler is dropped at the deadline, and the server aggregates the survivors into a new global model.">
+<defs>
+<marker id="arr346" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arrd" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b03030"/></marker>
+</defs>
+<style>
+.srv { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.dev { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.drop { fill:#fbeaea; stroke:#b03030; stroke-width:1.6; stroke-dasharray:5 4; }
+.t346 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s346 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.r346 { font:11px sans-serif; fill:#b03030; text-anchor:middle; }
+.l346 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr346); }
+.ld { fill:none; stroke:#b03030; stroke-width:1.6; stroke-dasharray:5 4; marker-end:url(#arrd); }
+</style>
+<text class="t346" x="120" y="26">Server (round t)</text>
+<rect class="srv" x="40" y="40" width="160" height="60" rx="9"/>
+<text class="t346" x="120" y="64">global model</text>
+<text class="t346" x="120" y="82">w_t</text>
+<text class="s346" x="120" y="128">1. select cohort</text>
+<text class="s346" x="120" y="144">from available pool</text>
+
+<line class="l346" x1="200" y1="70" x2="280" y2="70"/>
+<text class="s346" x="240" y="60">broadcast w_t</text>
+
+<text class="t346" x="430" y="26">Selected devices (run local steps)</text>
+<rect class="dev" x="300" y="40" width="120" height="56" rx="8"/>
+<text class="t346" x="360" y="62">Phone A (fast)</text>
+<text class="s346" x="360" y="80">8 local steps</text>
+<rect class="dev" x="300" y="112" width="120" height="56" rx="8"/>
+<text class="t346" x="360" y="134">Watch B</text>
+<text class="s346" x="360" y="152">4 local steps</text>
+<rect class="drop" x="300" y="184" width="120" height="56" rx="8"/>
+<text class="r346" x="360" y="206">Phone C (slow)</text>
+<text class="r346" x="360" y="224">misses deadline</text>
+<rect class="dev" x="300" y="256" width="120" height="56" rx="8"/>
+<text class="t346" x="360" y="278">Tablet D</text>
+<text class="s346" x="360" y="296">6 local steps</text>
+
+<path class="l346" d="M 420 68 L 560 68 L 560 158"/>
+<text class="s346" x="500" y="58">upload delta</text>
+<path class="l346" d="M 420 140 L 560 140 L 560 158"/>
+<path class="ld" d="M 420 212 L 500 212"/>
+<text class="r346" x="540" y="208">dropped</text>
+<path class="l346" d="M 420 284 L 560 284 L 560 196"/>
+
+<rect class="srv" x="560" y="160" width="150" height="40" rx="8"/>
+<text class="t346" x="635" y="185">weighted average</text>
+<line class="l346" x1="710" y1="180" x2="790" y2="180"/>
+<rect class="srv" x="790" y="150" width="80" height="60" rx="9"/>
+<text class="t346" x="830" y="176">w_(t+1)</text>
+<text class="s346" x="830" y="196">next round</text>
+<text class="s346" x="635" y="232">survivors only; C contributes nothing</text>
+</svg>
+<figcaption><strong>Figure 34.6.1:</strong> One cross-device FedAvg round. The server broadcasts $w_t$ to a selected cohort drawn from the currently available pool. Heterogeneous devices run different numbers of local steps; the fast ones upload weighted model deltas, the straggler (Phone C) misses the deadline and is dropped, and the server forms $w_{t+1}$ as the sample-size-weighted average of the survivors only. The set of survivors is the $S_t$ of the aggregation rule in Section 1.</figcaption>
+</figure>
+<p>Two quantities govern this round and both differ sharply from the datacenter. First, the expected number of contributors. If the server invites $m$ devices from an available pool and each completes and reports before the deadline independently with probability $p$, the expected count of usable updates is</p>
+$$\mathbb{E}\,|S_t| = m\,p, \qquad \operatorname{Var}|S_t| = m\,p(1-p).$$
+<p>An operator who needs at least $C$ updates per round to keep the average stable must over-invite, choosing $m \approx C/p$, because $p$ at the edge can be well below one. Second, the cost of sampling only a cohort rather than the whole population. We make both quantities concrete next.</p>
+
+<h2>3. Partial Participation and the Variance It Adds <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The deepest edge-specific effect is statistical. In datacenter data-parallel training every worker contributes every step, so the combined gradient is the exact full-batch (or full-shard) quantity, as proven in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>. At the edge only a small, random cohort reports each round, so the server's update is an <em>unbiased estimate</em> of the full-population update, not the thing itself. Unbiasedness keeps training pointed the right way; the variance of the estimate sets how noisy each step is and therefore how slowly and how stably the global model converges.</p>
+<p>Concretely, suppose the server samples a cohort of expected size $C$ uniformly from a population of $M$ devices. For a quantity whose per-device contribution has population variance $\sigma^2$, the variance of the cohort average scales like</p>
+$$\operatorname{Var}\big[\hat{\mu}_{\text{cohort}}\big] \;\approx\; \frac{\sigma^2}{C}\left(1 - \frac{C}{M}\right),$$
+<p>the familiar inverse-cohort-size law with a finite-population correction. The lesson is blunt: at $C = M$ (full participation) the variance vanishes and we recover the exact answer, while at $C \ll M$ the per-round noise is governed entirely by the cohort size $C$, not by the population size $M$. Larger cohorts buy stability at the cost of more communication and more devices burning battery per round; this is the central tuning knob of a production federated system. The demonstration below shows both ends of this trade on a deliberately tiny problem so the convergence is visible by eye.</p>
+<p>The demo simulates a population of five thousand edge devices, each holding only a handful of private points (a stand-in for "average typing speed" that lives on the phone). It runs FedAvg two ways: with full participation, where every device reports and the global estimate must reproduce the centralized pooled answer exactly; and with realistic partial participation, where only about five percent of devices are charging-and-on-wifi each round and the slowest fifth of those are dropped at the deadline. The data never leaves a device; only model values are averaged.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+M = 5000                                   # total edge devices
+true_mean = 3.0                            # global quantity we want to learn
+n_k = rng.integers(1, 12, size=M)          # tiny, UNEQUAL per-device data (1..11)
+bias = rng.normal(0.0, 0.8, size=M)        # per-device non-IID shift
+local_sum = np.array([                     # each device's private points, summed
+    (true_mean + bias[k] + rng.normal(0, 1.0, size=n_k[k])).sum()
+    for k in range(M)])
+local_mean = local_sum / n_k               # never leaves the device
+
+def fedavg_round(w, participants, lr=1.0):
+    deltas, weights = [], []
+    for k in participants:
+        w_k = w
+        for _ in range(8):                 # cheap ON-DEVICE local steps
+            w_k = w_k - lr * 0.2 * 2.0 * (w_k - local_mean[k])
+        deltas.append(w_k); weights.append(n_k[k])   # weight by sample count
+    weights = np.asarray(weights, dtype=float)
+    return np.dot(weights, deltas) / weights.sum()   # the FedAvg average
+
+central = local_sum.sum() / n_k.sum()       # pooled answer (cannot be computed for real)
+w, w2 = 0.0, 0.0
+for r in range(1, 7):
+    w = fedavg_round(w, np.arange(M))                          # full participation
+    avail = np.where(rng.random(M) &lt; 0.05)[0]                 # only ~5% charging+wifi
+    cohort = avail[rng.random(len(avail)) &lt; 0.8]               # drop slowest ~20%
+    if len(cohort): w2 = fedavg_round(w2, cohort)              # stragglers excluded
+</code></pre>
+<div class="code-caption"><strong>Code 34.6.1:</strong> A from-scratch cross-device FedAvg simulation over heterogeneous clients. Each device runs a few local steps on its own private data and reports only a model value; the server forms the sample-size-weighted average of whoever reported. The partial-participation path samples a five-percent available cohort per round and drops the slowest fifth as stragglers. The full driver (printing the per-round history and the variance comparison of Output 34.6.1) is run with <code>C:\Python314\python.exe</code>.</div>
+<pre><code class="language-text">round   full-part  partial(5%)
+    0     0.00000      0.00000
+    1     2.92820      2.82072
+    2     2.97738      2.97987
+    3     2.97821      2.86516
+    4     2.97822      2.86818
+    5     2.97822      2.90680
+    6     2.97822      2.93965
+
+centralized (pooled) target : 2.97822
+full-participation final    : 2.97822  (|err|=6.69e-11)
+partial 5% + stragglers     : 2.93965  (|err|=0.0386)
+
+per-round estimate std, full part.   : 0.00000
+per-round estimate std, 5% cohort    : 0.05722</code></pre>
+<div class="code-caption"><strong>Output 34.6.1:</strong> Full participation drives the global model to the centralized pooled answer to eleven significant figures, exactly the exactness result of Section 1.1 reappearing inside FedAvg. The five-percent cohort with stragglers dropped still converges toward the same target but wobbles on the way, and a single round's estimate carries a standard deviation of about 0.057 against zero for full participation. That nonzero per-round noise is the price of partial participation, and it is set by the cohort size, not the population size.</div>
+<p>The two columns tell the entire story of this section. The averaging is identical FedAvg in both; the only change is who participates. When everyone does, scale-out is exact. When five percent do and the slow ones are cut, the answer is right in expectation but noisy per round, and a production system spends its tuning budget keeping that noise small enough to converge without inviting so many devices that battery and bandwidth costs explode.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Exact Average, Now Computed by an Unreliable Crowd</div>
+<p>The weighted average at the heart of FedAvg is the same combining step that data parallelism made exact in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a> and that <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> turned into all-reduce. Federated edge learning shows that primitive at the far end of its range: instead of a tight cluster computing the average exactly every step, a shifting crowd of millions computes an unbiased <em>estimate</em> of it whenever its members happen to be available. The mathematics of the combine never changed; what changed is the reliability and homogeneity of the machines performing it, and that is the recurring story of scaling out.</p>
+</div>
+
+<h2>4. On-Device Training Constraints: Memory and Energy <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The "local training" step that Chapter 14 wrote in one line is, on a phone, the binding constraint. A device must hold the model, its activations, and optimizer state in a memory budget shared with the operating system and foreground apps, and it must finish before the user unplugs the charger or the screen wakes. Three constraints shape what local training can be.</p>
+<p>First, memory. Full backpropagation stores activations for every layer; on a constrained device this forces small batch sizes, gradient checkpointing, or training only a subset of layers (for example, fine-tuning an adapter or the final classifier while the backbone stays frozen). Second, energy. Local training and the subsequent upload both draw power and generate heat, so frameworks gate the job on charging state and thermal headroom, which is exactly why eligibility correlates with overnight charging. Third, the upload itself. A phone on a metered or slow link cannot send a full model every round, which makes communication compression (Section 6) not a refinement but a requirement. These constraints feed back into the algorithm: they are why edge FedAvg favors few local epochs on small models, and why the on-device runtime, not the server, sets the real ceiling on model size.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Gboard Learns Your Next Word Without Reading Your Texts</div>
+<p><strong>Who:</strong> The team behind a mobile keyboard's next-word prediction model, deployed to hundreds of millions of Android phones.</p>
+<p><strong>Situation:</strong> The keyboard needed to improve its suggestions from real typing, but the training signal (what people actually type) is among the most sensitive data a device holds and cannot be collected centrally.</p>
+<p><strong>Problem:</strong> Centralized training was off the table for privacy reasons, yet a model trained only on public text mispredicted the slang, names, and code-switching that real users type.</p>
+<p><strong>Dilemma:</strong> Ship a weaker model trained on public corpora, or build a training system that learns from on-device typing while the text never leaves the phone, accepting the engineering cost of cross-device federation.</p>
+<p><strong>Decision:</strong> They ran federated learning across the fleet: each phone trained the small recurrent language model locally on its own recent typing while charging and idle on wifi, and reported only model updates.</p>
+<p><strong>How:</strong> A server invited a few hundred eligible devices per round, set a reporting deadline, dropped stragglers, and combined survivors with the sample-size-weighted FedAvg average; the cycle repeated over many rounds and days, with secure aggregation hiding any single device's update.</p>
+<p><strong>Result:</strong> Next-word prediction quality improved measurably while raw keystrokes never left any phone, and the same federated pipeline was reused for emoji and query suggestions. This deployment is the canonical proof that cross-device federated edge learning works at population scale.</p>
+<p><strong>Lesson:</strong> When the most useful training data is also the most private and the most distributed, you bring the model to the data. The model is small enough to train on a phone overnight, and the population is large enough that a tiny, noisy contribution from each device sums to a strong global signal.</p>
+</div>
+
+<h2>5. Hierarchical Aggregation Through Fog Nodes <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A flat federation, where every device talks directly to one central server, strains both the server and the wide-area network when the client count reaches the millions. The fog layer introduced in <a href="section-34.2.html">Section 34.2</a> offers a natural remedy: insert intermediate aggregators (a base station, a campus gateway, a regional edge server) between the devices and the cloud, and aggregate in tiers. Devices report to a nearby fog node; each fog node averages its local cohort; the cloud averages across fog nodes. Because the weighted average is associative when the weights are carried along, hierarchical aggregation computes the same global model as flat FedAvg, while moving most of the traffic over short local links instead of the congested backhaul.</p>
+<p>The tiered average is just the flat rule applied twice. If fog node $f$ aggregates its device cohort $S_t^f$ into a partial model and partial weight,</p>
+$$w_t^f = \frac{1}{N_f}\sum_{k \in S_t^f} n_k\, w_t^k, \quad N_f = \!\!\sum_{k \in S_t^f}\!\! n_k, \qquad w_{t+1} = \frac{1}{\sum_f N_f}\sum_f N_f\, w_t^f,$$
+<p>then $w_{t+1}$ equals the flat average over all participating devices. The fog tier reduces fan-in at the cloud from millions of devices to thousands of fog nodes, lets each region run on its own schedule and time zone, and can mask a whole region's churn behind one aggregate report. It also creates a natural place to do partial secure aggregation and to absorb stragglers locally, themes that connect this tier to the privacy and robustness treatments of <a href="section-34.9.html">Section 34.9</a> and <a href="../module-35-reliable-secure-distributed-ai/index.html">Chapter 35</a>.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Flower Expresses a Federated Round in a Strategy Object</div>
+<p>Code 34.6.1 hand-rolled selection, deadlines, and the weighted average to expose the mechanics. Production frameworks such as Flower and TensorFlow Federated package the entire round, client selection, broadcast, on-device fit, straggler-tolerant collection, and aggregation, behind a server-side strategy, so the same weighted-average FedAvg becomes a few lines. The client supplies a local <code>fit</code>; the server supplies a strategy that already implements the Section 1 rule:</p>
+<pre><code class="language-python">import flwr as fl
+
+class TypingClient(fl.client.NumPyClient):
+    def fit(self, parameters, config):
+        set_weights(model, parameters)
+        train_on_device(model, local_data, epochs=1)   # runs ON the phone
+        return get_weights(model), len(local_data), {}  # len() is n_k for weighting
+
+# Server: FedAvg with over-invitation and straggler tolerance baked in.
+strategy = fl.server.strategy.FedAvg(
+    fraction_fit=0.01,           # invite ~1% of available clients per round
+    min_fit_clients=100,         # need >=100 survivors (the C of Section 3)
+    min_available_clients=1000)  # do not start a round below this pool size
+fl.server.start_server(config=fl.server.ServerConfig(num_rounds=200),
+                       strategy=strategy)
+</code></pre>
+<div class="code-caption"><strong>Code 34.6.2:</strong> The same FedAvg as Code 34.6.1, now via Flower. The strategy object handles over-invitation (<code>fraction_fit</code>), the survivor floor (<code>min_fit_clients</code>, the cohort size $C$ of Section 3), and the sample-weighted average internally; the framework also supplies hierarchical and secure-aggregation strategies that map onto the fog tier of Section 5.</div>
+</div>
+
+<h2>6. Communication Compression for the Uplink <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The scarcest resource in cross-device learning is the device's uplink. A full model can be tens or hundreds of megabytes, and a phone on cellular cannot send that every round without exhausting the user's data plan and patience. Federated edge learning therefore leans hard on compressing the client-to-server update, reusing the gradient-compression toolkit developed for communication-efficient optimization in <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a> but aimed at the model delta rather than the gradient. Three families dominate. Quantization sends each update value in a few bits instead of thirty-two. Sparsification sends only the largest-magnitude coordinates of the delta and zeros the rest, so a device transmits a small fraction of the parameters. Structured updates constrain the local change to a low-rank or sketched form so only the small factors travel. Because these compressors introduce bias or variance into the upload, they interact with the partial-participation noise of Section 3, and the system must balance compression aggressiveness against the cohort size needed to keep convergence stable.</p>
+<p>The same machinery serves a second, lighter-weight task that is often deployed before full federated training: federated analytics. Here the goal is not to train a model but to compute an aggregate statistic (the most common new words, a histogram of feature usage, a count of a rare event) over the population without collecting raw data. Apple and Google both run federated analytics in production for exactly this, combining on-device aggregation with the private-aggregation and differential-privacy techniques of <a href="section-34.9.html">Section 34.9</a> so that even the aggregate reveals little about any individual. Analytics and learning share the round structure, the compression, and the privacy layer; learning simply replaces "report a statistic" with "report a model update."</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Federated Learning Meets On-Device Foundation Models (2024 to 2026)</div>
+<p>The frontier has moved from training small classifiers to adapting billion-parameter models on the edge. Federated parameter-efficient fine-tuning, where each device trains only a low-rank adapter (LoRA-style) and uploads the tiny adapter rather than the full model, makes federated personalization of language models feasible within a phone's memory and uplink budget, and is an active line in 2024 to 2026 work on federated LoRA and its heterogeneous-rank variants. In parallel, asynchronous and buffered aggregation schemes (in the lineage of FedBuff) drop the synchronous round barrier so slow and fast devices contribute without the server stalling on stragglers, directly attacking the participation variance of Section 3. A third thread hardens these systems against adversarial clients, since an open population invites poisoned updates; robust and Byzantine-tolerant aggregation, developed in <a href="../module-35-reliable-secure-distributed-ai/index.html">Chapter 35</a>, is increasingly co-designed with the compression and privacy layers rather than bolted on afterward. The unifying goal is a federated pipeline that can personalize a foundation model across an untrusted, heterogeneous, intermittently available fleet, which is the hardest version of every challenge in this section at once.</p>
+</div>
+<p>Federated edge learning closes the loop the chapter opened. Sections 34.1 through 34.5 brought computation, inference, and coordination to the edge; this section brings <em>training</em> there too, so the edge is no longer only a place models run but a place they improve, on data that never centralizes. The remaining sections of this chapter turn to the cross-cutting concerns that federated learning has repeatedly leaned on: privacy and differential privacy in <a href="section-34.9.html">Section 34.9</a>, and the reliability and Byzantine-robustness machinery of <a href="../module-35-reliable-secure-distributed-ai/index.html">Chapter 35</a>. The federated medical-AI case study revisits all of it in the cross-silo regime where the clients are hospitals rather than phones.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.6.1: Cross-Device or Cross-Silo? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each deployment, decide whether it is cross-device or cross-silo federation, and name the one edge-specific pressure from Section 1 that dominates its design: (a) ten hospitals jointly training a tumor-segmentation model, each with a large local imaging archive and a reliable server; (b) a smartwatch fleet of fifty million units learning an activity classifier; (c) three autonomous-vehicle fleets owned by one company, each with on-vehicle compute and nightly depot wifi. Explain why the FedAvg aggregation rule is identical in all three while the surrounding system is not, and which case can safely ignore the partial-participation variance of Section 3.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.6.2: Over-Invitation and the Survivor Floor <span class="exercise-type analysis">Analysis</span></div>
+<p>An operator needs at least $C = 200$ usable updates per round for stable convergence. From history, an invited device completes and reports before the deadline with probability $p = 0.4$. Using $\mathbb{E}\,|S_t| = mp$ and $\operatorname{Var}|S_t| = mp(1-p)$ from Section 2, find the number $m$ of devices to invite so the expected survivor count is 200, then compute the standard deviation of the survivor count and argue whether inviting exactly $m = C/p$ is safe or whether the operator should over-invite further. Finally, relate your chosen $C$ to the per-round variance term $\sigma^2/C$ of Section 3: what happens to convergence noise if the operator halves $C$ to save battery?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.6.3: Add Top-k Sparsification to the Demo <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 34.6.1 to a small vector model (estimate a $d$-dimensional mean, $d = 64$, instead of a scalar). Before each device uploads, sparsify its delta by keeping only the top $k$ coordinates by magnitude and zeroing the rest, as in Section 6. Sweep $k \in \{64, 16, 4, 1\}$ and plot the final error against the centralized answer versus the average bytes uploaded per device. Then combine top-$k$ with the five-percent partial participation and report how the two noise sources compound. State the smallest $k$ for which convergence is still acceptable, and connect your finding to the compression-versus-cohort-size trade-off named in Section 6.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-34.5.html"><span class="nav-label">Previous</span><span class="nav-num">Section 34.5</span><span class="nav-title">Distributed Sensing</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 34</span><span class="nav-num">Contents</span><span class="nav-title">Edge, Fog, and On-Device Distributed AI</span></a>
+<a class="next" href="section-34.7.html"><span class="nav-label">Next</span><span class="nav-num">Section 34.7</span><span class="nav-title">Latency-Critical Distributed AI</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

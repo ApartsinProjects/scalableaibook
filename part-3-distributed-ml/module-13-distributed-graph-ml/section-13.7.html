@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 13.7: Mini-Batch vs Full-Graph Distributed Training. The two paradigms for distributing GNN training, the memory and communication that separate them, and how to pick the one that fits your graph." name="description"/>
+<title>Section 13.7: Mini-Batch vs Full-Graph Distributed Training | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Distributed Machine Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 13: Distributed Graph Machine Learning</a></div>
+<h1>Mini-Batch vs Full-Graph Distributed Training</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I tried to hold the whole graph in my head at once. By the third layer I was holding everyone's neighbors' neighbors, and I quietly ran out of room to think."</p>
+<cite>A Worker That Materialized One Layer Too Many</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>There are exactly two ways to distribute the training of a graph neural network, and they sit at opposite ends of a memory-versus-communication trade-off.</strong> Full-graph training keeps the entire partitioned graph resident and, at every layer, runs one round of cross-partition neighbor aggregation (a vertex-centric superstep) followed by a gradient all-reduce; it computes the exact gradient but its memory and communication grow with the whole graph. Mini-batch training instead samples small batches of seed nodes and their bounded neighborhoods, fetching only the remote features those neighborhoods touch; its cost is set by the batch, not by the graph, so it is the only paradigm that survives at a billion edges, at the price of sampling variance. This section makes that trade-off quantitative, shows where each paradigm wins, and connects the choice back to strong-versus-weak scaling and the data-loader bottleneck you have already met.</p>
+</div>
+<p>By now you can partition a graph (<a href="section-13.2.html">Section 13.2</a>), run a vertex-centric superstep over the partitions (<a href="section-13.3.html">Section 13.3</a>), and sample bounded neighborhoods on a distributed graph (<a href="section-13.6.html">Section 13.6</a>). What remains is the decision that organizes a real training job: do you push the whole graph through the model every step, or do you sample? The answer is not a matter of taste. It is forced by the same kind of ceiling that opened this book, and once you write down the per-iteration memory and communication, the regime where each paradigm is the right tool becomes a calculation rather than an opinion.</p>
+<p>The reason this matters more for graphs than for ordinary deep learning is the neighbor explosion. A standard mini-batch of independent images costs the same no matter how large the dataset is. A mini-batch of graph nodes does not, because computing a node's $L$-layer embedding pulls in its neighbors, then their neighbors, and so on for $L$ hops; without sampling, the receptive field of a single node can cover a large fraction of the whole graph. The two paradigms are two different answers to that explosion: full-graph training pays for it once by materializing every node's embedding at every layer, and mini-batch training caps it by sampling a fixed fanout at each hop.</p>
+
+<h2>1. Full-Graph Training: Exact, Resident, Communication-Heavy <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>In full-graph training the entire graph stays partitioned across the cluster for the whole run, and one training iteration is a forward and backward pass over all of it at once. Each GNN layer is a vertex-centric superstep in the sense of <a href="section-13.3.html">Section 13.3</a>: every node gathers messages from all of its neighbors, and whenever a neighbor lives on another partition its current embedding must travel across the partition cut. After $L$ such supersteps the loss is computed on the labeled nodes, the backward pass runs the same communication pattern in reverse, and finally the parameter gradients are combined with an all-reduce, the very collective introduced in <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> and made into a training loop in <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>.</p>
+<p>Two costs dominate, and both scale with the graph. The first is memory: holding every node's embedding at every layer means the activation memory grows linearly with the number of nodes $n$, as $\Theta(L \cdot n \cdot F)$ for $F$-dimensional features. The second is communication: every layer ships one feature vector across each boundary edge. If the graph has $m$ edges and a fraction $\rho$ of them cross a partition cut, each layer moves about $L \cdot m \cdot \rho \cdot F$ numbers of boundary traffic, on top of the gradient all-reduce. The boundary fraction $\rho$ is exactly what good partitioning (<a href="section-13.2.html">Section 13.2</a>) tries to shrink, but for a well-connected graph spread over $P$ partitions it cannot fall much below $(P-1)/P$, so it climbs toward one as you add workers.</p>
+<p>The payoff for these costs is exactness. Full-graph training computes the true gradient of the loss over the entire graph, with no sampling noise, so it converges in the same number of epochs as single-machine training would and reproduces the textbook GNN exactly. When the graph fits across the cluster and you want a reference result or the cleanest possible convergence, this is the paradigm to reach for.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Full-Graph Cost Is Tied to the Graph; Sampled Cost Is Tied to the Batch</div>
+<p>The single fact that decides everything in this section: full-graph per-iteration memory and communication grow with the size of the graph ($n$ nodes, $m$ edges), while sampled mini-batch cost grows with the batch and the sampling fanout and is independent of the graph once the graph is large. That is why full-graph training is the natural choice for graphs that comfortably fit the cluster and sampling is the only option once the graph dwarfs any single iteration's working set. Everything else, accuracy, variance, tuning, follows from which quantity your cost is bolted to.</p>
+</div>
+
+<h2>2. Mini-Batch Training: Sampled, Bounded, Tunable <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Mini-batch training breaks the link between cost and graph size. Each worker draws a batch of seed nodes (the nodes whose loss it will compute this step), then builds a bounded computation block by sampling a fixed number of neighbors per node at each of the $L$ hops, the distributed neighbor sampling of <a href="section-13.6.html">Section 13.6</a>. Only the features of the nodes in that block are fetched, and only the remote ones cross the network. The worker runs the GNN on this small block, computes a stochastic gradient, and joins the same all-reduce as before. Because the block size depends on the batch and the fanout rather than on $n$, both memory and communication per iteration are bounded no matter how large the graph grows.</p>
+<p>Concretely, with batch size $B$, fanout $r$, and depth $L$, the sampled block holds on the order of $B \cdot r^L$ nodes (capped by the graph), so activation memory is $\Theta(L \cdot B \cdot r^L \cdot F)$ with no dependence on $n$. The communication per step is the remote slice of that block's input features, again independent of the total graph. This is the property that makes mini-batch training the dominant approach for billion-edge graphs: you can train on a graph that does not even fit on one machine, because no single iteration ever needs more than one block at a time.</p>
+<p>The cost of this freedom is variance. Sampling a fanout instead of using every neighbor turns the exact gradient into a stochastic estimate, so each step is noisier and you may need more steps, a larger fanout, or variance-reduction tricks to match full-graph accuracy. The fanout $r$ is the dial: larger $r$ shrinks the variance and raises the per-step cost toward full-graph, smaller $r$ does the reverse. Tuning that dial is the central craft of distributed GNN training, and it is a direct graph analogue of choosing a batch size in ordinary stochastic gradient descent.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left panel shows full-graph training as three stacked supersteps moving all node embeddings across partition cuts; right panel shows mini-batch training sampling a small bounded block of nodes and fetching only a few remote features.">
+<defs>
+<marker id="arr137" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b137 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w137 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g137 { fill:#eaf3ec; stroke:#2f7d4f; stroke-width:1.6; }
+.t137 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s137 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l137 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr137); }
+.cut137 { stroke:#b86b1f; stroke-width:1.4; stroke-dasharray:5 4; }
+</style>
+<text class="t137" x="215" y="26">Full-graph: every layer is a superstep</text>
+<rect class="b137" x="40" y="44" width="350" height="56" rx="8"/>
+<text class="t137" x="215" y="68">Layer 1: all nodes aggregate</text>
+<text class="s137" x="215" y="86">every boundary edge ships an embedding</text>
+<rect class="b137" x="40" y="116" width="350" height="56" rx="8"/>
+<text class="t137" x="215" y="140">Layer 2: all nodes aggregate</text>
+<text class="s137" x="215" y="158">cross-partition traffic again</text>
+<rect class="b137" x="40" y="188" width="350" height="56" rx="8"/>
+<text class="t137" x="215" y="212">Layer 3: all nodes aggregate</text>
+<text class="s137" x="215" y="230">cross-partition traffic again</text>
+<line x1="215" y1="100" x2="215" y2="116" class="l137"/>
+<line x1="215" y1="172" x2="215" y2="188" class="l137"/>
+<line x1="215" y1="244" x2="215" y2="270" class="l137"/>
+<rect class="b137" x="120" y="278" width="190" height="44" rx="8"/>
+<text class="t137" x="215" y="305">gradient all-reduce</text>
+<text class="s137" x="215" y="348">memory and comm grow with the WHOLE graph</text>
+<line x1="430" y1="44" x2="430" y2="334" class="cut137"/>
+<text class="t137" x="645" y="26">Mini-batch: a bounded sampled block</text>
+<circle class="g137" cx="645" cy="70" r="16"/>
+<text class="t137" x="645" y="74" style="font-size:0.7em">seed</text>
+<circle class="g137" cx="585" cy="135" r="13"/>
+<circle class="g137" cx="645" cy="135" r="13"/>
+<circle class="w137" cx="705" cy="135" r="13"/>
+<circle class="g137" cx="560" cy="205" r="11"/>
+<circle class="g137" cx="615" cy="205" r="11"/>
+<circle class="w137" cx="670" cy="205" r="11"/>
+<circle class="g137" cx="725" cy="205" r="11"/>
+<line x1="645" y1="86" x2="588" y2="123" class="l137"/>
+<line x1="645" y1="86" x2="645" y2="121" class="l137"/>
+<line x1="645" y1="86" x2="702" y2="123" class="l137"/>
+<line x1="585" y1="148" x2="562" y2="195" class="l137"/>
+<line x1="585" y1="148" x2="612" y2="195" class="l137"/>
+<line x1="645" y1="148" x2="668" y2="195" class="l137"/>
+<line x1="705" y1="148" x2="723" y2="195" class="l137"/>
+<text class="s137" x="645" y="248">fanout 2 per hop, depth 3</text>
+<text class="s137" x="780" y="135" style="text-anchor:end; fill:#b86b1f">remote</text>
+<rect class="g137" x="560" y="278" width="170" height="44" rx="8"/>
+<text class="t137" x="645" y="305">same all-reduce</text>
+<text class="s137" x="645" y="348">cost set by BATCH, not by graph size</text>
+</svg>
+<figcaption><strong>Figure 13.7.1:</strong> The two paradigms side by side. On the left, full-graph training runs every GNN layer as a vertex-centric superstep over all nodes, shipping a feature vector across each of the $\rho m$ boundary edges per layer; its working set is the whole graph. On the right, mini-batch training samples one seed node's $L$-hop neighborhood with a fixed fanout (green nodes are local, orange are remote features that must be fetched), so the working set is capped by the batch and fanout regardless of how large the graph is. Both finish the step with the same gradient all-reduce.</figcaption>
+</figure>
+
+<h2>3. The Trade-Off, Made Quantitative <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Talking about "memory-bound" and "communication-heavy" is only useful once the numbers are on the table. The model below estimates the per-iteration memory and cross-partition communication of both paradigms as the graph grows, holding the model fixed (three layers, 128-dimensional features, eight partitions) and letting the node count climb from ten thousand to a hundred million. The full-graph estimates use the $\Theta(L \cdot n \cdot F)$ memory and $L \cdot m \cdot \rho \cdot F$ communication from Section 1; the sampled estimates use the bounded block from Section 2. Reference Figure 13.7.1 for the two patterns the formulas encode.</p>
+<pre><code class="language-python"># Fixed model / training settings
+L = 3                 # number of GNN layers
+F = 128               # feature dimension per node
+BYTES = 4             # float32
+avg_deg = 16          # average node degree
+batch = 1024          # mini-batch seed nodes (sampled training only)
+fanout = 10           # neighbors sampled per node per layer
+P = 8                 # cluster partitions (workers)
+
+def full_graph_iter(n_nodes):
+    """Every layer materializes all node embeddings and ships boundary
+    embeddings across partition cuts (a vertex-centric superstep)."""
+    n_edges = n_nodes * avg_deg
+    mem = L * n_nodes * F * BYTES                       # all layers resident
+    cut_frac = (P - 1) / P                              # ~boundary-edge fraction
+    comm = L * n_edges * cut_frac * F * BYTES           # one F-vector per cut edge per layer
+    return mem, comm
+
+def sampled_iter(n_nodes):
+    """A bounded L-hop sampled block; size depends on batch and fanout,
+    NOT on the total graph size."""
+    block, frontier = batch, batch
+    for _ in range(L):                                  # grow the L-hop frontier
+        frontier *= fanout
+        block += frontier
+    block = min(block, n_nodes)                         # capped by the graph
+    cut_frac = (P - 1) / P
+    mem = L * block * F * BYTES
+    comm = block * cut_frac * F * BYTES                 # only remote block features
+    return mem, comm
+
+def human(b):                                           # bytes -> human-readable
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if b < 1024 or unit == "TB":
+            return f"{b:.1f} {unit}"
+        b /= 1024
+
+print(f"{'nodes':>12} | {'full mem':>9}  {'full comm':>9} |"
+      f" {'samp mem':>9}  {'samp comm':>9} | {'mem x':>6}  {'comm x':>6}")
+print("-" * 84)
+for n in (10_000, 100_000, 1_000_000, 10_000_000, 100_000_000):
+    fm, fc = full_graph_iter(n)
+    sm, sc = sampled_iter(n)
+    print(f"{n:>12,} | {human(fm):>9}  {human(fc):>9} |"
+          f" {human(sm):>9}  {human(sc):>9} | {fm/sm:>5.0f}x  {fc/sc:>5.0f}x")
+</code></pre>
+<div class="code-caption"><strong>Code 13.7.1:</strong> The two cost models as plain functions, swept across five graph sizes. <code>full_graph_iter</code> scales every quantity with the node and edge counts; <code>sampled_iter</code> caps the working set with the batch and fanout, so its cost flattens once the graph is larger than one sampled block.</div>
+<p>The loop prints the per-iteration memory and communication for each paradigm across five graph sizes, plus the ratio between them. The output below is the real result of executing the script.</p>
+<pre><code class="language-text">       nodes |  full mem  full comm |  samp mem  samp comm |  mem x  comm x
+------------------------------------------------------------------------------------
+      10,000 |   14.6 MB   205.1 MB |   14.6 MB     4.3 MB |     1x     48x
+     100,000 |  146.5 MB     2.0 GB |  146.5 MB    42.7 MB |     1x     48x
+   1,000,000 |    1.4 GB    20.0 GB |    1.4 GB   427.2 MB |     1x     48x
+  10,000,000 |   14.3 GB   200.3 GB |    1.6 GB   486.1 MB |     9x    422x
+ 100,000,000 |  143.1 GB     2.0 TB |    1.6 GB   486.1 MB |    88x   4219x</code></pre>
+<div class="code-caption"><strong>Output 13.7.1:</strong> Full-graph cost climbs without bound (143 GB of activations and 2 TB of boundary traffic per iteration at a hundred million nodes), while the sampled block plateaus near 1.6 GB and 486 MB once the graph exceeds one block. At ten thousand nodes the whole graph is smaller than a sampled block, so memory ties and full-graph is the simpler choice; by a hundred million nodes sampling uses 88 times less memory and over four thousand times less communication per step.</div>
+<p>The table tells the whole story of this section in two columns. For small graphs the sampled block is as large as the graph itself, so memory is identical and full-graph training wins on simplicity and exactness while costing nothing extra. As the graph grows past the size of a single block, the full-graph numbers explode along both axes while the sampled numbers freeze, and somewhere in that crossover the only paradigm that still runs at all is the one whose cost is pinned to the batch. The communication ratio is already 48 times in sampling's favor even when memory ties, because full-graph training pays for every boundary edge every layer whereas sampling pays only for the features it actually reads.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Fraud Graph That Would Not Fit</div>
+<p><strong>Who:</strong> A platform engineer on the trust-and-safety team at a payments company training a GNN to flag fraudulent accounts.</p>
+<p><strong>Situation:</strong> The account-interaction graph had grown to roughly 1.2 billion edges across 90 million nodes, and the prototype trained full-graph on a small subgraph that fit one machine.</p>
+<p><strong>Problem:</strong> Scaling the full-graph job to the real graph blew past cluster memory at the second layer, and each step was shipping terabytes of boundary embeddings, so an epoch never finished.</p>
+<p><strong>Dilemma:</strong> Keep full-graph training for its exact gradients and buy a far larger memory-rich cluster, or switch to neighbor-sampled mini-batches that fit comfortably but introduce sampling variance the team had not characterized.</p>
+<p><strong>Decision:</strong> They moved to mini-batch training with a fanout of 15, 10, 5 across three layers, because the cost model (the same shape as Output 13.7.1) showed the sampled working set staying near a gigabyte regardless of the graph size, while full-graph stayed firmly out of reach.</p>
+<p><strong>How:</strong> They sharded the graph with a vertex-cut partitioner (<a href="section-13.2.html">Section 13.2</a>), ran distributed neighbor sampling (<a href="section-13.6.html">Section 13.6</a>) to build each batch, and overlapped the remote-feature fetch with computation so the sampler did not stall the workers.</p>
+<p><strong>Result:</strong> An epoch dropped from never-finishing to about forty minutes on the existing cluster, and a modest fanout bump plus a few extra epochs recovered the accuracy lost to sampling variance, landing within half a point of the full-graph prototype on the held-out subgraph.</p>
+<p><strong>Lesson:</strong> When the graph dwarfs any single iteration's working set, sampling is not a convenience, it is the only paradigm that runs; spend the freed budget on fanout and epochs to buy the accuracy back.</p>
+</div>
+
+<h2>4. The Hybrid, and Choosing a Regime <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The two paradigms are endpoints of a spectrum, not a binary. A practical middle ground is subgraph or cluster sampling: partition the graph into many dense clusters, then run full-graph training on one whole cluster per step. Inside a cluster the gradient is exact and there is no neighbor explosion to sample away, but the cluster is small enough to fit in memory and most of its edges stay local, so cross-partition traffic collapses. Methods in the Cluster-GCN and GraphSAINT family live here, trading a controlled bias (a node loses the neighbors that fell outside its cluster) for the memory savings of mini-batch training and most of the exactness of full-graph training. The fanout dial of Section 2 and the cluster size of the hybrid are two knobs on the same trade-off curve.</p>
+<p>Choosing a regime comes down to a short checklist. If the graph plus three layers of activations fits across your cluster and you want a reference result or the fastest convergence in epochs, train full-graph. If the graph dwarfs any single iteration's working set, or you need to scale to more workers without communication overwhelming compute, sample. If you are in between, or sampling variance is hurting accuracy more than you can afford, reach for the hybrid and tune the cluster size. The same logic appears whenever you size a distributed job: pick the paradigm whose dominant cost is bolted to the quantity you can control.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Strong vs Weak Scaling, Now on a Graph</div>
+<p>This choice is the graph-shaped version of the strong-versus-weak scaling distinction from <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.3.html">Section 3.3</a>. Full-graph training is a strong-scaling story: the problem (the whole graph) is fixed, you add workers to finish each exact iteration faster, and the rising boundary fraction $\rho \to (P-1)/P$ is exactly the communication term that strong scaling warns will eventually dominate. Mini-batch training is closer to weak scaling: each worker keeps a fixed-size sampled block of work, so you add workers to process more batches in parallel rather than to shrink a fixed one, and the per-worker cost stays flat as the cluster grows. Recognizing which scaling regime your training loop is in tells you immediately whether adding machines will help or whether communication will eat the gains, the central judgment this book keeps returning to.</p>
+</div>
+<p>The sampler that feeds mini-batch training is itself a distributed data-loading problem, and it has the same failure mode you met in <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/section-8.5.html">Section 8.5</a>: if building and fetching the next batch is slower than the GNN forward and backward pass, the accelerators idle waiting on the data loader, and the freedom sampling bought you is squandered on a stalled pipeline. The remedy is the same too, prefetch and overlap the sampling and remote-feature fetch with computation, so that by the time a step finishes the next block is already resident. A sampled GNN trainer that does not overlap its sampler is a fast paradigm hobbled by a slow loader.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One Flag Switches Paradigms in DGL</div>
+<p>Writing either paradigm by hand means managing the partitioned graph, the boundary exchange, the sampler, and the remote-feature fetch. Graph-learning frameworks collapse the choice to a data-loader configuration. In DGL, the same model trains full-graph or mini-batch depending on which loader you wrap it in, and the distributed sampler, feature fetch, and prefetch overlap are handled internally:</p>
+<pre><code class="language-python">import dgl
+
+# Mini-batch: a bounded sampled block per step (Section 2).
+sampler = dgl.dataloading.NeighborSampler([15, 10, 5])   # fanout per layer
+loader  = dgl.dataloading.DataLoader(
+    g, train_nids, sampler,
+    batch_size=1024, shuffle=True,
+    use_ddp=True, num_workers=4)                          # distributed + prefetch
+
+# Full-graph: one block that is the entire graph (Section 1).
+full_sampler = dgl.dataloading.MultiLayerFullNeighborSampler(3)
+</code></pre>
+<div class="code-caption"><strong>Code 13.7.2:</strong> Switching paradigms is a one-line change of sampler: <code>NeighborSampler([...])</code> for bounded mini-batches, <code>MultiLayerFullNeighborSampler</code> for exact full-graph passes. The dozens of lines of partition management, boundary exchange, and overlapped feature fetch that Output 13.7.1 models by hand are all internal to the loader, which is the subject of <a href="section-13.8.html">Section 13.8</a>.</div>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Closing the Full-Graph Gap (2024 to 2026)</div>
+<p>The active research question is whether you can keep mini-batch memory while recovering full-graph accuracy and speed. One line attacks the redundant remote fetches: historical-embedding and feature-caching methods (in the lineage of GNNAutoScale and the BNS-GCN boundary-sampling work) cache stale neighbor embeddings on each partition so a step rarely has to cross the network, shrinking the communication term in Output 13.7.1 by large factors with bounded staleness error. A second line pushes full-graph training itself to scale, with 2024 to 2025 systems such as the distributed full-graph trainers in the DGL and Quiver ecosystems partitioning activations and pipelining the inter-partition exchange so that exact training reaches graphs that previously forced sampling. A third studies the variance directly, deriving fanout schedules and variance-reduced samplers that provably approach the full-graph gradient. The throughline is that the clean either-or of this section is being engineered into a tunable continuum, with caching and pipelining quietly moving the crossover point in the table.</p>
+</div>
+<p>You now have the two paradigms, the quantitative trade-off that separates them, the hybrid that interpolates, and the rule for choosing. What remains is to see how production systems package all of this, the partitioner, the distributed sampler, the boundary exchange, and the paradigm switch, into a few lines of configuration. That is the subject of <a href="section-13.8.html">Section 13.8</a>, which surveys DistDGL, GraphLearn-style systems, and the frameworks that turn everything in this chapter into a training job you can launch.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.7.1: Find the Crossover <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the cost shapes in Code 13.7.1 ($\Theta(L \cdot n \cdot F)$ full-graph memory versus a sampled block of about $B \cdot r^L$ nodes), explain why the memory ratio in Output 13.7.1 stays at $1\times$ for the three smallest graphs and only starts climbing at ten million nodes. Compute, for the given settings ($B = 1024$, $r = 10$, $L = 3$), the approximate node count at which the sampled block stops being smaller than the whole graph, and relate it to where the ratio in the table leaves $1\times$.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.7.2: Add the Hybrid Row <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 13.7.1 with a third function <code>cluster_iter(n_nodes)</code> for the hybrid of Section 4: each step trains full-graph on one cluster of $c$ nodes (take $c = 50{,}000$), so memory is $\Theta(L \cdot c \cdot F)$ and communication is only the boundary edges of that one cluster (assume the partitioner keeps the within-cluster cut fraction down to $0.1$). Print the hybrid memory and communication alongside the existing two paradigms across the same graph sizes, and report at which node count the hybrid's communication drops below the full-graph value by more than $100\times$. Comment on what bias the cluster boundary introduces that neither pure paradigm has.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.7.3: When Does Sampling Stop Helping Throughput? <span class="exercise-type analysis">Analysis</span></div>
+<p>Suppose your accelerator computes one sampled GNN step in 40 milliseconds, and building plus fetching the next block (the distributed sampler of <a href="section-13.6.html">Section 13.6</a>) takes 55 milliseconds per step without overlap. Using the data-loader reasoning from <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/section-8.5.html">Section 8.5</a>, compute the achievable steps per second with and without prefetch overlap, and the fraction of accelerator time wasted in the un-overlapped case. Then argue, from these numbers, why the memory and communication savings of Output 13.7.1 can be entirely cancelled by a slow sampler, and what minimum overlap fraction you need for the GNN compute to become the bottleneck again.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-13.6.html"><span class="nav-label">Previous</span><span class="nav-num">Section 13.6</span><span class="nav-title">Distributed Neighbor Sampling</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 13</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Graph Machine Learning</span></a>
+<a class="next" href="section-13.8.html"><span class="nav-label">Next</span><span class="nav-num">Section 13.8</span><span class="nav-title">Frameworks</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

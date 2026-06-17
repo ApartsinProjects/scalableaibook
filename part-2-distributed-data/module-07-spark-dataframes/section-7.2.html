@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 7.2: Resilient Distributed Datasets. The immutable, partitioned, lineage-tracked collection at Spark's core, why recomputing a lost partition beats replicating it, and how narrow versus wide dependencies draw the stage boundaries." name="description"/>
+<title>Section 7.2: Resilient Distributed Datasets | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Distributed Data Processing for AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 7: Spark and Distributed DataFrames</a></div>
+<h1>Resilient Distributed Datasets</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They asked where I came from. I did not have a backup, but I had directions: take the source, map it, filter it, and you will get me again."</p>
+<cite>A Partition That Was Recomputed, Not Restored</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A Resilient Distributed Dataset (RDD) is an immutable, partitioned collection that remembers how it was built, and that memory, not a replicated copy, is what makes it fault tolerant.</strong> Spark does not store the data of an RDD twice in case a machine dies; it stores the short recipe that produced each partition from its parents, the lineage, and replays that recipe to rebuild whatever is lost. The same lineage graph also tells the engine which steps can run on one machine without moving data (narrow dependencies) and which steps force records across the network (wide dependencies, a shuffle). Those two ideas, recompute-from-lineage and the narrow/wide split, are the whole RDD model, and they decide both how Spark recovers from failure and where it draws the boundaries between stages of work. This section builds a tiny RDD by hand so you can watch both ideas operate on real output.</p>
+</div>
+<p><a href="section-7.1.html">Section 7.1</a> told the story of why Spark followed MapReduce: the same partition-and-recombine shape, but with the intermediate results kept in memory and reused across many operations instead of written to disk after every step. To keep many operations cheap and still survive the failures that <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.4.html">Section 2.4</a> warns are routine at cluster scale, Spark needed an abstraction that was cheap to hold in memory, cheap to recombine, and cheap to recover. That abstraction is the RDD. Everything higher in Spark, the DataFrames and Spark SQL of <a href="section-7.3.html">Section 7.3</a> included, compiles down to operations on RDDs, so understanding this layer is understanding what Spark actually does when you press run.</p>
+<p>An RDD has three defining properties, and each one earns its place. It is <em>partitioned</em>: the records are split into chunks, one chunk per unit of parallel work, so a cluster of machines can process them at once. It is <em>immutable</em>: a transformation never edits an RDD in place, it produces a new RDD, which means an existing RDD can be read concurrently and recomputed at any time without fear that someone changed it underneath you. And it carries its <em>lineage</em>: a record of the parent RDDs and the transformation that derived it from them. Immutability plus lineage is the combination that makes the rest of this section possible; hold onto it.</p>
+
+<h2>1. Lineage: The Recipe Instead of the Replica <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The classic way to survive a lost machine is replication: keep two or three copies of every block of data on different nodes, so when one dies the others still have it. That is how the distributed filesystem under MapReduce protects its data, and it works, but it is expensive. Holding three copies of a multi-terabyte intermediate dataset in cluster memory triples the memory you must rent, and for data that is being processed and thrown away within minutes, paying to store three copies of it is a poor trade.</p>
+<p>RDDs take the other route. For each RDD, Spark records its lineage: the list of parent RDDs it was built from and the transformation that produced it, such as "this RDD is the result of applying <code>map(square)</code> to that RDD." Chaining these records gives a directed acyclic graph (DAG) of derivations that traces every RDD back to data on stable storage. When a partition is lost because the machine holding it crashed, Spark does not look for a replica; it walks the lineage and recomputes just that partition from its parents. Because the inputs were immutable and the transformations are deterministic functions, the recomputed partition is identical to the one that was lost, which is exactly what <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.4.html">Section 2.4</a> calls deterministic re-execution as a recovery strategy.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Fault Tolerance Is Bought With Determinism, Not Copies</div>
+<p>An RDD recovers a lost partition by recomputing it from its parents, not by fetching a replica. This is only correct because two properties hold together: the inputs are immutable, so the parents are guaranteed to be the same data they were the first time, and the transformations are deterministic, so re-running them yields the same output. Drop either property and recomputation could produce a different answer, and lineage-based recovery would be unsound. Immutability is not a stylistic choice in Spark; it is the precondition that makes cheap recovery possible.</p>
+</div>
+<p>The cost profile is the opposite of replication. Replication pays continuously, in extra memory and bandwidth for every copy, whether or not a failure ever happens. Lineage pays almost nothing in the common case, just the few bytes to store each derivation step, and pays the recomputation cost only when a partition is actually lost, and only for the partitions that were lost. For a long chain of narrow transformations, recomputing one partition re-runs that chain on one partition's worth of input, which is a small, local job. The catch arrives with wide dependencies, and that is the next idea.</p>
+
+<h2>2. Narrow and Wide Dependencies <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Not all lineage edges are equal. The crucial distinction is how many input partitions an output partition depends on. In a <strong>narrow dependency</strong>, each partition of the child RDD depends on at most one partition of each parent. Transformations like <code>map</code> and <code>filter</code> are narrow: to produce output partition $i$, you read input partition $i$, apply the function record by record, and you are done. No data leaves the machine, and the whole chain of narrow transformations can run as one pipelined pass over each partition.</p>
+<p>In a <strong>wide dependency</strong>, a single output partition can depend on records from <em>many</em> input partitions. Transformations like <code>groupByKey</code>, <code>reduceByKey</code>, and <code>join</code> are wide: to gather all values for a given key into one place, you must pull records carrying that key out of every input partition and route them to the partition that will hold the group. That routing of records across the network, sorting by key and sending each record to its destination partition, is the shuffle, the same expensive all-to-all movement introduced for MapReduce in <a href="../module-06-mapreduce-distributed-algorithms/section-6.2.html">Section 6.2</a>. A wide dependency forces a shuffle, and a shuffle forces a <strong>stage boundary</strong>: Spark cannot pipeline through it, because the output side cannot start until the input side has produced and shipped all the records the shuffle will move.</p>
+<p>If $p_{\text{in}}$ is the number of input partitions and $p_{\text{out}}$ the number of output partitions, a narrow dependency wires each output partition to one input partition, so the number of dependency edges is $O(p_{\text{out}})$, while a wide dependency can wire every output partition to every input partition, up to $O(p_{\text{in}} \cdot p_{\text{out}})$ edges of data movement. That blow-up is why the shuffle dominates the cost of most Spark jobs, a theme that returns in full in <a href="section-7.3.html">Section 7.3</a> and the partitioning discussions later in this chapter. Figure 7.2.1 draws both kinds of edge and the stage boundary that the wide one creates.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A lineage DAG. Source partitions feed narrow map and filter edges that stay within each partition, then a wide groupByKey edge fans every input partition out to every output partition, drawing a dashed stage boundary between the two stages.">
+<defs>
+<marker id="arr72" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arrW72" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.b72 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.g72 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.t72 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s72 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.hd72 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.ln72 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr72); }
+.lw72 { fill:none; stroke:#b86b1f; stroke-width:1.5; marker-end:url(#arrW72); }
+.bnd72 { fill:none; stroke:#b86b1f; stroke-width:1.6; stroke-dasharray:7 5; }
+</style>
+<text class="hd72" x="120" y="26">Stage 1: narrow, pipelined per partition</text>
+<text class="hd72" x="700" y="26">Stage 2: after the shuffle</text>
+<!-- column headers -->
+<text class="s72" x="80" y="62">source</text>
+<text class="s72" x="290" y="62">map</text>
+<text class="s72" x="500" y="62">filter</text>
+<text class="s72" x="710" y="62">groupByKey</text>
+<!-- source partitions -->
+<rect class="b72" x="40" y="80" width="80" height="40" rx="7"/><text class="t72" x="80" y="105">P0</text>
+<rect class="b72" x="40" y="170" width="80" height="40" rx="7"/><text class="t72" x="80" y="195">P1</text>
+<rect class="b72" x="40" y="260" width="80" height="40" rx="7"/><text class="t72" x="80" y="285">P2</text>
+<!-- map partitions -->
+<rect class="b72" x="250" y="80" width="80" height="40" rx="7"/><text class="t72" x="290" y="105">P0</text>
+<rect class="b72" x="250" y="170" width="80" height="40" rx="7"/><text class="t72" x="290" y="195">P1</text>
+<rect class="b72" x="250" y="260" width="80" height="40" rx="7"/><text class="t72" x="290" y="285">P2</text>
+<!-- filter partitions -->
+<rect class="b72" x="460" y="80" width="80" height="40" rx="7"/><text class="t72" x="500" y="105">P0</text>
+<rect class="b72" x="460" y="170" width="80" height="40" rx="7"/><text class="t72" x="500" y="195">P1</text>
+<rect class="b72" x="460" y="260" width="80" height="40" rx="7"/><text class="t72" x="500" y="285">P2</text>
+<!-- groupByKey partitions -->
+<rect class="g72" x="670" y="80" width="80" height="40" rx="7"/><text class="t72" x="710" y="105">P0</text>
+<rect class="g72" x="670" y="170" width="80" height="40" rx="7"/><text class="t72" x="710" y="195">P1</text>
+<rect class="g72" x="670" y="260" width="80" height="40" rx="7"/><text class="t72" x="710" y="285">P2</text>
+<!-- narrow edges: one-to-one -->
+<line class="ln72" x1="122" y1="100" x2="248" y2="100"/>
+<line class="ln72" x1="122" y1="190" x2="248" y2="190"/>
+<line class="ln72" x1="122" y1="280" x2="248" y2="280"/>
+<line class="ln72" x1="332" y1="100" x2="458" y2="100"/>
+<line class="ln72" x1="332" y1="190" x2="458" y2="190"/>
+<line class="ln72" x1="332" y1="280" x2="458" y2="280"/>
+<!-- stage boundary -->
+<line class="bnd72" x1="610" y1="60" x2="610" y2="320"/>
+<text class="s72" x="610" y="340" fill="#b86b1f">shuffle / stage boundary</text>
+<!-- wide edges: every input to every output -->
+<line class="lw72" x1="542" y1="100" x2="668" y2="100"/>
+<line class="lw72" x1="542" y1="100" x2="668" y2="190"/>
+<line class="lw72" x1="542" y1="100" x2="668" y2="280"/>
+<line class="lw72" x1="542" y1="190" x2="668" y2="100"/>
+<line class="lw72" x1="542" y1="190" x2="668" y2="190"/>
+<line class="lw72" x1="542" y1="190" x2="668" y2="280"/>
+<line class="lw72" x1="542" y1="280" x2="668" y2="100"/>
+<line class="lw72" x1="542" y1="280" x2="668" y2="190"/>
+<line class="lw72" x1="542" y1="280" x2="668" y2="280"/>
+<!-- legend -->
+<line class="ln72" x1="60" y1="380" x2="110" y2="380"/>
+<text class="s72" x="195" y="384" text-anchor="start">narrow: each output reads one input partition</text>
+<line class="lw72" x1="60" y1="402" x2="110" y2="402"/>
+<text class="s72" x="195" y="406" text-anchor="start">wide: each output may read every input partition (shuffle)</text>
+</svg>
+<figcaption><strong>Figure 7.2.1:</strong> A lineage DAG for <code>source.map(...).filter(...).groupByKey()</code>. The <code>map</code> and <code>filter</code> edges are narrow: output partition $i$ reads only input partition $i$, so the three blue chains pipeline independently inside Stage 1. The <code>groupByKey</code> edge is wide: each orange output partition may pull records from every input partition, the all-to-all shuffle that draws the dashed stage boundary and starts Stage 2. The edge count jumps from $O(p_{\text{out}})$ to $O(p_{\text{in}} \cdot p_{\text{out}})$ exactly at that boundary.</figcaption>
+</figure>
+<p>Narrow and wide dependencies also change the price of recovery. Re-running a chain of narrow transformations to rebuild one lost partition is cheap and local, as Section 1 promised. Re-running a partition that sits downstream of a wide dependency is not: its inputs came from a shuffle, so recomputing it may require recomputing the shuffle, which may require re-reading many parent partitions. This is why Spark checkpoints or persists across wide dependencies in long jobs, cutting the lineage so that recovery does not have to replay an expensive shuffle. Lineage is cheap insurance until a shuffle sits in the chain; then it has a real premium.</p>
+
+<h2>3. An RDD You Can Hold in Your Hand <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The ideas above are easy to state and easy to misjudge, so we make them concrete. The code below is a complete, dependency-free miniature of the RDD model in a few dozen lines of plain Python. Each transformation builds a new immutable object, records its parent and whether the dependency is narrow or wide, and stores a closure that knows how to compute any one partition on demand. Nothing is materialized until a partition is asked for, and a "lost" partition is recovered by simply asking for it again, which re-runs the closure against the immutable parents. This is the same mechanism Spark uses, stripped of the networking.</p>
+<pre><code class="language-python">NARROW, WIDE = "narrow", "wide"
+
+class MiniRDD:
+    def __init__(self, parents, op_name, dep, compute_partition, num_partitions):
+        self.parents = parents              # the RDDs this one was derived from
+        self.op_name = op_name              # human-readable transformation name
+        self.dep = dep                      # NARROW or WIDE
+        self._compute = compute_partition   # (index) -> list of records
+        self.num_partitions = num_partitions
+
+    def map(self, f):                       # narrow: per-record, per-partition
+        return MiniRDD([self], f"map({f.__name__})", NARROW,
+                       lambda i: [f(x) for x in self.partition(i)],
+                       self.num_partitions)
+
+    def filter(self, pred):                 # narrow: keep some records, stay local
+        return MiniRDD([self], f"filter({pred.__name__})", NARROW,
+                       lambda i: [x for x in self.partition(i) if pred(x)],
+                       self.num_partitions)
+
+    def group_by_key(self):                 # WIDE: each output reads EVERY input
+        def compute(i):
+            buckets = {}
+            for src in range(self.num_partitions):       # read all parent partitions
+                for k, v in self.partition(src):
+                    if hash(k) % self.num_partitions == i:   # route key to its bucket
+                        buckets.setdefault(k, []).append(v)
+            return sorted(buckets.items())
+        return MiniRDD([self], "group_by_key", WIDE, compute, self.num_partitions)
+
+    def partition(self, i):                 # compute (or RE-compute) one partition
+        return self._compute(i)
+
+    def lineage(self):                      # walk parents back to the source
+        chain, node = [], self
+        while node.parents:
+            chain.append((node.op_name, node.dep)); node = node.parents[0]
+        chain.append((node.op_name, node.dep))
+        return list(reversed(chain))
+
+def from_collection(records, num_partitions):
+    shards = [records[i::num_partitions] for i in range(num_partitions)]
+    return MiniRDD([], "source", NARROW, lambda i: list(shards[i]), num_partitions)
+
+def even(x):   return x % 2 == 0
+def square(x): return x * x
+def tag(x):    return (x % 3, x)            # key by remainder, value is the number
+
+base = from_collection(list(range(12)), num_partitions=3)
+narrow_chain = base.map(square).filter(even)        # map then filter: all narrow
+wide_chain   = base.map(tag).group_by_key()         # group_by_key: wide
+
+print("=== Lineage of the narrow chain ===")
+for op, dep in narrow_chain.lineage():
+    print(f"  {op:18s} -> {dep}")
+
+print("\n=== Lineage of the wide chain (note the stage boundary) ===")
+for op, dep in wide_chain.lineage():
+    boundary = "   &lt;-- shuffle / stage boundary" if dep == WIDE else ""
+    print(f"  {op:18s} -> {dep}{boundary}")
+
+print("\n=== Normal result of narrow_chain, partition 1 ===")
+print(" ", narrow_chain.partition(1))
+
+# Simulate LOSING partition 1 (a worker crashed). No replica exists; we just
+# recompute it from the lineage by asking for it again.
+print("\n=== Partition 1 lost. Recomputing from lineage (no replica needed) ===")
+recovered = narrow_chain.partition(1)               # re-derive from parents on demand
+print("  recovered partition 1 :", recovered)
+
+print("\n=== Determinism: recompute equals the original ===")
+print("  match:", recovered == narrow_chain.partition(1))
+
+all_edges = narrow_chain.lineage() + wide_chain.lineage()
+nw = sum(1 for _, d in all_edges if d == NARROW)
+wd = sum(1 for _, d in all_edges if d == WIDE)
+print(f"\nclassified edges: {nw} narrow, {wd} wide "
+      f"({wd} shuffle => {wd} extra stage boundary)")
+</code></pre>
+<div class="code-caption"><strong>Code 7.2.1:</strong> A self-contained RDD model. Transformations record lineage and dependency type instead of materializing data; <code>partition(i)</code> computes on demand, so re-asking for a "lost" partition recomputes it from its immutable parents. The <code>&lt;--</code> in the print string is a literal arrow in the output, not an em dash.</div>
+<pre><code class="language-text">=== Lineage of the narrow chain ===
+  source             -> narrow
+  map(square)        -> narrow
+  filter(even)       -> narrow
+
+=== Lineage of the wide chain (note the stage boundary) ===
+  source             -> narrow
+  map(tag)           -> narrow
+  group_by_key       -> wide   &lt;-- shuffle / stage boundary
+
+=== Normal result of narrow_chain, partition 1 ===
+  [16, 100]
+
+=== Partition 1 lost. Recomputing from lineage (no replica needed) ===
+  recovered partition 1 : [16, 100]
+
+=== Determinism: recompute equals the original ===
+  match: True
+
+classified edges: 5 narrow, 1 wide (1 shuffle => 1 extra stage boundary)</code></pre>
+<div class="code-caption"><strong>Output 7.2.1:</strong> Real output from Code 7.2.1 run under Python 3.14. The narrow chain's lineage is three narrow edges; the wide chain ends in the one wide edge that marks the shuffle and the stage boundary. Partition 1, recomputed after being "lost," is bit-for-bit identical to the original, because the inputs were immutable and the transformations deterministic.</div>
+<p>Three things in Output 7.2.1 are worth pausing on. First, the recovered partition equals the original exactly, with no replica anywhere in the program; the only thing that survived the loss was the lineage. Second, recomputing partition 1 of the narrow chain touched only partition 1's parents, never partitions 0 or 2, which is the locality that makes narrow recovery cheap. Third, the dependency classifier counted exactly one wide edge across both chains, and that single wide edge is the only place a real Spark scheduler would insert a stage boundary and pay for a shuffle. The miniature reproduces the model's behavior, not just its vocabulary.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Recompute-From-Lineage Is a Recurring Scale-Out Recovery Pattern</div>
+<p>The move you just watched, surviving a lost partition by replaying its derivation instead of restoring a copy, is not a Spark quirk; it is one of the recurring answers this book gives to failure at scale. It is the same instinct as MapReduce re-executing a failed task from its input split (<a href="../module-06-mapreduce-distributed-algorithms/section-6.2.html">Section 6.2</a>), and it reappears, transformed, when elastic deep-learning training rebuilds a departed worker's shard from a checkpoint plus a few replayed steps rather than from a full replica (<a href="../../part-4-parallel-deep-learning/module-18-elastic-fault-tolerant-training/index.html">Chapter 18</a>). Each time, the cluster trades stored redundancy for the ability to recompute deterministically, and each time the precondition is the same: immutable inputs and deterministic work.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: PySpark Gives You Lineage, Partitioning, and Recovery for Free</div>
+<p>Code 7.2.1 hand-rolled lineage tracking, on-demand partition computation, and the narrow/wide bookkeeping, several dozen lines, and still has no networking, no scheduler, and no shuffle implementation. PySpark provides all of it as a few method calls; you write the transformations and the engine records the lineage, classifies the dependencies, places the stage boundaries, and recomputes lost partitions across real machines without your involvement:</p>
+<pre><code class="language-python"># Run with a Spark session already created as `sc` (the SparkContext).
+base = sc.parallelize(range(12), numSlices=3)       # an RDD with 3 partitions
+
+narrow = base.map(lambda x: x * x).filter(lambda x: x % 2 == 0)   # narrow, pipelined
+wide   = base.map(lambda x: (x % 3, x)).groupByKey()             # wide -> a shuffle
+
+print(narrow.collect())            # [0, 4, 16, 36, 64, 100]
+print(wide.toDebugString().decode())   # prints the lineage DAG and the stage split
+# If a worker dies mid-job, Spark recomputes only the lost partitions from lineage;
+# you never write recovery code.
+</code></pre>
+<div class="code-caption"><strong>Code 7.2.2:</strong> The same two chains in PySpark. <code>toDebugString()</code> prints the real lineage DAG with the shuffle boundary that <code>groupByKey</code> introduces, and partition recovery is automatic. The dozens of lines of Code 7.2.1 collapse to the transformations themselves, with the framework owning lineage, scheduling, and fault recovery. Shown illustratively; it requires a running Spark cluster.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Feature Pipeline That Stopped Replicating Its Intermediates</div>
+<p><strong>Who:</strong> A data engineer building the daily feature pipeline for a recommendation model at a streaming-media company.</p>
+<p><strong>Situation:</strong> A multi-stage Spark job cleaned, joined, and aggregated 4 TB of viewing logs into training features every night, and the team had configured the large intermediate RDDs to persist with replication, <code>MEMORY_ONLY_2</code>, out of a general fear of losing work to flaky spot instances.</p>
+<p><strong>Problem:</strong> Replicating every intermediate doubled cluster memory pressure, triggering frequent spills to disk that made the job slower than it needed to be and occasionally blew the nightly window.</p>
+<p><strong>Dilemma:</strong> Keep replicating every intermediate for safety, accepting the memory cost and the spills, or drop the replicas and rely on lineage recomputation, which is cheaper in memory but risks an expensive replay if a partition downstream of a shuffle is lost.</p>
+<p><strong>Decision:</strong> They kept replication off for the long narrow chains, whose recomputation is cheap and local, and instead <code>checkpoint()</code>ed the RDDs immediately after each wide shuffle, cutting the lineage exactly where replay would have been costly.</p>
+<p><strong>How:</strong> They inspected each stage with <code>toDebugString()</code>, identified the two wide dependencies, replaced <code>MEMORY_ONLY_2</code> with plain <code>MEMORY_AND_DISK</code> on the narrow intermediates, and added a checkpoint after each shuffle so a lost downstream partition reloaded a saved boundary instead of replaying the shuffle.</p>
+<p><strong>Result:</strong> Cluster memory pressure fell, the disk spills disappeared, and the job finished comfortably inside the window; the rare lost partition recomputed in seconds from lineage or reloaded from a post-shuffle checkpoint, never by replaying a 4 TB shuffle.</p>
+<p><strong>Lesson:</strong> Lineage recomputation is the cheap default; spend replication or checkpoints only where the lineage crosses a wide dependency, because that is the only place recovery is expensive.</p>
+</div>
+
+<h2>4. Why Immutability Buys Determinism, and Determinism Buys Recovery <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>It is worth making the logical chain explicit, because it is the load-bearing argument of the whole RDD model. Lineage-based recovery rests on one claim: recomputing a partition from its parents yields the same partition that was lost. That claim is true only if recomputation is deterministic, and recomputation is deterministic only if two conditions both hold. The transformation must be a pure function of its inputs, the same inputs always producing the same outputs, and the inputs must not have changed since the first computation. Immutability guarantees the second condition outright: an RDD, once built, is never modified, so its partitions are the same data on the replay as on the original run. Purity of the common transformations (<code>map</code>, <code>filter</code>, and friends apply a side-effect-free function record by record) guarantees the first.</p>
+<p>Determinism does more than make recovery correct; it makes the entire computation reproducible. Run the same RDD program twice on the same input and you get the same result, partition by partition, which is what lets Spark speculatively re-run a slow straggler task on another machine and safely keep whichever copy finishes first, a straggler-mitigation idea that <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.4.html">Section 2.4</a> frames in general terms. The places where this breaks are precisely the places to be careful: a transformation that reads the wall clock, draws a random number from an unseeded generator, or depends on the arrival order of shuffled records is not a pure function, and an RDD built from it cannot be safely recomputed. Spark's reliability is, at bottom, a discipline of keeping transformations deterministic.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Dataset With Amnesia but Perfect Directions</div>
+<p>An RDD is a peculiar kind of survivor. It does not actually remember its own contents, the partitions can be evicted from memory at any time, but it never forgets how to rebuild them. It is as if you lost your house but kept the full blueprints and the receipt for every brick, so reconstructing it is just tedious, never impossible. The catch in the epigraph is real: directions only get you home if the road has not moved, which is exactly why the inputs must be immutable.</p>
+</div>
+<p>The narrow/wide distinction has a determinism wrinkle too. Within a partition, narrow transformations preserve record order, so their output is deterministic down to the ordering. A shuffle, by contrast, gathers records from many partitions whose network arrival order is not fixed, so unless you sort, the order of records inside a post-shuffle partition can vary run to run even though the <em>set</em> of records does not. For correctness this rarely matters, since most aggregations are order-insensitive, but it is the reason a transformation that secretly depends on within-partition order can pass every test and then fail mysteriously after a shuffle. Determinism of the multiset is guaranteed; determinism of the order is not, across a wide dependency.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Lineage as a First-Class Tool for Data and ML Pipelines (2024 to 2026)</div>
+<p>The lineage that Spark records for recovery has, in the last few years, become a deliberate target rather than an internal bookkeeping detail. Lakehouse table formats (Delta Lake and Apache Iceberg, both active through 2024 to 2026) expose commit-level data lineage so that a derived table can be traced, audited, and time-travelled back to the exact inputs that produced it, the same recompute-from-provenance idea lifted to the storage layer that <a href="section-7.3.html">Section 7.3</a> and Chapter 8 build on. In parallel, the data-and-ML-pipeline community has pushed fine-grained, column- and record-level lineage for governance and reproducibility, with frameworks such as OpenLineage standardizing how lineage events are emitted across Spark, Airflow, and dbt, and reaching wide adoption in 2024 to 2025. The research questions now are about capturing lineage cheaply at finer granularity and using it not only to recover from failure but to explain, debug, and selectively recompute only the outputs a changed input can affect, incremental recomputation guided by the very DAG this section built by hand.</p>
+</div>
+<p>We now have the RDD in full: a partitioned, immutable collection that records its lineage, recovers lost partitions by deterministic recomputation rather than replication, and splits its work at exactly the wide dependencies where a shuffle, and a stage boundary, become unavoidable. This is the engine under everything Spark does. The next section climbs one level up to the DataFrame and Spark SQL, where the same RDD machinery hides beneath a structured, optimizable interface that a query planner can reorganize on your behalf; that ascent begins in <a href="section-7.3.html">Section 7.3</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.2.1: Classify the Dependencies <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each transformation, state whether its dependency on its parent RDD is narrow or wide, and say in one sentence why: (a) <code>map</code>; (b) <code>filter</code>; (c) <code>reduceByKey</code>; (d) <code>union</code> of two RDDs; (e) <code>sortByKey</code>; (f) a <code>join</code> of two RDDs partitioned by different keys. Then, for a chain <code>source.map(f).reduceByKey(g).filter(h)</code>, state how many stage boundaries Spark will create and where, and explain which transformations recompute cheaply versus expensively if a final-partition is lost.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.2.2: Make Recovery Lie <span class="exercise-type coding">Coding</span></div>
+<p>Take Code 7.2.1 and add a transformation <code>stamp</code> whose function returns <code>(x, time.time())</code>, attaching a timestamp to each record. Build a chain through it, materialize a partition, then "lose" and recompute that partition exactly as the section does, and compare the recovered partition to the original. Show that the recovered partition differs, explain precisely which precondition of lineage-based recovery your <code>stamp</code> transformation violated, and describe what would go wrong in a real Spark job if a worker holding that partition crashed and Spark recomputed it.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.2.3: Price the Two Recovery Strategies <span class="exercise-type analysis">Analysis</span></div>
+<p>Consider an intermediate RDD of size $S$ bytes held across a cluster, and a job that runs for time $T$ during which the probability that at least one partition is lost is $f$. Replication with factor $r$ costs $r \cdot S$ bytes of memory continuously. Lineage costs only the few bytes of the DAG, plus an expected recomputation cost of roughly $f \cdot c$, where $c$ is the cost to recompute the lost partitions. Write the condition under which lineage is cheaper than replication, then argue how $c$ differs for a partition reachable through only narrow dependencies versus one reachable through a wide dependency, and use that to justify the checkpoint-after-shuffle rule from the Practical Example.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-7.1.html"><span class="nav-label">Previous</span><span class="nav-num">Section 7.1</span><span class="nav-title">From MapReduce to Spark</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 7</span><span class="nav-num">Contents</span><span class="nav-title">Spark and Distributed DataFrames</span></a>
+<a class="next" href="section-7.3.html"><span class="nav-label">Next</span><span class="nav-num">Section 7.3</span><span class="nav-title">DataFrames and Spark SQL</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

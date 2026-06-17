@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 23.6: Large-Model Loading, Cold Starts, and Warm Pools. Why a multi-gigabyte model takes seconds to minutes to become ready, why that lag breaks GPU autoscaling and serverless inference, and how warm pools, weight streaming, and snapshots trade idle cost for SLO safety." name="description"/>
+<title>Section 23.6: Large-Model Loading, Cold Starts, and Warm Pools | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 23: Distributed Inference Systems</a></div>
+<h1>Large-Model Loading, Cold Starts, and Warm Pools</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I was scheduled in eight hundred milliseconds. Then I spent four minutes reading my own weights off a disk, and the traffic spike I was summoned to handle had already given up and gone home."</p>
+<cite>A Replica That Booted Too Late</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A GPU replica is not ready the instant the scheduler places it; it is ready only after a multi-gigabyte model has been pulled from storage, loaded and sharded into device memory, and warmed until its kernels and caches are hot, a sequence that takes seconds to many minutes.</strong> That latency is the cold start, and it is the hidden reason GPU autoscaling lags behind demand and the reason serverless GPU inference is hard: the new capacity you ask for during a spike does not exist yet when you need it. This section measures where the time goes, ties each cost back to the storage, sharding, and per-node-warmup chapters that own it, and develops the central mitigation: keep a pool of already-loaded replicas warm and idle so capacity is ready before the spike, paying money for readiness you may not use. The trade-off between that idle cost and your latency objective is the design decision this section teaches you to make with numbers.</p>
+</div>
+<p>The earlier sections of this chapter treated a replica as a unit you can add or remove: <a href="section-23.5.html">Section 23.5</a> packed several models onto shared GPUs, and the autoscaler of Section 23.4 grew and shrank the replica count in response to utilization and queue depth. Both implicitly assumed that adding a replica is cheap and fast, the way adding a stateless web server behind a load balancer is cheap and fast. For large models that assumption is false. A web server ships a few megabytes of code and serves its first request in well under a second. A modern inference replica must move the model itself into GPU memory before it can answer anything, and the model is the largest object in the system. This single fact, that the serving unit carries gigabytes of state that must be materialized on the device, reshapes how a serving fleet scales, fails over, and bills.</p>
+<p>The size of the gap is easy to underestimate. A 7-billion-parameter model in half precision is roughly fourteen gigabytes of weights; a 70-billion-parameter model is around a hundred and forty gigabytes that must be sharded across several GPUs before any of them can serve; the largest deployed models reach several hundred gigabytes. Pulling that many bytes from object storage, placing them on the right devices, building the CUDA context, and warming the kernels is not a rounding error against a sub-second scheduling decision. It is the dominant term, and a fleet that ignores it will autoscale into a spike it has already missed.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Top: a cold-start timeline showing four sequential phases, pull weights, load and shard, warm kernels, then serve, with only the last phase able to answer requests. Bottom: a traffic spike where cold-start scaling lags behind demand while a warm pool of spare replicas absorbs the spike immediately.">
+<defs>
+<marker id="arr236" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.box236 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.pull236 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.warm236 { fill:#eaf6ee; stroke:#2e7d4f; stroke-width:1.6; }
+.serve236 { fill:#e7eefc; stroke:#2b5cc4; stroke-width:1.6; }
+.t236 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s236 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.lbl236 { font:600 13px sans-serif; fill:#14385c; text-anchor:start; }
+.ax236 { fill:none; stroke:#9aa3ad; stroke-width:1.3; }
+.cold236 { fill:none; stroke:#b86b1f; stroke-width:2.2; }
+.demand236 { fill:none; stroke:#14385c; stroke-width:2.2; stroke-dasharray:5 3; }
+.pool236 { fill:none; stroke:#2e7d4f; stroke-width:2.2; }
+</style>
+<text class="lbl236" x="30" y="26">Cold-start timeline: a new replica is silent until the last phase</text>
+<rect class="pull236" x="30" y="44" width="180" height="52" rx="8"/>
+<text class="t236" x="120" y="66">1. Pull weights</text>
+<text class="s236" x="120" y="84">object store &#8594; node</text>
+<rect class="box236" x="218" y="44" width="180" height="52" rx="8"/>
+<text class="t236" x="308" y="66">2. Load &amp; shard</text>
+<text class="s236" x="308" y="84">host &#8594; GPU memory</text>
+<rect class="box236" x="406" y="44" width="180" height="52" rx="8"/>
+<text class="t236" x="496" y="66">3. Warm kernels</text>
+<text class="s236" x="496" y="84">CUDA context, graphs</text>
+<rect class="serve236" x="594" y="44" width="180" height="52" rx="8"/>
+<text class="t236" x="684" y="66">4. Serve</text>
+<text class="s236" x="684" y="84">first token at last</text>
+<line class="ax236" x1="210" y1="70" x2="218" y2="70" marker-end="url(#arr236)"/>
+<line class="ax236" x1="398" y1="70" x2="406" y2="70" marker-end="url(#arr236)"/>
+<line class="ax236" x1="586" y1="70" x2="594" y2="70" marker-end="url(#arr236)"/>
+<line class="ax236" x1="30" y1="112" x2="774" y2="112" marker-end="url(#arr236)"/>
+<text class="s236" x="402" y="128">T<tspan baseline-shift="sub" font-size="9">load</tspan> = seconds to minutes, replica answers nothing during phases 1 to 3</text>
+<text class="lbl236" x="30" y="182">Spike response: cold-start scaling lags; a warm pool absorbs it at once</text>
+<line class="ax236" x1="70" y1="380" x2="800" y2="380"/>
+<line class="ax236" x1="70" y1="380" x2="70" y2="210"/>
+<text class="s236" x="435" y="404">time</text>
+<text class="s236" x="40" y="300" transform="rotate(-90 40 300)">capacity / demand</text>
+<path class="demand236" d="M 70 350 L 250 350 L 270 240 L 520 240 L 540 350 L 800 350"/>
+<text class="s236" x="395" y="232" fill="#14385c">demand (spike)</text>
+<path class="cold236" d="M 70 350 L 270 350 L 430 350 L 470 250 L 540 250 L 700 250 L 720 350 L 800 350"/>
+<text class="s236" x="372" y="346" fill="#b86b1f" text-anchor="start">cold-start capacity (arrives after T<tspan baseline-shift="sub" font-size="9">load</tspan>, too late)</text>
+<path class="pool236" d="M 70 250 L 800 250"/>
+<text class="s236" x="120" y="244" fill="#2e7d4f" text-anchor="start">warm pool: ready before the spike</text>
+</svg>
+<figcaption><strong>Figure 23.6.1:</strong> Top, the four-phase cold start: a freshly scheduled replica must pull its weights from storage, load and shard them onto the GPUs, and warm its kernels before phase four, when it can finally serve. The total time $T_{\text{load}}$ is the cold-start latency. Bottom, a traffic spike: cold-start scaling (orange) only adds capacity $T_{\text{load}}$ seconds after demand rises, so it misses the leading edge entirely, while a warm pool (green) holds spare loaded replicas above baseline and absorbs the spike the instant it arrives.</figcaption>
+</figure>
+
+<h2>1. Where the Cold-Start Time Goes <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>It helps to break the cold start into its contributing costs, because each one is owned by a different part of the system and has a different remedy. The first cost is pulling the weights. The model lives in object storage or a registry, and the new node must read every byte across the network before it can place anything on a GPU. At a per-node read bandwidth of $B$ bytes per second for a model of $S$ bytes, this phase alone takes $S / B$ seconds, and for a multi-hundred-gigabyte model over a shared network link that is minutes, not seconds. This is the same storage-and-loading bottleneck that <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/section-8.2.html">Section 8.2</a> analyzed for training data; here the object being streamed is the model rather than the dataset, but the bandwidth arithmetic is identical.</p>
+<p>The second cost is loading and sharding the weights onto the devices. Bytes that have arrived on the host still have to be copied over the PCIe or NVLink bus into GPU memory, and for a model too large for one GPU they must be split across several according to a tensor-parallel or pipeline plan before any device holds a runnable slice. That partition is exactly the sharded-loading problem of <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>: the same layout that lets a 70-billion-parameter model fit across eight GPUs at serving time also dictates how its checkpoint is read and scattered at load time. The third cost is building the CUDA context and warming the kernels: the first forward pass triggers just-in-time compilation, autotuning, and CUDA-graph capture, and any prefix or KV cache the engine relies on starts empty and cold. That warmup is the per-node startup cost detailed in <a href="../module-22-per-node-inference-efficiency/section-22.8.html">Section 22.8</a>, and until it completes the replica's first few requests run slow even after the weights are in place.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Serving Unit Carries Gigabytes of State, So Capacity Is Slow to Create</div>
+<p>A stateless web replica is ready almost instantly because it ships only code. A large-model inference replica is ready only after the model, the system's largest object, has been streamed from storage, scattered across GPUs, and warmed. The total cold-start latency $T_{\text{load}}$ is the sum of these phases, and because it is dominated by moving and placing gigabytes, it does not shrink when you have more requests waiting; it is fixed by bandwidth and warmup, not by demand. This is why "just add a replica" lags reality, and why every mitigation in this section attacks $T_{\text{load}}$ either by paying it in advance (warm pools, snapshots) or by making the bytes arrive faster (streaming, local caching).</p>
+</div>
+<p>Putting the phases together, the cold-start latency is</p>
+$$T_{\text{load}} \;=\; \underbrace{\frac{S}{B}}_{\text{pull weights}} \;+\; \underbrace{T_{\text{shard}}}_{\text{load \& shard to GPUs}} \;+\; \underbrace{T_{\text{warm}}}_{\text{CUDA context, kernels, caches}},$$
+<p>and the binding term shifts with the model. For a small model on fast local storage, warmup dominates; for a hundred-gigabyte model behind a shared object store, the pull term $S/B$ swamps everything else. Knowing which term binds tells you which mitigation to reach for, exactly as <a href="../../part-1-foundations/module-01-scale-out-ai/index.html">Chapter 1</a> insisted you match the remedy to the ceiling that actually binds.</p>
+
+<h2>2. Why Cold Starts Break Autoscaling and Serverless GPU <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>An autoscaler observes a signal (utilization, queue depth), decides it needs more replicas, and requests them. With stateless services the requested capacity is usable within a second, so the control loop is tight and the lag between deciding and serving is negligible. With large-model replicas the requested capacity is usable only after $T_{\text{load}}$, which inserts a fixed dead time into the control loop. During a spike that dead time is precisely when you most need the capacity, and the replicas you summoned arrive after the leading edge of the spike has already overwhelmed the replicas you had. This is the mechanism behind the autoscaling lag flagged in Section 23.4: the loop is not slow because the autoscaler is timid; it is slow because the thing it creates takes minutes to exist.</p>
+<p>The same dead time is what makes serverless GPU inference hard. The serverless promise is scale to zero: hold no replicas when idle, spin one up on the first request, and pay nothing in between. For a stateless function that is a clean win because spin-up is milliseconds. For a large model, scale to zero means every first request after an idle period pays the full $T_{\text{load}}$, so the user who triggers the wake waits seconds to minutes for an answer. Scale to zero is therefore viable only for workloads that tolerate that first-request latency: batch jobs, internal tools, low-traffic endpoints where a cold first request is acceptable. For latency-sensitive serving the honest choice is to keep capacity warm, which means the next section's idea.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Replica That Was Always Five Minutes Away</div>
+<p>There is a classic incident shape on serving teams: dashboards are green, the autoscaler is firing correctly, replica count is climbing, and users are still timing out. The autoscaler did its job perfectly; it just promised capacity that was, and would remain for several minutes, busy reading its own weights off a disk. The fix is never a more aggressive autoscaler. A faster trigger only summons more replicas that are all equally five minutes away. The fix is to have the capacity already loaded before the trigger fires.</p>
+</div>
+
+<h2>3. Warm Pools and the Cost-Versus-Readiness Trade-Off <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The direct remedy for a fixed cold-start dead time is to pay it in advance. A warm pool keeps $K$ spare replicas fully loaded, warmed, and idle above the baseline you need for steady traffic, so when a spike arrives the capacity is already on the device and serves the very first request. The pool converts an unavoidable startup latency into a standing cost: those $K$ replicas hold GPUs and bill for them whether or not a spike ever comes. That is the cost-versus-readiness trade-off in one sentence, and it is a genuine business decision rather than a purely technical one. A pool sized for the worst spike meets the latency objective always but wastes money during the long stretches of normal traffic; a pool sized too small saves money but lets some spikes through to the cold-start dead time.</p>
+<p>You can put numbers on it. If a spike of size $\Delta$ requests per second arrives and one ready replica serves $c$ requests per second, you need $\lceil \Delta / c \rceil$ spare replicas warm to absorb it without ever touching the cold path. The idle cost is those replicas times their hourly GPU price times the fraction of time the spike is absent. Sizing the pool is then a quantitative balance between the dollars of idle GPUs and the dollars (or SLO credits) of violated latency, the same kind of cost model <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a> built for communication. The demo below makes the readiness side of that balance vivid by simulating a spike against both strategies.</p>
+<p>The simulation runs a one-second-tick queue for two minutes. Steady traffic of 40 requests per second jumps to 200 for a fifty-second spike, each ready replica serves 30 requests per second, and a cold replica needs 25 seconds to become ready. The SLO requires every request to begin service within two seconds. We compare pure cold-start autoscaling, which starts with no spares and requests cold replicas once the queue builds, against a warm pool that holds six spare loaded replicas above baseline.</p>
+<pre><code class="language-python">import random
+from collections import deque
+
+random.seed(7)
+HORIZON, BASE_RPS, SPIKE_RPS = 120, 40, 200      # seconds; arrivals/sec before, during
+SPIKE_START, SPIKE_END = 20, 70                  # spike window (seconds)
+CAP_PER_REP, T_LOAD, W_SLO, N_BASE = 30, 25, 2, 2  # serve rate, cold-start sec, SLO sec, always-on
+
+def arrivals(t):                                 # rough Poisson arrivals this tick
+    rate = SPIKE_RPS if SPIKE_START &lt;= t &lt; SPIKE_END else BASE_RPS
+    return sum(1 for _ in range(rate * 3) if random.random() &lt; 1.0 / 3.0)
+
+def simulate(warm_spares, autoscale):
+    ready = N_BASE + warm_spares                 # replicas able to serve right now
+    pending, requested, q = [], 0, deque()       # loading replicas, count requested, arrival ticks
+    total = late = 0
+    for t in range(HORIZON):
+        ready += sum(1 for r in pending if r == t)        # cold replicas finish loading
+        pending = [r for r in pending if r &gt; t]
+        if autoscale and len(q) &gt; CAP_PER_REP:            # autoscaler reacts to queue depth
+            want = len(q) // CAP_PER_REP
+            while requested &lt; want:                        # but each new replica lags by T_LOAD
+                pending.append(t + T_LOAD); requested += 1
+        a = arrivals(t); total += a
+        for _ in range(a): q.append(t)                    # enqueue arrivals with their time
+        for _ in range(min(ready * CAP_PER_REP, len(q))): # serve up to capacity
+            if t - q.popleft() &gt; W_SLO: late += 1          # started service too late?
+    late += sum(1 for arr in q if HORIZON - arr &gt; W_SLO)   # drain leftover queue
+    return total, late, ready
+
+print(f"{'strategy':34s} {'requests':>8s} {'SLO_viol':>9s} {'viol_%':>7s} {'replicas_end':>13s}")
+for label, spares in [("cold-start autoscaling (0 spare)", 0), ("warm pool (6 spare replicas)", 6)]:
+    tot, late, endready = simulate(spares, autoscale=True)
+    print(f"{label:34s} {tot:8d} {late:9d} {100.0*late/tot:6.1f}% {endready:13d}")
+</code></pre>
+<div class="code-caption"><strong>Code 23.6.1:</strong> A discrete-time queue simulation comparing cold-start autoscaling against a warm pool under a traffic spike. The cold path can only add capacity <code>T_LOAD</code> seconds after the queue builds, modeling the autoscaling dead time; the warm pool holds <code>warm_spares</code> ready replicas above baseline so the spike is served immediately.</div>
+<pre><code class="language-text">strategy                           requests  SLO_viol  viol_%  replicas_end
+cold-start autoscaling (0 spare)      12804      6022   47.0%           124
+warm pool (6 spare replicas)          12875         0    0.0%             8</code></pre>
+<div class="code-caption"><strong>Output 23.6.1:</strong> Under the same spike, cold-start autoscaling violates the two-second SLO on 47 percent of requests because its new replicas arrive 25 seconds too late, and it over-provisions to 124 replicas while chasing a spike that is already over. The six-replica warm pool serves every request on time and ends with eight replicas. Readiness, not autoscaler aggressiveness, is what meets the SLO.</div>
+<p>The contrast is stark and it is the whole point of the section. The cold-start strategy is not lazy; its autoscaler fires hard, eventually requesting so many replicas that it ends with 124 of them, far more than the warm pool's eight. But because every one of those replicas needed 25 seconds to load, they all arrived after the spike's leading edge had already blown the SLO, and the late flood then over-provisions wildly. The warm pool spent six idle replicas' worth of GPU money to hold capacity ready, and in return served the entire spike without a single violation. That is the trade purchased: standing idle cost in exchange for capacity that exists at the instant of demand rather than $T_{\text{load}}$ seconds after it.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Per-Node Cold-Start Cost, Multiplied Across the Fleet</div>
+<p>The cold-start latency $T_{\text{load}}$ is a per-node quantity, set by one replica's weight pull, sharded load, and kernel warmup from <a href="../module-22-per-node-inference-efficiency/index.html">Chapter 22</a>. This section is where that single-node number becomes a fleet property: the same $T_{\text{load}}$ that delays one replica is what forces a whole serving cluster to hold warm spares, lag its autoscaler, and price idle readiness against SLO risk. The scale-up cost of starting one engine does not stay local; multiplied across a fleet that must add and remove replicas continuously, it dictates the distributed serving architecture, and it returns once more in <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a> where loading a single model already spans many machines.</p>
+</div>
+
+<h2>4. Shrinking the Cold Start Itself <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Warm pools pay the cold start in advance; the complementary family of techniques makes the cold start itself smaller, so that when you do load a replica it becomes ready in less time. The most direct lever is the pull term $S/B$. Caching weights on local NVMe means the second and later replicas on a node read from a fast local disk rather than re-pulling from object storage across the network, turning minutes into seconds for warm-cache nodes. Fast weight streaming overlaps the pull with the load: rather than downloading the whole checkpoint and then copying it to the GPU, the engine streams shards and begins placing the earliest layers on the device while later layers are still arriving, so the two slowest phases run concurrently instead of in series.</p>
+<p>A second lever attacks warmup. Snapshotting a warmed process captures a replica after it has loaded and warmed, freezing the hot CUDA context and caches, so a new replica restores from the snapshot rather than recompiling kernels and recapturing graphs from scratch. Lazy and parallel loading help on both fronts: lazy loading defers weights the first request does not touch, letting the replica serve before it is fully materialized, and parallel loading reads many shards across many threads or many GPUs at once so the load phase is bounded by aggregate bandwidth rather than a single stream. None of these eliminates $T_{\text{load}}$, but each shrinks a term in it, which both lowers the first-request latency for scale-to-zero workloads and lets a warm pool be smaller for the same readiness, because a faster cold path is a cheaper backstop when the pool is exhausted.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Ray Serve Declares the Warm Pool for You</div>
+<p>Code 23.6.1 simulated a warm pool by hand to expose the mechanism. In production you declare it. A serving framework lets you set a minimum number of always-loaded replicas (the warm floor) and a maximum the autoscaler may grow to, plus a grace period before idle replicas are reclaimed, and it handles the loading, health-checking, and routing internally:</p>
+<pre><code class="language-python"># Ray Serve: keep a warm floor of replicas always loaded, autoscale above it.
+from ray import serve
+
+@serve.deployment(
+    autoscaling_config={
+        "min_replicas": 8,          # the warm pool: always loaded and ready
+        "max_replicas": 40,         # ceiling the autoscaler may grow to
+        "target_ongoing_requests": 12,
+        "downscale_delay_s": 600,   # grace period so we do not pay T_load to re-add
+    },
+    ray_actor_options={"num_gpus": 1},
+)
+class LLM:
+    def __init__(self):
+        self.engine = load_and_warm_model()   # the slow T_load, paid once at replica start
+    async def __call__(self, request):
+        return await self.engine.generate(request)
+</code></pre>
+<div class="code-caption"><strong>Code 23.6.2:</strong> The warm pool of Code 23.6.1 expressed declaratively. Setting <code>min_replicas</code> above zero holds a warm floor, <code>downscale_delay_s</code> keeps replicas alive through brief lulls so they are not reloaded immediately, and the framework owns the loading, warmup, and batch-aware routing that the manual simulation only approximated.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Endpoint That Scaled to Zero and Then to Anger</div>
+<p><strong>Who:</strong> A platform engineer running a multi-tenant inference service for a SaaS company.</p>
+<p><strong>Situation:</strong> A 34-billion-parameter code-assistant model was deployed behind a scale-to-zero endpoint to save GPU cost on a workload that was idle most nights.</p>
+<p><strong>Problem:</strong> Each morning the first developer to hit the endpoint waited almost four minutes for a response while a cold replica pulled 68 gigabytes of weights and warmed its kernels, and the support queue filled with timeout complaints.</p>
+<p><strong>Dilemma:</strong> Keep scale-to-zero and its near-free idle cost but accept brutal first-request latency, or hold replicas warm around the clock and pay for GPUs that sit idle through the night.</p>
+<p><strong>Decision:</strong> Neither extreme. They kept a warm pool of two replicas during business hours, scaled to zero only in a narrow overnight window, and cached the weights on local NVMe so the cold path, when it did fire, read from local disk instead of object storage.</p>
+<p><strong>How:</strong> A schedule set <code>min_replicas</code> to two from 7am to 9pm and to zero otherwise, and a node-local weight cache cut the cold-start pull from object storage from about 210 seconds to about 40 once a node had served the model before.</p>
+<p><strong>Result:</strong> Daytime first-request latency dropped to the warm path of under a second, the worst overnight cold start fell from nearly four minutes to under a minute, and GPU spend stayed within budget because the warm pool ran only during the hours that actually saw traffic.</p>
+<p><strong>Lesson:</strong> Cold-start mitigation is a portfolio, not a single switch. Combine a warm pool sized to real traffic hours with a faster cold path (local caching) so the rare cold start that slips through is itself cheap.</p>
+</div>
+
+<h2>5. Choosing a Strategy for a Given Workload <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The strategies are not rivals; they are points on a spectrum from cheapest-idle to fastest-ready, and the right point depends on the workload's tolerance for a cold first request. A latency-critical interactive endpoint with a strict SLO and spiky traffic sits at the fast-ready end: a warm pool sized to the expected spike, backed by fast streaming and local caches so even a pool miss recovers quickly. A throughput-oriented batch endpoint, where requests queue anyway and no human waits on the first token, sits at the cheap-idle end: scale to zero is correct, and paying $T_{\text{load}}$ once at the start of a batch is negligible against the hours the batch runs. Most production services live in between, with a small warm floor for the common case and autoscaling above it for genuine surges.</p>
+<p>The decision also threads into the next section. A warm pool is not only a performance device; it is a redundancy device, because spare loaded replicas are exactly what lets a fleet survive the loss of a serving replica without a cold-start gap while a replacement loads. <a href="section-23.7.html">Section 23.7</a> takes up that connection directly, treating availability, failover, and the redundant capacity that keeps a serving fleet answering through failures. The cold-start cost you learned to price here is the same cost that failover must hide, and the warm pool you sized for spikes is the same pool that absorbs a failed replica.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Fast Model Loading and Serverless GPU Inference (2024 to 2026)</div>
+<p>Because $T_{\text{load}}$ gates both autoscaling and serverless economics, a vigorous line of recent work attacks it directly. Fast weight-streaming and tiered-cache loaders (for example the safetensors fast-load path and systems like Run:ai Model Streamer and AWS's tensor-streaming loaders, 2024 to 2025) overlap the object-store pull with the GPU copy and report large reductions in time to first ready. Snapshot-and-restore approaches that freeze a warmed process, in the lineage of serverless snapshotting research, are being adapted to GPU state so a replica restores hot caches instead of recompiling kernels. On the serverless side, systems work on GPU cold starts (such as ServerlessLLM and related 2024 to 2025 efforts) combines locality-aware scheduling, multi-tier weight caching, and live migration to push scale-to-zero closer to viability for latency-sensitive models. The shared premise across all of this matches the section's: treat the cold start as a quantity to engineer down, not a constant to accept, while warm pools remain the dependable backstop when readiness must be guaranteed.</p>
+</div>
+<p>We have located where cold-start time goes, shown why that fixed dead time lags autoscaling and frustrates serverless GPU, priced the warm pool's trade of idle cost for readiness with a simulation, and surveyed the techniques that shrink the cold start itself. The capacity you now know how to keep warm and ready is also the capacity that keeps a fleet available when a replica fails, which is where the chapter turns next.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.6.1: Which Term Binds? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each deployment, decide which term of $T_{\text{load}} = S/B + T_{\text{shard}} + T_{\text{warm}}$ dominates and which single mitigation from Section 4 you would apply first: (a) a 140-gigabyte model pulled over a shared 1.25 gigabyte-per-second link to a fresh node; (b) a 3-gigabyte model on a node whose local NVMe already cached it last hour, but whose engine recompiles CUDA graphs on every start; (c) a 70-billion-parameter model whose checkpoint is on fast local disk but must be sharded across eight GPUs before any can serve. Explain why applying the wrong mitigation (for instance, a warm pool when the real problem is recompilation) would leave the dominant term untouched.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.6.2: Size the Warm Pool <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 23.6.1 to sweep <code>warm_spares</code> from 0 to 8 and, for each value, record the SLO-violation percentage and the idle replica-seconds spent above baseline (a replica is idle in a tick when it is ready but the queue empties before it serves). Plot or tabulate violation percentage against idle cost. Identify the smallest warm pool that drives violations to zero, and argue from your table where the cost-versus-readiness knee sits. Then raise <code>SPIKE_RPS</code> and show how the knee moves, connecting the result to the $\lceil \Delta / c \rceil$ sizing rule from Section 3.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.6.3: Cold Path Versus Warm Pool Economics <span class="exercise-type analysis">Analysis</span></div>
+<p>A 70-billion-parameter model needs eight GPUs per replica at \$3 per GPU-hour. Spikes that require two extra replicas occur for 30 minutes a day; the rest of the day they are absent. A warm pool of two replicas costs idle GPU-hours during the 23.5 spike-free hours. Separately, fast streaming plus a local cache could cut $T_{\text{load}}$ from 4 minutes to 40 seconds, making a cold-start backstop tolerable for some of the spike. Estimate the daily idle cost of the always-warm pool, compare it to the SLO cost of letting the 40-second cold path absorb the first part of each spike, and recommend a policy. State the assumption about how much SLO violation is acceptable that flips your recommendation, tying the reasoning back to the cost model of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-23.5.html"><span class="nav-label">Previous</span><span class="nav-num">Section 23.5</span><span class="nav-title">Multi-Model and Multi-Tenant GPU Serving</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 23</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Inference Systems</span></a>
+<a class="next" href="section-23.7.html"><span class="nav-label">Next</span><span class="nav-num">Section 23.7</span><span class="nav-title">Availability, Failover, and Redundancy</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

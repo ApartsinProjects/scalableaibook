@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 24.2: Tensor-Parallel Inference. Splitting one model across GPUs to serve a single request: sharded weights, a per-layer all-reduce, a sharded KV cache, and the latency-versus-overhead trade-off that caps the tensor-parallel degree to one node." name="description"/>
+<title>Section 24.2: Tensor-Parallel Inference | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 24: Distributed LLM Serving</a></div>
+<h1>Tensor-Parallel Inference</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They cut me into eight slices and told me I would feel faster. They were right, until layer eighty-one, when I spent more time gossiping than thinking."</p>
+<cite>A Weight Matrix Sharded One Slice Too Far</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Tensor-parallel inference takes one model that does not fit, or does not run fast enough, on a single GPU and splits every layer's weights across several GPUs, so that the GPUs jointly compute each token of a single request and combine their partial results with an all-reduce on every layer.</strong> It is the training technique of <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/section-16.2.html">Section 16.2</a> turned toward serving: the same column-and-row weight split, the same per-layer collective, now run forward-only to answer a prompt. It buys two things at once, smaller weight memory per GPU and lower per-token latency, and it charges one price, an all-reduce per layer per token. That price is only bearable on the fastest interconnect, which is why tensor parallelism almost always stays inside a single node. This section shows the split, proves it equals the single-GPU answer, and models exactly where the all-reduce overhead overtakes the speedup.</p>
+</div>
+<p>In the previous section we saw why a large language model can outgrow one GPU on two separate fronts: its weights may not fit, and even when they fit, a single GPU may compute each token too slowly for the latency budget. Replication, the subject of <a href="../module-23-distributed-inference-systems/index.html">Chapter 23</a>, answers neither problem, because a replica is a full copy of the model on one device; if the model does not fit on one device, you cannot make a replica at all, and adding replicas never makes a single request faster. The remedy is to make one logical model span several GPUs. Tensor parallelism is the first and most latency-friendly way to do that, and it is, almost beat for beat, the inference reuse of a method this book already developed for training.</p>
+
+<h2>1. The Same Split, Now Forward-Only <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Recall the Megatron-style split from <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/section-16.2.html">Section 16.2</a>. A transformer layer is, at its core, two large matrix multiplications back to back: an up-projection that widens the hidden vector, a nonlinearity, and a down-projection that narrows it again. Tensor parallelism partitions those matrices along their shared inner dimension. The first weight matrix is split by columns, so each of the $T$ GPUs holds a vertical slice and computes only a slice of the widened activation. The second weight matrix is split by rows to match, so each GPU multiplies its activation slice by its own row slice and produces a partial copy of the full-width output. No GPU holds the whole layer; each holds a $1/T$ slice of both weight matrices, and the attention block splits the same way, by attention heads.</p>
+<p>The partial outputs are the key. Each GPU computes a full-shape output vector that is correct except that it is missing the contributions of the slices held by the other GPUs. Because the down-projection is a sum over the inner dimension, and a sum decomposes exactly the way the gradient sum did in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>, adding the $T$ partial outputs reconstructs the exact single-GPU result. That addition is an all-reduce: every GPU contributes one vector, the vectors are summed, and every GPU receives the total so it can feed the next layer. This is the same all-reduce collective introduced in <a href="../../part-1-foundations/module-04-communication-primitives/section-4.3.html">Section 4.3</a>, now fired once on the forward pass of each layer rather than once on the backward pass of each step. Figure 24.2.1 lays out this split across three GPUs, with the column-and-row weight slices, the head-sharded KV cache, and the per-layer all-reduce that combines the partial outputs.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of one transformer layer split across three GPUs: each GPU holds a column slice of the up-projection weight and a row slice of the down-projection weight, computes a partial output, and the three partials are summed by an all-reduce; the KV cache is shown sharded by attention head across the same three GPUs.">
+<defs>
+<marker id="arr242" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b242 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.g242 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.r242 { fill:#eef6ee; stroke:#2e7d46; stroke-width:1.6; }
+.t242 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s242 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l242 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr242); }
+.d242 { fill:none; stroke:#2e7d46; stroke-width:1.4; stroke-dasharray:4 3; }
+</style>
+<text class="t242" x="440" y="24">One transformer layer, tensor-parallel across 3 GPUs</text>
+<rect class="b242" x="370" y="40" width="140" height="36" rx="8"/>
+<text class="t242" x="440" y="63">input token x</text>
+<path class="l242" d="M 410 76 L 150 104"/>
+<path class="l242" d="M 440 76 L 440 104"/>
+<path class="l242" d="M 470 76 L 730 104"/>
+<g>
+<rect class="g242" x="60" y="106" width="180" height="118" rx="9"/>
+<text class="t242" x="150" y="128">GPU 0</text>
+<text class="s242" x="150" y="148">W1 columns [0 : d/3]</text>
+<text class="s242" x="150" y="166">W2 rows [0 : d/3]</text>
+<text class="s242" x="150" y="190">partial out y0</text>
+<text class="s242" x="150" y="210">KV cache: heads 0..</text>
+</g>
+<g>
+<rect class="g242" x="350" y="106" width="180" height="118" rx="9"/>
+<text class="t242" x="440" y="128">GPU 1</text>
+<text class="s242" x="440" y="148">W1 columns [d/3 : 2d/3]</text>
+<text class="s242" x="440" y="166">W2 rows [d/3 : 2d/3]</text>
+<text class="s242" x="440" y="190">partial out y1</text>
+<text class="s242" x="440" y="210">KV cache: heads ..</text>
+</g>
+<g>
+<rect class="g242" x="640" y="106" width="180" height="118" rx="9"/>
+<text class="t242" x="730" y="128">GPU 2</text>
+<text class="s242" x="730" y="148">W1 columns [2d/3 : d]</text>
+<text class="s242" x="730" y="166">W2 rows [2d/3 : d]</text>
+<text class="s242" x="730" y="190">partial out y2</text>
+<text class="s242" x="730" y="210">KV cache: heads ..N</text>
+</g>
+<path class="d242" d="M 240 200 L 350 200"/>
+<path class="d242" d="M 530 200 L 640 200"/>
+<text class="s242" x="440" y="244">KV cache sharded by head across the same 3 GPUs (dashed: one cache, three slices)</text>
+<path class="l242" d="M 150 224 L 360 286"/>
+<path class="l242" d="M 440 224 L 440 286"/>
+<path class="l242" d="M 730 224 L 520 286"/>
+<rect class="r242" x="300" y="288" width="280" height="50" rx="9"/>
+<text class="t242" x="440" y="310">All-reduce (SUM)</text>
+<text class="s242" x="440" y="328">y = y0 + y1 + y2, one per layer per token</text>
+<path class="l242" d="M 440 338 L 440 372"/>
+<rect class="b242" x="370" y="374" width="140" height="36" rx="8"/>
+<text class="t242" x="440" y="397">output token y</text>
+</svg>
+<figcaption><strong>Figure 24.2.1:</strong> One transformer layer served tensor-parallel across three GPUs. Each GPU holds a column slice of the up-projection ($W_1$) and the matching row slice of the down-projection ($W_2$), and produces a full-shape partial output. The three partials are summed by an all-reduce (green) to recover the exact single-GPU output, and this collective fires once per layer for every token. The KV cache (dashed) is sharded by attention head across the same three GPUs, so no GPU stores the whole cache.</figcaption>
+</figure>
+<p>Two consequences follow immediately, and they are exactly why tensor parallelism is used at inference rather than only at training. First, the weight memory per GPU drops by a factor of $T$, because each GPU stores only its slice; a model that needs four GPUs' worth of memory becomes servable on four GPUs that no single one could host. Second, the per-token latency drops, because the two big matrix multiplications that dominate each layer are now done $T$ ways in parallel, with each GPU doing $1/T$ of the arithmetic. Replication can give you neither: it cannot fit a model that does not fit, and it cannot make one token faster. Tensor parallelism makes ONE replica span GPUs; replication, the contrast we draw in Section 5, adds MORE replicas. They are orthogonal, and a real serving stack uses both.</p>
+
+<h2>2. Verifying the Split Equals One GPU <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The claim that summing partial outputs reconstructs the single-GPU result is the whole correctness argument, and it is worth seeing run rather than asserted. The code below builds one transformer feed-forward block, computes its output the ordinary single-GPU way, then computes it again as $T$ sharded GPUs that each hold a column slice of the first weight, the matching row slice of the second weight, and contribute one partial output to an all-reduce. It checks that the two agree for several values of $T$.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+d_model, d_ff, S = 256, 1024, 16      # hidden dim, FFN inner dim, sequence length
+
+x  = rng.standard_normal((S, d_model)) / np.sqrt(d_model)
+W1 = rng.standard_normal((d_model, d_ff)) / np.sqrt(d_model)
+W2 = rng.standard_normal((d_ff, d_model)) / np.sqrt(d_ff)
+
+def gelu(z):
+    return 0.5 * z * (1.0 + np.tanh(np.sqrt(2/np.pi) * (z + 0.044715 * z**3)))
+
+# Single-GPU reference: y = gelu(x @ W1) @ W2
+ref = gelu(x @ W1) @ W2
+
+# Tensor-parallel across T simulated GPUs.
+# W1 column-parallel (slice the d_ff axis), W2 row-parallel (same axis).
+# Each GPU returns a full-shape partial; summing them is the all-reduce.
+def tensor_parallel(T):
+    cols = np.array_split(np.arange(d_ff), T)        # how the inner dim is sliced
+    partials = []
+    for c in cols:                                    # each c lives on one GPU
+        W1_shard = W1[:, c]                            # column slice of W1
+        W2_shard = W2[c, :]                            # matching row slice of W2
+        h = gelu(x @ W1_shard)                         # local activation (S, |c|)
+        partials.append(h @ W2_shard)                 # partial (S, d_model) output
+    return np.sum(partials, axis=0)                   # all-reduce SUM across GPUs
+
+for T in (1, 2, 4, 8):
+    out = tensor_parallel(T)
+    print(f"T={T}  max|TP - single| = {np.max(np.abs(out - ref)):.2e}")
+</code></pre>
+<div class="code-caption"><strong>Code 24.2.1:</strong> A transformer feed-forward block served tensor-parallel across $T$ simulated GPUs. The column-parallel and row-parallel slices are chosen so that summing the per-GPU partial outputs is exactly an all-reduce, and the result is compared against the single-GPU output <code>ref</code>.</div>
+<pre><code class="language-text">T=1  max|TP - single| = 0.00e+00
+T=2  max|TP - single| = 2.50e-16
+T=4  max|TP - single| = 2.64e-16
+T=8  max|TP - single| = 2.50e-16
+</code></pre>
+<div class="code-caption"><strong>Output 24.2.1:</strong> Across $T = 1, 2, 4, 8$ GPUs the tensor-parallel output matches the single-GPU output to floating-point rounding ($\sim 2 \times 10^{-16}$). The split changes the answer by nothing that matters; it changes only where the work runs.</div>
+<p>The agreement reported in Output 24.2.1 is at the level of double-precision rounding, so tensor parallelism is, like data parallelism before it, an exact reorganization and not an approximation. The reader who served a request expecting a degraded answer gets the identical answer. What changed is purely operational: the arithmetic that one GPU would have done alone is now spread across $T$ GPUs, with one all-reduce per layer stitching their partial outputs back into the single coherent token the model would have produced.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Tensor Parallelism Trades Compute for a Per-Layer Collective</div>
+<p>Splitting a layer across $T$ GPUs divides its matrix-multiply work by $T$ but adds one all-reduce of the hidden vector to every layer. The compute saving is large and shrinks as $1/T$; the all-reduce cost is small per call but is paid on every one of the model's layers for every single token generated. Whether the trade is worth it depends entirely on how fast the GPUs can exchange that hidden vector, which is why tensor parallelism lives or dies by the interconnect.</p>
+</div>
+
+<h2>3. Why It Must Stay on the Fastest Interconnect <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The all-reduce per layer is the entire reason tensor parallelism is confined, in practice, to a single node. A token-generation step walks every layer of the model in sequence, and each layer ends with an all-reduce that every GPU must finish before the next layer can begin. For an 80-layer model generating one token, that is 80 all-reduces standing directly on the critical path, with no useful computation to hide behind them, because the next layer literally depends on the summed result. This is the topology argument of <a href="../../part-1-foundations/module-04-communication-primitives/section-4.9.html">Section 4.9</a> made concrete: a collective on the critical path must run on the fastest links available, and within a node those links are NVLink, which moves data between GPUs at hundreds of gigabytes per second, an order of magnitude faster than the network between nodes.</p>
+<p>Push the tensor-parallel group across a node boundary and every one of those 80 per-token all-reduces now crosses the slow inter-node fabric. The collective that was a rounding error in the layer's time budget becomes the dominant term, and per-token latency rises instead of falls. This is why practical tensor-parallel degree is capped, usually to the number of GPUs in one node (8 on a typical server), and why spanning more machines is the job of pipeline parallelism in <a href="section-24.3.html">Section 24.3</a>, which communicates far less often. Tensor parallelism is the within-node tool; the moment you leave the node, its economics invert.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Chattiest Method in the Book</div>
+<p>Data-parallel training in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a> all-reduces once per training step, which might be once every few hundred milliseconds. Tensor-parallel decoding all-reduces once per layer per token, which for an 80-layer model answering at 50 tokens per second is 4,000 all-reduces every second. It is, by a wide margin, the most talkative collective pattern you will meet, and it is precisely that talkativeness that nails it to NVLink.</p>
+</div>
+
+<h2>4. The Latency-Versus-Overhead Trade-Off <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>If more GPUs always made each token faster, you would use as many as you could buy. They do not, and the reason is the all-reduce. We can model the per-token latency directly. Let the per-layer compute on one GPU cost $c_0$, falling as $c_0/T$ when split across $T$ GPUs. Let the per-layer all-reduce cost grow with $T$ as a ring or tree collective does, roughly $a + b\log_2 T$ for $T > 1$, where $a$ is a fixed latency floor and $b$ scales the per-step transfer term. Then the per-token latency for an $L$-layer model is</p>
+$$\text{latency}(T) = L \left( \frac{c_0}{T} + a + b\log_2 T \right), \qquad T > 1.$$
+<p>The first term falls with more GPUs; the second and third rise. Their sum has a minimum and then climbs, so adding GPUs helps until the all-reduce overhead overtakes the shrinking compute, after which more GPUs make each token slower, not faster. The same code that verified correctness also evaluates this model in Code 24.2.2, so the diminishing returns are measured rather than claimed.</p>
+<pre><code class="language-python"># Latency model: compute falls as 1/T, all-reduce overhead grows with T.
+# Units are milliseconds; values are illustrative of an NVLink-class node.
+c0, a, b, L = 1.00, 0.04, 0.06, 80     # per-layer compute, allreduce floor, allreduce slope, layers
+print(f"{'T':>3} {'compute':>9} {'allreduce':>10} {'total/layer':>12} {'token(ms)':>10} {'speedup':>8}")
+base = None
+for T in (1, 2, 4, 8, 16):
+    compute = c0 / T
+    allred  = (a + b * np.log2(T)) if T > 1 else 0.0   # no collective with one GPU
+    per_layer = compute + allred
+    token = per_layer * L                              # L layers on the critical path
+    base = token if base is None else base
+    print(f"{T:>3} {compute:>9.3f} {allred:>10.3f} {per_layer:>12.3f} {token:>10.2f} {base/token:>7.2f}x")
+</code></pre>
+<div class="code-caption"><strong>Code 24.2.2:</strong> The per-token latency model evaluated for $T = 1$ to $16$. The <code>compute</code> column shrinks as $1/T$ while the <code>allreduce</code> column grows as $a + b\log_2 T$, and their sum across $L = 80$ layers is the per-token latency whose speedup over a single GPU is reported in the last column.</div>
+<pre><code class="language-text">  T   compute  allreduce  total/layer  token(ms)  speedup
+  1     1.000      0.000        1.000      80.00      1.00x
+  2     0.500      0.100        0.600      48.00      1.67x
+  4     0.250      0.160        0.410      32.80      2.44x
+  8     0.125      0.220        0.345      27.60      2.90x
+ 16     0.062      0.280        0.342      27.40      2.92x
+</code></pre>
+<div class="code-caption"><strong>Output 24.2.2:</strong> Going from 1 to 8 GPUs cuts per-token latency from 80 ms to 27.6 ms, a $2.9\times$ speedup, far short of the ideal $8\times$ because the all-reduce term has grown. Doubling again to 16 GPUs buys almost nothing ($2.90\times \to 2.92\times$): the all-reduce now dominates and the compute saving has run out.</div>
+<p>The numbers tell the practical story crisply. Two GPUs give a healthy $1.67\times$; eight give $2.9\times$, already well below the ideal $8\times$ because every halving of compute is partly eaten by a growing collective. Sixteen GPUs are essentially pointless here, gaining 0.02 of a multiplier while doubling the hardware bill, and on real hardware where 16 GPUs would straddle two nodes the curve would bend the other way and latency would rise. This is the quantitative form of the rule from Section 3: there is a sweet spot for the tensor-parallel degree, it is usually within one node, and past it you are paying for GPUs that make the model slower.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: A Collective Returns, Now on the Hot Path</div>
+<p>The all-reduce proved exact by hand in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a> and specified as a primitive in <a href="../../part-1-foundations/module-04-communication-primitives/section-4.3.html">Chapter 4</a> returns here in its most demanding role. In data-parallel training it fired once per step; in tensor-parallel serving it fires once per layer per token, directly on the latency critical path. The same operation that made distributed training exact now makes distributed serving fast, and the same cost model that bounded its training overhead (<a href="../module-23-distributed-inference-systems/index.html">Chapter 23</a>'s fleet sizing rests on these per-node numbers) bounds its serving overhead. Scale-out reuses one primitive across the whole book; what changes is how often, and how urgently, it must run.</p>
+</div>
+
+<h2>5. The Sharded KV Cache, and the Contrast with Replication <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Weights are not the only thing tensor parallelism shards. The KV cache, the per-token attention state whose per-node economics <a href="../module-22-per-node-inference-efficiency/index.html">Chapter 22</a> developed as a prerequisite, is also split across the tensor-parallel GPUs. Because attention is partitioned by head, each GPU computes and stores the keys and values only for its own heads, so the cache for a long context is divided $T$ ways alongside the weights. This is the multiplication promised at the end of Chapter 22: per-node KV-cache pressure, already the dominant memory cost of long-context serving, is here relieved by the same factor $T$ that relieves the weight memory, which is part of why tensor parallelism is what makes very long contexts servable at all. No extra collective is needed for the cache itself; each GPU's heads stay on that GPU, and the per-layer all-reduce that combines the attention output already carries the cross-head coupling.</p>
+<p>It helps to state plainly how this differs from replication, the subject of <a href="../module-23-distributed-inference-systems/index.html">Chapter 23</a>. Replication makes copies: each replica is a complete model on its own GPU (or its own tensor-parallel group), and adding replicas raises how many requests per second the fleet can serve. Tensor parallelism makes one model bigger than one GPU: it spans a single logical model across several GPUs to fit it and to speed up each token. The two compose cleanly and are the two axes of a serving deployment, often written together as a configuration like "tensor-parallel size 8, with 6 replicas." You reach for tensor parallelism when one model will not fit or one token is too slow; you reach for replication when one request stream is more than the fleet can keep up with. Confusing them is a common and expensive mistake: adding replicas will never fix a model that does not fit, and adding tensor-parallel GPUs past the sweet spot will never raise throughput.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Fitting the 70B That Would Not Fit</div>
+<p><strong>Who:</strong> An inference platform engineer at a company rolling out an internal coding assistant.</p>
+<p><strong>Situation:</strong> The chosen 70-billion-parameter model needed roughly 140 GB in half precision, but the available GPUs held 80 GB each, so the model did not fit on one device at all.</p>
+<p><strong>Problem:</strong> Replication, their usual scaling lever, was useless here: you cannot make a replica of a model that will not load onto a single GPU.</p>
+<p><strong>Dilemma:</strong> Quantize aggressively to squeeze onto one GPU and risk quality, or span the model across GPUs and decide how many, knowing that too few would still not fit and too many would waste hardware on a flat part of the latency curve.</p>
+<p><strong>Decision:</strong> They set tensor-parallel size to 4 within a single 8-GPU node, which fit the model comfortably (about 35 GB plus cache per GPU) and put each token's matrix multiplies on four GPUs over NVLink.</p>
+<p><strong>How:</strong> They launched vLLM with <code>tensor_parallel_size=4</code>, leaving the framework to place the column-and-row weight shards, shard the KV cache by head, and schedule the per-layer all-reduces on NVLink; the remaining four GPUs in the node held a second replica.</p>
+<p><strong>Result:</strong> The model fit and served at the latency target, and the two replicas (each tensor-parallel-4) doubled throughput, exactly the two orthogonal axes from this section working together.</p>
+<p><strong>Lesson:</strong> Tensor parallelism is the lever for "does not fit" and "too slow per token"; replication is the lever for "not enough requests per second." A real deployment sets both, and keeps the tensor-parallel group inside one node.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: vLLM Does the Sharding and the All-Reduces for You</div>
+<p>Code 24.2.1 placed the weight slices and summed the partials by hand, which for a real model means orchestrating column-and-row shards across every layer, a head-sharded KV cache, and the NVLink all-reduce schedule, hundreds of lines of careful collective code. A production serving engine reduces all of it to one argument:</p>
+<pre><code class="language-python">from vllm import LLM, SamplingParams
+
+# tensor_parallel_size=4 shards every layer's weights and the KV cache across
+# 4 GPUs on this node, and inserts the per-layer all-reduce on NVLink.
+llm = LLM(model="meta-llama/Llama-3.1-70B-Instruct", tensor_parallel_size=4)
+
+out = llm.generate(["Explain tensor parallelism in one sentence."],
+                   SamplingParams(max_tokens=64))
+print(out[0].outputs[0].text)
+</code></pre>
+<div class="code-caption"><strong>Code 24.2.3:</strong> The same split as Code 24.2.1, now as one <code>tensor_parallel_size</code> argument to vLLM. The engine handles weight sharding, the head-sharded KV cache, and the per-layer NVLink all-reduce that Section 3 insists must stay within a node; the manual collective code collapses to a single keyword.</div>
+</div>
+
+<h2>6. When Tensor Parallelism Is the Right Tool <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Tensor parallelism is the right answer to two questions and the wrong answer to a third. It is right when a model does not fit on one GPU, because it divides the weight and cache memory by $T$. It is right when a single token must be produced faster than one GPU can manage, because it divides the per-layer compute by $T$, up to the sweet spot the latency model exposed. It is the wrong answer when the model already fits and runs fast enough and you simply need more requests per second; that is replication's job, and reaching for tensor parallelism there just adds all-reduces to a model that did not need them. Keep the group inside one node, find the tensor-parallel degree at the bottom of the latency curve rather than the largest you can afford, and let pipeline parallelism (<a href="section-24.3.html">Section 24.3</a>) carry the model across nodes when one node is genuinely not enough.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Cutting the Per-Layer Collective (2024 to 2026)</div>
+<p>Because the all-reduce per layer is tensor parallelism's defining cost, a vigorous research line attacks it. Computation-communication overlap fuses the matrix multiply with the collective so the all-reduce hides behind the GEMM rather than stalling after it; NVIDIA's TransformerEngine and the Flux kernels (Chang et al., 2024) push this fine-grained overlap into production decoding. Sequence-parallel and Ulysses-style schemes (Jacobs et al., 2023, with 2024 to 2025 serving variants) rearrange where the collective falls so that activation memory shrinks alongside the weights. A separate thread asks whether the collective must be a full all-reduce at all, exploring lower-precision (FP8) communication and quantized activations on the wire to shrink the bytes per call, echoing the communication-avoiding training work of <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a>. The throughline is the one this section measured: the field treats the per-layer all-reduce as a cost to engineer down, because it is the term that caps the tensor-parallel degree.</p>
+</div>
+<p>We now have the within-node tool for serving a model too large or too slow for one GPU: shard every layer's weights and KV cache across $T$ GPUs, pay one all-reduce per layer on NVLink, and stop at the degree where the collective overtakes the speedup. When one node is not enough, the model must be cut a different way, across nodes, with far less frequent communication. That is pipeline parallelism, and <a href="section-24.3.html">Section 24.3</a> takes it up.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.2.1: Why Not Just Add Replicas? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A teammate proposes serving a 140 GB model on 80 GB GPUs by "running more replicas." Explain in two or three sentences why this cannot work, what tensor parallelism does instead, and the one situation in which their replication instinct is exactly right. Then state, for a deployment described as "tensor-parallel size 8, 6 replicas," how many GPUs it uses and what each of the two numbers buys you.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.2.2: Shard the Attention Block <span class="exercise-type coding">Coding</span></div>
+<p>Code 24.2.1 sharded a feed-forward block. Extend it to a single-head-group attention block: split a multi-head attention layer by heads across $T$ simulated GPUs, where each GPU computes the attention output for its own heads and stores only its heads' keys and values (the sharded KV cache of Section 5). Concatenate the per-GPU head outputs, apply the row-parallel output projection with an all-reduce, and verify the result matches a single-GPU multi-head attention forward pass to floating-point rounding. Report the per-GPU KV-cache size as a function of $T$ for a context of $C$ tokens.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.2.3: Find the Sweet Spot <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the latency model $\text{latency}(T) = L\left(c_0/T + a + b\log_2 T\right)$ from Section 4, treat $T$ as continuous and differentiate to find the $T$ that minimizes per-token latency in terms of $c_0$, $a$, $b$. With the section's values ($c_0 = 1$, $a = 0.04$, $b = 0.06$), compute that optimal $T$ and compare it to the discrete results in Output 24.2.2. Then explain what happens to the optimum if $b$ grows tenfold, the situation when the all-reduce crosses a node boundary onto a slow fabric, and connect your answer to why the group is capped to one node.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-24.1.html"><span class="nav-label">Previous</span><span class="nav-num">Section 24.1</span><span class="nav-title">Why Large-Model Serving Spans Many Machines</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 24</span><span class="nav-num">Contents</span><span class="nav-title">Distributed LLM Serving</span></a>
+<a class="next" href="section-24.3.html"><span class="nav-label">Next</span><span class="nav-num">Section 24.3</span><span class="nav-title">Pipeline-Parallel and Multi-Node Inference</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

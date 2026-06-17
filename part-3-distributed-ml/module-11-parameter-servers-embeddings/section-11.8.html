@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 11.8: Fault Tolerance in Parameter Servers. Why losing a server shard loses part of the model, and how replication, checkpointing, and a consensus-backed recovery protocol keep the authoritative state alive while stateless workers simply restart." name="description"/>
+<title>Section 11.8: Fault Tolerance in Parameter Servers | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Distributed Machine Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 11: Parameter Servers and Distributed Embeddings</a></div>
+<h1>Fault Tolerance in Parameter Servers</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I am the only copy of these weights on the entire cluster. Sleep well, everyone."</p>
+<cite>A Parameter Shard With No Replica</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A parameter server holds the authoritative copy of the model, so a parameter server that fails does not slow the job down, it deletes part of the model.</strong> This is the asymmetry that governs fault tolerance in the push-pull architecture: workers are stateless and disposable, but the server shards carry irreplaceable state. The defenses follow directly from that single fact. Replicate every shard so a primary and its replicas never die together; checkpoint the parameters to durable storage so a correlated failure still has a floor; and recover through a consistent control-plane protocol so the cluster agrees on exactly who now owns each shard. A failed worker is just restarted and re-pulls; a failed server is a small consensus problem wearing a training-job costume.</p>
+</div>
+<p>Up to this section the chapter has treated the parameter server as a reliable backplane: workers <a href="section-11.2.html">push gradients and pull parameters</a> (Section 11.2), the table is <a href="section-11.3.html">split across shards</a> (Section 11.3), and updates flow <a href="section-11.4.html">synchronously or asynchronously</a> (Section 11.4) under a <a href="section-11.5.html">staleness bound</a> (Section 11.5). We assumed the shards stay up. On a real cluster of hundreds of machines, at any given moment something is broken, and the question stops being whether a server fails and becomes what happens to the model when one does. This section answers that, building on the general recovery machinery of <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.4.html">Section 2.4</a> and specializing it to the one component that cannot afford to forget.</p>
+
+<h2>1. The Asymmetry: Stateful Servers, Stateless Workers <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>In the push-pull architecture two roles fail in completely different ways, and conflating them is the first mistake. A worker pulls the current parameters, computes a gradient on its data shard, and pushes that gradient back. It keeps nothing that the cluster cannot regenerate: its model copy is a cache of the server's state, and its in-flight gradient is recomputable from the same minibatch. When a worker dies, the loss is one minibatch of partially-done arithmetic. You restart the process, it re-pulls the latest parameters, and it rejoins the round as if it had merely been slow. Nothing about the model is at risk.</p>
+<p>The server is the opposite. Each shard holds the authoritative value of a slice of the parameters, the one true copy that every worker reads from and writes to. There is no upstream source to re-pull it from, because the shard <em>is</em> the source. When a server shard dies without a replica, the parameters it owned are gone, and the only way to get them back is to recompute them from data, which for a model trained over days is not a recovery, it is starting over. This is why fault tolerance in a parameter server is fundamentally a story about protecting state, not about restarting compute.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Protect the State, Not the Computation</div>
+<p>Worker failure costs you computation, which is cheap and regenerable: restart and re-pull. Server failure costs you state, which is irreplaceable: the shard is the only copy of its parameters. Every parameter-server fault-tolerance mechanism, replication, checkpointing, consensus-backed recovery, exists to make sure no single failure is the last copy of any parameter. Match the mechanism to the role, and never spend a replication budget protecting the stateless half of the system.</p>
+</div>
+
+<h2>2. Replication: A Primary and Its Replicas <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The direct defense against losing a shard is to keep more than one copy of it. Each logical shard becomes a small replica group: one <strong>primary</strong> that workers talk to, plus one or more <strong>replicas</strong> that hold the same parameters. Every write the primary applies is forwarded to the replicas, so that if the primary dies, a replica already holds the up-to-date state and can be promoted to primary. With a replication factor of $r$, the parameters of a shard survive as long as at least one of its $r$ copies survives. If each machine fails independently with probability $p$ in a recovery window, the chance that a specific shard loses every copy drops from $p$ to $p^{r}$, the familiar exponential payoff of redundancy.</p>
+<p>The cheapest way to keep replicas current is <strong>chain replication</strong>: arrange the copies in a line, send each write to the head, and let it flow primary to replica to replica down the chain, with reads served from the tail once the write has reached it. The structure makes the consistency argument easy, because a value is only acknowledged after it has traversed the whole chain, so the tail never serves a value the head has not committed. Figure 11.8.1 shows the replica group before and after a primary failure, with the promotion that keeps the parameters available.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of a replicated parameter shard. On the left, a worker pushes a gradient to the primary, which chains the write through two replicas. On the right, the primary has failed and the first replica has been promoted to primary, so the chain continues and no parameters are lost.">
+<defs>
+<marker id="arr118" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr118o" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.b118 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.p118 { fill:#e8f0e4; stroke:#3a6b2f; stroke-width:1.8; }
+.r118 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.d118 { fill:#f0f0f0; stroke:#9aa0a6; stroke-width:1.6; stroke-dasharray:5 4; }
+.t118 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.tp118 { font:600 13px sans-serif; fill:#3a6b2f; text-anchor:middle; }
+.s118 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l118 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr118); }
+.lo118 { fill:none; stroke:#b86b1f; stroke-width:1.8; marker-end:url(#arr118o); }
+.x118 { stroke:#b3261e; stroke-width:2.4; }
+</style>
+<text class="t118" x="220" y="24">Before: primary serves the chain</text>
+<rect class="b118" x="40" y="120" width="90" height="50" rx="8"/>
+<text class="t118" x="85" y="142">Worker</text>
+<text class="s118" x="85" y="158">push grad</text>
+<rect class="p118" x="160" y="120" width="92" height="50" rx="8"/>
+<text class="tp118" x="206" y="142">Primary</text>
+<text class="s118" x="206" y="158">params</text>
+<rect class="r118" x="278" y="120" width="92" height="50" rx="8"/>
+<text class="t118" x="324" y="142">Replica 1</text>
+<text class="s118" x="324" y="158">params</text>
+<rect class="r118" x="396" y="120" width="92" height="50" rx="8"/>
+<text class="t118" x="442" y="142">Replica 2</text>
+<text class="s118" x="442" y="158">params</text>
+<line x1="130" y1="145" x2="158" y2="145" class="l118"/>
+<line x1="252" y1="145" x2="276" y2="145" class="l118"/>
+<line x1="370" y1="145" x2="394" y2="145" class="l118"/>
+<text class="s118" x="324" y="196">write flows head to tail</text>
+<text class="t118" x="650" y="24">After: replica promoted, no loss</text>
+<rect class="b118" x="500" y="120" width="90" height="50" rx="8"/>
+<text class="t118" x="545" y="142">Worker</text>
+<text class="s118" x="545" y="158">re-route</text>
+<rect class="d118" x="620" y="120" width="92" height="50" rx="8"/>
+<text class="s118" x="666" y="138">Primary</text>
+<text class="s118" x="666" y="158">failed</text>
+<line class="x118" x1="630" y1="128" x2="702" y2="162"/>
+<line class="x118" x1="702" y1="128" x2="630" y2="162"/>
+<rect class="p118" x="620" y="210" width="92" height="50" rx="8"/>
+<text class="tp118" x="666" y="232">Replica 1</text>
+<text class="s118" x="666" y="248">now primary</text>
+<rect class="r118" x="738" y="210" width="92" height="50" rx="8"/>
+<text class="t118" x="784" y="232">Replica 2</text>
+<text class="s118" x="784" y="248">params</text>
+<path class="lo118" d="M 545 170 L 545 235 L 618 235"/>
+<line x1="712" y1="235" x2="736" y2="235" class="l118"/>
+<text class="s118" x="666" y="292">replica held every committed write,</text>
+<text class="s118" x="666" y="308">so promotion loses zero parameters</text>
+</svg>
+<figcaption><strong>Figure 11.8.1:</strong> A replicated parameter shard under chain replication. On the left, a worker's push flows head to tail through the primary and its two replicas, so every replica holds each committed write. On the right, the primary has failed; because Replica 1 already held the up-to-date parameters, promoting it to primary keeps the shard available and loses nothing. Without replicas, the crossed-out box would simply take its parameters with it.</figcaption>
+</figure>
+
+<h2>3. Checkpointing and the Recovery Protocol <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Replication defends against independent failures, but failures are not always independent. A rack loses power, a cloud zone reboots, a bad deploy crashes every server process at once; correlated failures can take down a whole replica group together. The floor under that worst case is the periodic <strong>checkpoint</strong>: every so often, each shard writes its parameters to durable storage (a distributed file system or object store), and the job records which step the checkpoint corresponds to. If every live copy of a shard is gone, recovery loads the last checkpoint and replays from there, trading some lost steps for a guarantee that the model can always be reconstructed. Checkpoint frequency is the usual tension: more often means less lost work on recovery but more bytes written during normal training, the same write-amplification bound the elastic-training machinery turns into a budget in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.4.html">Section 2.4</a>.</p>
+<p>Replication and checkpointing supply the redundant copies; the <strong>recovery protocol</strong> is what turns those copies back into a single coherent model. When a primary fails, the cluster must agree on three things: that the primary is actually dead (not merely slow), which replica becomes the new primary, and that workers re-route their pushes and pulls to it. If two replicas each believe they are the new primary, they will accept divergent writes and the shard's state forks, the classic split-brain failure. Avoiding that is a consensus problem, solved by the control plane exactly as in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.6.html">Section 2.6</a>: a coordination service backed by a consensus algorithm holds the authoritative shard-to-primary assignment, and a promotion is only valid once that service has committed it. The training data plane stays fast and lock-free; the rare, slow, must-be-correct decision of who owns a shard is delegated to the consensus layer built for exactly that.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Checkpoint Cadence That Paid for Itself</div>
+<p><strong>Who:</strong> A platform engineer running a week-long parameter-server training job for a large recommendation model on a few hundred spot instances.</p>
+<p><strong>Situation:</strong> The embedding shards held terabytes of parameters; spot reclamation killed several server machines per day, and each replica group had a replication factor of two.</p>
+<p><strong>Problem:</strong> Twice the team watched a rack-level reclamation take both copies of a shard within the same minute, and with no recent checkpoint the only option was to restart the run from scratch.</p>
+<p><strong>Dilemma:</strong> Checkpoint every few minutes and pay a heavy, constant write load to the object store, or checkpoint hourly and risk losing an hour of progress on every correlated failure.</p>
+<p><strong>Decision:</strong> They raised the replication factor to three for the embedding shards and set an adaptive checkpoint cadence: frequent during the volatile daytime spot market, sparse overnight when reclamation was rare.</p>
+<p><strong>How:</strong> A consensus-backed coordinator tracked primaries and triggered promotion on failure; checkpoints were written incrementally so only changed embedding rows hit the store.</p>
+<p><strong>Result:</strong> Over the next month no run was lost. Correlated failures still happened, but a surviving replica or a recent incremental checkpoint always covered them, and the extra write load was a small fraction of the gradient traffic.</p>
+<p><strong>Lesson:</strong> Replication handles the common independent failure; checkpointing is the floor under the rare correlated one. You need both, and the cadence of each should track how the failures actually arrive.</p>
+</div>
+
+<h2>4. Consistency or Availability: The Store Must Choose <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>A replicated parameter store is a distributed store, so it inherits the trade-off of every distributed store. When the network partitions a primary from its replicas, the system faces a choice it cannot dodge: keep accepting writes on the reachable side and risk the copies diverging, or refuse writes until the partition heals and stay consistent at the cost of availability. This is the CAP trade-off applied to the parameter store, the same tension formalized in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.5.html">Section 2.5</a>, and the right answer depends on how the training loop consumes the parameters.</p>
+<p>The pleasant surprise is that machine-learning training is unusually tolerant of the weak side of this trade-off. The optimization is already robust to <a href="section-11.5.html">staleness</a> (Section 11.5): a worker that reads parameters a few steps behind, or whose push is briefly delayed, still moves the model in a useful direction, because stochastic gradient descent is a noisy process to begin with. So a parameter store can lean toward availability, serving slightly stale reads during a partition and reconciling when it heals, where a bank ledger never could. This is also why <strong>asynchronous training tolerates a transiently missing worker gracefully</strong>: in async mode no worker waits on any specific peer, so a worker that vanishes for a few seconds, or forever, simply stops contributing, and the others march on without a barrier to stall them. A synchronous step, by contrast, blocks on the slowest participant, which is why elastic and asynchronous schemes are the natural partners of fault tolerance, a thread picked up for full training jobs in <a href="../module-10-distributed-optimization/index.html">Chapter 10</a>.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Recovery Is a Consensus Problem in Disguise</div>
+<p>The recurring move of this book is that scaling out forces general distributed-systems primitives into the heart of an AI workload. Here the primitive is consensus. Deciding which replica owns a shard after a failure is the same agreement problem that runs MapReduce re-execution in <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a> and that elastic deep-learning training will generalize to entire worker groups joining and leaving mid-run. A parameter server does not get to invent its own notion of "who is in charge"; it borrows the control-plane consensus of <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.6.html">Section 2.6</a> and spends it sparingly, on the rare decisions that must be exactly right.</p>
+</div>
+
+<h2>5. A Failure, Simulated <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The code below makes the asymmetry concrete with a pure-Python parameter store. Sixteen parameters are spread across four shards by a hash; gradients are pushed for five hundred steps; and partway through, the primary for shard 2 crashes. We run it twice. In the replicated cluster, shard 2's replica already holds every committed write, so the control plane promotes it and training continues. In the unreplicated cluster, shard 2's parameters simply vanish. A third, failure-free run gives the ground-truth model to measure drift against.</p>
+<pre><code class="language-python">import hashlib
+
+NUM_SHARDS = 4
+
+def owner(key):
+    """Deterministic shard placement, like consistent hashing in a real PS."""
+    h = int(hashlib.sha1(str(key).encode()).hexdigest(), 16)
+    return h % NUM_SHARDS
+
+class Shard:
+    """One server shard: an authoritative slice of the model, plus an optional
+    chained replica that receives every write the primary applies."""
+    def __init__(self, shard_id, replica=None):
+        self.shard_id = shard_id
+        self.params = {}           # parameter_id -> value (the authoritative state)
+        self.replica = replica     # next link in the replication chain, or None
+        self.alive = True
+
+    def push(self, key, grad, lr=0.1):
+        if not self.alive:
+            raise RuntimeError(f"shard {self.shard_id} is down")
+        self.params[key] = self.params.get(key, 0.0) - lr * grad
+        if self.replica is not None:                 # chain the write downstream
+            self.replica.params[key] = self.params[key]
+
+    def pull(self, key):
+        if not self.alive:
+            raise RuntimeError(f"shard {self.shard_id} is down")
+        return self.params.get(key, 0.0)
+
+def build_cluster(replicated):
+    replicas = [Shard(f"{i}-replica") for i in range(NUM_SHARDS)] if replicated else [None]*NUM_SHARDS
+    primaries = [Shard(i, replicas[i]) for i in range(NUM_SHARDS)]
+    return primaries, replicas
+
+def train(primaries, replicas, replicated, kill_after=200):
+    """Push gradients for 16 parameters across 500 steps; shard 2 dies mid-run."""
+    keys = list(range(16))
+    failed = False
+    for step in range(500):
+        if step == kill_after and not failed:
+            primaries[2].alive = False               # primary for shard 2 crashes
+            if replicated:
+                # control-plane recovery: promote the replica to primary
+                promoted = replicas[2]
+                promoted.alive = True
+                primaries[2] = promoted
+            failed = True
+        for key in keys:
+            s = owner(key)
+            grad = 0.01 * ((step % 7) - 3)            # a deterministic pseudo-gradient
+            try:
+                primaries[s].push(key, grad)
+            except RuntimeError:
+                pass                                  # write lost: no replica to take over
+    recovered, lost = {}, 0
+    for key in keys:
+        s = owner(key)
+        try:
+            recovered[key] = primaries[s].pull(key)
+        except RuntimeError:
+            lost += 1
+    return recovered, lost
+
+# Reference run: no failure at all, gives the ground-truth model.
+ref_primaries, ref_replicas = build_cluster(replicated=True)
+reference, _ = train(ref_primaries, ref_replicas, replicated=True, kill_after=10**9)
+
+# Replicated cluster: shard 2 primary fails, its replica is promoted.
+rep_primaries, rep_replicas = build_cluster(replicated=True)
+rep_model, rep_lost = train(rep_primaries, rep_replicas, replicated=True)
+
+# Unreplicated cluster: shard 2 fails and its parameters are gone.
+bare_primaries, bare_replicas = build_cluster(replicated=False)
+bare_model, bare_lost = train(bare_primaries, bare_replicas, replicated=False)
+
+def max_drift(model):
+    return max((abs(model[k] - reference[k]) for k in reference if k in model), default=0.0)
+
+print(f"parameters in model              : {len(reference)}")
+print(f"shard 2 owns parameter ids       : {[k for k in range(16) if owner(k) == 2]}")
+print()
+print("REPLICATED  (replica promoted on failure)")
+print(f"  parameters lost                : {rep_lost}")
+print(f"  max drift vs no-failure run     : {max_drift(rep_model):.2e}")
+print(f"  training continued             : yes")
+print()
+print("UNREPLICATED  (shard 2 had no replica)")
+print(f"  parameters lost                : {bare_lost}")
+print(f"  parameters still present       : {len(bare_model)}")
+print(f"  fraction of model lost          : {bare_lost / len(reference):.0%}")
+</code></pre>
+<div class="code-caption"><strong>Code 11.8.1:</strong> A pure-Python parameter store in which one shard's primary fails mid-training. The only difference between the two clusters is whether each shard carries a chained replica; everything else, the data, the gradients, the failure step, is identical.</div>
+<pre><code class="language-text">parameters in model              : 16
+shard 2 owns parameter ids       : [4, 7, 15]
+
+REPLICATED  (replica promoted on failure)
+  parameters lost                : 0
+  max drift vs no-failure run     : 0.00e+00
+  training continued             : yes
+
+UNREPLICATED  (shard 2 had no replica)
+  parameters lost                : 3
+  parameters still present       : 13
+  fraction of model lost          : 19%
+</code></pre>
+<div class="code-caption"><strong>Output 11.8.1:</strong> The replicated cluster loses zero parameters and its final model is bit-for-bit identical to the failure-free run; the unreplicated cluster permanently loses the three parameters shard 2 owned, 19% of the model. The failure was the same in both cases; only the replica decided whether it mattered.</div>
+<p>The two runs differ in exactly one design choice, and that choice is the whole subject of this section. The replicated cluster treats a server crash as a routing event: the control plane promotes a replica, workers re-route, and the model is untouched. The unreplicated cluster treats the same crash as data loss, because the shard truly was the last copy of its parameters. Note also what the workers never had to do; they are stateless, so none of this recovery touched them, exactly the asymmetry Section 1 set up.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Server That Was Too Important to Crash</div>
+<p>There is a folk failure mode where a team, proud that their single parameter server has never gone down, treats its uptime as a feature rather than a ticking clock. The model lives entirely in that one box's memory. The day the box finally reboots, for a kernel patch nobody scheduled, a week of training evaporates in the time it takes a fan to spin down. A replica is not a vote of no confidence in your hardware; it is an admission that hardware is mortal and the model would prefer to outlive it.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Replication and Checkpointing You Do Not Hand-Roll</div>
+<p>Code 11.8.1 wires up replication and promotion by hand to expose the mechanism. In production you lean on systems that already solve it. A coordination service such as etcd or ZooKeeper holds the authoritative shard-to-primary assignment behind a Raft or ZAB consensus core, so promotion never forks; you register a shard and watch a key, you do not implement leader election. For the checkpoint floor, frameworks expose a one-line save of the entire distributed parameter state to durable storage:</p>
+<pre><code class="language-python"># Periodic durable checkpoint of the sharded parameter state.
+# The framework gathers every shard (and skips redundant replicas) and writes
+# one consistent snapshot tagged with the training step.
+if step % checkpoint_every == 0:
+    server.save_checkpoint(path=f"s3://ckpts/model-step-{step}",
+                           include_optimizer_state=True)   # resume exactly here
+</code></pre>
+<div class="code-caption"><strong>Code 11.8.2:</strong> The checkpoint floor as one call. The dozens of lines of gather, dedup, and consistent-snapshot logic that a hand-rolled version needs collapse into a framework method; the consensus-backed coordinator (etcd, ZooKeeper) separately handles the promotion that Code 11.8.1 simulated.</div>
+</div>
+
+<h2>6. Worker Failure: The Easy Half <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>For completeness, the other side of the asymmetry deserves an explicit statement, because it is the half people over-engineer. A worker carries no authoritative state, so its failure has a one-line recovery: detect that it stopped sending heartbeats, restart the process (or hand its data shard to a spare), and let it re-pull the current parameters and resume. In synchronous training the coordinator either waits briefly for the restart or drops the worker from the round; in asynchronous training nothing waits at all, since no step is gated on any particular worker. Either way no checkpoint, no consensus, and no replica is involved, because there is nothing to protect. The entire fault-tolerance budget of a parameter-server system should flow to the stateful servers, where a single loss is permanent, and not to the workers, where every loss is a quick restart.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Cheaper Reliable State (2024 to 2026)</div>
+<p>The cost of protecting parameter-server state is now itself a research target. Recent checkpointing systems push toward making snapshots nearly free: asynchronous and tiered checkpointing in the lineage of CheckFreq and Gemini overlap the write with computation and stage snapshots in host or peer memory before they reach durable storage, so a terabyte-scale model can checkpoint far more often without stalling the step. In parallel, the elastic-training stacks that grew out of TorchElastic and Ray treat a server or worker leaving as a membership change to be reconciled rather than a crash to be feared, leaning on the same consensus-backed coordination this section describes. A third thread, sharded and in-memory replication that survives single-host loss without a full durable write, is converging parameter-server reliability with the failure model of large foundation-model training, where the cost of losing even minutes of a thousand-GPU run makes correlated-failure recovery a first-class design concern. The common direction is clear: keep the authoritative state continuously protected while paying as little as possible of the training step's time to do it.</p>
+</div>
+<p>With the model now able to survive the loss of the servers that hold it, the chapter has a complete picture of the parameter-server architecture: how it stores parameters, shards them, updates them, bounds their staleness, scales them to terabytes, and keeps them alive through failure. The natural next question is whether this centralized-state design is even the right one for modern systems, or whether the all-reduce of <a href="../module-10-distributed-optimization/index.html">Chapter 10</a> has quietly made it obsolete for many workloads. That comparison is the subject of <a href="section-11.9.html">Section 11.9</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.8.1: Where Does the Budget Go? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A team protects every component of their parameter-server job equally: replication factor three on the workers and replication factor three on the server shards. Explain why half of that budget is wasted, what failure each half is actually guarding against, and rewrite the policy so the redundancy lands where state lives. Then describe one scenario in which a worker <em>does</em> hold state worth protecting, and what minimal mechanism (not full replication) would suffice for it.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.8.2: Make the Loss Worse, Then Fix It <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 11.8.1 so that <em>two</em> shards fail during training, and add a replication factor parameter $r$ (a chain of $r$ copies per shard). Sweep $r$ from one to three and, for each, kill a random subset of primaries; report the fraction of parameters lost. Then add a periodic checkpoint: every fifty steps, copy each shard's parameters to a separate dictionary, and on a total replica-group loss, restore the affected parameters from the last checkpoint. Measure how many steps of progress a checkpoint-based recovery costs versus the zero-loss replica promotion, and state when each mechanism is the one that saves you.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.8.3: Consistency Versus Availability Under Partition <span class="exercise-type analysis">Analysis</span></div>
+<p>A primary is partitioned from its replicas for $T$ seconds while workers keep pushing. Argue, using the staleness tolerance of <a href="section-11.5.html">Section 11.5</a> and the CAP trade-off of <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.5.html">Section 2.5</a>, for an availability-leaning policy that keeps serving slightly stale parameters during the partition, and identify the one property of stochastic gradient descent that makes this safe for training but unsafe for, say, a financial ledger. Then state a concrete bound on $T$ beyond which even SGD's tolerance breaks down, and explain what observable training symptom would tell you the partition has lasted too long.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-11.7.html"><span class="nav-label">Previous</span><span class="nav-num">Section 11.7</span><span class="nav-title">Terabyte-Scale Embeddings</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 11</span><span class="nav-num">Contents</span><span class="nav-title">Parameter Servers and Distributed Embeddings</span></a>
+<a class="next" href="section-11.9.html"><span class="nav-label">Next</span><span class="nav-num">Section 11.9</span><span class="nav-title">Parameter Servers vs All-Reduce in Modern Systems</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

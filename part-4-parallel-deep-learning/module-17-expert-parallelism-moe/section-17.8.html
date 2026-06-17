@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 17.8: Serving Distributed MoE Models. Why a sparse model that was cheap to train per token is awkward to serve: all experts must stay resident across the fleet, making MoE serving memory-bound and communication-bound rather than compute-bound." name="description"/>
+<title>Section 17.8: Serving Distributed MoE Models | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 17: Expert Parallelism and Sparse Distributed Models</a></div>
+<h1>Serving Distributed MoE Models</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"At training time they praised me for doing so little work per token. At serving time they discovered they still had to feed and house all sixty-three of my idle colleagues."</p>
+<cite>An Expert Nobody Routed To</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A Mixture-of-Experts model is cheap to run per token and expensive to keep alive: only the top-$k$ experts fire for any given token, yet every expert must stay resident in the memory of the serving fleet, because the next token might route anywhere.</strong> This inverts the usual serving intuition. A dense model is sized by its arithmetic: more FLOPs per token means more GPUs. A sparse MoE model is sized by its memory and its communication: the parameters that no single token uses still occupy the cluster, and the inference all-to-all from <a href="section-17.5.html">Section 17.5</a> still moves tokens between machines on every layer. Serving MoE well is therefore the art of amortizing a fixed memory and communication cost over enough tokens that the cheap per-token compute is no longer the bottleneck it appears to be. This section shows why the paradox arises, why small batches make it worse, and the strategies that turn a hard-to-serve sparse model into a high-throughput one.</p>
+</div>
+<p>The previous sections built a sparse model that trains efficiently: <a href="section-17.5.html">Section 17.5</a> routed tokens to experts on other machines with an all-to-all, <a href="section-17.6.html">Section 17.6</a> balanced the load across those experts, and <a href="section-17.7.html">Section 17.7</a> capped each expert with a capacity factor so the kernels stayed regular. Every one of those mechanisms was justified by the training economics: a sparse model touches only a fraction of its parameters per token, so it buys more total capacity for the same training FLOPs. Serving inherits all of that machinery and then collides with a different cost structure. The flop savings that made training attractive do almost nothing for the resource that actually constrains a deployed MoE model, which is memory, and the all-to-all that was a tolerable training overhead becomes a per-request latency tax that small batches cannot hide.</p>
+
+<h2>1. The Serving Paradox: Cheap Per Token, Heavy in Total <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Recall the central trick of a sparse layer. With $E$ experts and top-$k$ routing, a token's feed-forward block uses $k$ experts out of $E$, so the active parameter count per token is a small fraction $k/E$ of the layer's total. During training this is pure profit: the gradient and the forward pass only ever touch the active experts, so the FLOPs per token track $k$, not $E$. You can raise $E$ to grow the model's knowledge capacity while holding the per-token compute fixed. That is the entire reason MoE exists, and <a href="section-17.1.html">Section 17.1</a> framed it as decoupling capacity from compute.</p>
+<p>Serving does not get to enjoy this decoupling on the resource that matters. To answer any request, the system must be ready to route a token to any of the $E$ experts, because routing is data-dependent and decided at inference time. Every expert must therefore be loaded into device memory somewhere on the fleet, all the time. The parameters that a given token never uses are not free; they occupy GPUs, draw power, and define the minimum cluster size. Write the two costs side by side. Resident weight memory scales with the full expert count,</p>
+$$M_{\text{resident}} = b \cdot L \cdot E \cdot P_{\text{expert}},$$
+<p>where $b$ is bytes per parameter, $L$ is the number of MoE layers, and $P_{\text{expert}}$ is the parameter count of one expert. Compute, by contrast, scales only with the active experts,</p>
+$$F_{\text{token}} = 2 \, k \, L \, P_{\text{expert}},$$
+<p>the familiar two-FLOP-per-parameter cost of a matmul over the $k$ experts that actually fire. The ratio of what you must provision to what a token consumes is</p>
+$$\frac{M_{\text{resident}}}{b \, F_{\text{token}} / 2} = \frac{E}{k},$$
+<p>so a model with $E = 64$ experts and $k = 2$ keeps thirty-two times more parameters resident than any single token pays compute for. The dense-model habit of estimating fleet size from FLOPs gives an answer that is off by that factor of $E/k$. MoE serving is sized by the memory wall, and only after that wall is paid does the cheap compute become visible. This is the same shape of problem you met serving a terabyte-scale embedding table in <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/section-11.7.html">Section 11.7</a>: a vast parameter store where any one query reads only a sliver, so the system is provisioned for total residency and a sharded lookup, not for arithmetic.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: MoE Serving Is Memory-Bound and Communication-Bound, Not Compute-Bound</div>
+<p>The sparsity that makes MoE cheap to train per token does nothing to shrink the resident model. Every expert must stay loaded across the serving fleet because routing is decided at runtime, so the fleet is sized by total parameters (the memory wall), while the per-token FLOPs reflect only the top-$k$ active experts. Layered on top is the inference all-to-all of <a href="section-17.5.html">Section 17.5</a>, which moves tokens between machines on every MoE layer regardless of how few FLOPs each token costs. Diagnose an MoE serving deployment by its bytes resident and its tokens moved, not by its arithmetic, and you will size the cluster correctly the first time.</p>
+</div>
+
+<h2>2. All Experts Resident, Tokens in Flight <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The serving picture is the inference-time face of the expert parallelism from <a href="section-17.4.html">Section 17.4</a>. The experts of each MoE layer are sharded across the GPUs of the serving fleet, every GPU permanently holding its slice of the experts. When a batch of tokens arrives, the router on each GPU decides, per token, which experts those tokens need, and an all-to-all collective ships each token to the GPU that owns its chosen expert. The experts compute, and a second all-to-all returns the results to the tokens' home GPUs so the next layer can proceed. Figure 17.8.1 shows this arrangement: the experts are stationary and resident, the tokens are the things that travel.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of MoE serving: four serving GPUs each permanently hold a shard of experts; a batch of tokens enters, an all-to-all routes each token to the GPU owning its top-k expert, the experts compute, and a return all-to-all brings results home.">
+<defs>
+<marker id="arr178" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr178o" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.b178 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.e178 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.h178 { fill:#eaf2ea; stroke:#2f7d4f; stroke-width:1.6; }
+.t178 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.to178 { font:600 13px sans-serif; fill:#b86b1f; text-anchor:middle; }
+.s178 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l178 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr178); }
+.lo178 { fill:none; stroke:#b86b1f; stroke-width:1.6; marker-end:url(#arr178o); stroke-dasharray:5 3; }
+</style>
+<text class="t178" x="430" y="24">Batch of tokens enters (every GPU runs the router)</text>
+<rect class="h178" x="120" y="40" width="620" height="34" rx="8"/>
+<text class="t178" x="430" y="62">B tokens, each picks its top-k experts (data-dependent)</text>
+<text class="to178" x="430" y="104">All-to-all #1: send each token to the GPU owning its expert</text>
+<line x1="200" y1="74" x2="180" y2="120" class="lo178"/>
+<line x1="380" y1="74" x2="400" y2="120" class="lo178"/>
+<line x1="560" y1="74" x2="540" y2="120" class="lo178"/>
+<line x1="700" y1="74" x2="660" y2="120" class="lo178"/>
+<rect class="e178" x="100" y="128" width="150" height="92" rx="10"/>
+<text class="t178" x="175" y="152">Serving GPU 1</text>
+<text class="s178" x="175" y="172">experts 0..15</text>
+<text class="s178" x="175" y="190">resident in HBM</text>
+<text class="s178" x="175" y="208">computes routed tokens</text>
+<rect class="e178" x="270" y="128" width="150" height="92" rx="10"/>
+<text class="t178" x="345" y="152">Serving GPU 2</text>
+<text class="s178" x="345" y="172">experts 16..31</text>
+<text class="s178" x="345" y="190">resident in HBM</text>
+<text class="s178" x="345" y="208">computes routed tokens</text>
+<rect class="e178" x="440" y="128" width="150" height="92" rx="10"/>
+<text class="t178" x="515" y="152">Serving GPU 3</text>
+<text class="s178" x="515" y="172">experts 32..47</text>
+<text class="s178" x="515" y="190">resident in HBM</text>
+<text class="s178" x="515" y="208">computes routed tokens</text>
+<rect class="e178" x="610" y="128" width="150" height="92" rx="10"/>
+<text class="t178" x="685" y="152">Serving GPU 4</text>
+<text class="s178" x="685" y="172">experts 48..63</text>
+<text class="s178" x="685" y="190">resident in HBM</text>
+<text class="s178" x="685" y="208">computes routed tokens</text>
+<text class="to178" x="430" y="262">All-to-all #2: return each token's output to its home GPU</text>
+<line x1="175" y1="220" x2="200" y2="288" class="lo178"/>
+<line x1="345" y1="220" x2="380" y2="288" class="lo178"/>
+<line x1="515" y1="220" x2="540" y2="288" class="lo178"/>
+<line x1="685" y1="220" x2="660" y2="288" class="lo178"/>
+<rect class="h178" x="120" y="294" width="620" height="34" rx="8"/>
+<text class="t178" x="430" y="316">Outputs reassembled; next layer proceeds (router runs again)</text>
+<text class="s178" x="430" y="352">All E=64 experts stay resident across the 4 GPUs; only the tokens move, twice per MoE layer.</text>
+</svg>
+<figcaption><strong>Figure 17.8.1:</strong> MoE serving as stationary experts and traveling tokens. Each of the four serving GPUs permanently holds a shard of the $E$ experts in high-bandwidth memory. For every MoE layer, an all-to-all sends each token to the GPU that owns its chosen expert (orange, dashed), the experts compute, and a return all-to-all brings the outputs home. The resident memory is fixed by the full expert count; the communication recurs on every layer, twice. This is the inference-time view of the expert parallelism introduced in <a href="section-17.4.html">Section 17.4</a>.</figcaption>
+</figure>
+<p>Two costs are visible in the figure and neither depends on how few FLOPs a token consumes. The vertical cost is memory: all sixty-four experts sit in HBM across the four GPUs whether one token arrives or a thousand. The horizontal cost is communication: two all-to-all collectives per MoE layer, every layer, for every batch. A model with thirty-two MoE layers therefore pays sixty-four all-to-all collectives to produce one forward pass, and each one is a synchronization point where every GPU waits for the slowest peer. The serving system's job is to make sure that, by the time those fixed costs are paid, enough useful token-compute rides along with them.</p>
+
+<h2>3. Why Small Batches Hurt <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The all-to-all and the expert matmuls are both efficient only when many tokens flow through them. Consider where a batch of $B$ tokens ends up after top-$k$ routing across $E$ experts. In expectation, each expert receives</p>
+$$t_{\text{expert}} = \frac{B \, k}{E}$$
+<p>tokens. At small batch this number is tiny. With $B = 8$, $k = 2$, and $E = 64$, each expert sees a quarter of a token on average, meaning most experts receive nothing at all and the GPUs that hold them sit idle while still occupying the cluster. The all-to-all still fires, moving a handful of tokens across the network and paying its full latency, but the expert matmuls it feeds are too small to use the hardware. A matrix multiply on a modern accelerator needs roughly a tile's worth of rows, on the order of $128$, before it saturates the tensor cores; a matmul over a quarter of a token is almost pure overhead. This is the latency-bound regime where MoE serving is at its worst, because you pay the memory wall and the communication tax to do an arithmetically trivial amount of work.</p>
+<p>The remedy is batching, the same amortization lever as everywhere else in serving, but with a sharper threshold than dense models face. To fill every expert's matmul tile of size $\tau$ in expectation, you need $t_{\text{expert}} \ge \tau$, which rearranges to a minimum batch of</p>
+$$B \ge \frac{\tau \, E}{k}.$$
+<p>The factor $E/k$ is the same one from the serving paradox: the more experts you add to grow capacity, the larger the batch you must assemble before each expert is busy. Dense serving wants big batches for efficiency; sparse serving needs them, and needs them larger in proportion to the expert count. The runnable model below makes the whole chain concrete, from the parameter budget through the batch-size sweep to the threshold at which the experts finally fill.</p>
+<pre><code class="language-python"># Model MoE serving cost: memory for all experts vs FLOPs for top-k,
+# across batch sizes, to show memory-bound serving and the batch needed
+# to make the inference all-to-all efficient.
+d_model, d_ff = 4096, 14336     # hidden width, expert intermediate width
+E, k, L = 64, 2, 32             # experts/layer, top-k, MoE layers
+b = 2                           # bytes per parameter (bf16)
+
+params_per_expert = 2 * d_model * d_ff
+params_all   = params_per_expert * E * L          # ALL experts must stay resident
+params_active = params_per_expert * k * L         # only top-k fire per token
+
+print("resident weight memory (bf16) :", f"{params_all*b/1e9:.0f} GB",
+      "<- sizes the fleet")
+print("active params per token       :", f"{params_active/1e9:.1f} B",
+      f"({100*params_active/params_all:.1f}% of total)")
+print("FLOPs per token (top-k only)  :", f"{2*params_active/1e9:.0f} GFLOP")
+
+tile = 128                                          # rows to saturate a matmul tile
+print("\n batch   tokens/expert  fill%   status")
+for B in [1, 8, 32, 128, 1024, 4096]:
+    t_expert = B * k / E                            # expected tokens at one expert
+    fill = min(1.0, t_expert / tile)
+    status = ("starved" if t_expert < 1 else
+              "under-filled" if t_expert < tile else "efficient")
+    print(f"{B:6d}  {t_expert:13.2f}  {100*fill:5.1f}  {status}")
+
+print("\nbatch to fill every expert tile : B >=", int(tile * E / k))
+print("ratio resident:active params    : 1 :", int(params_all / params_active))
+</code></pre>
+<div class="code-caption"><strong>Code 17.8.1:</strong> A pure-Python cost model of MoE serving. It computes the resident memory (all experts, all layers) against the per-token FLOPs (top-$k$ only), then sweeps the batch size to show how many tokens reach each expert and when the matmul tiles finally fill.</div>
+<pre><code class="language-text">resident weight memory (bf16) : 481 GB &lt;- sizes the fleet
+active params per token       : 7.5 B (3.1% of total)
+FLOPs per token (top-k only)  : 15 GFLOP
+
+ batch   tokens/expert  fill%   status
+     1           0.03    0.0  starved
+     8           0.25    0.2  starved
+    32           1.00    0.8  under-filled
+   128           4.00    3.1  under-filled
+  1024          32.00   25.0  under-filled
+  4096         128.00  100.0  efficient
+
+batch to fill every expert tile : B &gt;= 4096
+ratio resident:active params    : 1 : 32</code></pre>
+<div class="code-caption"><strong>Output 17.8.1:</strong> The serving paradox in numbers. The fleet must hold $481$ GB of experts, yet each token pays for only $15$ GFLOP over $3.1\%$ of the parameters. Until the batch reaches $4096$ tokens, every expert is starved or under-filled, so the all-to-all and the expert kernels run far below peak. The resident-to-active ratio is exactly $E/k = 32$.</div>
+<p>The output makes the threshold vivid. At a batch of one, the natural setting for an interactive single-user request, each expert receives three hundredths of a token: the model is almost all idle silicon and network round-trips. Only at four thousand tokens, the value $\tau E / k$ predicted above, do the experts fill their tiles. The practical consequence is that MoE serving lives or dies on continuous batching, the technique that pools concurrent requests into one large in-flight batch so the experts always have work. We meet that technique as the backbone of distributed LLM serving in <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>, where the same all-to-all and the same batching pressure reappear, now multiplied across a serving fleet with strict latency budgets.</p>
+<div class="callout fun-note">
+<div class="callout-title">A Restaurant With Sixty-Four Specialist Chefs</div>
+<p>Picture a kitchen with sixty-four chefs, each the sole expert in one dish, and a rule that every order goes to exactly two of them. If a single customer walks in, two chefs cook and sixty-two stand around, all still on payroll and all still occupying the building. The kitchen only looks efficient at a banquet: fill the dining room and suddenly every chef has a full station. An MoE model is that kitchen. It is gloriously cheap per dish and absurd to keep open for one diner, which is exactly why serving teams obsess over keeping the room full.</p>
+</div>
+
+<h2>4. Serving Strategies: Placement, Caching, and Offload <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Given a fixed memory wall and a recurring all-to-all, the engineering levers are about placing experts well and amortizing the communication. Four strategies dominate. The first is expert parallelism at inference, already shown in Figure 17.8.1: shard the experts across the serving GPUs so the resident memory is divided, accepting the all-to-all as the price of not replicating $481$ GB on every node. The second is placement by popularity. Routing is rarely uniform even after the load-balancing of <a href="section-17.6.html">Section 17.6</a>; some experts attract more traffic, so co-locating hot experts to minimize cross-node hops, or replicating the hottest experts on several GPUs, shortens the average all-to-all path. The third is caching and offload: experts that are cold for a given workload can be held in CPU memory or on fast storage and paged into HBM on demand, trading a residency cost for an occasional load latency, which pays off precisely because most experts are idle most of the time at low batch.</p>
+<p>The fourth lever is per-node efficiency, the scale-up prerequisite of <a href="../../part-5-distributed-inference/module-22-per-node-inference-efficiency/index.html">Chapter 22</a>. Quantizing the expert weights from $16$-bit to $8$- or $4$-bit roughly halves or quarters the resident memory, which directly relaxes the memory wall that sizes the whole fleet; a $481$ GB model in bf16 becomes a $120$ GB model in int4, fitting on far fewer GPUs. Because MoE is memory-bound at serving time, quantization buys more here than it does for a compute-bound dense model: it attacks the binding constraint directly. These per-node techniques are not the main event, but for sparse serving they move the fleet-size needle more than any kernel tuning, which is why we treat them as a labeled prerequisite rather than an afterthought.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: vLLM and SGLang Serve MoE With Expert Parallelism and Continuous Batching</div>
+<p>Implementing the inference all-to-all, the per-layer expert routing, the continuous batcher, and quantized expert weights by hand is thousands of lines. Production serving engines fold all of it behind a launch flag. With vLLM, an MoE checkpoint such as Mixtral or DeepSeek-MoE is served with expert parallelism and continuous batching enabled by configuration, not code:</p>
+<pre><code class="language-bash"># vLLM: serve a Mixture-of-Experts model with expert + tensor parallelism.
+# Experts are sharded across GPUs; the engine runs the all-to-all, the
+# continuous batcher that keeps experts full, and int8/fp8 expert weights.
+vllm serve mistralai/Mixtral-8x7B-Instruct-v0.1 \
+    --tensor-parallel-size 2 \
+    --enable-expert-parallel \
+    --quantization fp8 \
+    --max-num-seqs 256          # pool many requests into one in-flight batch
+</code></pre>
+<div class="code-caption"><strong>Code 17.8.2:</strong> The whole serving stack of this section as one command. vLLM (and SGLang, with its analogous MoE expert-parallel backend) handles the sharded expert placement, the two-way all-to-all per layer, the continuous batching that fills the experts, and the quantized weights that relax the memory wall, collapsing the hand-rolled system of Code 17.8.1 and Figure 17.8.1 into configuration flags.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The MoE Chatbot That Was Fast in the Benchmark and Slow in Production</div>
+<p><strong>Who:</strong> An inference platform engineer deploying an open-weight $8\times 22$B sparse chat model.</p>
+<p><strong>Situation:</strong> Offline throughput benchmarks at batch $512$ looked excellent, beating a dense model of comparable quality on tokens per second per dollar.</p>
+<p><strong>Problem:</strong> In production the model served interactive users one request at a time, and median latency was three times worse than the dense baseline at the same GPU count.</p>
+<p><strong>Dilemma:</strong> Add more GPUs to cut latency, which does nothing because the bottleneck is the all-to-all round-trips and starved experts, not raw compute, or change the serving strategy and risk a larger engineering effort.</p>
+<p><strong>Decision:</strong> They diagnosed it as the small-batch regime of Section 3: at batch one, each expert saw a fraction of a token, so every MoE layer paid two all-to-all collectives to do almost no arithmetic.</p>
+<p><strong>How:</strong> They enabled continuous batching to pool concurrent users into one in-flight batch, co-located the hottest experts to shorten the all-to-all, and quantized the expert weights to fp8 so the model fit on fewer, better-connected GPUs with faster collectives.</p>
+<p><strong>Result:</strong> Under real concurrent load the experts filled, the all-to-all amortized over many tokens, and median latency fell below the dense baseline while keeping the MoE cost advantage. The benchmark had been right; it had just measured the regime the production traffic never reached.</p>
+<p><strong>Lesson:</strong> An MoE model's serving cost is a function of batch occupancy, not of its FLOPs. Benchmark in the batch regime your traffic will actually hit, and engineer the batcher and the expert placement before you reach for more hardware.</p>
+</div>
+
+<h2>5. The Communication Lineage, Now at Serving Time <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>It is worth naming what the serving all-to-all is, because it closes an arc that runs through the whole book. The collective that ferries tokens to experts in Figure 17.8.1 is a descendant of the all-reduce you computed by hand in <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a> for data-parallel gradients, and a cousin of the reduce-scatter and all-gather that move shards in the ZeRO and FSDP training of <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>. What changed is the regime. In training, the collective runs once per step on large, predictable tensors and overlaps generously with backward compute, so its cost hides. In serving, it runs twice per layer on small, data-dependent token batches under a latency budget, so its cost is exposed and unforgiving. The same primitive, profiled in a different operating point, flips from a background overhead to the dominant term.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: A Sparse Model Is a Distributed System Even to Serve One Token</div>
+<p>The spine of this book is that AI at scale is a distributed-systems problem, and MoE serving is the sharpest case yet. A dense model can, in principle, answer a request from one machine. A large sparse model cannot: its experts do not fit on one device, so even a single token's forward pass is a distributed computation, crossing the network through an all-to-all on every layer, gated by the slowest peer. The capacity that sparsity buys is paid for in mandatory communication and mandatory residency, the two taxes this book has tracked since the all-reduce of <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Chapter 1</a>. Serving an MoE model is not an optimization on top of a single-machine program; it is a distributed system whose efficiency is set by how well you amortize those taxes.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Serving Sparse Models Under Memory Pressure (2024 to 2026)</div>
+<p>Because MoE serving is memory-bound, a vigorous research line attacks the residency cost directly. Expert offloading systems such as Mixtral-Offloading and the MoE-Infinity and Pre-gated MoE lines (2024) keep cold experts in CPU memory or on storage and predict, from the router's early signals, which experts the next tokens will need, prefetching them into HBM to hide the load latency; this lets large sparse models run on a single consumer GPU at the cost of carefully scheduled paging. A parallel thread, including DeepSeek-V2 and V3 (2024 to 2025), redesigns the architecture for serving from the start: shared always-on experts plus many fine-grained routed experts, and node-limited routing that caps how many machines any token's experts can span, shrinking the all-to-all fan-out. Quantization research pushes expert weights to $4$-bit and below with MoE-aware calibration, since halving the resident bytes is worth more for a memory-bound sparse model than for a dense one. The common thread is that the field now treats the resident-memory wall and the all-to-all fan-out, not the FLOPs, as the quantities to engineer down, exactly as Output 17.8.1 frames them.</p>
+</div>
+<p>We now have the full serving picture: a model that is cheap per token yet sized by total memory, served by sharding all experts across the fleet, kept efficient by batching enough tokens to fill the experts and amortize the all-to-all, and made affordable by placement, caching, and quantization. The natural next question is whether all of this complexity is worth it compared with a plain dense model that, while heavier per token, asks for none of these serving gymnastics. That is the trade-off we settle in <a href="section-17.9.html">Section 17.9</a>, weighing the capacity-per-FLOP advantage of sparse models against the memory, communication, and operational costs that this section has laid bare.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.8.1: Size the Fleet From the Right Constraint <span class="exercise-type conceptual">Conceptual</span></div>
+<p>An MoE model has $E = 128$ experts per layer, top-$k = 2$ routing, $L = 48$ MoE layers, and each expert holds $0.3$ billion parameters, stored in bf16. State whether the serving fleet is sized by memory or by per-token FLOPs, and explain why a colleague who estimates the GPU count from the active (top-$k$) parameter budget will under-provision. Give the factor by which they will be wrong, and name two strategies from Section 4 that change the answer without changing the model.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.8.2: Find the Efficient Batch <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 17.8.1 so it sweeps both batch size and the expert count $E \in \{8, 32, 64, 256\}$ at fixed top-$k = 2$, and for each $E$ prints the smallest batch that fills the matmul tile (use tile size $\tau = 128$). Plot or tabulate the threshold batch against $E$ and confirm it grows linearly as $\tau E / k$. Then add a second curve for $k = 4$ and explain, in one sentence, why raising $k$ lowers the batch needed to keep the experts busy but raises the FLOPs per token.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.8.3: All-to-All Tax Per Forward Pass <span class="exercise-type analysis">Analysis</span></div>
+<p>A request runs through a model with $L = 32$ MoE layers, each performing two all-to-all collectives (dispatch and combine), and each all-to-all costs a fixed latency of $80$ microseconds dominated by network round-trips at small batch. Estimate the total all-to-all latency for one forward pass and compare it to the time the active experts spend computing, assuming the top-$k$ matmuls take $200$ microseconds in total at batch one. Argue from these two numbers whether the request is communication-bound or compute-bound, then repeat the reasoning for a batch of $4096$ where the matmuls take $40$ milliseconds and the all-to-all latency is unchanged per layer. Explain what your two answers say about why continuous batching is mandatory for MoE serving, and connect it to the fleet-wide batching pressure you will meet in <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-17.7.html"><span class="nav-label">Previous</span><span class="nav-num">Section 17.7</span><span class="nav-title">Capacity Factors, Token Dropping, and Stability</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 17</span><span class="nav-num">Contents</span><span class="nav-title">Expert Parallelism and Sparse Distributed Models</span></a>
+<a class="next" href="section-17.9.html"><span class="nav-label">Next</span><span class="nav-num">Section 17.9</span><span class="nav-title">Trade-Offs vs Dense Distributed Models</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

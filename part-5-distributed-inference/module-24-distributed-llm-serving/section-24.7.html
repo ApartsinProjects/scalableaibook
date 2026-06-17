@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 24.7: Prefix Caching and Multi-LoRA Fleets. Two fleet-level optimizations that exploit sharing: reusing the KV cache of common prefixes to cut TTFT, and serving thousands of LoRA adapters over one shared base model at near-zero marginal memory." name="description"/>
+<title>Section 24.7: Prefix Caching and Multi-LoRA Fleets | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 24: Distributed LLM Serving</a></div>
+<h1>Prefix Caching and Multi-LoRA Fleets</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Every request handed me the same thousand-token system prompt, and every request asked me to read it again from scratch. The day someone let me remember it, I cut my morning workload by ninety percent and finally had time for the actual questions."</p>
+<cite>A KV Cache That Learned to Share</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Real LLM platforms are not a stream of unrelated requests; they are a stream of requests that share enormous amounts of structure, and a serving fleet that recognizes the sharing serves far more traffic on the same hardware.</strong> Two kinds of sharing dominate production. Requests share <em>prompt prefixes</em>: the same long system prompt, the same few-shot template, the same retrieved document appears at the front of thousands of requests, and computing its key-value cache once instead of once per request collapses the prefill cost. Requests also share a <em>base model</em>: a multi-tenant platform may host thousands of fine-tuned variants that differ only by a small low-rank adapter, and holding one base in GPU memory while swapping tiny adapters per request gives every tenant a custom model at almost no marginal memory. This section turns both forms of sharing into fleet-level mechanisms: a distributed prefix-KV store with prefix-affinity routing, and multi-LoRA batching that serves different adapters in one batch over one base.</p>
+</div>
+<p>The previous section built request scheduling and continuous batching that keep a multi-node serving fleet busy at the token level. Those mechanisms treat each request as independent work to be packed efficiently. This section exploits the opposite fact: across a real workload, requests are deeply <em>not</em> independent. They overlap in their inputs (a shared prefix) and in the model they want (a shared base with a per-tenant tweak). Both overlaps are pure waste when ignored and pure savings when exploited, and at fleet scale the savings are the difference between a platform that is economical and one that is not. We take the two optimizations in turn, prefix caching first, then multi-LoRA serving, because they rest on the same idea applied to two different shared resources: the KV cache and the model weights. Figure 24.7.1 places the two side by side: a shared prefix's KV cache computed once for many requests on the left, and one base model serving a batch of different LoRA adapters on the right.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 880 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two panels. Left: three requests with the same shared prefix reuse one cached KV block on a replica, computing only their unique suffixes. Right: one base model in GPU memory serves a batch of requests that each carry a different small LoRA adapter.">
+<defs>
+<marker id="arr247" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b247 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.p247 { fill:#e6f0e6; stroke:#2f7d46; stroke-width:1.6; }
+.w247 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.a247 { fill:#efe7f7; stroke:#6b3fa0; stroke-width:1.6; }
+.t247 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s247 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.h247 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.l247 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr247); }
+</style>
+<text class="h247" x="220" y="24">Prefix caching: one KV cache, many requests</text>
+<rect class="p247" x="120" y="44" width="200" height="46" rx="8"/>
+<text class="t247" x="220" y="64">Shared prefix KV</text>
+<text class="s247" x="220" y="80">system prompt + few-shot (cached once)</text>
+<rect class="w247" x="40" y="150" width="120" height="44" rx="8"/>
+<text class="t247" x="100" y="170">Request A</text>
+<text class="s247" x="100" y="186">unique suffix</text>
+<rect class="w247" x="180" y="150" width="120" height="44" rx="8"/>
+<text class="t247" x="240" y="170">Request B</text>
+<text class="s247" x="240" y="186">unique suffix</text>
+<rect class="w247" x="320" y="150" width="120" height="44" rx="8"/>
+<text class="t247" x="380" y="170">Request C</text>
+<text class="s247" x="380" y="186">unique suffix</text>
+<path class="l247" d="M 100 148 L 100 110 L 200 110 L 200 92"/>
+<path class="l247" d="M 240 148 L 240 92"/>
+<path class="l247" d="M 380 148 L 380 110 L 280 110 L 280 92"/>
+<text class="s247" x="220" y="232">prefill skipped for the shared part; only suffixes computed</text>
+<line x1="470" y1="40" x2="470" y2="340" stroke="#c7ced8" stroke-width="1.4" stroke-dasharray="5 4"/>
+<text class="h247" x="675" y="24">Multi-LoRA: one base, many adapters</text>
+<rect class="b247" x="560" y="48" width="230" height="50" rx="8"/>
+<text class="t247" x="675" y="70">Shared base model (in GPU memory)</text>
+<text class="s247" x="675" y="86">14 GB, loaded once</text>
+<rect class="a247" x="520" y="150" width="90" height="60" rx="8"/>
+<text class="t247" x="565" y="174">req 1</text>
+<text class="s247" x="565" y="192">adapter A</text>
+<text class="s247" x="565" y="205">17 MB</text>
+<rect class="a247" x="630" y="150" width="90" height="60" rx="8"/>
+<text class="t247" x="675" y="174">req 2</text>
+<text class="s247" x="675" y="192">adapter B</text>
+<text class="s247" x="675" y="205">17 MB</text>
+<rect class="a247" x="740" y="150" width="90" height="60" rx="8"/>
+<text class="t247" x="785" y="174">req 3</text>
+<text class="s247" x="785" y="192">adapter C</text>
+<text class="s247" x="785" y="205">17 MB</text>
+<path class="l247" d="M 565 148 L 565 120 L 660 120 L 660 100"/>
+<path class="l247" d="M 675 148 L 675 100"/>
+<path class="l247" d="M 785 148 L 785 120 L 690 120 L 690 100"/>
+<rect class="b247" x="560" y="262" width="230" height="44" rx="8"/>
+<text class="t247" x="675" y="282">One batched forward pass</text>
+<text class="s247" x="675" y="298">base GEMM + per-request adapter delta</text>
+<path class="l247" d="M 565 210 L 565 240 L 660 240 L 660 260"/>
+<path class="l247" d="M 675 210 L 675 260"/>
+<path class="l247" d="M 785 210 L 785 240 L 690 240 L 690 260"/>
+</svg>
+<figcaption><strong>Figure 24.7.1:</strong> The two forms of sharing this section exploits. Left: three requests carry the same long prefix, so the fleet computes that prefix's KV cache once and each request prefills only its short unique suffix. Right: a batch mixes requests for three different tenants, each with its own small LoRA adapter, served by a single base model in GPU memory with the adapter applied per request inside one forward pass.</figcaption>
+</figure>
+
+<h2>1. Why Prefixes Repeat, and What Caching Them Saves <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>An autoregressive transformer answers a request in two phases. Prefill reads the whole prompt and builds a key-value (KV) cache for every token, a cost that grows with the prompt length; decode then generates the answer one token at a time, reading that cache. <a href="../module-22-per-node-inference-efficiency/index.html">Chapter 22</a> established the per-node economics of that KV cache, and <a href="section-24.4.html">Section 24.4</a> distributed it across machines as a paged store. The observation that drives prefix caching is simple: in production, the front of the prompt is very often identical across many requests. A chatbot prepends the same multi-thousand-token system prompt to every conversation. A classification service prepends the same few-shot template to every input. A retrieval-augmented generation (RAG) pipeline places the same retrieved document at the front of every question about that document. In each case the KV cache of the shared prefix is bit-for-bit the same no matter which request computed it.</p>
+<p>If the prefix is shared, computing its KV cache once and reusing it skips the prefill for that segment entirely on every later request. Let a prompt have $L$ tokens of which a fraction $f$ belong to a cached shared prefix. Prefill compute scales with the number of tokens actually run through the network, so the work drops from $L$ to $(1-f)L$ tokens, a saved fraction of exactly $f$. Time to first token (TTFT), the latency a user feels before any output appears, is dominated by prefill, so it shrinks in the same proportion. The savings are not marginal: when a 4000-token RAG context is shared and only a 200-token question is unique, $f \approx 0.95$ and the fleet does one twentieth of the prefill work it would do without caching.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Shared Prefixes Turn Prefill From Per-Request Into Per-Prefix Work</div>
+<p>Without prefix caching, prefill cost is paid once per request and scales with the full prompt length. With it, the cost of a shared segment is paid once per <em>distinct prefix</em> and amortized over every request that reuses it. A workload of $R$ requests that all share one long prefix moves from $O(R \cdot L)$ prefill tokens to $O(L + R \cdot L_{\text{unique}})$. The economic consequence is that the marginal cost of an extra request collapses to the cost of its unique suffix, which is why RAG and agent platforms, where the shared context dwarfs the unique query, gain the most.</p>
+</div>
+
+<h2>2. From One Cache to a Fleet: Prefix-Affinity Routing <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>On a single replica, reuse is automatic: the cache is right there. At fleet scale the problem is placement. A cached prefix lives in the GPU memory of whichever replica computed it, and the savings only materialize if later requests carrying that same prefix are routed to that same replica. Sending them anywhere else forces a recomputation and wastes the cache. The fleet therefore needs two cooperating pieces: a <em>shared or distributed prefix-KV store</em> that records which prefixes are cached where (the paged KV store of <a href="section-24.4.html">Section 24.4</a> is exactly this substrate), and a router that performs <em>prefix-affinity routing</em>, hashing the incoming prompt's prefix and steering the request to the replica that already holds its cache.</p>
+<p>This is the same load-balancing-versus-locality tension that <a href="../module-23-distributed-inference-systems/section-23.2.html">Section 23.2</a> introduced for request routing, now sharpened by the cache. A purely load-balancing router spreads work evenly but destroys cache locality; a purely affinity-based router maximizes reuse but can pile all traffic for a hot prefix onto one replica. Production routers blend the two: prefer the cache-holding replica, but spill to a less-loaded peer (replicating the hot prefix there) when the affinity target saturates. Because building and matching prefixes by hand is tedious and error-prone, the most influential recent system makes prefix sharing automatic.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: RadixAttention and Automatic Prefix Sharing (2024 to 2026)</div>
+<p>RadixAttention, introduced with SGLang (Zheng et al., 2024), organizes all cached KV state in a radix tree keyed by token sequences, so any new request automatically reuses the longest already-cached prefix without the programmer marking shared segments at all. A least-recently-used eviction policy over the tree keeps hot prefixes resident, and the structure naturally captures branching workloads (an agent exploring several continuations of one context, or a few-shot template shared by many distinct queries). vLLM shipped automatic prefix caching on the same principle, and the idea has since extended to cross-request KV reuse across nodes and to disk-and-CPU offload tiers that hold prefixes too large for GPU memory. The frontier now studies KV cache sharing across a whole datacenter, including content-addressed prefix stores that let any replica fetch a remote prefix's cache rather than recompute it, tying prefix caching directly to the distributed KV store of <a href="section-24.4.html">Section 24.4</a>.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Cache That Pays Rent</div>
+<p>A long system prompt used to be pure overhead, dead weight prepended to every call and recomputed every time. Prefix caching inverts its economics: the longer and more widely shared the prompt, the more a single cached copy earns back across the requests that reuse it. The thousand-token persona that once looked like a tax becomes the cheapest part of the request, paid for once and then free.</p>
+</div>
+
+<h2>3. Multi-LoRA: Thousands of Models Over One Base <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The second form of sharing is in the weights. <a href="../../part-4-parallel-deep-learning/module-19-training-foundation-models/section-19.7.html">Section 19.7</a> introduced low-rank adaptation (LoRA): instead of fine-tuning all of a base model's weights, you freeze the base and learn a small low-rank update $\Delta W = BA$ for selected weight matrices, where $A \in \mathbb{R}^{r \times h}$ and $B \in \mathbb{R}^{h \times r}$ with rank $r \ll h$. The adapted weight is $W + BA$. The adapter is tiny: for a 7-billion-parameter base, a rank-16 adapter on the attention projections is roughly seventeen megabytes against fourteen gigabytes for the base, a thousandfold smaller.</p>
+<p>A multi-tenant platform exploits this directly. Suppose a company serves one fine-tuned variant per customer, or a writing tool offers thousands of style adapters. Loading a separate full deployment per adapter would replicate the entire base model $N$ times, an impossible memory bill at $N$ in the thousands. Multi-LoRA serving keeps <em>one</em> base in GPU memory and stores only the small adapters, applying the right one per request. The total memory is the base plus $N$ adapters, $M_{\text{multi}} = M_{\text{base}} + N \cdot M_{\text{adapter}}$, against $M_{\text{sep}} = N \cdot M_{\text{base}}$ for separate deployments. The saved fraction is</p>
+$$1 - \frac{M_{\text{base}} + N \cdot M_{\text{adapter}}}{N \cdot M_{\text{base}}} = 1 - \frac{1}{N} - \frac{M_{\text{adapter}}}{M_{\text{base}}},$$
+<p>which approaches $1$ as $N$ grows because $M_{\text{adapter}} / M_{\text{base}} \approx 10^{-3}$. Each new tenant costs almost nothing. This is the multi-model serving problem of <a href="../module-23-distributed-inference-systems/section-23.5.html">Section 23.5</a> in its most favorable form: the models are not arbitrary and unrelated but share a common base, so they cohabit one GPU instead of contending for many.</p>
+<p>The mechanism that makes this fast is batching requests for <em>different</em> adapters together. A naive implementation would group requests by adapter and run one batch per adapter, wrecking the batching efficiency that <a href="section-24.6.html">Section 24.6</a> worked to build. The advance of S-LoRA (Sheng et al., 2023) and Punica (Chen et al., 2023) is a batched kernel that computes the shared base matrix multiply once for the whole heterogeneous batch and then adds each request's low-rank delta $B_j A_j x_j$ using its own adapter, so a single forward pass serves a batch in which every request belongs to a different tenant. The base GEMM is amortized across all requests; only the small per-request adapter math differs.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Sharing Is the Fleet-Scale Form of Efficiency</div>
+<p>Scale-up made one model fast on one node (the quantization and KV-cache work of <a href="../module-22-per-node-inference-efficiency/index.html">Chapter 22</a>). Scale-out multiplies a different lever: it lets one cached prefix and one base model serve an entire fleet of requests and tenants. Prefix-affinity routing and multi-LoRA batching are not single-node tricks; they are fleet-level reorganizations that only pay off when a router, a distributed KV store, and a batching scheduler cooperate across machines. The recurring pattern of this book reappears here, that the biggest wins come from recognizing what is shared across the cluster and computing it once, the same instinct that made the all-reduce of <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a> exact rather than redundant.</p>
+</div>
+
+<h2>4. Modeling the Two Savings <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The code below makes both effects concrete with arithmetic that mirrors the formulas above. Part A sweeps the shared-prefix fraction $f$ and reports the unique tokens that must still be prefilled, the resulting TTFT, and the fraction of prefill compute saved. Part B sweeps the number of tenants $N$ and contrasts the GPU memory of $N$ separate base deployments against one shared base plus $N$ small adapters. Both parts use only the per-token and per-byte costs introduced above, so the numbers are traceable to the model rather than to any framework.</p>
+<pre><code class="language-python">import numpy as np
+
+# ---------- Part A: prefix caching ----------
+# A request has a prompt of L_total tokens; a fraction f is a SHARED prefix
+# (system prompt / few-shot template / RAG document) whose KV cache is already
+# in the fleet, so only the unique (1 - f) * L_total tokens must be prefilled.
+L_total = 4096                      # tokens in the full prompt
+prefill_tok_per_ms = 8.0           # tokens prefilled per millisecond on one replica
+queue_ms = 12.0                    # fixed scheduling/queue overhead per request
+
+print("Part A: prefix caching as shared-prefix fraction grows")
+print(f"{'shared f':&gt;9} {'unique tok':&gt;11} {'TTFT ms':&gt;9} {'compute saved':&gt;14}")
+base_tokens = L_total              # f = 0 baseline: prefill everything
+base_ttft = queue_ms + base_tokens / prefill_tok_per_ms
+for f in [0.0, 0.25, 0.50, 0.75, 0.90, 0.95]:
+    unique = int(round((1.0 - f) * L_total))
+    ttft = queue_ms + unique / prefill_tok_per_ms
+    saved = 1.0 - (unique / base_tokens)        # fraction of prefill FLOPs skipped
+    print(f"{f:&gt;9.2f} {unique:&gt;11d} {ttft:&gt;9.1f} {saved:&gt;13.0%}")
+speedup = base_ttft / (queue_ms + (1 - 0.90) * L_total / prefill_tok_per_ms)
+print(f"TTFT at f=0.90 is {speedup:.1f}x faster than the no-cache baseline")
+
+# ---------- Part B: multi-LoRA memory ----------
+# Separate deployments load the FULL base model N times. Multi-LoRA keeps ONE
+# base in GPU memory and adds only the small per-adapter low-rank matrices.
+print("\nPart B: serving N LoRA adapters, separate vs multi-LoRA over one base")
+base_gb = 14.0                     # 7B base model in fp16
+h, L_layers, r = 4096, 32, 16      # hidden size, layers, LoRA rank
+# LoRA on attention q,v: two projections, each two matrices (A,B) per layer, fp16
+adapter_params = L_layers * 2 * (2 * r * h)
+adapter_gb = adapter_params * 2 / 1e9          # 2 bytes per fp16 param
+print(f"base model: {base_gb:.1f} GB   one adapter: {adapter_gb*1000:.1f} MB (rank r={r})")
+print(f"{'N adapters':&gt;11} {'separate GB':&gt;12} {'multi-LoRA GB':&gt;14} {'memory saved':&gt;13}")
+for N in [1, 10, 100, 1000]:
+    separate = N * base_gb                      # N full copies of the base
+    multi = base_gb + N * adapter_gb            # one base + N tiny adapters
+    saved = 1.0 - multi / separate
+    print(f"{N:&gt;11d} {separate:&gt;12.1f} {multi:&gt;14.2f} {saved:&gt;12.1%}")
+</code></pre>
+<div class="code-caption"><strong>Code 24.7.1:</strong> A pure-Python model of both fleet savings: prefill compute and TTFT as the shared-prefix fraction $f$ grows (Part A), and GPU memory for $N$ separate base deployments versus one shared base plus $N$ LoRA adapters (Part B). The adapter size follows directly from the rank-$r$ low-rank factorization of <a href="../../part-4-parallel-deep-learning/module-19-training-foundation-models/section-19.7.html">Section 19.7</a>.</div>
+<pre><code class="language-text">Part A: prefix caching as shared-prefix fraction grows
+ shared f  unique tok   TTFT ms  compute saved
+     0.00        4096     524.0            0%
+     0.25        3072     396.0           25%
+     0.50        2048     268.0           50%
+     0.75        1024     140.0           75%
+     0.90         410      63.2           90%
+     0.95         205      37.6           95%
+TTFT at f=0.90 is 8.3x faster than the no-cache baseline
+
+Part B: serving N LoRA adapters, separate vs multi-LoRA over one base
+base model: 14.0 GB   one adapter: 16.8 MB (rank r=16)
+ N adapters  separate GB  multi-LoRA GB  memory saved
+          1         14.0          14.02        -0.1%
+         10        140.0          14.17        89.9%
+        100       1400.0          15.68        98.9%
+       1000      14000.0          30.78        99.8%</code></pre>
+<div class="code-caption"><strong>Output 24.7.1:</strong> A 90 percent shared prefix cuts TTFT by 8.3 times (Part A), and serving a thousand tenants over one shared base needs 30.8 GB instead of 14 TB, a 99.8 percent memory saving (Part B). At $N = 1$ multi-LoRA is marginally worse because the adapter is pure overhead with nothing to amortize; the saving turns decisively positive the moment a second tenant arrives.</div>
+<p>Two features of Output 24.7.1 are worth dwelling on. In Part A the saving equals $f$ exactly, confirming the model from Section 1, and TTFT falls from 524 ms to 63 ms once a 4000-token context is mostly shared, the kind of latency drop a user feels immediately. In Part B the separate-deployment column reaches fourteen <em>terabytes</em> of GPU memory for a thousand tenants, which no realistic fleet can hold, while the multi-LoRA column stays under thirty-one gigabytes, comfortably inside two or three GPUs. The negative saving at $N = 1$ is the honest edge case: when there is nothing to share, sharing machinery is overhead. Every cell of the table is reproduced by the arithmetic in Code 24.7.1, which is why a from-scratch model is enough to expose the scaling that makes these optimizations mandatory rather than optional on real platforms.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The RAG Platform That Stopped Re-Reading Its Documents</div>
+<p><strong>Who:</strong> An ML platform engineer running a document-question-answering service for an enterprise customer base.</p>
+<p><strong>Situation:</strong> Each request stuffed a retrieved 3500-token document plus a 600-token instruction block in front of a short user question, and traffic was bursty: many users asked different questions about the same handful of popular documents within seconds of each other.</p>
+<p><strong>Problem:</strong> Prefill dominated cost and latency. The fleet prefilled the same documents thousands of times an hour, TTFT sat above half a second, and GPU hours were budgeted almost entirely for re-reading text the system had already read.</p>
+<p><strong>Dilemma:</strong> Buy more GPUs to brute-force the prefill, simple but linear in cost, or restructure the fleet to recognize that most of each prompt was shared and route for cache reuse, cheaper but requiring an affinity-aware router and a shared prefix store.</p>
+<p><strong>Decision:</strong> They enabled automatic prefix caching in the engine and added prefix-affinity routing on top of the existing load balancer, hashing the document-plus-instruction prefix and steering same-document requests to the replica already holding its KV cache.</p>
+<p><strong>How:</strong> They switched to an engine with RadixAttention-style automatic prefix caching (see the Library Shortcut), set the router to prefer the cache-holding replica and spill to the least-loaded peer only past a saturation threshold, and kept the paged KV store of <a href="section-24.4.html">Section 24.4</a> as the substrate so hot prefixes stayed resident.</p>
+<p><strong>Result:</strong> With a measured shared-prefix fraction near 0.9, prefill compute fell by roughly the predicted ninety percent, TTFT dropped from above 500 ms to under 80 ms on cache hits, and the same hardware absorbed several times the request rate, mirroring Part A of Output 24.7.1.</p>
+<p><strong>Lesson:</strong> When the shared part of the prompt dwarfs the unique part, caching the prefix and routing for affinity is the highest-leverage change available, and it costs router logic rather than GPUs.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: SGLang and vLLM Do Prefix Caching and Multi-LoRA for You</div>
+<p>Code 24.7.1 modeled the savings; production engines deliver them with a flag. SGLang turns on RadixAttention automatic prefix sharing by default, and both SGLang and vLLM serve many LoRA adapters over one base with per-request adapter selection, batching different adapters together:</p>
+<pre><code class="language-python"># vLLM: one base model, automatic prefix caching + multi-LoRA, a few lines.
+from vllm import LLM, SamplingParams
+from vllm.lora.request import LoRARequest
+
+llm = LLM(
+    model="meta-llama/Llama-2-7b-hf",
+    enable_prefix_caching=True,        # reuse shared-prefix KV across requests
+    enable_lora=True, max_loras=64,    # hold many adapters over one base in GPU
+)
+
+# Each request picks its tenant's adapter; the engine batches them together
+# and reuses any cached prefix automatically. No manual cache or routing code.
+out = llm.generate(
+    prompts=[long_shared_system_prompt + user_question],
+    sampling_params=SamplingParams(max_tokens=128),
+    lora_request=LoRARequest("tenant_42", 42, "/adapters/tenant_42"),
+)
+</code></pre>
+<div class="code-caption"><strong>Code 24.7.2:</strong> The hundreds of lines of radix-tree cache management, prefix hashing, adapter paging, and batched LoRA kernels collapse to two constructor flags and a per-request adapter handle. The engine handles cache eviction, prefix matching, and the S-LoRA-style batched delta internally; SGLang exposes the same capabilities with RadixAttention on by default.</div>
+</div>
+
+<h2>5. When Sharing Does Not Pay <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Both optimizations have a regime where the machinery costs more than it returns, and a fleet that applies them blindly can lose. Prefix caching only helps when prefixes actually repeat. A workload of all-unique prompts (every user pastes a different document, no template is shared) has $f \approx 0$, and the cache then consumes GPU memory and bookkeeping for prefixes that are never reused, evicting useful KV blocks in the process. The router's affinity logic adds latency to every request for a reuse that never comes. The remedy is to measure the real prefix-hit rate and enable caching where it is high, which is exactly why the engines expose it as a toggle rather than forcing it on.</p>
+<p>Multi-LoRA has its own limits. The $N = 1$ row of Output 24.7.1 already showed that a single tenant gains nothing; the saving needs scale. More subtly, very high adapter ranks erode the assumption that adapters are tiny: a rank-256 adapter is sixteen times larger than the rank-16 one modeled here, and at large $N$ the $N \cdot M_{\text{adapter}}$ term stops being negligible, so the per-tenant cost is no longer near zero. There is also a throughput tax: the batched adapter kernel does extra low-rank work per request on top of the shared base GEMM, so a batch of many distinct adapters runs somewhat slower than a batch of identical ones, the price of the per-request flexibility. The MoE serving of <a href="section-24.8.html">Section 24.8</a>, which we turn to next, faces a related batching question from a different direction: not many small adapters over one dense base, but a few large experts selected per token across the fleet.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.7.1: Where the Prefix Pays Off <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each workload, estimate the shared-prefix fraction $f$ and state whether prefix-affinity routing is worth its complexity, justifying with the saved-fraction model from Section 1: (a) a customer-support bot with a 1500-token system persona and 50-token user turns; (b) a code-search tool where every query is a different, unique code snippet with no shared template; (c) a RAG service answering many questions about a small library of frequently accessed documents. For the case where caching does not pay, explain what the cache costs the fleet even when it is never reused.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.7.2: The Crossover Tenant Count <span class="exercise-type coding">Coding</span></div>
+<p>Extend Part B of Code 24.7.1 to find, for a given adapter rank $r$, the smallest number of tenants $N$ at which multi-LoRA saves at least 95 percent of memory versus separate deployments. Then sweep $r \in \{8, 16, 64, 256\}$ and plot or tabulate how that crossover $N$ moves as the adapter grows. Using the saved-fraction formula $1 - 1/N - M_{\text{adapter}}/M_{\text{base}}$, explain analytically why larger $r$ pushes the crossover higher and what adapter rank would make multi-LoRA pointless even at $N = 1000$.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.7.3: Affinity Versus Balance <span class="exercise-type analysis">Analysis</span></div>
+<p>A fleet of 4 replicas receives requests for 3 prefixes whose traffic shares are 0.70, 0.20, and 0.10. A pure prefix-affinity router pins each prefix to one replica. Compute the per-replica load and identify the hot spot. Now design a blended policy that replicates the 0.70 prefix onto a second replica past a saturation threshold, and estimate the new load balance and the extra KV memory that replication costs. Argue, with reference to the routing tension of <a href="../module-23-distributed-inference-systems/section-23.2.html">Section 23.2</a>, why neither pure affinity nor pure load balancing is optimal and what signal the router should use to choose between them per request.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-24.6.html"><span class="nav-label">Previous</span><span class="nav-num">Section 24.6</span><span class="nav-title">Request Scheduling and Continuous Batching</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 24</span><span class="nav-num">Contents</span><span class="nav-title">Distributed LLM Serving</span></a>
+<a class="next" href="section-24.8.html"><span class="nav-label">Next</span><span class="nav-num">Section 24.8</span><span class="nav-title">Serving Distributed MoE Models</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

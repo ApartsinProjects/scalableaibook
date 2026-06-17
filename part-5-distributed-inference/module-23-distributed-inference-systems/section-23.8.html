@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 23.8: Serving Frameworks and Practice. Triton, Ray Serve, KServe, and managed endpoints, how to choose between them, and a from-scratch serving system that ties the whole chapter together." name="description"/>
+<title>Section 23.8: Serving Frameworks and Practice | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 23: Distributed Inference Systems</a></div>
+<h1>Serving Frameworks and Practice</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I spent a week building a router, a batcher, and an autoscaler. Then I read the Triton docs and learned I had built three flags."</p>
+<cite>A Serving Stack That Reinvented the Wheel</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The seven ideas this chapter built by hand, batch-aware routing, queue-depth autoscaling, multi-model multiplexing, warm pools, and failover, are not things you implement from scratch in production; they are configuration surfaces on a serving framework.</strong> NVIDIA Triton, Ray Serve, KServe, TorchServe, and the cloud-managed endpoints each package the same primitives behind different abstractions, and they differ in exactly the dimensions this chapter cared about: how they form batches, what signal they autoscale on, how many models they hold per GPU, and how deeply they integrate with Kubernetes. This closing section maps that landscape, gives you a decision procedure, shows where the LLM-specific engines of <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a> plug in underneath, and then assembles a complete serving system in pure Python so you can see every moving part the frameworks hide.</p>
+</div>
+<p>Across the previous seven sections we treated distributed inference as a set of mechanisms to design: replicate an optimized node, route requests so that batches form and prefixes stick, scale the replica count on the right signal, pack many models onto shared accelerators, hide cold starts behind warm pools, and survive the failure of any single node. Every one of those mechanisms exists, fully implemented and battle-tested, inside one or more serving frameworks. The engineering question in practice is almost never "how do I build a dynamic batcher?" It is "which framework already has the batcher, the autoscaler, and the Kubernetes integration that match my workload, and how do I configure it?" This section answers that question, then earns the chapter's central claim one more time by building the whole system from nothing.</p>
+
+<h2>1. The Four Families of Serving Framework <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The production serving landscape sorts into four families, distinguished less by what they can do than by the layer they live at and the team they were built for. Understanding the layer is the key to choosing well, because the families are not strictly competitors; they frequently stack.</p>
+<p><strong>NVIDIA Triton Inference Server</strong> is the model-runtime workhorse. It loads models from many backends in one process (TensorRT, PyTorch, ONNX Runtime, TensorFlow, Python, and custom C++), and it implements the batch-aware serving mechanics of <a href="section-23.2.html">Section 23.2</a> as first-class features: dynamic batching with a configurable queue delay, multiple concurrent model instances per GPU to multiplex as in <a href="section-23.5.html">Section 23.5</a>, and model ensembles that chain preprocessing, inference, and postprocessing into one server-side graph. Triton is what you reach for when the unit of work is a single optimized model and you want the highest throughput per GPU with the least application code.</p>
+<p><strong>Ray Serve</strong> is the Python-native composition layer. A deployment is an ordinary Python class with a few decorators; Ray Serve gives it replicas, batching (via an <code>@serve.batch</code> decorator that implements the same dynamic batching by hand-built in Section 1 of this section's demo), and autoscaling, and it lets you wire many deployments into a directed graph where one model's output feeds another. Because it is built on Ray, the same cluster runtime that powers distributed training and tuning in <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/index.html">Chapter 33</a>, a Ray Serve application shares a scheduler with your data and training jobs and scales across nodes without leaving the Python process model. It is the natural choice when your serving logic is itself a Python program, a pipeline of models, business logic, and calls to other services, rather than a single model file.</p>
+<p><strong>KServe</strong> is the Kubernetes-native control plane. It defines an <code>InferenceService</code> custom resource and leans on Knative to deliver the two features that matter most in a cluster: scale-to-zero (a model with no traffic consumes no GPU, the extreme of the autoscaling in <a href="section-23.4.html">Section 23.4</a>) and traffic-split canary rollout (send 10% of requests to a new model version, watch the metrics, then shift the rest). KServe does not implement the model runtime itself; it orchestrates one, typically Triton, TorchServe, or a custom predictor, underneath. It is what you choose when serving must live inside an existing Kubernetes platform alongside GitOps, autoscaling policy, and observability you already run.</p>
+<p><strong>TorchServe and the cloud-managed endpoints</strong> round out the field. TorchServe is a focused PyTorch model server with dynamic batching and a management API, lighter than Triton when you serve only PyTorch. The managed endpoints, Amazon SageMaker, Google Vertex AI, and their peers, wrap one of the runtimes above behind a fully hosted control plane: you hand them a model artifact and a container, and they provide the autoscaling, the canary deployment, the load balancer, and the monitoring as a service. They trade configurability and cost for operational simplicity, and they are the right answer when you would rather not run the cluster at all.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Frameworks Differ on Four Axes, the Same Four This Chapter Built</div>
+<p>When you compare serving frameworks, ignore the marketing and ask four questions, each tracing back to a section of this chapter. How does it form batches (dynamic batching, queue delay, continuous batching)? What signal does it autoscale on (request rate, GPU utilization, or queue depth, the signal <a href="section-23.4.html">Section 23.4</a> argued for)? How many distinct models can share one GPU (concurrent instances, multi-model endpoints)? And how deep is its Kubernetes integration (a plain process, a Helm chart, or a native custom resource with scale-to-zero)? Every framework is a different point in that four-dimensional space, and the right one is the point closest to your workload's actual demands.</p>
+</div>
+
+<h2>2. A Decision Procedure <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The four axes turn the choice into a short decision procedure rather than a popularity contest. Table 23.8.1 lays out where each family is strongest so the procedure has something to point at.</p>
+<div class="table-caption"><strong>Table 23.8.1:</strong> The four serving-framework families against the axes this chapter cared about. "Stacks under" means the framework commonly runs another runtime beneath it rather than implementing its own.</div>
+<table>
+<thead>
+<tr><th scope="col">Framework</th><th scope="col">Layer</th><th scope="col">Dynamic batching</th><th scope="col">Autoscaling signal</th><th scope="col">Multi-model per GPU</th><th scope="col">Kubernetes</th></tr>
+</thead>
+<tbody>
+<tr><td>Triton</td><td>Model runtime</td><td>Built in, configurable delay</td><td>Metrics exported; scaler external</td><td>Concurrent instances, model ensembles</td><td>Runs as a pod; KServe drives it</td></tr>
+<tr><td>Ray Serve</td><td>Python composition</td><td><code>@serve.batch</code> decorator</td><td>Queue depth and ongoing requests</td><td>Many deployments, fractional GPUs</td><td>Runs on Ray; KubeRay operator</td></tr>
+<tr><td>KServe</td><td>K8s control plane</td><td>Delegated to the runtime</td><td>Concurrency, scale-to-zero (Knative)</td><td>Multi-model serving (ModelMesh)</td><td>Native <code>InferenceService</code> CRD</td></tr>
+<tr><td>TorchServe / managed</td><td>Server / hosted</td><td>Built in (PyTorch)</td><td>Provider-managed (SageMaker, Vertex)</td><td>Multi-model endpoints</td><td>Container; provider abstracts it</td></tr>
+</tbody>
+</table>
+<p>The procedure reads off the table in four steps. First, if you do not want to operate infrastructure at all, pick a managed endpoint and stop; the rest of the procedure is for teams running their own serving. Second, if you already live on Kubernetes and need scale-to-zero or canary rollout as platform features, choose KServe and let it drive a runtime beneath it. Third, if your serving logic is a Python pipeline (multiple models, retrieval, business rules) rather than a single model, choose Ray Serve so the composition stays in one process and shares a cluster with your other Ray workloads. Fourth, if the unit of work is one optimized model and you want maximum throughput per GPU, choose Triton, optionally with KServe on top. The families compose: a very common production shape is Triton as the runtime, KServe as the control plane, on a Ray-or-Kubernetes cluster.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Chapter's Serving System in a Handful of Config Lines</div>
+<p>The demo in Section 4 below builds a router, a dynamic batcher, a queue-depth autoscaler, and health checks in roughly 100 lines of Python. Each framework collapses those same four mechanisms into declarations. In Triton the batcher is three lines of model config; in Ray Serve it is two decorators; in KServe the autoscaler and canary are fields on one resource. The three snippets below each replace a different slice of the from-scratch system.</p>
+<pre><code class="language-python"># Triton: dynamic batching + 2 concurrent instances per GPU (config.pbtxt).
+# This is Sections 23.2 and 23.5 of this chapter, as configuration.
+#   dynamic_batching { max_queue_delay_microseconds: 10000 }   # 10 ms window
+#   instance_group [ { count: 2, kind: KIND_GPU } ]            # multiplex 2 models
+
+# Ray Serve: replicas + dynamic batching + queue-depth autoscaling.
+from ray import serve
+
+@serve.deployment(
+    autoscaling_config={"min_replicas": 1, "max_replicas": 8,
+                        "target_ongoing_requests": 10},   # the queue-depth signal
+)
+class Ranker:
+    @serve.batch(max_batch_size=16, batch_wait_timeout_s=0.010)  # dynamic batching
+    async def __call__(self, requests):
+        return self.model.predict(requests)                # one GPU call per batch
+</code></pre>
+<div class="code-caption"><strong>Code 23.8.1:</strong> The batcher and autoscaler the demo builds by hand, expressed as Triton model config and a Ray Serve deployment. The roughly 100 lines of Section 4 become a few decorators and config keys; the framework supplies the request transport, the batch queue, the scaling controller, and the health probes.</div>
+</div>
+
+<h2>3. Where LLM Engines Fit, and the Deployment Surface <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The frameworks above treat a model as a function from a batch of inputs to a batch of outputs. That abstraction fits classifiers, rankers, embedders, and detectors, and it is the right one for most of the fleet. It does not fit autoregressive language models, whose unit of work is a token, not a request, and whose batches must be re-formed at every decoding step. That is why a distinct layer of LLM-specific engines, vLLM, Text Generation Inference (TGI), and TensorRT-LLM, exists, and it is the entire subject of <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a>. These engines implement continuous batching (admitting and retiring sequences mid-batch), paged KV-cache management, and tensor-parallel sharding across GPUs. Crucially, they sit underneath or beside the general frameworks rather than replacing them: vLLM runs as a Triton backend and as a Ray Serve deployment, and KServe can front a vLLM runtime through the same <code>InferenceService</code> it uses for any other model. The general framework still provides routing, autoscaling, versioning, and observability; the engine provides token-level serving.</p>
+<p>Whichever framework you choose, it exposes the same deployment surface, and the surface is where serving meets operations. Requests arrive over <strong>gRPC or HTTP</strong>; Triton and TorchServe speak both, with gRPC preferred for its lower per-call overhead on high-throughput paths. <strong>Model versioning and canary rollout</strong> let you ship a new model the way you ship code: deploy version $N{+}1$ alongside version $N$, route a small traffic fraction to it, compare quality and latency, and promote or roll back. This is the inference-time half of the deployment discipline that <a href="../module-26-mlops-distributed-ai/index.html">Chapter 26</a> develops into full MLOps, where the model registry, the rollout policy, and the rollback trigger become governed artifacts rather than manual steps. And <strong>observability</strong> closes the loop: every framework exports the metrics this chapter has been computing, request rate, batch size, queue depth, GPU utilization, and per-request latency percentiles, in a Prometheus-scrapable form, because you cannot autoscale on queue depth or alert on a p99 regression that you do not measure.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The full distributed serving stack: clients send gRPC and HTTP requests to a batch-aware router, which feeds a dynamic batcher, which dispatches batches to a pool of GPU replicas on a cluster. A queue-depth autoscaler watches the batcher queue and adds or removes replicas, a health checker probes replicas and reroutes around failures, and a metrics sink exports observability signals.">
+<defs>
+<marker id="arr238" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arro238" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.b238 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w238 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.c238 { fill:#eef6ef; stroke:#2f7d4f; stroke-width:1.6; }
+.t238 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.tw238 { font:600 13px sans-serif; fill:#8a4d12; text-anchor:middle; }
+.s238 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l238 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr238); }
+.lo238 { fill:none; stroke:#b86b1f; stroke-width:1.6; stroke-dasharray:5 3; marker-end:url(#arro238); }
+.cap238 { font:600 12px sans-serif; fill:#2f7d4f; text-anchor:middle; }
+</style>
+<rect x="20" y="200" width="120" height="64" rx="9" class="b238"/>
+<text class="t238" x="80" y="228">Clients</text>
+<text class="s238" x="80" y="246">gRPC / HTTP</text>
+<line x1="140" y1="232" x2="196" y2="232" class="l238"/>
+<rect x="200" y="196" width="138" height="72" rx="9" class="b238"/>
+<text class="t238" x="269" y="224">Batch-aware</text>
+<text class="t238" x="269" y="240">router</text>
+<text class="s238" x="269" y="258">prefix-affine</text>
+<line x1="338" y1="232" x2="394" y2="232" class="l238"/>
+<rect x="398" y="190" width="120" height="84" rx="9" class="b238"/>
+<text class="t238" x="458" y="220">Dynamic</text>
+<text class="t238" x="458" y="236">batcher</text>
+<text class="s238" x="458" y="256">queue, 10 ms</text>
+<text class="s238" x="458" y="270">window</text>
+<rect x="600" y="70" width="160" height="52" rx="8" class="w238"/>
+<text class="tw238" x="680" y="92">GPU replica 1</text>
+<text class="s238" x="680" y="110">optimized node</text>
+<rect x="600" y="142" width="160" height="52" rx="8" class="w238"/>
+<text class="tw238" x="680" y="164">GPU replica 2</text>
+<text class="s238" x="680" y="182">optimized node</text>
+<rect x="600" y="214" width="160" height="52" rx="8" class="w238"/>
+<text class="tw238" x="680" y="236">GPU replica 3</text>
+<text class="s238" x="680" y="254">added by scaler</text>
+<rect x="600" y="286" width="160" height="40" rx="8" class="w238" stroke-dasharray="5 3"/>
+<text class="s238" x="680" y="311">warm pool (idle)</text>
+<path class="l238" d="M 518 218 L 560 120 L 596 100"/>
+<path class="l238" d="M 518 230 L 596 168"/>
+<path class="l238" d="M 518 244 L 560 240 L 596 240"/>
+<rect x="780" y="40" width="80" height="300" rx="9" class="c238"/>
+<text class="cap238" x="820" y="180" transform="rotate(90 820 190)">cluster (Kubernetes / Ray)</text>
+<rect x="360" y="350" width="180" height="58" rx="9" class="b238"/>
+<text class="t238" x="450" y="376">Queue-depth</text>
+<text class="t238" x="450" y="392">autoscaler</text>
+<path class="lo238" d="M 458 274 L 458 346"/>
+<text class="s238" x="540" y="320">reads depth</text>
+<path class="lo238" d="M 540 372 L 640 372 L 660 326"/>
+<text class="s238" x="600" y="402">adds / retires replicas</text>
+<rect x="60" y="350" width="180" height="58" rx="9" class="b238"/>
+<text class="t238" x="150" y="376">Health checker</text>
+<text class="s238" x="150" y="394">probe + reroute</text>
+<path class="lo238" d="M 240 366 L 320 320 L 596 196"/>
+<path class="lo238" d="M 150 350 L 150 300 L 250 250 L 269 270"/>
+<rect x="360" y="426" width="180" height="36" rx="9" class="c238"/>
+<text class="cap238" x="450" y="449">Metrics sink (Prometheus)</text>
+<path class="lo238" d="M 450 408 L 450 424"/>
+</svg>
+<figcaption><strong>Figure 23.8.1:</strong> The full distributed serving stack this chapter assembles. Clients reach a batch-aware router (blue) over gRPC or HTTP; it feeds a dynamic batcher whose queue is watched by a queue-depth autoscaler that adds and retires GPU replicas (orange) on the cluster (green). A health checker probes replicas and reroutes around failures, a warm pool absorbs cold starts, and every component exports to a metrics sink. Solid arrows carry requests; dashed orange arrows carry control and observability signals. Code 23.8.2 implements this exact diagram.</figcaption>
+</figure>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Server That Was Faster Empty</div>
+<p>A team once benchmarked a fresh KServe deployment and reported astonishing tail latency: a flat 4 milliseconds at p99. The catch was scale-to-zero. With no traffic, the service had scaled to zero pods, and their load tester was measuring the latency of an HTTP 503 returned before any model ran. The first real request paid an eight-second cold start while a pod spun up. The lesson of <a href="section-23.6.html">Section 23.6</a>, in one embarrassing graph: a warm pool is not a luxury, and a benchmark that never hits a cold model is measuring the wrong thing.</p>
+</div>
+
+<h2>4. The Whole Chapter, Assembled From Scratch <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>To make every mechanism concrete one last time, we build a minimal but complete serving system in pure Python, no frameworks, and drive it with a synthetic load trace that surges in the middle and suffers a node failure on the way down. The system has the four parts of Figure 23.8.1: a router that ingests requests into a central queue, a dynamic batcher that lets each idle replica pull up to a batch within a 10 millisecond window, a queue-depth autoscaler that adds and retires replicas on a 100 millisecond control loop (respecting cold starts), and a health check that marks a replica unhealthy mid-run so traffic reroutes around it. It reports the four observability signals that every framework in Section 1 exports: throughput, tail latency, GPU utilization, and replica count.</p>
+<pre><code class="language-python">import random, statistics, collections
+random.seed(7)
+
+MAX_BATCH, BATCH_WINDOW = 16, 0.010      # dynamic batch cap and 10 ms fill window
+BASE_MS, PER_ITEM_MS = 12.0, 3.0         # fixed + marginal GPU cost per batch
+SLO_MS = 200.0                           # p99 latency objective
+SCALE_UP_Q, SCALE_DOWN_Q = 10, 3         # queue depth per replica to scale up / down
+WARM_POOL, COLD_START_S = 1, 0.8         # warm spare; weight-load time per new replica
+DT, SIM_S = 0.001, 30.0                  # 1 ms tick, 30 s trace
+
+class Replica:
+    _next = 0
+    def __init__(self, t):
+        self.id = Replica._next; Replica._next += 1
+        self.ready_at = t + COLD_START_S          # warm-pool cold start
+        self.busy_until = 0.0; self.healthy = True; self.served = 0
+    def ready(self, t):  return self.healthy and t >= self.ready_at
+    def idle(self, t):   return self.ready(t) and t >= self.busy_until
+
+def gpu_batch_ms(n): return BASE_MS + PER_ITEM_MS * n   # batch is cheaper per item
+
+def arrivals(t):                                         # Poisson-ish load trace
+    rate = 40.0 + 600.0 * max(0.0, 1 - abs(t - 15.0) / 9.0)   # surge peaks at t=15s
+    return random.random() < rate * DT
+
+queue = collections.deque()
+replicas = [Replica(-COLD_START_S) for _ in range(2)]   # 2 start warm
+latencies, util_samples, replica_counts = [], [], []
+t = 0.0; inject_fault_at = 20.0; fault_done = False
+while t < SIM_S:
+    if not fault_done and t >= inject_fault_at:          # health check kills one node
+        for r in replicas:
+            if r.ready(t): r.healthy = False; fault_done = True; break
+    if arrivals(t): queue.append(t)                      # router ingests to the queue
+    for r in replicas:                                   # dynamic batching per replica
+        if r.idle(t) and queue and (len(queue) >= MAX_BATCH or t - queue[0] >= BATCH_WINDOW):
+            items = [queue.popleft() for _ in range(min(MAX_BATCH, len(queue)))]
+            r.busy_until = t + gpu_batch_ms(len(items)) / 1000.0
+            r.served += len(items)
+            for arr in items: latencies.append((r.busy_until - arr) * 1000.0)
+    if int(round(t * 1000)) % 100 == 0:                  # autoscaler: 100 ms control loop
+        ready = [r for r in replicas if r.ready(t)]
+        pending = sum(1 for r in replicas if not r.ready(t) and r.healthy)
+        depth = len(queue) / max(1, len(ready))
+        if depth > SCALE_UP_Q and pending == 0:
+            replicas.append(Replica(t))                  # spin up, pays a cold start
+        elif depth < SCALE_DOWN_Q and len(ready) > 1 + WARM_POOL:
+            for r in replicas:
+                if r.idle(t): replicas.remove(r); break  # retire one idle replica
+        busy = sum(1 for r in ready if t < r.busy_until)
+        util_samples.append(busy / max(1, len(ready))); replica_counts.append(len(ready))
+    t += DT
+
+def pct(xs, p): xs = sorted(xs); return xs[min(int(len(xs) * p), len(xs) - 1)]
+total = sum(r.served for r in replicas)
+print(f"requests served        : {total}")
+print(f"throughput (req/s)     : {total / SIM_S:7.1f}")
+print(f"mean latency (ms)      : {statistics.mean(latencies):7.1f}")
+print(f"p50 latency  (ms)      : {pct(latencies, 0.50):7.1f}")
+print(f"p99 latency  (ms)      : {pct(latencies, 0.99):7.1f}")
+print(f"SLO ({SLO_MS:.0f} ms) met      : {'yes' if pct(latencies,0.99) <= SLO_MS else 'no'}")
+print(f"mean GPU utilization   : {statistics.mean(util_samples)*100:7.1f} %")
+print(f"replica count min/max  : {min(replica_counts)} / {max(replica_counts)}")
+</code></pre>
+<div class="code-caption"><strong>Code 23.8.2:</strong> A complete distributed serving system, router plus dynamic batcher plus queue-depth autoscaler plus health-checked failover, in one file of pure Python. It implements Figure 23.8.1 exactly and is driven by a load trace that surges near $t=15$ seconds and loses a replica at $t=20$ seconds.</div>
+<pre><code class="language-text">requests served        : 3328
+throughput (req/s)     :   110.9
+mean latency (ms)      :    63.4
+p50 latency  (ms)      :    55.0
+p99 latency  (ms)      :   163.0
+SLO (200 ms) met      : yes
+mean GPU utilization   :    56.7 %
+replica count min/max  : 1 / 3
+</code></pre>
+<div class="code-caption"><strong>Output 23.8.2:</strong> The system absorbs the surge by scaling from one replica to three and back, holds p99 latency at 163 milliseconds under a 200 millisecond objective, keeps mean GPU utilization near 57%, and survives the injected node failure, all without any framework. This is the chapter's thesis demonstrated end to end.</div>
+<p>The numbers tell the chapter's whole story in one run. Throughput of 111 requests per second is sustained because batches amortize the fixed per-batch GPU cost across up to sixteen requests; the autoscaler holds the tail latency under its objective by growing from one replica to three exactly when queue depth demands it, then retiring the extras as the surge recedes; utilization stays in a healthy band rather than pinned at 100% (saturated and dropping requests) or near 0% (paying for idle GPUs); and the failover at $t=20$ seconds costs only a transient blip because the remaining replicas absorb the rerouted load. Code 23.8.1 showed that a production framework collapses all of this into a few decorators and config keys. The point of building it by hand is to know precisely what those keys control, so that when the p99 line on your dashboard climbs, you know whether to widen the batch window, lower the scale-up threshold, or enlarge the warm pool.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Custom Serving Stack That Became Three Config Files</div>
+<p><strong>Who:</strong> An ML platform engineer at a fintech running a fraud-scoring model fleet.</p>
+<p><strong>Situation:</strong> The team had a homegrown Python service, much like Code 23.8.2, with a router, a batcher, and a queue-depth autoscaler they maintained themselves.</p>
+<p><strong>Problem:</strong> The custom stack drifted: its batcher dropped requests under bursts, its autoscaler lagged the morning traffic ramp, and on-call paged twice a month for serving incidents the team had to debug from first principles.</p>
+<p><strong>Dilemma:</strong> Keep investing engineering time hardening the bespoke service, which fit their exact needs but was theirs to operate, or migrate to a framework that already solved these problems but demanded they relearn their stack as configuration.</p>
+<p><strong>Decision:</strong> They migrated the runtime to Triton for its dynamic batcher and concurrent instances, and put KServe on top for scale-to-zero on the overnight lull and canary rollout of new model versions, because both features were exactly the mechanisms they had been hand-rolling.</p>
+<p><strong>How:</strong> The roughly 600 lines of custom serving code collapsed into a Triton <code>config.pbtxt</code> (batch window, two GPU instances) and a KServe <code>InferenceService</code> manifest (autoscaling target, canary traffic split), with their fraud model dropped in as an ONNX artifact.</p>
+<p><strong>Result:</strong> Tail latency under bursts improved because Triton's batcher was better tuned than theirs, GPU spend fell because scale-to-zero reclaimed idle overnight capacity, and serving pages dropped to near zero. The team's understanding from having built the stack by hand made the migration fast: every config key mapped to a mechanism they already knew.</p>
+<p><strong>Lesson:</strong> Build the system once to understand it, then let a framework operate it. The value of the from-scratch exercise is not the code you keep; it is knowing exactly what each framework knob does when production stresses it.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Disaggregated and SLO-Driven Serving (2024 to 2026)</div>
+<p>The serving frameworks of this section are converging on two research-driven shapes. The first is <strong>prefill-decode disaggregation</strong>: systems such as DistServe (Zhong et al., 2024) and Splitwise (Patel et al., 2024) run the compute-bound prefill phase and the memory-bound decode phase of LLM inference on separate, independently scaled pools of GPUs, because the batch-aware routing of <a href="section-23.2.html">Section 23.2</a> wants opposite policies for the two phases. The second is <strong>SLO-aware autoscaling and scheduling</strong>, where the scaler optimizes directly against a latency objective rather than a proxy like queue depth, and admission control sheds or reprioritizes load to protect the tail under bursty traffic. Both are being folded into the open frameworks: vLLM and Ray Serve now expose disaggregated and SLO-targeted modes, and KServe's autoscaling is moving from concurrency toward latency-objective signals. The mechanisms this chapter built by hand are exactly the surfaces these systems are making smarter, which is the subject the next chapter takes up for language models specifically.</p>
+</div>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Model Serving Is Not Web Serving, Scaled Out</div>
+<p>This chapter advanced the book's spine by refusing the easy analogy to web serving. A stateless web tier scales by cloning identical processes behind a round-robin load balancer; an inference fleet cannot, because the unit that scales is an expensive optimized accelerator (<a href="../module-22-per-node-inference-efficiency/index.html">Chapter 22</a>), throughput comes from batching rather than from raw replica count, routing must be batch-aware and prefix-affine rather than random, autoscaling reads queue depth rather than CPU, and a cold start costs seconds rather than milliseconds. Every section took one of those differences and turned it into a mechanism. The per-node economics of <a href="../module-22-per-node-inference-efficiency/index.html">Chapter 22</a> entered as the thing we replicate; <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a> will multiply every one of these mechanisms by the token-level statefulness of large language models.</p>
+</div>
+
+<div class="callout key-takeaway">
+<div class="callout-title">Key Takeaway: Chapter 23 in One Breath</div>
+<p>Model serving is not web serving. You replicate optimized accelerator nodes rather than stateless processes; you route batch-aware and prefix-affine so that batches form and KV-caches stay warm; you autoscale on queue depth rather than CPU because queue depth is what predicts the tail; you multiplex many models onto shared GPUs to keep utilization high; you manage cold starts with warm pools because loading a large model costs seconds; and you engineer for availability so the failure of any single node is a blip, not an outage. The serving frameworks, Triton, Ray Serve, KServe, TorchServe, and the managed endpoints, package all six of these into configuration, and the LLM engines of the next chapter slot in underneath to do the same at the granularity of a single token. Build the system by hand once, as Code 23.8.2 does, and the framework's knobs stop being magic.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.8.1: Match the Framework to the Workload <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each workload, name the serving-framework family from Table 23.8.1 you would choose first and justify it against the four axes (batching, autoscaling signal, multi-model, Kubernetes): (a) a single optimized image classifier that must hit the highest possible throughput per GPU on a fixed fleet; (b) a recommendation pipeline that runs a candidate generator, a ranker, and business-rule filters as one Python program; (c) a platform team that already runs everything on Kubernetes with GitOps and needs new models to scale to zero overnight and roll out by canary; (d) a two-person startup that wants to ship a fine-tuned model this week without operating any cluster. Explain why the obvious second choice in each case is worse.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.8.2: Tune the System to Its SLO <span class="exercise-type coding">Coding</span></div>
+<p>Take Code 23.8.2 and tighten the objective to <code>SLO_MS = 120</code>. The unmodified system will miss it during the surge. Find a configuration that meets the tighter SLO by adjusting only the four operational knobs the frameworks expose: <code>MAX_BATCH</code>, <code>BATCH_WINDOW</code>, <code>SCALE_UP_Q</code>, and <code>WARM_POOL</code> (you may also raise the starting replica count). Report the throughput, mean GPU utilization, and max replica count of your solution, and explain the trade-off you made: which knob bought the lower tail latency, and what did it cost in utilization or replica count? Connect your answer to the warm-pool argument of <a href="section-23.6.html">Section 23.6</a>.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.8.3: The Cost of the Cold Start <span class="exercise-type analysis">Analysis</span></div>
+<p>In Code 23.8.2 the autoscaler adds at most one replica per 100 millisecond control loop and only when no replica is already loading (<code>pending == 0</code>), so a new replica takes <code>COLD_START_S</code> seconds to serve traffic. Suppose the surge ramps from a steady rate $\lambda_0$ to a peak $\lambda_p$ over a window of $W$ seconds, each replica serves at most $\mu$ requests per second, and a cold start takes $c$ seconds. Derive an expression for the number of replicas the system is short by at the moment the surge peaks, as a function of $\lambda_p$, $\mu$, $c$, and the ramp slope. Use it to argue how large a warm pool you would pre-provision to keep the p99 latency under the SLO during the ramp, and explain why a slower ramp (larger $W$) needs a smaller warm pool. Relate the result to the failover case: why does losing a replica mid-surge behave like a negative warm pool?</p>
+</div>
+
+<div class="callout project-ideas">
+<div class="callout-title">Project Ideas</div>
+<p>Three projects to turn this chapter into something running. Each is sized for a few sessions of agent-driven build-and-measure, on a single GPU or even CPU for the harness.</p>
+<p><strong>1. Batch-aware router with queue-depth autoscaling, measured against an SLO.</strong> Extend Code 23.8.2 into a real service: wrap a small model (a quantized ResNet or a sentence embedder) in an HTTP server, put a router and dynamic batcher in front, and drive it with a recorded or synthetic load trace. Sweep the four knobs (batch size, batch window, scale-up threshold, warm-pool size) and plot throughput against the p99-latency SLO-attainment frontier. Deliverable: the Pareto frontier showing how much throughput each millisecond of allowed tail latency buys, and the knob setting that maximizes throughput subject to meeting the SLO.</p>
+<p><strong>2. Triton versus Ray Serve, head to head, on one model.</strong> Serve the same model under Triton (with dynamic batching and two concurrent instances) and under Ray Serve (with <code>@serve.batch</code> and queue-depth autoscaling), as in Code 23.8.1. Drive both with an identical load generator and a bursty trace, and compare throughput per GPU, p50 and p99 latency, GPU utilization, and tail behavior under the burst. Deliverable: a measured table that turns the qualitative axes of Table 23.8.1 into numbers for your specific model and hardware, plus a short note on which framework's defaults were closer to optimal and why.</p>
+<p><strong>3. A multi-model GPU multiplexer with warm-pool cold-start mitigation.</strong> Build a server that holds several distinct models and packs them onto a shared GPU (the multiplexing of <a href="section-23.5.html">Section 23.5</a>), evicting cold models under memory pressure and keeping a warm pool of the most-requested ones. Drive it with a skewed request mix and measure cold-start frequency, p99 latency, and GPU memory headroom as you vary the warm-pool size and the eviction policy (LRU versus request-frequency weighted). Deliverable: a curve of cold-start rate against warm-pool size, the memory cost of each pool size, and a recommendation for the workload's sweet spot.</p>
+</div>
+
+<p>This closes Chapter 23. We began by insisting that model serving is its own discipline, not web serving with GPUs, and we end having built every mechanism that makes it so, by hand and then in the frameworks that productionize them. The fleet now replicates optimized nodes, routes batch-aware, autoscales on queue depth, multiplexes many models, hides cold starts, and survives failure. <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a> takes the hardest case, the large language model, where serving spans many machines for a single model and every mechanism here is re-derived at the granularity of a token.</p>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-23.7.html"><span class="nav-label">Previous</span><span class="nav-num">Section 23.7</span><span class="nav-title">Availability, Failover, and Redundancy</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 23</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Inference Systems</span></a>
+<a class="next" href="../module-24-distributed-llm-serving/index.html"><span class="nav-label">Next</span><span class="nav-num">Chapter 24</span><span class="nav-title">Distributed LLM Serving</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

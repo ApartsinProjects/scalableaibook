@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 7.8: PySpark for AI Workloads. Why Arrow-backed vectorized UDFs beat row-at-a-time Python, how Spark MLlib distributes classical ML, and the production pattern where Spark does feature engineering and hands sharded data to deep-learning training." name="description"/>
+<title>Section 7.8: PySpark for AI Workloads | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Distributed Data Processing for AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 7: Spark and Distributed DataFrames</a></div>
+<h1>PySpark for AI Workloads</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They told me to apply a Python function to a billion rows. I applied it one row at a time, called Python a billion times, and serialized my way to retirement."</p>
+<cite>A JVM Executor That Discovered Arrow Too Late</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>In an AI pipeline, Spark rarely trains the final deep model; it does the distributed work that feeds the model, turning raw rows into clean, featurized, sharded tensors that a GPU cluster can consume.</strong> PySpark is the Python gateway to that work, but it sits on a JVM engine, and the boundary between Python and the JVM is where naive AI code goes to die: a per-row Python function forces the engine to serialize one value, cross the language boundary, call Python, and serialize back, billions of times. The fix is to move whole columns across that boundary at once using Apache Arrow, so a single Python call sees a batch and NumPy does the work at native speed. This section shows that boundary, measures the cost of crossing it the wrong way, and places Spark in the larger pipeline where it prepares data and then hands sharded files to deep-learning training that lives on different machines entirely.</p>
+</div>
+<p>The previous sections of this chapter treated Spark as a distributed data engine: DataFrames, lazy DAGs, partitioning, and the shuffle that <a href="section-7.7.html">Section 7.7</a> dissected. That machinery is general; it processes web logs and financial records as happily as machine-learning features. This section narrows the lens to AI specifically. The question is no longer "how does Spark execute a join?" but "how do I run my Python and NumPy logic, the code that actually computes a feature or applies a model, across a cluster without paying a crippling per-row tax?" The answer turns on one architectural fact about PySpark, and on a serialization format named Arrow that makes the fact survivable.</p>
+
+<h2>1. PySpark Sits on a JVM, and That Boundary Has a Price <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Spark is written in Scala and runs on the Java Virtual Machine. When you write PySpark, your Python driver program builds a query plan and ships it to JVM executors that do the heavy lifting in their own process. As long as your transformation is expressible in Spark's built-in DataFrame operations (a filter, a join, a group-by, an arithmetic column expression), the executor runs everything inside the JVM and Python is never invoked on the data at all; your Python code only described the plan. This is the fast path, and most data preparation should stay on it.</p>
+<p>The trouble starts when the logic you need lives in Python: a feature that calls a NumPy routine, a tokenizer, a small model applied per record, anything Spark's expression language cannot represent. To run that code, the executor must hand each value out of the JVM, into a Python worker process, and back. A plain Python user-defined function (UDF) does this one row at a time: serialize a value, send it across the process boundary, call your function, serialize the result, send it back. The compute inside your function might be trivial; the cost is the billions of boundary crossings around it. Figure 7.8.1 shows where this boundary sits and why the row-at-a-time path is so much narrower than the batched one.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of a Spark executor showing the JVM side holding columnar data, a process boundary in the middle, and a Python worker on the right. A thin row-at-a-time arrow crosses the boundary one value at a time, while a wide Arrow batch arrow moves a whole column in one crossing.">
+<defs>
+<marker id="arr78" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr78w" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#1f7a4d"/></marker>
+</defs>
+<style>
+.b78 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.j78 { fill:#eef4fb; stroke:#14385c; stroke-width:1.6; }
+.p78 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.t78 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s78 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.thin78 { fill:none; stroke:#14385c; stroke-width:1.4; marker-end:url(#arr78); }
+.wide78 { fill:none; stroke:#1f7a4d; stroke-width:7; marker-end:url(#arr78w); opacity:0.85; }
+.g78 { fill:#1f7a4d; font:600 12px sans-serif; text-anchor:middle; }
+</style>
+<text class="t78" x="430" y="26">One Spark executor: the JVM-to-Python boundary</text>
+<rect class="j78" x="40" y="60" width="240" height="240" rx="10"/>
+<text class="t78" x="160" y="86">JVM executor</text>
+<text class="s78" x="160" y="106">columnar DataFrame shard</text>
+<rect class="b78" x="70" y="124" width="180" height="20" rx="4"/>
+<rect class="b78" x="70" y="150" width="180" height="20" rx="4"/>
+<rect class="b78" x="70" y="176" width="180" height="20" rx="4"/>
+<rect class="b78" x="70" y="202" width="180" height="20" rx="4"/>
+<text class="s78" x="160" y="252">runs built-in</text>
+<text class="s78" x="160" y="268">expressions natively</text>
+<line x1="430" y1="56" x2="430" y2="304" stroke="#b86b1f" stroke-width="1.4" stroke-dasharray="5 4"/>
+<text class="s78" x="430" y="320">process boundary (serialize here)</text>
+<rect class="p78" x="580" y="60" width="240" height="240" rx="10"/>
+<text class="t78" x="700" y="86">Python worker</text>
+<text class="s78" x="700" y="106">your NumPy / model code</text>
+<path class="thin78" d="M 282 140 L 578 140"/>
+<text class="s78" x="430" y="132">row-at-a-time UDF: one value per crossing</text>
+<path class="wide78" d="M 282 215 L 572 215"/>
+<text class="g78" x="430" y="206">Arrow batch: a whole column per crossing</text>
+<text class="s78" x="700" y="252">pandas / np.ndarray</text>
+<text class="s78" x="700" y="268">native batch compute</text>
+</svg>
+<figcaption><strong>Figure 7.8.1:</strong> The boundary that governs PySpark AI performance. Built-in DataFrame expressions stay inside the JVM (left). When logic must run in Python, data crosses the process boundary in the middle. A row-at-a-time UDF (thin arrow) crosses once per value and pays serialization and a Python call billions of times; an Arrow-backed vectorized UDF (wide arrow) moves an entire column in one crossing, and Python sees it as a NumPy array.</figcaption>
+</figure>
+
+<h2>2. Vectorized UDFs: Move Columns, Not Rows <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The remedy is to stop crossing the boundary one value at a time. A vectorized UDF (in PySpark, a <code>pandas_udf</code>) receives not a single value but a whole batch of them, delivered as a pandas Series or NumPy array through Apache Arrow's columnar memory layout. Arrow lets the JVM and the Python worker share the same in-memory representation of a column, so the transfer is a bulk copy of contiguous bytes rather than a per-row serialize-and-deserialize. Your function is then called once per batch, not once per row, and inside it you run NumPy or pandas at native, vectorized speed. The number of boundary crossings drops from the number of rows to the number of batches, which is smaller by a factor of tens of thousands.</p>
+<p>To see the size of that effect without needing a cluster, we can isolate the part that matters: the difference between calling a Python function once per element and running the identical math once over a whole batch. The code below applies a standardize-then-clip feature transform, the kind of column preparation a Spark feature pipeline performs before training, two ways on four million values: a pure-Python row-at-a-time loop, then a single vectorized NumPy expression. Both compute exactly the same numbers; only the boundary-crossing pattern differs.</p>
+<pre><code class="language-python">import numpy as np
+import time
+
+# A standardize-then-clip feature transform, the kind Spark applies to a
+# column of model inputs before training. We run it two ways on the same data.
+rng = np.random.default_rng(0)
+N = 4_000_000
+col = rng.standard_normal(N).astype(np.float64)
+mean, std = col.mean(), col.std()
+
+def transform_scalar(x):
+    # Pure-Python per-row logic: this is what a row-at-a-time UDF runs.
+    z = (x - mean) / std
+    if z &gt; 3.0:  return 3.0
+    if z &lt; -3.0: return -3.0
+    return z
+
+# Row-at-a-time path: one Python function call per element.
+t0 = time.perf_counter()
+out_row = [transform_scalar(x) for x in col]
+t_row = time.perf_counter() - t0
+
+# Vectorized path: the identical math expressed once over the whole batch,
+# the way an Arrow-backed pandas UDF receives and returns a column.
+t0 = time.perf_counter()
+z = (col - mean) / std
+out_vec = np.clip(z, -3.0, 3.0)
+t_vec = time.perf_counter() - t0
+
+print(f"rows transformed     : {N:,}")
+print(f"row-at-a-time UDF    : {t_row:.3f} s")
+print(f"vectorized UDF       : {t_vec:.3f} s")
+print(f"speedup              : {t_row / t_vec:.1f}x")
+print(f"max abs difference   : {np.max(np.abs(np.asarray(out_row) - out_vec)):.2e}")
+</code></pre>
+<div class="code-caption"><strong>Code 7.8.1:</strong> The cost of crossing the language boundary one row at a time, isolated in pure Python so it runs anywhere. The scalar loop stands in for a row-at-a-time UDF; the NumPy block stands in for the batched compute an Arrow-backed <code>pandas_udf</code> performs. The final line confirms the two paths produce identical values.</div>
+<pre><code class="language-text">rows transformed     : 4,000,000
+row-at-a-time UDF    : 1.079 s
+vectorized UDF       : 0.022 s
+speedup              : 49.3x
+max abs difference   : 0.00e+00
+</code></pre>
+<div class="code-caption"><strong>Output 7.8.1:</strong> Batching the same transform is about fifty times faster on this machine while changing not a single output value (the difference is exactly zero). On a real cluster the gap is usually larger still, because the vectorized path also avoids the per-row serialization across the JVM-to-Python boundary that this single-process measurement does not even include.</div>
+<p>The forty-nine-fold gap in Output 7.8.1 comes entirely from amortizing per-element Python overhead, and it is a lower bound on what you gain inside Spark, where the row-at-a-time path additionally pays serialization across the process boundary that Code 7.8.1 never touched. The lesson generalizes past this one transform: whenever your AI logic must run in Python on a Spark column, express it so a single call sees a whole batch.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Boundary, Not the Math, Is the Bottleneck</div>
+<p>In a PySpark AI pipeline, the expensive thing is rarely the arithmetic inside your feature function; it is the act of moving data across the JVM-to-Python boundary and invoking Python around each value. A row-at-a-time UDF pays that cost once per row; an Arrow-backed vectorized UDF pays it once per batch and runs the math at NumPy speed. Before reaching for any UDF at all, check whether a built-in DataFrame expression can do the job inside the JVM, where the boundary is never crossed; only when the logic is genuinely Python-only should you write a UDF, and then it should always be vectorized.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: pandas_udf Turns Code 7.8.1 Into a Cluster Operation</div>
+<p>Code 7.8.1 measured the batched-versus-per-row gap in one process. In PySpark you express the batched path with the <code>pandas_udf</code> decorator, and Spark handles the Arrow transfer, the batching, and the distribution across executors for you. The same transform, now running on a distributed DataFrame:</p>
+<pre><code class="language-python">import pandas as pd
+from pyspark.sql.functions import pandas_udf
+
+@pandas_udf("double")                     # Arrow-backed; receives a batch, not a row
+def standardize_clip(col: pd.Series) -&gt; pd.Series:
+    z = (col - MEAN) / STD                # vectorized over the whole batch
+    return z.clip(-3.0, 3.0)              # returns a Series, one Arrow crossing
+
+df = df.withColumn("feat", standardize_clip("raw_value"))   # lazy, runs on executors
+</code></pre>
+<div class="code-caption"><strong>Code 7.8.2:</strong> The same standardize-then-clip transform as Code 7.8.1, now as a vectorized <code>pandas_udf</code> that runs across a cluster. The decorator and one column expression replace all the manual batching and serialization logic; Spark moves each partition's column to a Python worker through Arrow, calls <code>standardize_clip</code> once per batch, and writes the result back. A plain <code>@udf</code> here would run the row-at-a-time path of Output 7.8.1 on every executor.</div>
+</div>
+
+<h2>3. Spark MLlib: Classical ML That Already Lives on the Cluster <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Not every model needs a UDF. For classical machine learning, Spark ships MLlib, a library of distributed estimators and transformers that run natively on the JVM and never touch the Python boundary on the data path. MLlib's <code>Pipeline</code> abstraction chains feature transformers and an estimator into one object that fits across the whole cluster: a <code>StringIndexer</code> and <code>OneHotEncoder</code> prepare categorical columns, a <code>VectorAssembler</code> packs features into a single vector column, and an estimator such as <code>LogisticRegression</code> or <code>GBTClassifier</code> trains on the partitioned DataFrame using distributed optimization. The whole sequence is lazy and benefits from the same DAG planning as any other Spark job.</p>
+<pre><code class="language-python">from pyspark.ml import Pipeline
+from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler
+from pyspark.ml.classification import LogisticRegression
+
+idx = StringIndexer(inputCol="country", outputCol="country_idx")
+ohe = OneHotEncoder(inputCols=["country_idx"], outputCols=["country_vec"])
+asm = VectorAssembler(inputCols=["country_vec", "feat"], outputCol="features")
+lr  = LogisticRegression(featuresCol="features", labelCol="label")
+
+pipeline = Pipeline(stages=[idx, ohe, asm, lr])    # one distributed fit
+model = pipeline.fit(train_df)                      # trains across all executors
+preds = model.transform(test_df)                    # distributed scoring
+</code></pre>
+<div class="code-caption"><strong>Code 7.8.3:</strong> A Spark MLlib pipeline that indexes a categorical column, one-hot encodes it, assembles a feature vector, and fits a logistic-regression model, all distributed across the cluster without a single Python UDF on the data path. This is the right tool when the model itself is classical; deep learning needs the handoff described in Section 4.</div>
+<p>MLlib is the natural home for distributed linear models, tree ensembles, clustering, and the like, and it is a full topic in its own right. The distributed-optimization machinery underneath these estimators, and the gradient-boosting and tree methods that scale particularly well on Spark, are developed in <a href="../../part-3-distributed-ml/module-12-distributed-classical-ml/index.html">Chapter 12</a>. For this chapter the point is narrower: when your model is classical, you often do not need a UDF at all, because MLlib already distributes the fit. The interesting case for AI at scale is the one MLlib does not cover, deep learning, and that is where Spark changes role.</p>
+
+<h2>4. The Production Pattern: Spark Preps, the GPU Cluster Trains <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Deep-learning training does not run inside Spark. A modern training job lives on GPUs, synchronizes gradients with the collectives of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>, and is driven by PyTorch, not by a JVM query engine. The dominant production pattern therefore splits the work cleanly across two systems: Spark performs the distributed, data-heavy preparation (cleaning, joining, deduplicating, featurizing, and shaping the dataset), then writes the result to sharded columnar files that a separate deep-learning cluster reads. Spark's job ends where the tensors begin. Figure 7.8.2 traces this handoff.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A left-to-right pipeline. A Spark cluster box performs feature engineering and writes sharded Parquet files. The shards fan out to data loaders, which feed three GPU workers that exchange gradients through an all-reduce step.">
+<defs>
+<marker id="arr78b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.sp78 { fill:#eef4fb; stroke:#14385c; stroke-width:1.6; }
+.sh78 { fill:#f4f7fb; stroke:#5a626c; stroke-width:1.3; }
+.gp78 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.ar78 { fill:#eaf6ef; stroke:#1f7a4d; stroke-width:1.6; }
+.tt78 { font:600 13.5px sans-serif; fill:#14385c; text-anchor:middle; }
+.ss78 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.ll78 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr78b); }
+</style>
+<rect class="sp78" x="20" y="96" width="150" height="108" rx="10"/>
+<text class="tt78" x="95" y="132">Spark cluster</text>
+<text class="ss78" x="95" y="154">clean, join, dedup,</text>
+<text class="ss78" x="95" y="170">featurize (Sec 1-3)</text>
+<text class="ss78" x="95" y="186">vectorized UDFs</text>
+<rect class="sh78" x="232" y="92" width="96" height="26" rx="4"/>
+<text class="ss78" x="280" y="109">shard 1.parquet</text>
+<rect class="sh78" x="232" y="137" width="96" height="26" rx="4"/>
+<text class="ss78" x="280" y="154">shard 2.parquet</text>
+<rect class="sh78" x="232" y="182" width="96" height="26" rx="4"/>
+<text class="ss78" x="280" y="199">shard K.parquet</text>
+<text class="ss78" x="280" y="78">sharded columnar files</text>
+<line x1="170" y1="150" x2="228" y2="105" class="ll78"/>
+<line x1="170" y1="150" x2="228" y2="150" class="ll78"/>
+<line x1="170" y1="150" x2="228" y2="195" class="ll78"/>
+<rect class="gp78" x="430" y="58" width="150" height="50" rx="8"/>
+<text class="tt78" x="505" y="79">GPU worker 1</text>
+<text class="ss78" x="505" y="96">loader + model</text>
+<rect class="gp78" x="430" y="126" width="150" height="50" rx="8"/>
+<text class="tt78" x="505" y="147">GPU worker 2</text>
+<text class="ss78" x="505" y="164">loader + model</text>
+<rect class="gp78" x="430" y="194" width="150" height="50" rx="8"/>
+<text class="tt78" x="505" y="215">GPU worker K</text>
+<text class="ss78" x="505" y="232">loader + model</text>
+<line x1="328" y1="105" x2="426" y2="83" class="ll78"/>
+<line x1="328" y1="150" x2="426" y2="151" class="ll78"/>
+<line x1="328" y1="195" x2="426" y2="219" class="ll78"/>
+<rect class="ar78" x="660" y="126" width="180" height="50" rx="8"/>
+<text class="tt78" x="750" y="147">all-reduce</text>
+<text class="ss78" x="750" y="164">gradient sync (Ch 4, 15)</text>
+<line x1="580" y1="83" x2="658" y2="138" class="ll78"/>
+<line x1="580" y1="151" x2="656" y2="151" class="ll78"/>
+<line x1="580" y1="219" x2="658" y2="164" class="ll78"/>
+</svg>
+<figcaption><strong>Figure 7.8.2:</strong> The Spark-to-training handoff. Spark does the distributed feature engineering of Sections 1 to 3 and writes sharded columnar files (one shard per intended worker). A separate GPU cluster reads those shards through its data loaders and runs data-parallel training, synchronizing gradients with the all-reduce of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>. The two systems never share a process; the sharded files are the contract between them.</figcaption>
+</figure>
+<p>This division of labor is not a workaround; it is the design. Spark is built for wide, shuffle-heavy data transformation on commodity CPUs, and a GPU spends most of a Spark job idle. A training cluster is built to keep accelerators saturated and is wasteful at the irregular, IO-bound work of data cleaning. Letting each system do what it is good at, and connecting them through sharded files on shared storage, is how the largest training pipelines are actually built. The seam between them, getting bytes off storage and into a GPU fast enough to keep it fed, is its own hard problem: the data-loading bottleneck that <a href="../module-08-distributed-storage-data-loading/index.html">Chapter 8</a> is devoted to, and the data-parallel training loop on the far side is the subject of <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: One Job, Split Across Two Distributed Systems</div>
+<p>The handoff in Figure 7.8.2 is the book's distribution thesis applied at the level of whole systems rather than a single algorithm. The same dataset is distributed twice for two different reasons: across Spark executors because the data does not fit on one machine and the featurization must scale on CPUs, then across GPU workers because the model training must scale on accelerators. The sharded files are the boundary where one form of distribution ends and another begins, and the shuffle that built those shards in <a href="section-7.7.html">Section 7.7</a> reappears, transformed, as the all-reduce that synchronizes the workers reading them. Recognizing where one distribution axis hands off to the next is exactly the design fluency the book is building toward.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The GPU That Watched Spark Work</div>
+<p>A common and expensive mistake is to run Spark feature engineering on a GPU-equipped cluster "to save a step." The accelerators sit at near-zero utilization for the entire shuffle-heavy job while you pay GPU-hour prices for CPU-bound work, then the actual training cannot start until the prep finishes anyway. The cheap fix is the boring one in Figure 7.8.2: prep on CPU instances, write shards, and only then wake the GPUs.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Feature Pipeline That Starved the GPUs</div>
+<p><strong>Who:</strong> A data engineer at a streaming-media company building the training pipeline for a recommendation model.</p>
+<p><strong>Situation:</strong> A nightly job featurized two billion interaction records in Spark, then trained a deep ranking model on an eight-GPU node.</p>
+<p><strong>Problem:</strong> The featurization step ran a per-row Python UDF that called a small NumPy normalization, and the Spark stage alone took over five hours, leaving the GPUs idle and waiting.</p>
+<p><strong>Dilemma:</strong> Rewrite the feature logic in Spark's native expressions where possible and convert the rest to a vectorized <code>pandas_udf</code>, or rent a larger Spark cluster to brute-force the slow UDF at higher cost.</p>
+<p><strong>Decision:</strong> They converted the normalization to an Arrow-backed <code>pandas_udf</code> and pushed the simple arithmetic into built-in column expressions, exactly the move Output 7.8.1 quantifies, rather than paying for more machines to run slow code.</p>
+<p><strong>How:</strong> The row-at-a-time UDF became a batched function receiving a pandas Series; two derived columns moved to native Spark expressions; the output was written as sharded Parquet for the training loader.</p>
+<p><strong>Result:</strong> The featurization stage fell from over five hours to about twenty minutes on the same cluster, the GPUs started training far earlier in the window, and the numerical output was unchanged.</p>
+<p><strong>Lesson:</strong> When a Spark AI job is slow, suspect the language boundary before the cluster size. A vectorized UDF often turns a "we need more machines" problem into a "we wrote the UDF wrong" problem.</p>
+</div>
+
+<h2>5. Why Arrow Is the Enabling Layer <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>It is worth naming explicitly what makes vectorized UDFs possible, because the same idea recurs throughout the data side of AI. Apache Arrow defines a language-independent, columnar in-memory format. When Spark hands a batch to a Python worker as Arrow, the JVM and Python agree, byte for byte, on how that column is laid out in memory, so the transfer is a bulk memory copy (often a shared buffer) rather than a value-by-value serialization through a slow encoding. NumPy and pandas can wrap that buffer directly. The cost model changes from "pay once per row to serialize" to "pay once per batch to copy a contiguous block," which is why the boundary stops being the bottleneck once batches are large enough.</p>
+<p>Arrow is the same format underneath the columnar files Spark writes for the training handoff, so the data crosses from Spark to the training loader without a re-encoding either. This is not a Spark-only convenience; Arrow has become the lingua franca that lets the data-prep world and the deep-learning world exchange columns cheaply, and it returns in <a href="../module-08-distributed-storage-data-loading/index.html">Chapter 8</a> as the on-disk and over-the-wire format for sharded training data. When you choose a vectorized UDF over a row-at-a-time one, you are choosing to ride Arrow instead of fighting it.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Closing the Spark-to-GPU Gap (2024 to 2026)</div>
+<p>The clean two-system handoff of Figure 7.8.2 is under active pressure to become tighter and, where it pays, GPU-accelerated end to end. The RAPIDS Accelerator for Apache Spark pushes DataFrame operations and shuffles onto GPUs, and recent releases extend GPU execution to more of the feature-engineering path so that prep and training can share accelerators when the workload justifies it. On the loading side, NVIDIA DALI and the Ray Data ecosystem (2024 to 2025) blur the boundary further by streaming Arrow batches directly from columnar storage into GPU training without a separate Spark write step, attacking the data-loading bottleneck of <a href="../module-08-distributed-storage-data-loading/index.html">Chapter 8</a> head on. A parallel thread treats the entire pipeline as one schedulable computation, so the featurization in Section 2 and the data-parallel training in Section 4 can overlap instead of running strictly in sequence. The open question is when fusing the two systems beats keeping them separate; the answer still depends on how shuffle-heavy the prep is relative to how compute-heavy the model is, which is exactly the cost reasoning <a href="section-7.9.html">Section 7.9</a> makes precise.</p>
+</div>
+<p>With the language boundary understood and the prep-then-train handoff in place, the remaining question for a PySpark AI workload is the one any distributed system eventually asks: where is the time actually going, and how do I make it go away? Partition counts, shuffle sizes, serialization formats, and executor memory all bear on whether a feature pipeline like the one in this section runs in twenty minutes or five hours. That measurement-and-tuning discipline is the subject of <a href="section-7.9.html">Section 7.9</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.8.1: Native, Vectorized, or Row-at-a-Time? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each transformation, decide whether it should be a built-in Spark DataFrame expression (no boundary crossing), an Arrow-backed <code>pandas_udf</code> (one crossing per batch), or whether a plain row-at-a-time UDF is unavoidable, and justify each choice using the boundary argument of Section 1: (a) multiply a numeric column by a constant and add another column; (b) standardize a column using its global mean and standard deviation; (c) run a pretrained Python tokenizer that returns a variable-length list of token ids per text row; (d) clip a column to the range $[-3, 3]$. For any case where you chose a UDF, explain what stops Spark's native expression language from doing the job inside the JVM.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.8.2: Measure the Batch-Size Curve <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 7.8.1 so that, instead of comparing only the full per-row loop against the full vectorized call, it processes the data in batches of size $B$ and calls the vectorized transform once per batch, for $B \in \{1, 10, 100, 10^3, 10^4, 10^5\}$. Plot or print elapsed time against $B$. Identify the batch size beyond which further increases stop helping, and explain the shape of the curve in terms of fixed per-call Python overhead amortized over $B$ elements. Relate your finding to why a real <code>pandas_udf</code> exposes a configurable Arrow batch size rather than processing one row or one whole partition at a time.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.8.3: Size the Handoff <span class="exercise-type analysis">Analysis</span></div>
+<p>A Spark job featurizes $2 \times 10^9$ records into feature vectors of $256$ float32 values each and writes them as sharded files for a data-parallel training run on $K = 16$ GPU workers. Estimate the total featurized dataset size in bytes, the size of one shard if shards are equal, and, given a shared-storage read bandwidth of $2$ gigabytes per second per worker, the time for all workers to read one full epoch in parallel. Compare that read time to a plausible per-epoch GPU compute time of a few minutes, and argue from the two numbers whether the data loader of <a href="../module-08-distributed-storage-data-loading/index.html">Chapter 8</a> or the training compute is more likely to bound this pipeline. State which way your conclusion flips if the read bandwidth is ten times lower.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-7.7.html"><span class="nav-label">Previous</span><span class="nav-num">Section 7.7</span><span class="nav-title">Joins, Shuffles, and Data Skew</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 7</span><span class="nav-num">Contents</span><span class="nav-title">Spark and Distributed DataFrames</span></a>
+<a class="next" href="section-7.9.html"><span class="nav-label">Next</span><span class="nav-num">Section 7.9</span><span class="nav-title">Spark Performance Tuning</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

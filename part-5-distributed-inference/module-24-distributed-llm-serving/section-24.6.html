@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 24.6: Request Scheduling and Continuous Batching Across Nodes. The iteration-level scheduler that admits, batches, and preempts requests under a distributed KV-cache budget to maximize goodput and meet TTFT/TPOT SLOs." name="description"/>
+<title>Section 24.6: Request Scheduling and Continuous Batching Across Nodes | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 24: Distributed LLM Serving</a></div>
+<h1>Request Scheduling and Continuous Batching Across Nodes</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I had the FLOPs. I had the memory. What I did not have was anyone telling me which token to compute next, so I computed the wrong one very quickly."</p>
+<cite>A GPU With Nothing Useful to Decode</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>In a distributed LLM serving system the scheduler, not the arithmetic, decides how much useful work a cluster delivers.</strong> Every replica has a fixed pool of accelerators and a fixed KV-cache budget, and at each generation step a scheduler chooses which queued requests to admit into the running batch, which to make wait, and which already-running sequence to evict so that a higher-priority request can move forward. Get those choices right and a modest fleet meets its latency targets at high utilization; get them wrong and the same hardware burns cycles on work that misses its deadline anyway. This section lifts the single-node continuous batching of <a href="../module-22-per-node-inference-efficiency/section-22.7.html">Section 22.7</a> into a distributed scheduling problem that spans replicas, tensor and pipeline groups, and the disaggregated prefill/decode pools of <a href="section-24.5.html">Section 24.5</a>, and shows why achieved goodput is a scheduling outcome before it is a hardware one.</p>
+</div>
+<p>The previous sections of this chapter built the parts of a distributed LLM server: tensor and pipeline groups that hold a model too large for one device, a paged KV cache (<a href="section-24.4.html">Section 24.4</a>) that lets many sequences share accelerator memory at block granularity, and the prefill/decode disaggregation (<a href="section-24.5.html">Section 24.5</a>) that sends the two phases of generation to pools tuned for each. None of those parts produces a single completed response on its own. The component that turns a pile of capable hardware into a stream of finished generations is the scheduler, and it is the subject of this section. It is also the component that most directly determines whether your service-level objectives are met, because the scheduler is where requests wait, where they compete for scarce KV blocks, and where the decision to favor one request implies making another wait.</p>
+<p>What makes LLM serving distinctive, and what separates it from the request scheduling of an ordinary web service, is that a single LLM request is not one unit of work but hundreds: one expensive prefill step followed by many cheap decode steps, each of which must be batched with other requests to use the accelerator efficiently. The scheduler therefore operates not once per request but once per iteration, reconsidering the whole running set every time the model produces a token. That iteration-level granularity, introduced for one node in Chapter 22, is the hinge of this section, and everything below is about exercising it well across a cluster under a real KV-cache budget and real deadlines.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 880 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A serving scheduler diagram: a waiting queue of requests feeds an admission-control gate that checks the KV-cache budget; admitted requests join a running batch that is decoded one token per iteration; when the budget is exceeded a preemption arrow evicts a long-running sequence back to the queue.">
+<defs>
+<marker id="arr246" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr246r" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b8431f"/></marker>
+</defs>
+<style>
+.b246 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w246 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g246 { fill:#eaf4ec; stroke:#2c7a44; stroke-width:1.6; }
+.t246 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s246 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l246 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr246); }
+.p246 { fill:none; stroke:#b8431f; stroke-width:1.8; stroke-dasharray:5 4; marker-end:url(#arr246r); }
+</style>
+<text class="t246" x="92" y="30">Waiting queue</text>
+<rect class="w246" x="28" y="44" width="128" height="30" rx="6"/><text class="s246" x="92" y="63">short, priority hi</text>
+<rect class="w246" x="28" y="80" width="128" height="30" rx="6"/><text class="s246" x="92" y="99">long generation</text>
+<rect class="w246" x="28" y="116" width="128" height="30" rx="6"/><text class="s246" x="92" y="135">short, priority hi</text>
+<text class="s246" x="92" y="172">ordered by priority</text>
+<text class="s246" x="92" y="188">and deadline</text>
+<line x1="160" y1="95" x2="232" y2="95" class="l246"/>
+<rect class="g246" x="236" y="56" width="150" height="86" rx="10"/>
+<text class="t246" x="311" y="88">Admission</text>
+<text class="t246" x="311" y="106">control</text>
+<text class="s246" x="311" y="128">fits in KV budget?</text>
+<rect class="b246" x="236" y="170" width="150" height="52" rx="8"/>
+<text class="s246" x="311" y="192">KV-cache budget</text>
+<text class="s246" x="311" y="210">B blocks (24.4)</text>
+<line x1="311" y1="142" x2="311" y2="168" class="l246"/>
+<line x1="390" y1="95" x2="462" y2="95" class="l246"/>
+<text class="t246" x="600" y="30">Running batch (one decode step / iteration)</text>
+<rect class="b246" x="466" y="48" width="92" height="34" rx="6"/><text class="s246" x="512" y="69">seq A</text>
+<rect class="b246" x="466" y="90" width="92" height="34" rx="6"/><text class="s246" x="512" y="111">seq B (long)</text>
+<rect class="b246" x="466" y="132" width="92" height="34" rx="6"/><text class="s246" x="512" y="153">seq C</text>
+<rect class="b246" x="568" y="48" width="92" height="34" rx="6"/><text class="s246" x="614" y="69">seq D</text>
+<rect class="b246" x="568" y="90" width="92" height="34" rx="6"/><text class="s246" x="614" y="111">seq E</text>
+<rect class="b246" x="568" y="132" width="92" height="34" rx="6"/><text class="s246" x="614" y="153">seq F</text>
+<rect class="g246" x="690" y="74" width="160" height="64" rx="10"/>
+<text class="t246" x="770" y="100">Emit 1 token</text>
+<text class="s246" x="770" y="120">per running seq</text>
+<line x1="660" y1="106" x2="686" y2="106" class="l246"/>
+<path class="l246" d="M 770 138 L 770 250 L 512 250 L 512 200 L 512 168"/>
+<text class="s246" x="640" y="244">loop: re-admit / re-batch next iteration</text>
+<path class="p246" d="M 466 107 L 400 107 L 400 250 L 150 250 L 150 148"/>
+<text class="s246" x="300" y="270" fill="#b8431f">preempt / evict seq B when budget is exceeded; requeue for later</text>
+</svg>
+<figcaption><strong>Figure 24.6.1:</strong> The serving scheduler as a loop. The waiting queue (left), ordered by priority and deadline, feeds an admission-control gate that admits a request only if its prompt fits within the replica's remaining KV-cache budget of $B$ blocks (<a href="section-24.4.html">Section 24.4</a>). Admitted requests join the running batch, which emits exactly one token per sequence each iteration. When the budget is exceeded, the orange preemption path evicts a long-running sequence (seq B) back to the queue so higher-priority work can proceed. The same loop runs on every replica; a cluster-level router (24.5) decides which replica each request enters.</figcaption>
+</figure>
+
+<h2>1. From One Node to Many: What the Scheduler Now Decides <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>On a single node, continuous batching already made four decisions every iteration, as <a href="../module-22-per-node-inference-efficiency/section-22.7.html">Section 22.7</a> developed: which waiting requests to admit, how to pack them into the KV cache, which finished sequences to retire, and whether memory pressure forces a preemption. Distributing the server does not remove those decisions; it wraps them in a second layer. Before a request reaches any replica's iteration loop, a cluster-level router must choose which replica it enters, and that choice is now entangled with the disaggregated pools of <a href="section-24.5.html">Section 24.5</a>: a request in its prefill phase wants a prefill-tuned node, while its decode phase wants a decode-tuned node, possibly a different machine, with the KV cache migrated between them.</p>
+<p>The result is a two-tier scheduling problem. The outer tier places requests on replicas and balances load across the fleet, paying attention to which replica already holds a useful prefix in cache (the subject of <a href="section-24.7.html">Section 24.7</a>) and which is least loaded. The inner tier, the per-replica iteration-level scheduler, is the one drawn in Figure 24.6.1 and the one this section studies in depth, because it is where the KV budget binds and where SLO violations are actually born. The two tiers interact: an outer router that floods one replica with long generations will defeat even a perfect inner scheduler, and an inner scheduler that preempts aggressively changes the load the outer router observes. We treat the inner tier as the unit of analysis and keep the outer tier as the load-balancing and admission context, tying back to the request routing of <a href="../module-23-distributed-inference-systems/section-23.2.html">Section 23.2</a>.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Scheduling, Not FLOPs, Sets Achieved Goodput</div>
+<p>Two clusters with identical accelerators can deliver very different numbers of on-time responses, because the binding resource at decode time is rarely raw arithmetic; it is KV-cache memory and the deadline clock. A scheduler that admits a flood of long generations fills the KV cache, blocks short latency-sensitive requests, and lets them miss their deadlines while the hardware stays busy producing tokens nobody is waiting for under their SLO. Goodput, the rate of responses that finish within their latency budget, is therefore a property of the admission and preemption policy first and of the FLOPs second. The rest of this section makes that claim quantitative.</p>
+</div>
+
+<h2>2. Iteration-Level Scheduling and the KV-Cache Budget <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The unit of scheduling in modern LLM serving is the iteration, not the request. At each iteration the model runs one forward pass that produces exactly one new token for every sequence currently in the running batch; the scheduler then reconsiders the entire set before the next pass. This is what lets a short request that arrives while a long one is mid-generation slip into the batch immediately, rather than waiting for the long request to finish, which was the failing of request-level batching. The cost of admitting a request is memory: a sequence of current length $s$ tokens occupies $\lceil s / b \rceil$ KV blocks, where $b$ is the paging granularity (16 tokens in our demo, following PagedAttention). The constraint the scheduler must respect every iteration is that the total blocks held by the running set cannot exceed the replica's budget $B$:</p>
+$$\sum_{r \in \text{running}} \left\lceil \frac{s_r}{b} \right\rceil \le B, \qquad |\text{running}| \le M,$$
+<p>where $M$ is the maximum batch width the kernels support. Because each running sequence grows by one token per iteration, the left-hand sum is monotonically increasing until sequences finish and release their blocks, which is precisely why a scheduler that admits too eagerly will hit the budget and be forced to preempt. The art is to keep the running set large enough to use the accelerator well but not so large that admitting one more token's worth of cache evicts a request that was about to finish.</p>
+<p>We can make the objective precise. Let request $r$ have arrival time $a_r$, a deadline $d_r$ derived from its latency budget, and a completion step $c_r$ under a given policy (with $c_r = \infty$ if it never finishes in time). The scheduler maximizes <em>goodput</em>, the count of requests that finish on time,</p>
+$$G(\pi) = \sum_{r} \mathbf{1}\!\left[c_r(\pi) \le d_r\right],$$
+<p>over the space of admission and preemption policies $\pi$, subject to the budget constraint above at every iteration. The deadline $d_r$ encodes the two service-level objectives that matter for generation: time-to-first-token (TTFT), set by when prefill completes, and time-per-output-token (TPOT), set by how many decode steps the request waits through. A policy that maximizes raw token throughput is not the same as one that maximizes $G$; the difference is the whole point of this section, and Chapter 5's tail-latency treatment (<a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.3.html">Section 5.3</a>) explains why the right metric is the on-time count rather than the average.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Restaurant That Only Cooks Whole Meals First</div>
+<p>Request-level batching is the kitchen that refuses to start your appetizer until the table that ordered before you has finished dessert. Iteration-level scheduling is the kitchen that plates one course for every table on each trip out of the pass, so the person who ordered a salad is not held hostage by the table that ordered the twelve-course tasting menu. Same stove, same chefs; the difference is entirely in when the expediter decides what to fire next.</p>
+</div>
+
+<h2>3. Fairness, Priorities, and Preventing Starvation <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Maximizing goodput naively can be unfair: a policy could hit a high on-time count by always favoring the cheapest requests and letting expensive ones starve forever. Real services attach priorities (a paid tier ahead of a free tier, an interactive request ahead of a batch job) and require that no class be starved indefinitely. The tension is sharpest under mixed load, where a flood of long generations can monopolize the KV cache and push every short request past its deadline. The scheduler's job is to admit and preempt so that short, deadline-critical requests are not held hostage by long ones, while still making forward progress on the long ones so they do not starve.</p>
+<p>Two mechanisms achieve this. First, admission order: rather than first-come-first-served, the scheduler orders the waiting queue by deadline urgency and, among equally urgent requests, by expected cost, so a short request that will miss its TTFT is admitted ahead of a long request with hours of slack. Second, preemption: when a deadline-critical request cannot be admitted because the KV cache is full, the scheduler evicts a long-running sequence that has plenty of remaining slack, frees its blocks, and admits the urgent one; the evicted sequence is requeued and its KV cache is either swapped to host memory or recomputed when it resumes. This is the same preempt-to-make-room logic that elastic training uses for stragglers, here applied to deadlines rather than failures. The demo in the next section implements exactly these two mechanisms and measures what they buy.</p>
+
+<h2>4. A Scheduler Simulator: FCFS Versus SLO-Aware <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The code below is a pure-Python iteration-level scheduler for one replica with a fixed KV-cache budget. It generates a mixed workload (70% short latency-sensitive requests, 30% long generations), then runs two policies on it. The naive policy admits in first-come-first-served order and never preempts. The SLO-aware policy orders the queue by deadline and cost, and preempts a long, slack-rich sequence when a deadline-critical request is starving. Both policies obey the same budget constraint $\sum \lceil s_r / b \rceil \le B$ every iteration. We measure how many requests finish, how many finish <em>on time</em> (goodput $G$), and what fraction of short requests meet their SLO.</p>
+<pre><code class="language-python">import random
+from dataclasses import dataclass
+
+KV_BUDGET = 120          # total KV blocks available on the replica
+TOKENS_PER_BLOCK = 16    # KV paging granularity (cf. PagedAttention, 24.4)
+MAX_BATCH = 24           # max sequences decoded concurrently per step
+
+@dataclass
+class Req:
+    rid: int; arrival: int; prompt: int; gen: int; deadline: int
+    started: int = -1; done: int = -1; produced: int = 0
+    def blocks(self):                       # blocks held = ceil(len / b)
+        return -(-(self.prompt + self.produced) // TOKENS_PER_BLOCK)
+
+def make_workload(seed=7, n=80, horizon=200):
+    rng = random.Random(seed); reqs = []
+    for i in range(n):
+        arrival = rng.randint(0, horizon)
+        if rng.random() < 0.7:              # 70% short, latency-sensitive
+            prompt, gen, slack = rng.randint(8, 40), rng.randint(8, 32), rng.randint(30, 60)
+        else:                              # 30% long generations
+            prompt, gen, slack = rng.randint(64, 200), rng.randint(160, 320), rng.randint(220, 360)
+        reqs.append(Req(i, arrival, prompt, gen, arrival + slack))
+    return sorted(reqs, key=lambda r: r.arrival)
+
+def simulate(policy, max_steps=1400):
+    reqs = make_workload(); waiting, running, finished = list(reqs), [], []
+    step = 0
+    while (waiting or running) and step < max_steps:
+        ready = [r for r in waiting if r.arrival <= step]
+        used = sum(r.blocks() for r in running)
+        if policy == "fcfs":                          # admit in arrival order
+            order = sorted(ready, key=lambda r: r.arrival)
+        else:                                         # admit by deadline, then cost
+            order = sorted(ready, key=lambda r: (r.deadline, r.prompt + r.gen))
+        for r in order:                               # admission control vs KV budget
+            need = -(-(r.prompt) // TOKENS_PER_BLOCK)
+            if len(running) < MAX_BATCH and used + need <= KV_BUDGET:
+                r.started = step; running.append(r); waiting.remove(r); used += need
+        if policy == "slo":                           # preempt to rescue starving requests
+            starving = [r for r in waiting if r.arrival <= step
+                        and r.deadline - step < (r.prompt + r.gen)]
+            if starving:
+                free = KV_BUDGET - sum(r.blocks() for r in running)
+                victims = sorted([r for r in running if r.gen - r.produced > 100],
+                                 key=lambda r: -(r.gen - r.produced))
+                for v in victims:
+                    if free >= -(-(starving[0].prompt) // TOKENS_PER_BLOCK):
+                        break
+                    free += v.blocks(); v.produced = 0; v.started = -1
+                    running.remove(v); waiting.append(v)     # requeue + recompute KV
+        for r in running[:]:                          # one decode step: emit one token each
+            r.produced += 1
+            if r.produced >= r.gen:
+                r.done = step; finished.append(r); running.remove(r)
+        step += 1
+
+    completed = [r for r in finished if r.done >= 0]
+    on_time = [r for r in completed if r.done <= r.deadline]
+    short = [r for r in reqs if r.gen <= 40]
+    short_done = [r for r in on_time if r.gen <= 40]
+    return {"finished": len(completed), "goodput": len(on_time),
+            "short_slo_hit": len(short_done) / max(1, len(short)), "steps": step}
+
+print(f"{'policy':<8}{'finished':>10}{'goodput(on-time)':>18}{'short-SLO hit':>16}{'steps':>8}")
+for pol in ("fcfs", "slo"):
+    m = simulate(pol)
+    print(f"{pol:<8}{m['finished']:>10}{m['goodput']:>18}"
+          f"{m['short_slo_hit']:>15.0%}{m['steps']:>8}")
+</code></pre>
+<div class="code-caption"><strong>Code 24.6.1:</strong> An iteration-level serving scheduler simulated under a fixed KV-cache budget, comparing a first-come-first-served admission policy against an SLO-aware policy that orders by deadline and preempts slack-rich long generations to rescue starving short requests. Both policies decode one token per running sequence per step and obey the same block budget.</div>
+<pre><code class="language-text">policy    finished  goodput(on-time)   short-SLO hit   steps
+fcfs            80                34            46%     814
+slo             80                65           100%     948</code></pre>
+<div class="code-caption"><strong>Output 24.6.1:</strong> Both policies eventually finish all 80 requests, but the SLO-aware policy nearly doubles on-time goodput (34 to 65) and lifts the short-request SLO hit rate from 46% to 100%. The hardware and the workload are identical; only the admission and preemption decisions differ.</div>
+<p>The two policies finish the same number of requests, which is the trap that token-throughput dashboards fall into: by that measure the cluster looks fully utilized under both. Goodput tells the real story. First-come-first-served lets early-arriving long generations fill the KV cache, so short requests queue behind them and blow their tight deadlines; fewer than half the short requests meet their SLO. The SLO-aware policy admits urgent short requests first and evicts a slack-rich long sequence when one is starving, so every short request finishes on time and total on-time goodput almost doubles. The SLO policy runs a few more steps overall, because preemption forces some recomputation, a real cost; it spends that cost where it buys the most on-time responses. This is the quantitative form of the key insight: same FLOPs, very different goodput, decided entirely by scheduling.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Chatbot That Was Fast on Average and Slow When It Mattered</div>
+<p><strong>Who:</strong> A platform engineer running an LLM chat API on a fleet of eight GPU replicas behind a router.</p>
+<p><strong>Situation:</strong> The product mixed short interactive chats with occasional long document-summarization calls, all on the same endpoint.</p>
+<p><strong>Problem:</strong> Average TTFT looked healthy, but the p99 was terrible: interactive users intermittently waited many seconds while the dashboard reported high GPU utilization.</p>
+<p><strong>Dilemma:</strong> Add more replicas to cut the queue (expensive, and utilization was already high so the FLOPs were not idle), or change how each replica scheduled the work it already had.</p>
+<p><strong>Decision:</strong> They left the fleet size alone and switched the per-replica scheduler from first-come-first-served to a deadline-aware policy with preemption, exactly the contrast in Output 24.6.1.</p>
+<p><strong>How:</strong> They set a tight TTFT target for the interactive class, let the scheduler admit those ahead of long summaries, and enabled preemption of long generations (with KV swap to host memory) when an interactive request was about to miss its budget.</p>
+<p><strong>Result:</strong> p99 TTFT for interactive traffic fell sharply with no extra hardware; long summaries took marginally longer end to end, which their looser SLO tolerated, and overall on-time goodput rose.</p>
+<p><strong>Lesson:</strong> When utilization is already high but tail latency is bad, the fix is usually the scheduling policy, not more machines. Goodput, not throughput, is the number to optimize.</p>
+</div>
+
+<h2>5. Admission Control and Backpressure When the Cluster Is Saturated <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Preemption and clever ordering buy goodput up to a point, but a cluster has a finite capacity, and when arrivals exceed it no scheduling policy can make every request on time. Past saturation the right move is not to admit everything and degrade for all, but to apply admission control and backpressure: reject or shed the requests that cannot possibly meet their deadline so the cluster's capacity goes to requests that can. A request whose deadline has already passed by the time it would reach a free KV block is pure waste; admitting it consumes blocks that an in-budget request needed and pushes that one over the edge too, a cascade that turns a lightly overloaded cluster into a uselessly busy one. This is the same load-shedding discipline that protects any saturated distributed service, introduced for request routing in <a href="../module-23-distributed-inference-systems/section-23.2.html">Section 23.2</a>, here specialized to the KV-block resource.</p>
+<p>Backpressure is how the inner scheduler tells the outer router to stop sending work: when a replica's queue depth or KV occupancy crosses a threshold, it signals saturation, and the router routes new requests elsewhere or returns a fast, explicit rejection rather than letting them age silently in a queue. A fast rejection a client can retry or fail over on is a far better outcome than a slow timeout, because it preserves the cluster's goodput for the requests it accepts and gives the client an honest signal. The deadline-aware admission test, "can this request still finish in time given current occupancy?", is the natural place to enforce both: a request that fails it is shed at the door, never consuming a block. Tail latency under overload (<a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.3.html">Section 5.3</a>) is dominated by exactly these decisions.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: A Per-Node Loop, Multiplied Across the Fleet</div>
+<p>The iteration-level batching loop of <a href="../module-22-per-node-inference-efficiency/section-22.7.html">Section 22.7</a> was a scale-up technique: one node, one KV cache, one running set. This section is where it scales out. The same admit-pack-decode-preempt loop now runs on every replica, wrapped by a cluster router that places requests across the fleet and a backpressure signal that ties the replicas together into one coordinated service. The per-node KV-cache economics of Chapter 22 do not disappear when you distribute; they are multiplied across every replica and become the resource the distributed scheduler arbitrates. Scheduling is the axis that turns a rack of independent inference servers into a single system that meets a fleet-wide SLO.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: vLLM's Scheduler Does the Admit-and-Preempt Loop for You</div>
+<p>Code 24.6.1 hand-rolled the admission queue, the block-budget check, and the preemption logic to make them visible. In production you do not write this loop; vLLM's engine runs an iteration-level scheduler over a paged KV cache and exposes the policy as configuration rather than code. The running engine already does continuous batching, block accounting, and preemption-with-recompute internally:</p>
+<pre><code class="language-python"># vLLM exposes the scheduler as config, not as a loop you write.
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    max_num_seqs=256,            # M: max running sequences (batch width)
+    max_num_batched_tokens=8192, # per-iteration token budget for prefill+decode
+    gpu_memory_utilization=0.90, # sets the KV-cache block budget B (24.4)
+    enable_chunked_prefill=True, # split long prefills so decode is not starved
+)
+# The engine admits, batches, and preempts every iteration internally;
+# you submit requests and it schedules them against the KV budget.
+outputs = llm.generate(prompts, SamplingParams(max_tokens=128))
+</code></pre>
+<div class="code-caption"><strong>Code 24.6.2:</strong> The roughly forty lines of admission, budgeting, and preemption logic in Code 24.6.1 collapse to a handful of constructor arguments. vLLM's scheduler handles continuous batching, paged-block accounting, chunked prefill, and preemption-with-recompute; you tune the budget ($M$, the token budget, and the memory fraction that fixes $B$) instead of implementing the loop.</div>
+</div>
+
+<h2>6. Balancing Prefill and Decode <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>One scheduling tension deserves its own treatment because it is unique to LLMs: prefill and decode compete for the same accelerator but stress it differently. A prefill step processes a whole prompt at once and is compute-bound; a decode step processes one token per sequence and is memory-bandwidth-bound. If the scheduler runs a long prefill, every decoding sequence in the batch stalls for that whole step, spiking the TPOT of requests that were already generating, the phenomenon a naive scheduler suffers when a large prompt arrives. The disaggregation of <a href="section-24.5.html">Section 24.5</a> is one answer: send prefill and decode to separate pools so they never contend. Where the two phases share a node, the answer is <em>chunked prefill</em>: split a long prompt into smaller pieces and interleave those pieces with ongoing decode steps, so the prefill is paid down gradually and decode latency stays smooth.</p>
+<p>The scheduler's choice each iteration is therefore not just which requests to admit but how to compose the batch from prefill chunks and decode tokens to fill the per-iteration token budget without starving either phase. This is the frontier where current serving research is most active, because the right split depends on the live mix of prompt lengths and generation lengths, which the scheduler can observe but not control. The research frontier below names the systems that turned this balancing act into measurable goodput gains.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Goodput-Optimal LLM Scheduling (2024 to 2026)</div>
+<p>A wave of recent serving systems treats scheduling, not kernels, as the lever for goodput. Sarathi-Serve (Agrawal et al., 2024) introduced chunked prefill and stall-free batching, interleaving prefill chunks with decode so a large prompt no longer spikes the TPOT of in-flight requests, and reports large throughput gains under SLO constraints. Llumnix (Sun et al., 2024) adds cross-replica scheduling, live-migrating running requests between instances to defragment KV memory, isolate latency classes, and load-balance the fleet, the outer tier of the two-tier problem in Section 1. FastServe (Wu et al., 2023, with 2024 follow-ons) attacks head-of-line blocking with a preemptive, multi-level-feedback skip-join scheduler so short requests are not stuck behind long generations. A common thread runs through all three: each redefines the objective as deadline-constrained goodput rather than raw token throughput, and each shows that the policy, applied on top of the same paged KV cache, is worth more than additional hardware. These ideas now ship inside production engines such as vLLM and TensorRT-LLM.</p>
+</div>
+<p>With the scheduler in place, the cluster finally behaves as one coordinated LLM service: requests are placed on replicas, admitted under a shared KV budget, batched at iteration granularity, preempted to protect deadlines, and shed when the fleet saturates. The remaining lever is to avoid redundant work across requests that share structure, the prefixes many prompts hold in common and the adapter weights a multi-tenant fleet must juggle. That is where <a href="section-24.7.html">Section 24.7</a> takes us next, with prefix caching and multi-LoRA serving.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.6.1: Why Throughput and Goodput Diverge <span class="exercise-type conceptual">Conceptual</span></div>
+<p>In Output 24.6.1 both policies finished all 80 requests, so token throughput was effectively the same, yet on-time goodput differed by nearly a factor of two. Explain in terms of the KV-budget constraint and the deadline structure why first-come-first-served can keep the accelerator fully busy while still missing most short-request deadlines. Then argue why a dashboard that reports only tokens-per-second would mislead an operator of this service, and name the one metric from <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.3.html">Section 5.3</a> that would have exposed the problem.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.6.2: Add Priorities and Anti-Starvation <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 24.6.1 with a per-request priority field (say, two classes: interactive and batch). Modify the SLO-aware admission order so interactive requests are preferred, but add an aging rule so that a batch request that has waited more than $W$ steps is promoted, preventing indefinite starvation. Sweep $W$ and plot, for several values, the interactive-class goodput against the fraction of batch requests that eventually complete. Identify the value of $W$ that protects interactive SLOs without starving the batch class, and explain how this trade-off would shift if the long-request share rose from 30% to 60%.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.6.3: The Cost of Preemption <span class="exercise-type analysis">Analysis</span></div>
+<p>The SLO policy in Output 24.6.1 ran 948 steps versus 814 for FCFS, the extra steps being recomputation after preemption. Model this cost: suppose preempting a sequence of current length $s$ and resuming it later costs an extra $\lceil s/b \rceil$ block-recomputation steps (versus a cheaper KV swap to host memory that costs a fixed transfer instead). Derive a rule of thumb for when preemption-with-recompute is worth it, in terms of the slack of the victim sequence and the deadline margin of the request being rescued. At what victim length does swapping the KV cache to host memory become cheaper than recomputing it, and how does that threshold interact with the $B$-block budget?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-24.5.html"><span class="nav-label">Previous</span><span class="nav-num">Section 24.5</span><span class="nav-title">Prefill/Decode Disaggregation</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 24</span><span class="nav-num">Contents</span><span class="nav-title">Distributed LLM Serving</span></a>
+<a class="next" href="section-24.7.html"><span class="nav-label">Next</span><span class="nav-num">Section 24.7</span><span class="nav-title">Prefix Caching and Multi-LoRA Fleets</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

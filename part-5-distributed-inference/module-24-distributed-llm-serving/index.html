@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 24: Distributed LLM Serving. The chapter where a single inference request spans many machines: tensor-parallel and pipeline-parallel inference, a distributed and paged KV cache, prefill/decode disaggregation, cross-node request scheduling and continuous batching, prefix caching and multi-LoRA fleets, serving distributed MoE models, and the inference engines that package it all." name="description"/>
+<title>Chapter 24: Distributed LLM Serving | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 24: Distributed LLM Serving</a></div>
+<h1>Distributed LLM Serving</h1>
+<p class="chapter-subtitle">Chapter 23 ran many replicas of a model that still fit on one machine and coordinated them into an elastic, reliable fleet. This chapter removes the assumption that holds that picture together. A frontier language model does not fit on one accelerator: its weights overflow a single device's memory, and serving even one user's request means splitting the model across machines and threading the computation through all of them. That changes the unit of the problem. In Chapter 22 the unit was one node and one token; in Chapter 23 the unit was one replica behind a load balancer; here a single inference request is itself a distributed computation, a forward pass sharded across tensor-parallel devices, a pipeline of stages spread over nodes, a key-value cache that no longer lives in one place, and a prefill phase that may run on entirely different hardware from the decode phase that follows it. The nine sections build this distributed forward pass from the ground up: why large-model serving spans machines at all, how tensor and pipeline parallelism partition a single inference, how the KV cache becomes a distributed and paged structure, how prefill and decode disaggregate onto separate fleets, how requests are scheduled and continuously batched across nodes, how prefix caching and multi-LoRA serving share work across a fleet, how mixture-of-experts models add a routing dimension to all of this, and finally the inference engines, vLLM, TensorRT-LLM, and SGLang, that package these patterns into systems you can run. Read it as the moment the serving fleet of Chapter 23 turns inward: the node you were replicating splits open, and one request becomes a journey across machines.</p>
+</header>
+<main class="content" id="main-content">
+<figure class="chapter-hero">
+<img src="images/hero.png" alt="Conceptual illustration for Chapter 24: Distributed LLM Serving" loading="lazy">
+</figure>
+<blockquote class="epigraph">
+<p>"I used to fit on one GPU and answer in a single forward pass. Now my attention layers live on four devices, my later blocks on a different node, my KV cache is paged across a cluster, and my prefill happens in another building. I am, in every sense, a distributed system that occasionally returns a sentence."</p>
+<cite>A Shard That Believes It Is the Whole Model</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>This is the chapter where a single inference request becomes a distributed computation: one model split across tensor-parallel devices and pipeline stages, a KV cache paged across nodes, prefill and decode running on separate hardware, and a scheduler that batches requests over the whole cluster.</strong> Chapter 22 costed one node and one token; Chapter 23 multiplied that node into a fleet of replicas that each still fit on a single machine. The premise that survived both chapters was that the model lives on one accelerator and the only question is how many copies to run. A frontier-scale language model breaks that premise: its parameters exceed any single device's memory, so even serving one request requires splitting the model and coordinating the pieces. The per-node tricks of Chapter 22, FlashAttention, KV-cache paging, quantization, do not vanish; they run inside each shard. The generic distributed-serving machinery of Chapter 23, replicas, routing, autoscaling, failover, does not vanish either; it wraps around a node that has itself become distributed. What is new here is the inside of that node. Tensor parallelism splits each layer's matrices across devices and all-reduces the partial results, so the collective-communication primitives of Chapter 4 reappear on the critical path of every token. Pipeline parallelism cuts the model into stages on different nodes and streams microbatches through them. The KV cache, the dominant memory consumer at inference, becomes a paged structure that can span machines and be reused across requests. Prefill, which is compute-bound, and decode, which is memory-bandwidth-bound, separate onto hardware suited to each. A cross-node scheduler keeps continuous batches full across this whole apparatus, and mixture-of-experts adds a routing-and-dispatch dimension on top. The chapter is the general theory of serving one model as many machines, and it ends at the engines that implement that theory so you do not have to.</p>
+</div>
+
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+This chapter is the hardest case of Part V and the place where the book's per-node arithmetic and its distributed-systems machinery meet in a single request. Chapter 22 measured the unit, Chapter 23 replicated it, and here the unit itself dissolves: a language model too large for one accelerator must be split across devices and nodes, so a single forward pass becomes a coordinated computation across the cluster. Serving such a model is a distributed-systems problem with a distinctive shape, because the model is partitioned, the KV cache is large and stateful, the two phases of generation want different hardware, and the requests still arrive as a continuous, bursty stream that must be batched. The nine sections build the distributed forward pass in the order an engineer meets its parts.
+</p>
+<p>
+The sections fall into three movements. The first establishes why and how a single model spans machines: Section 24.1 motivates large-model serving as a genuinely distributed problem, Section 24.2 develops tensor-parallel inference that splits each layer across devices, and Section 24.3 develops pipeline-parallel and multi-node inference that splits the model into stages. The second movement is the memory and phase structure of generation: Section 24.4 turns the KV cache into a distributed and paged resource, and Section 24.5 disaggregates prefill from decode onto separate fleets. The third movement is the fleet-level coordination and specialization: Section 24.6 schedules requests and runs continuous batching across nodes, Section 24.7 shares work through prefix caching and serves many LoRA adapters at once, Section 24.8 adds the expert-routing dimension of mixture-of-experts serving, and Section 24.9 maps the whole apparatus onto the production inference engines that implement it.
+</p>
+<p>
+Read in order, the nine sections take you from "this model does not fit on one machine" to a working mental model of one model served as many: split each layer across tensor-parallel devices and all-reduce the partials, stream microbatches through pipeline stages on different nodes, page the KV cache so it spans machines and is reused across requests, place compute-bound prefill and bandwidth-bound decode on the hardware each prefers, keep continuous batches full with a scheduler that reasons across the cluster, reuse shared prefixes and multiplex thousands of LoRA adapters over one base model, route tokens to experts when the model is sparse, and reach for vLLM, TensorRT-LLM, or SGLang rather than rebuilding the engine by hand. The argument is cumulative and it closes Part V's inference arc: every pattern here assumes the per-node profile of Chapter 22 inside each shard and the serving-fleet machinery of Chapter 23 around the whole, and it hands a running large-model service forward to the retrieval and MLOps chapters that follow.
+</p>
+</div>
+
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>This chapter assumes the two serving chapters that precede it and the model-parallelism foundations from Part IV. From <a href="../module-22-per-node-inference-efficiency/index.html">Chapter 22: Per-Node Inference Efficiency</a> you carry the per-node vocabulary that runs inside every shard here: the latency and throughput of a single accelerator, the KV cache and how it bounds concurrency, continuous batching, and the prefill-versus-decode distinction that Section 24.5 turns into a hardware split. From <a href="../module-23-distributed-inference-systems/index.html">Chapter 23: Distributed Inference Systems</a> you carry the generic distributed-serving machinery that wraps around the distributed node of this chapter: replicas behind a load balancer, batch-aware routing, autoscaling on GPU signals, multi-tenant sharing, and failover, all of which still apply once the node itself spans machines. From <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16: Model, Pipeline, and Sharded Parallelism</a> you carry the model-partitioning toolkit this chapter specializes to inference: how a model is split across devices, how tensor and pipeline parallelism trade communication against memory, and the collective operations that stitch the shards back together. Beyond these the chapter assumes comfortable Python, a working picture of a transformer's attention and feed-forward layers, and the collective-communication primitives of Chapter 4. No prior experience with a specific inference engine is needed; Section 24.1 builds the why-it-spans-machines argument from the ground up before any system appears.</p>
+</div>
+
+<div class="objectives">
+<h3>Learning Objectives</h3>
+<ul>
+<li>Explain why serving a frontier-scale language model is a genuinely distributed problem, in particular how model size, KV-cache memory, and the two phases of generation force a single request across many machines.</li>
+<li>Describe tensor-parallel inference: how each layer's matrices are partitioned across devices and how partial results are combined with collective communication on the critical path of every token.</li>
+<li>Describe pipeline-parallel and multi-node inference: how a model is cut into stages on different nodes, how microbatches stream through the pipeline, and how the resulting latency and throughput trade off.</li>
+<li>Reason about the KV cache as a distributed and paged structure that spans machines, and explain how paging enables high concurrency and cross-request reuse.</li>
+<li>Explain prefill/decode disaggregation: why the compute-bound prefill phase and the bandwidth-bound decode phase benefit from separate hardware, and what coordinating them across a fleet costs.</li>
+<li>Design request scheduling and continuous batching that span nodes, keeping batches full across a partitioned model without starving any stage or replica.</li>
+<li>Apply prefix caching to reuse shared context across requests, and serve many LoRA adapters over a shared base model in a multi-tenant fleet.</li>
+<li>Serve distributed mixture-of-experts models, reasoning about expert routing, dispatch, and load balance as an added dimension of the distributed forward pass.</li>
+<li>Map the responsibilities of production inference engines such as vLLM, TensorRT-LLM, and SGLang onto the patterns developed in the chapter, and choose among them for a deployment.</li>
+</ul>
+</div>
+
+<div class="callout key-takeaway">
+<div class="callout-title">Remember the Chapter as One Sentence</div>
+<p>If you keep one thing from this chapter, keep this: <strong>distributed LLM serving turns a single inference request into a computation that spans many machines, splitting one model across tensor-parallel devices and pipeline stages, paging the KV cache across nodes, disaggregating compute-bound prefill from bandwidth-bound decode, and scheduling continuous batches across the whole cluster, with the per-node tricks of Chapter 22 running inside each shard and the serving fleet of Chapter 23 wrapped around the result.</strong> Read forward, the sections build that distributed forward pass in the order its parts arrive: first why the model spans machines, then tensor-parallel inference, then pipeline-parallel and multi-node inference, then the distributed and paged KV cache, then prefill/decode disaggregation, then cross-node scheduling and continuous batching, then prefix caching and multi-LoRA fleets, then mixture-of-experts serving, and finally the engines that implement it. Read as a question, the chapter asks of any model too large for one device: how is each layer split across the accelerators, how does a request flow through the pipeline stages, where does its KV cache live, on what hardware do prefill and decode run, how does the scheduler keep the cluster's batches full, what can be cached or shared across requests, and how does sparsity change the routing. The roadmap below walks the nine sections that answer it, and the last one hands you the engines that put the answers into production.</p>
+</div>
+
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num">24.1</span>
+<a class="section-title" href="section-24.1.html">Why Large-Model Serving Spans Many Machines</a>
+<span class="section-desc">Shows how a frontier-scale model's weights and KV cache overflow a single accelerator, so that even one user's request must be split across devices and nodes, making large-model serving a distributed computation from the first token.</span>
+</li>
+<li>
+<span class="section-num">24.2</span>
+<a class="section-title" href="section-24.2.html">Tensor-Parallel Inference</a>
+<span class="section-desc">Partitions each layer's matrices across devices and combines the partial results with collective communication, so a single forward pass runs in parallel across accelerators on the critical path of every token.</span>
+</li>
+<li>
+<span class="section-num">24.3</span>
+<a class="section-title" href="section-24.3.html">Pipeline-Parallel and Multi-Node Inference</a>
+<span class="section-desc">Cuts the model into stages on different nodes and streams microbatches through them, trading pipeline latency against throughput so a model larger than one node can serve a continuous request stream.</span>
+</li>
+<li>
+<span class="section-num">24.4</span>
+<a class="section-title" href="section-24.4.html">Distributed and Paged KV Cache</a>
+<span class="section-desc">Turns the KV cache, the dominant memory consumer at inference, into a paged structure that can span machines and be reused across requests, lifting concurrency far beyond a contiguous-allocation baseline.</span>
+</li>
+<li>
+<span class="section-num">24.5</span>
+<a class="section-title" href="section-24.5.html">Prefill/Decode Disaggregation</a>
+<span class="section-desc">Separates the compute-bound prefill phase from the memory-bandwidth-bound decode phase onto different hardware, and coordinates the handoff so each phase runs where it is most efficient.</span>
+</li>
+<li>
+<span class="section-num">24.6</span>
+<a class="section-title" href="section-24.6.html">Request Scheduling and Continuous Batching Across Nodes</a>
+<span class="section-desc">Schedules requests and runs continuous batching across a partitioned model and many nodes, keeping batches full at every stage without starving a pipeline stage or a tensor-parallel group.</span>
+</li>
+<li>
+<span class="section-num">24.7</span>
+<a class="section-title" href="section-24.7.html">Prefix Caching and Multi-LoRA Fleets</a>
+<span class="section-desc">Reuses shared context across requests through prefix caching and serves thousands of LoRA adapters over one base model, sharing computation and memory across a multi-tenant fleet.</span>
+</li>
+<li>
+<span class="section-num">24.8</span>
+<a class="section-title" href="section-24.8.html">Serving Distributed MoE Models</a>
+<span class="section-desc">Adds the expert-routing dimension of mixture-of-experts to the distributed forward pass, reasoning about token dispatch, expert placement, and load balance across the serving cluster.</span>
+</li>
+<li>
+<span class="section-num">24.9</span>
+<a class="section-title" href="section-24.9.html">Inference Engines and Practice</a>
+<span class="section-desc">Maps the chapter's patterns onto production inference engines such as vLLM, TensorRT-LLM, and SGLang, so you reach for a system that already implements the distributed forward pass instead of rebuilding it.</span>
+</li>
+</ul>
+
+<p>Read the nine sections in order and you will hold a working model of one language model served as many machines: <a href="section-24.1.html">Section 24.1</a> names why the model spans machines, <a href="section-24.2.html">Section 24.2</a> splits each layer across tensor-parallel devices, <a href="section-24.3.html">Section 24.3</a> streams the model through pipeline stages across nodes, <a href="section-24.4.html">Section 24.4</a> pages the KV cache across the cluster, <a href="section-24.5.html">Section 24.5</a> disaggregates prefill from decode, <a href="section-24.6.html">Section 24.6</a> keeps continuous batches full across nodes, <a href="section-24.7.html">Section 24.7</a> shares prefixes and multiplexes LoRA adapters, <a href="section-24.8.html">Section 24.8</a> adds expert routing for mixture-of-experts, and <a href="section-24.9.html">Section 24.9</a> packages it all in vLLM, TensorRT-LLM, and SGLang. The thread to watch is the two preceding chapters reappearing at two scales at once: the per-node profile of <a href="../module-22-per-node-inference-efficiency/index.html">Chapter 22</a> runs inside every shard, and the serving fleet of <a href="../module-23-distributed-inference-systems/index.html">Chapter 23</a> wraps around the node that has itself become a distributed system.</p>
+
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>This chapter served one large language model as a distributed computation across many machines. The next chapter changes the workload that the served model depends on. <a href="../module-25-distributed-retrieval-vector-search/index.html">Chapter 25: Distributed Retrieval and Vector Search</a> turns to the retrieval layer that feeds context into the serving stack you just built: how billions of vectors are sharded across machines, how approximate nearest-neighbor search runs in parallel over those shards, and how a distributed index answers a query fast enough to sit on the critical path of a generation request. Where this chapter asked how to run one model as many nodes, Chapter 25 asks how to search a corpus too large for one machine and return the passages a retrieval-augmented request needs. The serving patterns developed here do not disappear; they become the consumer of the retrieval system, the place where retrieved context enters the prefill phase and the prefix cache. Read it next, and watch the distributed forward pass acquire a distributed memory to draw on.</p>
+</div>
+
+<section class="bibliography" id="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+<h3 class="bib-category">Paged KV Cache and Inference Engines</h3>
+<div class="bib-entry-card">
+<p class="bib-ref">Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu, C. H., Gonzalez, J. E., Zhang, H., Stoica, I. "Efficient Memory Management for Large Language Model Serving with PagedAttention." arXiv:2309.06180, 2023 (SOSP 2023). <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">arxiv.org/abs/2309.06180</a></p>
+<p class="bib-annotation">The vLLM paper that introduced PagedAttention, a paged KV cache modeled on virtual memory that lifts serving concurrency dramatically, the foundational reference for the distributed and paged KV cache of Section 24.4.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Zheng, L., Yin, L., Xie, Z., Sun, C., Huang, J., Yu, C. H., Cao, S., Kozyrakis, C., Stoica, I., Gonzalez, J. E., Barrett, C., Sheng, Y. "SGLang: Efficient Execution of Structured Language Model Programs." arXiv:2312.07104, 2023. <a href="https://arxiv.org/abs/2312.07104" target="_blank" rel="noopener">arxiv.org/abs/2312.07104</a></p>
+<p class="bib-annotation">The system that introduced RadixAttention for automatic prefix-cache reuse across requests, a core reference for the prefix caching of Section 24.7 and the engines survey of Section 24.9.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">NVIDIA. "TensorRT-LLM." GitHub repository and documentation. <a href="https://github.com/NVIDIA/TensorRT-LLM" target="_blank" rel="noopener">github.com/NVIDIA/TensorRT-LLM</a></p>
+<p class="bib-annotation">The reference implementation of a production LLM inference engine with tensor and pipeline parallelism, in-flight batching, and paged KV cache, the canonical engine for Section 24.9.</p>
+<span class="bib-meta">🔧 Docs</span>
+</div>
+<h3 class="bib-category">Parallel and Scaled Inference</h3>
+<div class="bib-entry-card">
+<p class="bib-ref">Pope, R., Douglas, S., Chowdhery, A., Devlin, J., Bradbury, J., Levskaya, A., Heek, J., Xiao, K., Agrawal, S., Dean, J. "Efficiently Scaling Transformer Inference." arXiv:2211.05102, 2022 (MLSys 2023). <a href="https://arxiv.org/abs/2211.05102" target="_blank" rel="noopener">arxiv.org/abs/2211.05102</a></p>
+<p class="bib-annotation">The analysis of partitioning strategies and the latency-throughput trade-offs of tensor and pipeline parallelism for transformer inference, the analytic backbone of Sections 24.2 and 24.3.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<h3 class="bib-category">Prefill/Decode Disaggregation and Scheduling</h3>
+<div class="bib-entry-card">
+<p class="bib-ref">Zhong, Y., Liu, S., Chen, J., Hu, J., Zhu, Y., Liu, X., Jin, X., Zhang, H. "DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving." arXiv:2401.09670, 2024 (OSDI 2024). <a href="https://arxiv.org/abs/2401.09670" target="_blank" rel="noopener">arxiv.org/abs/2401.09670</a></p>
+<p class="bib-annotation">The system that disaggregates prefill and decode onto separate resources to optimize goodput under latency targets, the primary reference for the disaggregation of Section 24.5.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Patel, P., Choukse, E., Zhang, C., Shah, A., Goiri, Í., Maleki, S., Bianchini, R. "Splitwise: Efficient Generative LLM Inference Using Phase Splitting." arXiv:2311.18677, 2023 (ISCA 2024). <a href="https://arxiv.org/abs/2311.18677" target="_blank" rel="noopener">arxiv.org/abs/2311.18677</a></p>
+<p class="bib-annotation">The system that splits the prompt and token phases of generation onto distinct machine pools, a complementary reference for the prefill/decode disaggregation of Section 24.5.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Agrawal, A., Kedia, N., Panwar, A., Mohan, J., Kwatra, N., Gulavani, B., Tumanov, A., Ramjee, R. "Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve." arXiv:2403.02310, 2024 (OSDI 2024). <a href="https://arxiv.org/abs/2403.02310" target="_blank" rel="noopener">arxiv.org/abs/2403.02310</a></p>
+<p class="bib-annotation">The scheduler that uses chunked prefill and stall-free batching to balance throughput against latency, directly relevant to the cross-node continuous batching of Section 24.6.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Qin, R., Li, Z., He, W., Zhang, M., Wu, Y., Zheng, W., Xu, X. "Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving." arXiv:2407.00079, 2024. <a href="https://arxiv.org/abs/2407.00079" target="_blank" rel="noopener">arxiv.org/abs/2407.00079</a></p>
+<p class="bib-annotation">The KV-cache-centric serving architecture behind a large production chatbot, tying together the distributed KV cache of Section 24.4 with the disaggregation of Section 24.5.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Sun, B., Huang, Z., Zhao, H., Xiao, W., Zhang, X., Li, Y., Lin, W. "Llumnix: Dynamic Scheduling for Large Language Model Serving." arXiv:2406.03243, 2024 (OSDI 2024). <a href="https://arxiv.org/abs/2406.03243" target="_blank" rel="noopener">arxiv.org/abs/2406.03243</a></p>
+<p class="bib-annotation">The system that live-migrates requests across model instances to reduce tail latency and fragmentation, a core reference for the cross-node scheduling of Section 24.6.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<h3 class="bib-category">Multi-Tenant LoRA Serving</h3>
+<div class="bib-entry-card">
+<p class="bib-ref">Sheng, Y., Cao, S., Li, D., Hooper, C., Lee, N., Yang, S., Chou, C., Zhu, B., Zheng, L., Keutzer, K., Gonzalez, J. E., Stoica, I. "S-LoRA: Serving Thousands of Concurrent LoRA Adapters." arXiv:2311.03285, 2023. <a href="https://arxiv.org/abs/2311.03285" target="_blank" rel="noopener">arxiv.org/abs/2311.03285</a></p>
+<p class="bib-annotation">The system that serves thousands of LoRA adapters over a shared base model with unified paging and batched adapter computation, the primary reference for the multi-LoRA fleets of Section 24.7.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Chen, L., Ye, Z., Wu, Y., Zhuo, D., Ceze, L., Krishnamurthy, A. "Punica: Multi-Tenant LoRA Serving." arXiv:2310.18547, 2023 (MLSys 2024). <a href="https://arxiv.org/abs/2310.18547" target="_blank" rel="noopener">arxiv.org/abs/2310.18547</a></p>
+<p class="bib-annotation">The system that batches requests for many different LoRA adapters through a custom kernel over one base model, a complementary reference for the multi-tenant adapter serving of Section 24.7.</p>
+<span class="bib-meta">📄 Paper</span>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="../index.html"><span class="nav-label">Previous</span><span class="nav-num">Part V</span><span class="nav-title">Distributed Inference and Serving</span></a>
+<a class="up" href="../index.html"><span class="nav-label">Part V</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Inference and Serving</span></a>
+<a class="next" href="section-24.1.html"><span class="nav-label">Next</span><span class="nav-num">Section 24.1</span><span class="nav-title">Why Large-Model Serving Spans Many Machines</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

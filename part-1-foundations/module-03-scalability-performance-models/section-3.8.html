@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 3.8: Communication Cost Models. The alpha-beta latency-bandwidth model, its application to ring all-reduce, and the latency-bound versus bandwidth-bound regimes that decide which collective algorithm wins." name="description"/>
+<title>Section 3.8: Communication Cost Models | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Distributed AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 3: Scalability and Performance Models</a></div>
+<h1>Communication Cost Models</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They told me to compute faster. I compute instantly now. I am still slow, because I spend my life waiting for the first byte to arrive."</p>
+<cite>A GPU Idling on a Communication Barrier</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Every form of scale-out pays a tax in moved bytes, and that tax is predictable: the time to send a message is a fixed startup cost plus a per-byte cost, and almost every collective in this book is built from those two numbers.</strong> The roofline model of <a href="section-3.7.html">Section 3.7</a> told you when a single node is compute-bound or memory-bound. This section adds the third wall, the network, and gives you a back-of-the-envelope model, the alpha-beta model, that turns "communication is the tax on distribution" into an equation you can evaluate before you rent a single extra machine. With it you can predict how long a gradient all-reduce takes, see why ring all-reduce barely cares how many workers you add, and know in advance whether your job will be limited by message count or by raw bandwidth. That single distinction decides which collective algorithm wins, and it is the quantitative backbone for the parallelism trade-offs in the rest of the book.</p>
+</div>
+<p>Distribution moves data, and moving data takes time that computation cannot hide for free. When eight workers each finish their share of a gradient, they must combine those partial results before the next step can begin, and that combine travels over wires with finite speed. To decide whether adding machines actually helps, you need a model of communication time that is simple enough to compute in your head yet faithful enough to predict the shape of real measurements. The standard such model, borrowed from decades of high-performance computing and used unchanged for distributed deep learning, describes the cost of a single message with just two constants. Everything in this section is an application of that two-constant model to the collective operations that synchronize distributed training.</p>
+
+<h2>1. The Alpha-Beta Model of a Single Message <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Consider sending $n$ bytes from one machine to another. Empirically, the time this takes is well described by a straight line in $n$,</p>
+$$T(n) = \alpha + n\,\beta,$$
+<p>where $\alpha$ is the per-message latency (the fixed startup cost paid once per message regardless of size, measured in seconds) and $\beta$ is the inverse bandwidth (the marginal cost per byte, measured in seconds per byte, so that $1/\beta$ is the link bandwidth in bytes per second). The latency $\alpha$ bundles together the software overhead of issuing the transfer, the time for the first bits to traverse the link, and any per-message protocol cost; the bandwidth term $n\beta$ is the time to push the actual payload through a pipe of finite width. On a fast GPU interconnect, $\alpha$ is on the order of a few microseconds and $1/\beta$ is on the order of tens to hundreds of gigabytes per second. These two numbers are the entire model.</p>
+<p>The model is useful precisely because the two terms dominate in different regimes. For a tiny message, $n\beta$ is negligible and $T(n) \approx \alpha$: the cost is the fixed overhead of having a message at all, so sending one byte costs almost the same as sending a thousand. For a huge message, $\alpha$ is negligible and $T(n) \approx n\beta$: the cost is just the payload divided by the bandwidth. The message size at which the two terms are equal, $n = \alpha/\beta$, is the boundary between these two worlds, and it is the single most important quantity for choosing a communication strategy. We will name those two worlds, latency-bound and bandwidth-bound, in Section 4 and use the boundary to explain a measured crossover.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Two Numbers Predict Almost Every Communication Cost</div>
+<p>A single message costs $T(n) = \alpha + n\beta$. Latency $\alpha$ is what you pay just to start a transfer; inverse bandwidth $\beta$ is what you pay per byte. Small messages are dominated by $\alpha$ (you are paying for message <em>count</em>), large messages by $n\beta$ (you are paying for raw <em>volume</em>). Knowing only these two constants for your interconnect, you can predict the time of any point-to-point transfer and, as the next section shows, of the collectives that synchronize distributed training. The boundary between the two regimes sits at $n = \alpha/\beta$.</p>
+</div>
+<p>The model deliberately ignores a great deal: network congestion, contention when many messages share a link, the topology of the switches, and the overlap of communication with computation. Those refinements matter for precise performance tuning, and <a href="../module-04-communication-primitives/index.html">Chapter 4</a> brings the relevant ones back when it studies real interconnects and topology-aware placement. For the purpose of deciding "will this collective be fast enough, and how does its cost grow with the number of workers?", the two-constant line is accurate enough to be the right first tool, and wrong only in ways that make it conservative.</p>
+
+<h2>2. From One Message to a Collective <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A collective operation involves all $K$ workers and combines their data into a shared result. The all-reduce you met in <a href="../module-01-scale-out-ai/section-1.1.html">Section 1.1</a>, where every worker contributes a vector and every worker ends up holding the elementwise sum, is the collective that synchronizes gradients in data-parallel training, so it is the one whose cost we most want to predict. A naive implementation sends every worker's vector to a single coordinator, sums there, and broadcasts the result back; that coordinator's link carries $K$ vectors in and $K$ vectors out, so the cost grows linearly with $K$ and the coordinator becomes a bottleneck. The whole art of collective algorithms is to avoid that linear-in-$K$ bandwidth term.</p>
+<p>The algorithm that made large-scale data-parallel deep learning practical is <strong>ring all-reduce</strong>. The $K$ workers are arranged in a logical ring; each sends only to its right neighbor and receives only from its left. The vector of $n$ bytes is split into $K$ slices. In a first phase of $K-1$ steps (reduce-scatter), each worker forwards and accumulates one slice at a time, so that after the phase each worker owns the fully summed value of exactly one slice. In a second phase of $K-1$ steps (all-gather), those completed slices circulate around the ring until every worker holds all of them. Across both phases each worker sends $2(K-1)$ messages, and every message carries one slice of size $n/K$ bytes.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two stacked lines on axes of message size versus time. A flat line marks the latency term alpha, a rising line marks the bandwidth term n times beta, and they cross at the message size n equals alpha over beta, dividing the plane into a latency-bound region on the left and a bandwidth-bound region on the right.">
+<defs>
+<marker id="arr38" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.ax38 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr38); }
+.lat38 { fill:none; stroke:#b86b1f; stroke-width:2.4; }
+.bw38 { fill:none; stroke:#1f7a4d; stroke-width:2.4; }
+.tot38 { fill:none; stroke:#14385c; stroke-width:2.0; stroke-dasharray:5 4; }
+.gl38 { fill:none; stroke:#9aa3ad; stroke-width:1; stroke-dasharray:3 4; }
+.t38 { font:600 14px sans-serif; fill:#14385c; }
+.s38 { font:12px sans-serif; fill:#5a626c; }
+.lt38 { font:600 13px sans-serif; fill:#b86b1f; }
+.bt38 { font:600 13px sans-serif; fill:#1f7a4d; }
+.reg38 { font:600 13px sans-serif; fill:#5a626c; text-anchor:middle; }
+</style>
+<line class="ax38" x1="90" y1="300" x2="800" y2="300"/>
+<line class="ax38" x1="90" y1="300" x2="90" y2="40"/>
+<text class="t38" x="700" y="328">message size n</text>
+<text class="t38" x="40" y="50" transform="rotate(-90 40 50)">time T(n)</text>
+<line class="lat38" x1="90" y1="250" x2="780" y2="250"/>
+<text class="lt38" x="600" y="242">latency term: &#945; (constant)</text>
+<text class="s38" x="96" y="266">&#945;</text>
+<path class="bw38" d="M 90 300 L 780 70"/>
+<text class="bt38" x="600" y="96">bandwidth term: n&#946;</text>
+<path class="tot38" d="M 90 250 L 410 250 Q 415 235 430 230 L 780 21"/>
+<line class="gl38" x1="410" y1="300" x2="410" y2="250"/>
+<circle cx="410" cy="250" r="4.5" fill="#14385c"/>
+<text class="s38" x="372" y="318">n = &#945;/&#946;</text>
+<rect x="120" y="150" width="250" height="26" rx="5" fill="#fdf3e7" stroke="#b86b1f" stroke-width="1.2"/>
+<text class="reg38" x="245" y="168">latency-bound: T &#8776; &#945;</text>
+<rect x="470" y="150" width="270" height="26" rx="5" fill="#e9f5ee" stroke="#1f7a4d" stroke-width="1.2"/>
+<text class="reg38" x="605" y="168">bandwidth-bound: T &#8776; n&#946;</text>
+</svg>
+<figcaption><strong>Figure 3.8.1:</strong> The alpha-beta cost of one message as a function of message size $n$. The flat orange line is the fixed latency $\alpha$; the rising green line is the bandwidth term $n\beta$; their sum (dashed) is the actual transfer time. The two terms are equal at $n = \alpha/\beta$, which splits the plane into a latency-bound region on the left (tiny messages, cost set by message count) and a bandwidth-bound region on the right (large messages, cost set by total bytes). Section 4 confirms this crossover with a measured table.</figcaption>
+</figure>
+<p>Multiplying message count by per-message cost gives the ring all-reduce time under the alpha-beta model. Each of the $2(K-1)$ messages costs $\alpha + (n/K)\beta$, so</p>
+$$T_{\text{ring}}(n, K) = \underbrace{2(K-1)\,\alpha}_{\text{latency term}} + \underbrace{\frac{2(K-1)}{K}\, n\,\beta}_{\text{bandwidth term}}.$$
+<p>The bandwidth term is the remarkable one. The factor $2(K-1)/K = 2 - 2/K$ rises from $1$ at $K=2$ toward $2$ as $K$ grows, and then stays there: doubling the number of workers from 512 to 1024 barely changes it. So the bytes-on-the-wire cost of a ring all-reduce is essentially $2n\beta$, independent of how many workers participate. That near-independence is exactly why ring all-reduce scaled deep learning to thousands of GPUs. The price you pay for it is the latency term $2(K-1)\alpha$, which grows linearly with $K$: more workers means more hops around the ring, each costing one $\alpha$. The whole behavior of the collective is a tug-of-war between a bandwidth term that ignores $K$ and a latency term that scales with it.</p>
+
+<h2>3. Modeling All-Reduce in Code <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The formula is easy to mistrust until you watch the two terms move. The program below fixes a representative interconnect ($\alpha = 5$ microseconds, $1/\beta = 100$ gigabytes per second), implements $T_{\text{ring}}(n, K)$ directly, and then does two things: it holds the message size fixed and sweeps the worker count $K$ to show the bandwidth term flattening, then it holds $K$ fixed and sweeps the message size $n$ to show the crossover from latency-bound to bandwidth-bound. No network is involved; this is the cost model itself, evaluated.</p>
+<pre><code class="language-python">import numpy as np
+
+# alpha-beta model parameters for one representative GPU interconnect.
+alpha = 5e-6        # per-message latency: 5 microseconds
+beta  = 1.0 / 100e9 # inverse bandwidth: 1 / (100 GB/s), seconds per byte
+
+def ring_allreduce_time(n_bytes, K):
+    """Ring all-reduce of an n_bytes buffer across K workers.
+
+    2*(K-1) steps total (reduce-scatter then all-gather), each moving a
+    1/K slice. Bandwidth term ~ 2*(K-1)/K * n*beta (nearly K-independent);
+    latency term 2*(K-1)*alpha grows with K.
+    """
+    lat = 2 * (K - 1) * alpha
+    bw  = 2 * (K - 1) / K * n_bytes * beta
+    return lat, bw, lat + bw
+
+# (1) Bandwidth term is nearly independent of K; latency term grows with K.
+n = 100 * 1024**2   # 100 MiB gradient buffer
+print(f"Ring all-reduce of a {n//1024//1024} MiB buffer, latency vs bandwidth split:")
+print(f"{'K':&gt;5} {'latency(ms)':&gt;12} {'bandwidth(ms)':&gt;14} {'total(ms)':&gt;11} {'BW factor 2(K-1)/K':&gt;20}")
+for K in [2, 4, 8, 16, 64, 256, 1024]:
+    lat, bw, tot = ring_allreduce_time(n, K)
+    print(f"{K:&gt;5} {lat*1e3:&gt;12.4f} {bw*1e3:&gt;14.3f} {tot*1e3:&gt;11.3f} {2*(K-1)/K:&gt;20.4f}")
+
+# (2) Crossover from latency-bound to bandwidth-bound as message size grows.
+K = 16
+crossover = None
+for n in [64, 1024, 16*1024, 256*1024, 4*1024**2, 64*1024**2, 1024**3]:
+    lat, bw, tot = ring_allreduce_time(n, K)
+    regime = "latency-bound" if lat &gt; bw else "bandwidth-bound"
+    if crossover is None and bw &gt;= lat:
+        crossover = n
+    # ... printed per row in the full script
+</code></pre>
+<div class="code-caption"><strong>Code 3.8.1:</strong> The alpha-beta cost model for ring all-reduce, evaluated rather than measured. The first loop sweeps worker count $K$ at a fixed 100 MiB buffer; the second sweeps message size $n$ at a fixed $K=16$ to locate the latency-to-bandwidth crossover.</div>
+<pre><code class="language-text">alpha (latency)        : 5.0 us
+beta  (inverse BW)     : 1.00e-11 s/byte  (100 GB/s)
+
+Ring all-reduce of a 100 MiB buffer, latency vs bandwidth split:
+    K  latency(ms)  bandwidth(ms)   total(ms)   BW factor 2(K-1)/K
+    2       0.0100          1.049       1.059               1.0000
+    4       0.0300          1.573       1.603               1.5000
+    8       0.0700          1.835       1.905               1.7500
+   16       0.1500          1.966       2.116               1.8750
+   64       0.6300          2.064       2.694               1.9688
+  256       2.5500          2.089       4.639               1.9922
+ 1024      10.2300          2.095      12.325               1.9980
+
+Crossover for K=16: regime is latency-bound until n*beta per slice
+       bytes  latency(ms)  bandwidth(ms)           regime
+          64       0.1500         0.0000    latency-bound
+        1024       0.1500         0.0000    latency-bound
+       16384       0.1500         0.0003    latency-bound
+      262144       0.1500         0.0049    latency-bound
+     4194304       0.1500         0.0786    latency-bound
+    67108864       0.1500         1.2583  bandwidth-bound
+  1073741824       0.1500        20.1327  bandwidth-bound
+
+Latency and bandwidth terms cross near n = 65536 KiB for K=16.
+Below the crossover, more messages (latency) dominate; above it, bytes (bandwidth) dominate.</code></pre>
+<div class="code-caption"><strong>Output 3.8.1:</strong> Real output from the model. In the first block the bandwidth column climbs from 1.05 ms toward a ceiling near 2.1 ms and then stops, while the latency column grows without bound, exactly tracking the $2(K-1)\alpha$ versus $2n\beta$ split. In the second block the regime label flips between 4 MiB and 64 MiB, locating the measured crossover.</div>
+<p>Read the first block as a story about scaling out. For a large gradient buffer the bandwidth term is the same 2 milliseconds whether you use 8 workers or 1024, which is the property that lets data-parallel training add machines almost for free as far as the payload is concerned. The total time still grows, but only through the latency term, which climbs from 0.07 ms at $K=8$ to 10.2 ms at $K=1024$. For small buffers, where the bandwidth term is tiny, that latency growth is the entire cost, and it is why synchronizing many small tensors separately is far slower than fusing them into one large transfer, a real optimization that <a href="../module-04-communication-primitives/index.html">Chapter 4</a> calls gradient bucketing.</p>
+
+<h2>4. Bandwidth-Bound and Latency-Bound Regimes <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The second block of Output 3.8.1 is the practical heart of the section. Holding $K$ fixed and growing the message, the cost is flat (set entirely by $2(K-1)\alpha$) until the message is large, then rises linearly (set by $2n\beta/K \cdot K$, the bandwidth term). The label flips from latency-bound to bandwidth-bound between a 4 MiB and a 64 MiB buffer, which is the crossover that Figure 3.8.1 drew abstractly. A workload that lives to the left of this crossover, exchanging many small messages, is <strong>latency-bound</strong>: its time is dominated by message count, and the remedy is to send fewer, larger messages or to use an algorithm with fewer hops. A workload to the right is <strong>bandwidth-bound</strong>: its time is dominated by total bytes, and the remedy is to move fewer bytes (gradient compression, lower precision) or to buy more bandwidth.</p>
+<p>This single distinction decides which collective algorithm you should choose, and the choice flips with scale. Ring all-reduce minimizes the bandwidth term but pays $2(K-1)\alpha$ in latency, so it is the right tool for large messages on moderate worker counts but degrades when $K$ is huge and messages are small. A tree- or recursive-halving all-reduce has a latency term that grows only like $\log K$, so it wins in the latency-bound regime even though it moves more bytes. There is no universally best collective; there is only the algorithm whose dominant term matches the regime your message size and worker count put you in, and the alpha-beta model is what tells you which regime that is before you run anything.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Tax Collector Always Takes Two Cuts</div>
+<p>Think of $\alpha$ as a flat toll at the on-ramp and $\beta$ as a per-mile charge. A quick hop to the corner store is all toll and no mileage; a cross-country haul is all mileage and the toll rounds to nothing. The mistake distributed systems make again and again is paying the on-ramp toll thousands of times for thousands of tiny trips when one big truck would have done. Fusing small tensors into one all-reduce is the truck.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Let nccl-tests Measure Your Real Alpha and Beta</div>
+<p>You do not have to guess $\alpha$ and $\beta$ for your cluster; NVIDIA's <code>nccl-tests</code> measures them. Running the all-reduce benchmark sweeps the message size and reports, for each size, the time and an "algorithm bandwidth" plus a "bus bandwidth" that already folds in the $2(K-1)/K$ factor of the ring, so the reported bus bandwidth approaches $1/\beta$ for large messages:</p>
+<pre><code class="language-bash"># Build once, then run an all-reduce sweep across the visible GPUs.
+# -b start size, -e end size, -f doubling factor, -g GPUs per process.
+./build/all_reduce_perf -b 8 -e 1G -f 2 -g 8
+# Output columns: size(B)  time(us)  algbw(GB/s)  busbw(GB/s)
+#  small sizes  -> time ~ constant   (you are reading alpha, latency-bound)
+#  large sizes  -> busbw -> plateau  (you are reading 1/beta, bandwidth-bound)
+</code></pre>
+<div class="code-caption"><strong>Code 3.8.2:</strong> One <code>nccl-tests</code> command replaces a hand-built benchmark. The flat small-size times give your real $\alpha$; the large-size bus-bandwidth plateau gives your real $1/\beta$. PyTorch's profiler reports the same bus-bandwidth figure for the collectives inside a training step.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The All-Reduce That Stopped Scaling at 256 GPUs</div>
+<p><strong>Who:</strong> A systems engineer scaling a data-parallel language-model training job from 64 to 256 GPUs.</p>
+<p><strong>Situation:</strong> Each step synchronized gradients with ring all-reduce, and at 64 GPUs the per-step communication time was a comfortable 2 milliseconds.</p>
+<p><strong>Problem:</strong> At 256 GPUs the step time ballooned even though the model, and therefore the total gradient bytes, had not changed at all.</p>
+<p><strong>Dilemma:</strong> Buy a faster interconnect to raise bandwidth (cutting $\beta$), or change how gradients were communicated, without yet knowing which term had grown.</p>
+<p><strong>Decision:</strong> They applied the alpha-beta model first. The model said the bandwidth term was nearly fixed at $2n\beta$ regardless of $K$, so the regression had to be the latency term $2(K-1)\alpha$, made worse because the framework was firing a separate small all-reduce per layer.</p>
+<p><strong>How:</strong> They fused gradients into a few large buckets (raising $n$ per message so the bandwidth term dominated) and switched short messages to a tree all-reduce whose latency grows like $\log K$ rather than $K$.</p>
+<p><strong>Result:</strong> Per-step communication returned to a few milliseconds at 256 GPUs, and the predicted versus measured times agreed within the model's usual margin, confirming the diagnosis was the latency term, not bandwidth.</p>
+<p><strong>Lesson:</strong> When a collective stops scaling, the alpha-beta model tells you which term grew, and the regime (latency-bound versus bandwidth-bound) tells you which fix to reach for. Buying bandwidth would have wasted money on a latency problem.</p>
+</div>
+
+<h2>5. Why This Is the Backbone for Later Chapters <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The alpha-beta model is not a self-contained curiosity; it is the costing function that every later parallelism decision plugs into. When <a href="../module-04-communication-primitives/index.html">Chapter 4</a> compares ring, tree, and recursive-halving all-reduce, it is comparing their $\alpha$ and $\beta$ terms under the model you just built. When <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a> chooses how to split a model across data, tensor, pipeline, and expert dimensions (the so-called 3D parallelism), the trade-off between those dimensions is fundamentally a trade-off between collectives with different message sizes and worker counts, and the alpha-beta cost of each is what makes one layout faster than another. Tensor parallelism does frequent small all-reduces (latency-sensitive, so it wants the fastest intra-node links), while data parallelism does infrequent large ones (bandwidth-sensitive, so it tolerates slower inter-node links). That entire placement logic is the alpha-beta model applied to each collective in turn.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Communication Tax, Now Quantified</div>
+<p><a href="../module-01-scale-out-ai/section-1.1.html">Section 1.1</a> named communication as the tax on scale-out and promised to make it a number you could compute. This section is that promise kept: $T_{\text{ring}}(n,K) = 2(K-1)\alpha + \frac{2(K-1)}{K}n\beta$. From here on, whenever a chapter introduces a parallel method, you can ask which collective it relies on, what its message size and worker count are, and therefore whether it is latency-bound or bandwidth-bound. That question, answered with two constants, is how this book turns "should I distribute this, and how?" into arithmetic rather than folklore. <a href="section-3.9.html">Section 3.9</a> folds this communication cost into a full efficiency-and-cost accounting.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Squeezing the Alpha-Beta Cost (2024 to 2026)</div>
+<p>Because the alpha-beta model exposes exactly which term hurts, current systems research attacks each term separately. On the bandwidth ($\beta$) side, in-network aggregation pushes the reduce into the switch fabric so the data crosses the network roughly once instead of twice; NVIDIA's SHARP and successor designs report effective bandwidth gains for large all-reduces, and low-precision collectives (FP8 and below) shrink $n$ directly. On the latency ($\alpha$) side, work on overlapping communication with computation and on fused, fewer-message collectives in libraries such as recent NCCL releases and the Transformer Engine targets the $2(K-1)\alpha$ hop count that limits tensor-parallel layers. A third thread, communication-avoiding and local-update training in the DiLoCo lineage (Douillard et al., 2024), changes the message frequency itself so the collective fires far less often, trading a little statistical efficiency for a large cut in total $\alpha$ paid. We return to the optimization-side of that trade in <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a>; the point here is that every one of these advances is legible as lowering $\alpha$, lowering $\beta$, or lowering how often you pay either.</p>
+</div>
+<p>You now have the third performance wall to set beside compute and memory: the network, modeled as $\alpha + n\beta$ per message and assembled into collective costs whose dominant term you can read off in advance. The next section, <a href="section-3.9.html">Section 3.9</a>, combines this communication cost with the compute and scaling laws of the rest of the chapter into a single accounting of scaling efficiency and dollars, so that the question "how many machines should I use?" becomes one you answer with a cost curve rather than a hunch.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 3.8.1: Find the Crossover <span class="exercise-type analysis">Analysis</span></div>
+<p>For the interconnect in Code 3.8.1 ($\alpha = 5$ microseconds, $1/\beta = 100$ gigabytes per second), the single-message crossover sits at $n = \alpha/\beta$. Compute it in bytes and state whether a 1 KiB control message and a 50 MiB gradient buffer each fall in the latency-bound or bandwidth-bound regime. Then explain, using the ring all-reduce formula, why the crossover for the <em>collective</em> at $K = 16$ in Output 3.8.1 lands at a much larger message size than the single-message crossover does.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 3.8.2: Ring versus Tree <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 3.8.1 with a second cost function for a tree (recursive-halving) all-reduce whose latency term is $2\lceil\log_2 K\rceil\,\alpha$ and whose bandwidth term is the same $\frac{2(K-1)}{K}n\beta$ as the ring. For $K \in \{8, 64, 1024\}$ and message sizes from 1 KiB to 1 GiB, print which algorithm is faster in each cell. Identify the region of the (message size, $K$) plane where the tree wins, and explain in one sentence why it wins there in terms of which term dominates.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 3.8.3: Will Adding Workers Help? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A data-parallel training step does $C$ seconds of compute per worker and one ring all-reduce of a fixed $P$-parameter gradient (4 bytes each). Using the alpha-beta cost, write the per-step time as compute plus communication and argue from the two terms whether doubling $K$ from 128 to 256 speeds the step up, leaves it roughly unchanged, or slows it down, assuming the compute per worker stays fixed. State the condition on $\alpha$, $\beta$, $P$, and $C$ under which communication overtakes compute, and connect it to the communication-to-computation ratio that <a href="../module-05-evaluating-distributed-ai/index.html">Chapter 5</a> uses to evaluate distributed systems.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-3.7.html"><span class="nav-label">Previous</span><span class="nav-num">Section 3.7</span><span class="nav-title">The Roofline Model</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 3</span><span class="nav-num">Contents</span><span class="nav-title">Scalability and Performance Models</span></a>
+<a class="next" href="section-3.9.html"><span class="nav-label">Next</span><span class="nav-num">Section 3.9</span><span class="nav-title">Scaling Efficiency and Cost-Awareness</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

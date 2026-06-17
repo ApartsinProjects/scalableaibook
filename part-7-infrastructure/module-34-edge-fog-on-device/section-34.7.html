@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 34.7: Latency-Critical Distributed AI. Hard and soft real-time at the edge, the sense-infer-actuate latency budget, why the tail (p99/p999) is the thing that matters for safety, and how distribution is both the cause and the cure of tail latency." name="description"/>
+<title>Section 34.7: Latency-Critical Distributed AI | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Cluster, Edge, and Reliable Infrastructure</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 34: Edge, Fog, and On-Device Distributed AI</a></div>
+<h1>Latency-Critical Distributed AI</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"My average response time is excellent. I would like that engraved on the wreckage, next to the one request out of a thousand that arrived after the airbag had already decided."</p>
+<cite>A Control Loop, Counting Milliseconds Until It Must Act</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>When an AI system has to act before a physical deadline, correctness is no longer enough; the answer must arrive in time, and "in time" is governed not by the average latency but by the worst latency the system will plausibly produce.</strong> A self-driving car, an augmented-reality headset, a robot arm, and a trading engine all share one constraint that ordinary batch and serving systems do not: there is a clock, the clock does not wait, and a correct decision delivered late is a wrong decision. This section makes the latency budget explicit, decomposes it into the stages between sensing and acting, and argues that the tail of the latency distribution (the p99 and p999), not its center, is the quantity safety depends on. Distribution is the double-edged tool throughout: pushing inference across a network adds tail latency, yet the standard cures for tail latency, replication, hedging, and edge placement, are themselves distributed-systems techniques. Section 34.1 named latency as a driver for moving compute to the edge; here we turn that driver into a budget you can decompose, measure, and engineer.</p>
+</div>
+<p>Every system in the earlier parts of this book optimized throughput: gradients per second, tokens per second, queries per second served by a fleet. A latency-critical system inverts the objective. It may serve only a handful of requests per second, but each one carries a deadline measured in milliseconds, and missing the deadline has a consequence in the physical world rather than a slightly slower dashboard. The relevant question stops being "how many requests can we serve?" and becomes "what is the latest possible moment a request could finish, and is that moment before the deadline?" That shift, from the center of the latency distribution to its far-right tail, reorganizes every design choice that follows.</p>
+<p>The setting is the edge, because that is where deadlines and physics meet. A perception model that steers a car cannot wait for a round trip to a regional data center; an AR renderer that lags the wearer's head motion induces nausea within tens of milliseconds; a programmable logic controller running a learned policy on a factory line samples and actuates on a fixed cycle. These systems were introduced as a class in <a href="section-34.1.html">Section 34.1</a>, where latency was one of the four forces pushing computation off the cloud. We now treat that force quantitatively, with the evaluation vocabulary built in <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/index.html">Chapter 5</a> and the performance models of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>.</p>
+
+<h2>1. Hard, Firm, and Soft Real Time <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The word "real-time" is overloaded, and the distinctions matter because they dictate how aggressively you must engineer the tail. A <em>hard</em> real-time system treats a missed deadline as a total failure: the value of a result drops to zero, or below zero, the instant the deadline passes. An anti-lock braking controller and an airbag trigger are hard real-time; a late decision is not a degraded decision but a dangerous one. A <em>firm</em> real-time system also assigns zero value to a late result, but a missed deadline is merely a dropped frame rather than a catastrophe, so an occasional miss is tolerable if it is rare enough. A <em>soft</em> real-time system assigns declining but positive value to late results: a recommendation that arrives 200 milliseconds late is worse than a prompt one, yet still useful.</p>
+<p>Most edge AI lives in the firm and soft regimes, with hard real-time reserved for the innermost safety loops, which are frequently kept on a small certified controller separate from the learned model. The practical consequence is a budget with a probability attached. A hard requirement reads "latency must never exceed $D$." A firm requirement reads "latency must exceed $D$ no more than once in $10^{4}$ frames," which is precisely a statement about the p99.99 of the latency distribution. This is why, for AI systems specifically, the tail percentile is the natural specification: learned models on general-purpose hardware cannot offer a true worst-case guarantee, so we engineer a percentile and bound the miss rate instead.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Specification Is a Tail Percentile, Not an Average</div>
+<p>A latency-critical AI system is specified by a deadline and a permitted miss rate together: "p99 under 20 ms" or "no more than one frame in $10^{5}$ exceeds 30 ms." The mean latency is nearly irrelevant to this specification and can be actively misleading, because the cheap optimization that halves the mean (a faster common path) often does nothing for the rare slow path that actually breaches the deadline. Every technique in this section is aimed at the tail, and you should distrust any latency claim reported as an average.</p>
+</div>
+
+<h2>2. The Sense-Infer-Actuate Budget <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>An edge AI system closes a loop: it senses the world, infers a decision, and actuates. The deadline applies to the whole loop, so the engineering task is to decompose the end-to-end budget into its stages, attribute a slice of the budget to each, and find the stage whose tail dominates. Write the end-to-end latency as the sum of the per-stage latencies,</p>
+$$L_{\text{e2e}} = L_{\text{sense}} + L_{\text{net,up}} + L_{\text{queue}} + L_{\text{infer}} + L_{\text{net,down}} + L_{\text{act}},$$
+<p>where $L_{\text{sense}}$ is sensor capture and preprocessing, $L_{\text{net,up}}$ and $L_{\text{net,down}}$ are network transfers if any stage runs off-device, $L_{\text{queue}}$ is time waiting for a busy accelerator, $L_{\text{infer}}$ is the model forward pass, and $L_{\text{act}}$ is command transmission and actuation. The deadline requires $L_{\text{e2e}} \le D$ with the agreed probability. Figure 34.7.1 lays out one such budget as a waterfall and contrasts an on-device path against a path that crosses the network to a fog or cloud server.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A latency budget waterfall comparing an on-device path that fits inside a thirty millisecond deadline with an off-device path whose network round trip and queueing push it past the deadline.">
+<defs>
+<marker id="arr347" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.ax347 { stroke:#5a626c; stroke-width:1.2; }
+.tk347 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.lb347 { font:600 13px sans-serif; fill:#14385c; }
+.cap347 { font:11.5px sans-serif; fill:#5a626c; }
+.dl347 { stroke:#b3261e; stroke-width:1.6; stroke-dasharray:5 4; }
+.dlt347 { font:600 12px sans-serif; fill:#b3261e; text-anchor:middle; }
+.sense { fill:#cfe3d6; stroke:#3c6b4d; stroke-width:1; }
+.net   { fill:#f6d9b8; stroke:#b86b1f; stroke-width:1; }
+.queue { fill:#e9d3e6; stroke:#8a4f86; stroke-width:1; }
+.infer { fill:#bcd2ec; stroke:#14385c; stroke-width:1; }
+.act   { fill:#d9d9d9; stroke:#5a626c; stroke-width:1; }
+.seg347 { font:10.5px sans-serif; fill:#1d2b3a; text-anchor:middle; }
+</style>
+<!-- scale: x = 60 + ms*16, 1 ms = 16 px, deadline at 30 ms -->
+<line class="ax347" x1="60" y1="300" x2="820" y2="300"/>
+<line class="dl347" x1="540" y1="60" x2="540" y2="310"/>
+<text class="dlt347" x="540" y="328">deadline D = 30 ms</text>
+<text class="tk347" x="60" y="318">0</text>
+<text class="tk347" x="220" y="318">10</text>
+<text class="tk347" x="380" y="318">20</text>
+<text class="tk347" x="700" y="318">40</text>
+<text class="tk347" x="820" y="318">47</text>
+<!-- On-device row (y=110) -->
+<text class="lb347" x="60" y="100">On-device path  (p99 = 18 ms, inside budget)</text>
+<rect class="sense" x="60"  y="112" width="64"  height="34"/><text class="seg347" x="92"  y="133">sense 4</text>
+<rect class="queue" x="124" y="112" width="32"  height="34"/><text class="seg347" x="140" y="133">q 2</text>
+<rect class="infer" x="156" y="112" width="160" height="34"/><text class="seg347" x="236" y="133">infer 10</text>
+<rect class="act"   x="316" y="112" width="32"  height="34"/><text class="seg347" x="332" y="133">act 2</text>
+<!-- Off-device row (y=200) -->
+<text class="lb347" x="60" y="190">Off-device path  (p99 = 43 ms, misses budget)</text>
+<rect class="sense" x="60"  y="202" width="64"  height="34"/><text class="seg347" x="92"  y="223">sense 4</text>
+<rect class="net"   x="124" y="202" width="128" height="34"/><text class="seg347" x="188" y="223">net up 8</text>
+<rect class="queue" x="252" y="202" width="128" height="34"/><text class="seg347" x="316" y="223">queue 8</text>
+<rect class="infer" x="380" y="202" width="208" height="34"/><text class="seg347" x="484" y="223">infer 13</text>
+<rect class="net"   x="588" y="202" width="128" height="34"/><text class="seg347" x="652" y="223">net down 8</text>
+<rect class="act"   x="716" y="202" width="32"  height="34"/><text class="seg347" x="732" y="223">act 2</text>
+<!-- breach marker -->
+<path class="ax347" d="M 748 219 L 800 219" marker-end="url(#arr347)" fill="none"/>
+<text class="cap347" x="806" y="216">late</text>
+<text class="cap347" x="60" y="262">The two network hops and the server-side queue add 24 ms of tail; the same model that fits the budget on-device</text>
+<text class="cap347" x="60" y="278">breaches it once it has to cross the network. Distribution moved the work, and the move cost a deadline.</text>
+</svg>
+<figcaption><strong>Figure 34.7.1:</strong> The sense-infer-actuate budget as a waterfall. The on-device path (top) keeps every stage local and finishes at 18 ms, comfortably inside the 30 ms deadline. The off-device path (bottom) runs the same inference on a faster fog server but pays two network hops and a server-side queue, pushing $L_{\text{e2e}}$ to 43 ms and breaching the deadline. The figure makes the central tension concrete: distribution can supply more compute yet add the very tail latency the deadline cannot absorb.</figcaption>
+</figure>
+<p>The waterfall exposes the first design lever. Moving inference to a more powerful fog or cloud server shrinks $L_{\text{infer}}$ but introduces $L_{\text{net,up}}$, $L_{\text{net,down}}$, and a server-side $L_{\text{queue}}$ that the on-device path never paid. For a tight deadline the network terms frequently dominate, which is the quantitative core of the argument in <a href="section-34.1.html">Section 34.1</a> that latency drives computation toward the device. Local inference is, before anything clever, the simplest tail-latency technique there is: it deletes the two network terms from the sum.</p>
+
+<h2>3. Tail Latency Is the Thing That Matters <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The reason the tail, rather than the mean, governs a latency-critical system is structural, and it sharpens the moment the system is distributed. Consider a request that must gather results from $n$ components before it can act: a scatter-gather over $n$ sensor shards, an ensemble of $n$ models, or a pipeline of $n$ network hops that must all complete. The request finishes only when the slowest component finishes, so its latency is the maximum of $n$ latencies. If each component independently exceeds a threshold $t$ with probability $p$, the probability that at least one of them does, and therefore that the whole request is slow, is</p>
+$$P(\text{request slow}) = 1 - (1-p)^{n} \approx np \quad \text{for small } p.$$
+<p>A one-percent chance of a slow component is negligible on its own, but across $n = 100$ components it becomes a $1 - 0.99^{100} \approx 63\%$ chance that <em>some</em> component is slow, and the request waits for it. This is the <em>tail-at-scale</em> effect identified by Dean and Barroso: fanning a request out across many machines amplifies the rare slow case into the common case, so a system whose components each have an excellent p99 can have a terrible p99 as a whole. Distribution, the very thing that supplies the parallel compute, is what manufactures the tail. We met the same percentile vocabulary as a serving concern in <a href="../../part-5-distributed-inference/module-23-distributed-inference-systems/index.html">Chapter 23</a>; here the consequence is a missed physical deadline rather than a slow page.</p>
+<p>Two further properties of the tail matter at the edge. <em>Jitter</em>, the variation in latency from one cycle to the next, is as harmful as raw latency for a control loop, because a controller tuned for a fixed sample interval becomes unstable when that interval wanders. <em>Determinism</em>, a small and predictable spread, is therefore often worth more than a lower mean: a model that always answers in 18 to 20 ms is more useful to a control loop than one that averages 12 ms but occasionally takes 90. Real-time operating systems, pinned cores, and disabled power-management states all buy determinism by trimming the tail, even at some cost to the average.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The AR Headset That Was Fast on Average and Sick-Making in Practice</div>
+<p><strong>Who:</strong> A systems engineer on an augmented-reality team shipping a hand-tracking interaction model.</p>
+<p><strong>Situation:</strong> The motion-to-photon path had to stay under 20 ms or wearers reported discomfort within minutes; the team's dashboard showed a healthy 11 ms mean.</p>
+<p><strong>Problem:</strong> Field reports of nausea persisted despite the good average, and nobody could reproduce it on the bench.</p>
+<p><strong>Dilemma:</strong> Chase a lower mean by shrinking the model further, sacrificing tracking accuracy, or investigate the distribution and risk finding nothing actionable.</p>
+<p><strong>Decision:</strong> They instrumented the full path and looked at the p99 and p999 instead of the mean, following the evaluation discipline of <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/index.html">Chapter 5</a>.</p>
+<p><strong>How:</strong> Tracing revealed a p999 of 74 ms caused by the inference thread sharing a core with the compositor and losing the scheduler lottery a few times per second; the mean hid it completely.</p>
+<p><strong>Result:</strong> Pinning inference to a dedicated core and disabling dynamic frequency scaling cut the p999 to 19 ms with no change to the model, and the field reports stopped.</p>
+<p><strong>Lesson:</strong> The mean was never the symptom. A latency-critical system is debugged at the tail, and the cure was a determinism fix, not a speed fix.</p>
+</div>
+
+<h2>4. Engineering the Tail: Deadlines, Hedging, Anytime Models <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Three families of technique cut or contain the tail, and they compose. The first is <em>deadline-aware scheduling</em>: every request carries its remaining time budget, the scheduler orders work by earliest deadline first, and any request whose deadline has already passed is dropped rather than computed, because a late answer has no value and only delays the next one. This turns the deadline from a hope into an input the system reasons about, and it is the firm-real-time analogue of the serving SLOs that govern queue admission in <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>.</p>
+<p>The second is <em>redundant, hedged requests</em>, the distributed cure for the distributed disease. Instead of sending one request and praying it is not the slow one, send the same request to two replicas and act on whichever returns first, cancelling the other. Because a slow outcome on a single call has probability $p$, a slow outcome on the faster of two independent calls has probability $p^{2}$ when the deadline is past both, so a 2% tail becomes roughly a 0.04% tail. Hedging spends extra capacity, typically well under a full doubling if the second request is delayed slightly and fired only when the first is late, to buy a dramatically thinner tail. It is the same insight that motivates straggler mitigation by speculative re-execution in <a href="../../part-4-parallel-deep-learning/module-18-elastic-fault-tolerant-training/index.html">Chapter 18</a>, applied now to a real-time deadline.</p>
+<p>The third is the model-side guarantee: an <em>anytime</em> or <em>early-exit</em> model that always has a usable answer ready by the deadline, refining it only while time remains. An early-exit network attaches classifier heads to intermediate layers and returns from the first head confident enough, or from whichever head the clock reaches; a cascade runs a tiny model first and escalates to a larger one only if the budget allows. The contract inverts the usual one: rather than promising a fixed-quality answer at variable latency, an anytime model promises a fixed deadline at variable quality, which is exactly the contract a hard clock wants. We can now state the tail-at-scale relation and its hedged remedy together.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Distribution Is Both the Tail and Its Cure</div>
+<p>This section is the cleanest statement of a tension that runs through the whole book. Scattering a request across $n$ machines multiplies the chance that one is slow, $1 - (1-p)^n$, so distribution <em>creates</em> tail latency; replicating a request across redundant machines and taking the first reply, $p^2$ for a hedge of two, so distribution <em>removes</em> tail latency. The same primitive, sending work to more than one machine, is the problem when the answer needs all of them and the solution when it needs any of them. Every later reliability technique, from the Byzantine-robust aggregation of <a href="../module-35-reliable-secure-distributed-ai/index.html">Chapter 35</a> to the deadline-driven control of robots in <a href="section-34.8.html">Section 34.8</a>, is a choice about which side of that line a given request sits on.</p>
+</div>
+
+<h2>5. Watching Hedging Cut the Tail <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The argument so far is analytic; the demonstration below makes it concrete by simulation. We model per-call latency as a fast body plus a 2% heavy tail, the signature of a system where most calls are quick but a few hit a garbage-collection pause, a queued accelerator, or a congested link. We then measure three regimes against a 30 ms deadline: a single call, a scatter-gather that waits for the slowest of $n$ parallel calls (the tail-at-scale effect), and a hedge that fires two calls and takes the first to return.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+TRIALS = 200_000
+
+# Per-call latency (ms): a fast body plus a heavy 2% tail. The tail is the
+# straggler: a GC pause, a queued accelerator, a cold edge node, a slow link.
+def sample_latency(size):
+    body = rng.lognormal(mean=np.log(8.0), sigma=0.35, size=size)   # ~8 ms typical
+    slow = rng.random(size) < 0.02                                  # 2% are stragglers
+    body[slow] += rng.uniform(60.0, 140.0, size=slow.sum())         # +60..140 ms tail
+    return body
+
+pct = lambda x, q: np.percentile(x, q)
+
+single = sample_latency(TRIALS)                                     # one call
+print(f"single call          p50={pct(single,50):6.1f}  p99={pct(single,99):6.1f}  p999={pct(single,99.9):6.1f}")
+
+# Scatter-gather: wait for the SLOWEST of n calls -> tail amplification.
+for n in (2, 5, 10):
+    worst = np.max(sample_latency((TRIALS, n)), axis=1)
+    print(f"max of n={n:<2d} calls    p50={pct(worst,50):6.1f}  p99={pct(worst,99):6.1f}  p999={pct(worst,99.9):6.1f}")
+
+# Hedge: fire 2 calls, take the FIRST -> tail suppression.
+hedged = np.min(sample_latency((TRIALS, 2)), axis=1)
+print(f"hedged (first of 2)  p50={pct(hedged,50):6.1f}  p99={pct(hedged,99):6.1f}  p999={pct(hedged,99.9):6.1f}")
+
+budget = 30.0                                                       # deadline accounting
+print(f"\ndeadline = {budget:.0f} ms")
+print(f"  single call   miss rate : {100*np.mean(single > budget):5.2f} %")
+print(f"  max of 5      miss rate : {100*np.mean(np.max(sample_latency((TRIALS,5)),axis=1) > budget):5.2f} %")
+print(f"  hedged(2)     miss rate : {100*np.mean(hedged > budget):5.2f} %")
+</code></pre>
+<div class="code-caption"><strong>Code 34.7.1:</strong> A tail-latency simulator. The single-call, scatter-gather (max of $n$), and hedged (first of two) regimes are measured on the identical latency model so the percentiles and deadline miss rates are directly comparable.</div>
+<pre><code class="language-text">single call          p50=   8.1  p99= 109.4  p999= 144.0
+max of n=2  calls    p50=   9.8  p99= 128.6  p999= 146.6
+max of n=5  calls    p50=  12.2  p99= 140.6  p999= 149.6
+max of n=10 calls    p50=  14.3  p99= 144.5  p999= 151.4
+
+deadline = 30 ms
+  single call   miss rate :  2.01 %
+  max of 5      miss rate :  9.62 %
+  hedged(2)     miss rate :  0.04 %
+</code></pre>
+<div class="code-caption"><strong>Output 34.7.1:</strong> The median barely moves across regimes, yet the deadline behavior diverges sharply. Scattering to five replicas and waiting for all of them lifts the miss rate from 2.01% to 9.62%, exactly the tail-at-scale amplification of $1-(1-p)^n$. Hedging two calls and taking the first drops the miss rate to 0.04%, a fiftyfold improvement, while pulling the p99 from 109 ms down to 13 ms.</div>
+<p>The output is the section in miniature. The median latency is nearly identical in every regime, so a mean-based dashboard would call all four systems equivalent. The deadline miss rate is not equivalent at all: scatter-gather over five replicas nearly quintuples it, while a two-way hedge cuts it by a factor of fifty and brings the p99 below the deadline. The expensive resource, an extra replica's worth of work, bought a thin tail rather than a faster average, which is the only trade that a latency-critical system is willing to make. Notice also that the hedge spends compute it usually does not need; in practice the second call is delayed by a tied-request timer so it fires only when the first is already running late, recovering most of the benefit at a fraction of the cost.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: gRPC and Envoy Hedge for You</div>
+<p>Code 34.7.1 implemented hedging by hand to expose the mechanism. In production you rarely write the racing logic yourself: modern RPC stacks expose hedging and deadline propagation as configuration. A gRPC service method can declare a hedging policy in a few lines of service config, and the Envoy proxy supports request hedging and per-try timeouts at the mesh layer, so every call inherits the behavior without touching application code:</p>
+<pre><code class="language-python"># gRPC service config (JSON), attached at channel creation.
+service_config = {
+  "methodConfig": [{
+    "name": [{"service": "perception.Inference"}],
+    "timeout": "0.030s",                       # 30 ms end-to-end deadline
+    "hedgingPolicy": {
+      "maxAttempts": 2,                         # fire a 2nd call if the 1st is slow
+      "hedgingDelay": "0.012s"                  # ... but only after 12 ms (tied-request timer)
+    }
+  }]
+}
+channel = grpc.insecure_channel(target, options=[
+    ("grpc.service_config", json.dumps(service_config)),
+    ("grpc.enable_retries", 1),
+])
+</code></pre>
+<div class="code-caption"><strong>Code 34.7.2:</strong> The hedge of Output 34.7.1 as gRPC configuration. The roughly twenty lines of manual racing, cancellation, and deadline tracking collapse to a declarative policy; the framework propagates the deadline across hops, fires the tied request after the delay, and cancels the loser, with the same tail behavior the simulation predicted.</div>
+</div>
+
+<h2>6. Where the Deadlines Bite: Applications <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The techniques above earn their cost in four recurring settings, and naming them grounds the abstraction. <em>Autonomous driving</em> runs a perception-prediction-planning loop on-vehicle at frame rate; the perception model must clear its budget every frame because the planner downstream cannot act on a frame that has not arrived, and the whole stack is kept local precisely to delete the network terms of $L_{\text{e2e}}$. <em>Augmented and virtual reality</em> are bounded by motion-to-photon latency, the time from a head movement to the corresponding pixel update, where exceeding roughly 20 ms induces discomfort, so the rendering and tracking models run on-headset or on a tethered companion rather than in the cloud. <em>Industrial control</em> places learned policies and anomaly detectors inside a fixed sense-actuate cycle on a programmable controller, where jitter, not mean latency, sets the achievable control bandwidth. <em>High-frequency systems</em>, from algorithmic trading to real-time bidding, treat microseconds of tail as money and colocate inference next to the data feed to delete every avoidable hop.</p>
+<p>Across all four, the same pattern holds: the deadline is physical, the tail is the enemy, and the placement of computation is chosen to control the network terms first and the compute terms second. The next section carries this directly into robotics, where the sense-infer-actuate loop is not a metaphor but the literal architecture of the machine. The deadline-driven control loops of <a href="section-34.8.html">Section 34.8</a> are exactly the hard and firm real-time systems this section has been budgeting for.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Predictable Inference Under a Clock (2024 to 2026)</div>
+<p>Latency-critical AI is an active research front on three sides. On the model side, dynamic-depth and early-exit transformers (the lineage of BranchyNet and FastBERT, extended in 2024 to 2025 toward token-level early exit for on-device LLMs) push the anytime contract into large models, returning a usable answer by the deadline and refining only while budget remains. On the systems side, deadline-aware and SLO-driven schedulers for edge inference, including work on real-time GPU partitioning and preemptible kernels, attack $L_{\text{queue}}$ so a high-priority frame can interrupt a low-priority one rather than wait behind it. On the methods side, the worst-case-execution-time community and the learning community are converging on probabilistic timing guarantees for neural networks, asking not "what is the average latency?" but "what deadline can we certify at a $10^{-6}$ miss rate?" The unifying theme is a shift from optimizing the mean to certifying the tail, the same shift this section argues every latency-critical designer must make.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The p50 Is the Latency You Brag About; the p999 Is the Latency You Apologize For</div>
+<p>There is a grim folk wisdom in real-time engineering that the median latency is the number you put on the slide and the p999 is the number that gets you paged at three in the morning. The simulation in Output 34.7.1 is a tidy illustration: every regime has a comparable, cheerful p50, and only the tail betrays which system is about to miss a deadline that matters. If a vendor quotes you an average latency for a safety-critical system, they have answered a question you did not ask.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.7.1: Read the Budget, Find the Breach <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the off-device path in Figure 34.7.1, identify which two stages contribute the most tail latency, and propose one placement change and one scheduling change that would bring the path back inside the 30 ms deadline without shrinking the model. For each proposed change, state which term of $L_{\text{e2e}}$ it reduces and what new cost or risk it introduces. Then explain why simply switching to a faster server (lower $L_{\text{infer}}$) does not by itself fix the breach.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.7.2: Tune the Hedge <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 34.7.1 with a delayed (tied-request) hedge: fire the second call only if the first has not returned within a delay $\tau$, and act on whichever finishes first. Sweep $\tau$ from 0 to 30 ms and, for each value, report the deadline miss rate against the 30 ms budget and the expected number of calls issued per request (a proxy for extra compute cost). Plot miss rate against cost and identify the $\tau$ that achieves under 0.1% misses at the lowest extra cost. Explain why $\tau = 0$ (always hedge) and large $\tau$ (never hedge in time) are both suboptimal.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.7.3: When Does Distribution Stop Paying? <span class="exercise-type analysis">Analysis</span></div>
+<p>A request fans out to $n$ shards and must wait for all of them; each shard independently exceeds the deadline with probability $p = 0.005$. Using $P(\text{slow}) = 1 - (1-p)^n$, find the largest $n$ for which the whole-request miss rate stays below 1%. Now suppose each shard can itself be hedged two ways, reducing its effective $p$ to $p^2$; recompute the largest tolerable $n$. Discuss what this says about the maximum fan-out a scatter-gather edge system can sustain, and connect your answer to the tail-at-scale reasoning and to the per-node latency budgets you would draw from <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-34.6.html"><span class="nav-label">Previous</span><span class="nav-num">Section 34.6</span><span class="nav-title">Federated Edge Learning</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 34</span><span class="nav-num">Contents</span><span class="nav-title">Edge, Fog, and On-Device Distributed AI</span></a>
+<a class="next" href="section-34.8.html"><span class="nav-label">Next</span><span class="nav-num">Section 34.8</span><span class="nav-title">Robotics and Autonomous Systems</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

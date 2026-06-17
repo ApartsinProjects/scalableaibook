@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 20.6: Ape-X, R2D2, and SEED RL Designs. The landmark distributed-RL systems as points in one design space: where inference runs, on-policy versus replay, and the CPU/GPU split each one chose." name="description"/>
+<title>Section 20.6: Ape-X, R2D2, and SEED RL Designs | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 20: Distributed Reinforcement Learning Infrastructure</a></div>
+<h1>Ape-X, R2D2, and SEED RL Designs</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They asked me to step the environment and also run the whole policy and also compute priorities. I am one CPU. I have opinions about this arrangement."</p>
+<cite>An Actor Carrying More Than Its Share</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The famous distributed-RL systems are not a chronology to memorize; they are four answers to one design question: given the actor-learner split, where do you put inference, do you learn from replay or from a fresh on-policy stream, and how do you divide the work between cheap CPUs and scarce accelerators?</strong> IMPALA, Ape-X, R2D2, and SEED RL each fix one inefficiency in the others by moving a single piece of the pipeline. IMPALA pairs many actors with a central learner corrected by V-trace. Ape-X feeds hundreds of actors into one prioritized replay buffer. R2D2 carries that design into recurrent agents and confronts the systems problem of storing hidden state. SEED RL notices that running a big policy on every actor wastes accelerators, and moves inference off the actors entirely. This section reads the four as coordinates in a design space, then measures the exact tradeoff SEED exploits: when does centralizing inference beat running it on each actor?</p>
+</div>
+<p>The previous sections built the parts. <a href="section-20.2.html">Section 20.2</a> separated acting from learning into the actor-learner architecture, <a href="section-20.3.html">Section 20.3</a> scaled experience collection across many actors, <a href="section-20.4.html">Section 20.4</a> turned the replay buffer into a sharded distributed service, and <a href="section-20.5.html">Section 20.5</a> made off-policy learning correct at scale with V-trace. Now we assemble those parts into named systems. The point of studying them together is not historical completeness; it is that each system makes one different choice on one axis, so seeing them side by side teaches the axes themselves. A practitioner who internalizes the design space can place a new system on it in a minute, and can design a fifth point that fits a workload none of the four were built for.</p>
+
+<h2>1. One Design Space, Four Coordinates <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Every distributed-RL system in this section is a loop in which actors generate experience and a learner improves a policy from it. The systems differ in three decisions that, once you name them, become a small coordinate grid. The first axis is <strong>where policy inference runs</strong>: on each actor (the actor holds a copy of the policy and computes its own actions) or centrally (actors send raw observations and a central service computes actions in a batch). The second is <strong>how experience reaches the learner</strong>: through a replay buffer that stores and re-samples past transitions (off-policy), or as a fresh near-on-policy stream consumed once and discarded. The third is <strong>what the actor itself must compute and store</strong>, which is where recurrence bites, because an LSTM agent has hidden state that has to be carried, stored, and replayed.</p>
+<p>These are not independent knobs you can set at random; some combinations are natural and others fight themselves. Replay demands off-policy correction because stored transitions were generated by an older policy, the exact problem V-trace solves in <a href="section-20.5.html">Section 20.5</a>. Centralizing inference only pays off when the policy is large enough that batching many observations on one accelerator beats running it many times on small actor devices, the tradeoff this section measures. Recurrence forces a choice about hidden state that neither feed-forward replay nor on-policy streaming had to make. Table 20.6.1 places the four systems on the grid, and the rest of the section walks each coordinate and explains why its neighbors are where they are.</p>
+<div class="table-caption"><strong>Table 20.6.1:</strong> Four landmark distributed-RL systems as coordinates in one design space. Each row is the same actor-learner loop with one or two axes set differently; the right column names the single inefficiency that system removed from its neighbors.</div>
+<table>
+<thead>
+<tr><th scope="col">System</th><th scope="col">Inference runs</th><th scope="col">Experience path</th><th scope="col">Agent type</th><th scope="col">Key contribution</th></tr>
+</thead>
+<tbody>
+<tr><td>IMPALA</td><td>On each actor</td><td>On-policy stream, V-trace corrected</td><td>Feed-forward / recurrent</td><td>Scalable actor-critic template; off-policy correction for a fast on-policy stream</td></tr>
+<tr><td>Ape-X</td><td>On each actor</td><td>Shared prioritized replay</td><td>Feed-forward (DQN/DDPG)</td><td>Hundreds of actors, actor-side priority computation, decouples data scale from learning</td></tr>
+<tr><td>R2D2</td><td>On each actor</td><td>Shared prioritized replay of sequences</td><td>Recurrent (LSTM)</td><td>Recurrence under replay: stored hidden state and burn-in for sequence replay</td></tr>
+<tr><td>SEED RL</td><td>Centralized, batched on learner</td><td>Either (V-trace or replay)</td><td>Feed-forward / recurrent</td><td>Inference off the actors, batched on accelerators over fast networking</td></tr>
+</tbody>
+</table>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Each System Moved Exactly One Piece</div>
+<p>The progress from IMPALA to SEED is not four unrelated inventions; it is four single-axis moves on a shared loop. Ape-X swapped IMPALA's on-policy stream for a prioritized replay buffer (the experience-path axis). R2D2 took Ape-X and made the agent recurrent (the agent-type axis), which forced a new answer on hidden-state storage. SEED took the inference location and moved it off the actors (the inference-location axis). When you meet a new RL system, do not ask "what is it"; ask "which of these axes did it change, and what inefficiency did that fix?" The answer locates it on Table 20.6.1 immediately.</p>
+</div>
+
+<h2>2. IMPALA and Ape-X: Many Actors, One Learner <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>IMPALA is the template the others vary. It runs many actors that each hold a recent copy of the policy, step their environments, and ship trajectory fragments to a single central learner. Because actors run slightly stale policy copies while the learner keeps updating, the stream that arrives is not quite on-policy, and IMPALA corrects that lag with the V-trace targets developed in <a href="section-20.5.html">Section 20.5</a>. The contribution is the shape: a centralized learner with high accelerator utilization fed by a swarm of cheap actors, with a principled correction that keeps the off-by-a-few-updates staleness from biasing the gradient. Nearly every later actor-critic system at scale is a descendant of this layout.</p>
+<p>Ape-X keeps the swarm of actors but changes the experience path. Instead of a once-consumed on-policy stream, actors write transitions into a shared <em>prioritized</em> replay buffer, the sharded service of <a href="section-20.4.html">Section 20.4</a>, and the learner samples from it by priority. The decisive systems trick is that each actor computes the priority of its own transitions locally, from the temporal-difference error it already has in hand, so the buffer never has to score incoming data centrally. This decouples the scale of data generation from the scale of learning: you can run hundreds of actors filling the buffer while a single learner drains it at its own pace, and the priorities steer that single learner toward the most informative transitions. Ape-X showed that with feed-forward DQN-style agents, raw actor count alone buys large improvements, because the bottleneck was never the learner's math, it was the rate and quality of incoming experience.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Buffer Does Not Care Who Filled It</div>
+<p>An Ape-X actor that has computed a transition's priority has done a small favor for a learner it will never meet, on a shard it did not choose, for a sample that may be drawn a thousand updates later or never. The replay buffer is a beautifully indifferent intermediary: it accepts priorities from anyone and serves them to anyone, which is exactly why you can add a hundred more actors without telling the learner.</p>
+</div>
+
+<h2>3. R2D2: Recurrence Turns Replay Into a Systems Problem <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>R2D2 (Recurrent Replay Distributed DQN) takes the Ape-X layout and makes the agent recurrent, an LSTM, so the policy depends on history through a hidden state $h_t$. For a feed-forward agent a stored transition is self-contained: state in, action and reward out. For a recurrent agent it is not, because the action at time $t$ depended on $h_t$, which summarizes everything before $t$. Replaying a stored sequence requires knowing what the hidden state was when the data was generated, and that hidden state was produced by a policy that has since changed. This is a storage and consistency problem, not a learning-theory problem, and it is the reason R2D2 belongs in a systems chapter.</p>
+<p>R2D2's answer has two parts that every recurrent-replay system since has borrowed. First, it stores the actor's hidden state alongside the transition sequence in the buffer, so the learner has a starting point rather than a zero. Second, because that stored state is stale (it came from an older policy and the network weights have moved), the learner does not trust it directly; it runs a <em>burn-in</em>, replaying the first part of the sequence purely to warm up a fresh hidden state under current weights before computing any loss. The stored state seeds the warm-up; the burn-in repairs the staleness. The cost is concrete and worth stating plainly: the replay buffer now stores sequences plus hidden-state vectors instead of single transitions, which multiplies the bytes per sample and the network traffic the buffer service of <a href="section-20.4.html">Section 20.4</a> must move. Recurrence does not change the actor-learner shape; it inflates what flows through it.</p>
+
+<h2>4. SEED RL: Move Inference Off the Actors <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>IMPALA, Ape-X, and R2D2 all run the policy on the actors. SEED RL questions that. If the policy is a large neural network, running it on every actor means either putting an accelerator on each actor (most of them idle, since one environment step produces one observation and a batch of one wastes the hardware) or running the big policy on a CPU (slow). Either way, as the policy grows, the actors spend more of their time on inference and the expensive accelerators are starved by tiny batches. SEED RL's move is to take inference off the actors entirely: actors become thin clients that only step environments and exchange observations and actions with a central service over fast networking. The learner machine, which already has the accelerators, batches observations from <em>all</em> actors into one large forward pass, computes actions, and streams them back.</p>
+<p>The result is a different CPU/GPU split from the one in <a href="section-20.3.html">Section 20.3</a>. Actors are pure CPU environment-steppers with no policy and no accelerator. The central accelerator runs both learning and inference, and crucially it runs inference at a batch size equal to the number of actors, which is exactly the regime accelerators are built for. The cost SEED pays is two network hops per step, an observation out and an action back, which is why it depends on fast networking to keep that latency small. The diagram in Figure 20.6.1 contrasts the two layouts, and the demonstration that follows measures when the trade pays off.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two layouts side by side. On the left, actor-side inference: each actor box contains both an environment and a policy network, and only sends finished experience to the learner. On the right, centralized batched inference: actors contain only environments and send observations to a central inference plus learning box that holds the policy and batches all observations into one forward pass.">
+<defs>
+<marker id="arr206" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr206o" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.b206 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w206 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g206 { fill:#eaf3ec; stroke:#2e7d4f; stroke-width:1.6; }
+.t206 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s206 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l206 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr206); }
+.lo206 { fill:none; stroke:#b86b1f; stroke-width:1.7; marker-end:url(#arr206o); }
+.hd206 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+</style>
+<text class="hd206" x="215" y="24">Actor-side inference (IMPALA / Ape-X / R2D2)</text>
+<rect class="w206" x="40" y="44" width="150" height="70" rx="8"/>
+<text class="t206" x="115" y="66">Actor 1</text>
+<text class="s206" x="115" y="84">env + policy copy</text>
+<text class="s206" x="115" y="100">runs its own forward</text>
+<rect class="w206" x="40" y="128" width="150" height="70" rx="8"/>
+<text class="t206" x="115" y="150">Actor 2</text>
+<text class="s206" x="115" y="168">env + policy copy</text>
+<text class="s206" x="115" y="184">runs its own forward</text>
+<rect class="w206" x="40" y="212" width="150" height="70" rx="8"/>
+<text class="t206" x="115" y="234">Actor A</text>
+<text class="s206" x="115" y="252">env + policy copy</text>
+<text class="s206" x="115" y="268">runs its own forward</text>
+<rect class="b206" x="270" y="128" width="130" height="86" rx="8"/>
+<text class="t206" x="335" y="162">Learner</text>
+<text class="s206" x="335" y="182">accelerator</text>
+<text class="s206" x="335" y="198">learns only</text>
+<path class="l206" d="M 190 79 L 230 79 L 230 150 L 268 150"/>
+<path class="l206" d="M 190 163 L 268 163"/>
+<path class="l206" d="M 190 247 L 230 247 L 230 178 L 268 178"/>
+<text class="s206" x="232" y="296">experience (small batches of 1 per forward)</text>
+<line x1="430" y1="40" x2="430" y2="340" stroke="#c8ced6" stroke-width="1.4" stroke-dasharray="5 5"/>
+<text class="hd206" x="645" y="24">Centralized batched inference (SEED RL)</text>
+<rect class="g206" x="470" y="44" width="140" height="58" rx="8"/>
+<text class="t206" x="540" y="68">Actor 1</text>
+<text class="s206" x="540" y="86">env only (CPU)</text>
+<rect class="g206" x="470" y="116" width="140" height="58" rx="8"/>
+<text class="t206" x="540" y="140">Actor 2</text>
+<text class="s206" x="540" y="158">env only (CPU)</text>
+<rect class="g206" x="470" y="188" width="140" height="58" rx="8"/>
+<text class="t206" x="540" y="212">Actor A</text>
+<text class="s206" x="540" y="230">env only (CPU)</text>
+<rect class="b206" x="690" y="96" width="140" height="110" rx="8"/>
+<text class="t206" x="760" y="126">Inference</text>
+<text class="t206" x="760" y="144">+ Learner</text>
+<text class="s206" x="760" y="166">accelerator</text>
+<text class="s206" x="760" y="184">batches all A obs</text>
+<text class="s206" x="760" y="200">into one forward</text>
+<path class="lo206" d="M 610 73 L 650 73 L 650 130 L 688 130"/>
+<path class="lo206" d="M 610 145 L 688 145"/>
+<path class="lo206" d="M 610 217 L 650 217 L 650 162 L 688 162"/>
+<path class="l206" d="M 688 178 L 650 178 L 650 256 L 540 256 L 540 248"/>
+<text class="s206" x="600" y="300" fill="#b86b1f">observations out</text>
+<text class="s206" x="600" y="318">actions back (2 fast hops/step)</text>
+</svg>
+<figcaption><strong>Figure 20.6.1:</strong> The inference-location axis. On the left, every actor carries a policy copy and runs its own forward pass on a batch of one, so accelerators sit idle or the big policy runs slowly on CPU. On the right, SEED RL strips the policy off the actors; they step environments and send observations (orange) to a central service that batches all $A$ of them into one forward pass and returns actions, paying two fast network hops per step. The demonstration in Code 20.6.1 measures which side wins as the policy grows.</figcaption>
+</figure>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Inference Is a Distribution Axis Too</div>
+<p>SEED RL is a clean instance of the book's central move: an essential activity, here policy inference, is partitioned across machines and recombined, and the recombination (batching all actors' observations into one forward) is what makes it efficient. The same logic that made batched serving the right shape for LLM inference in <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a> reappears here inside the training loop: gather many small requests, run them as one large batch on the accelerator, scatter the results back. When you see "batch the small requests centrally" in serving and again in RL, you are seeing one distribution pattern wearing two hats.</p>
+</div>
+
+<h2>5. When Centralizing Inference Wins <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>SEED's bet is only worth the two network hops when the policy is large enough that batched inference on an accelerator decisively beats per-actor inference. We can see the crossover with a pure-throughput model that needs no RL at all. Each environment step costs a fixed amount of CPU time plus one policy forward pass. In the actor-side layout, each actor runs the forward alone on a small device, so the cost grows roughly linearly with policy size and never enjoys batching. In the centralized layout, the single accelerator batches all $A$ actors' observations into one forward, so a fixed launch overhead is amortized across the batch and the per-observation cost is far lower, at the price of two network hops per step. The code below sweeps policy size and reports the aggregate step throughput of each layout.</p>
+<pre><code class="language-python">ENV_MS = 4.0          # env.step() per actor, milliseconds (fixed)
+NET_MS = 0.3          # one-way obs/action round-trip on fast networking
+A = 256               # number of actors stepping in parallel
+
+# Actor device is small: per-forward latency grows ~linearly in policy FLOPs
+# with no batching benefit (each actor has a batch of one).
+def actor_fwd_ms(p_mflops):
+    return 0.05 * p_mflops
+
+# The central accelerator has a fixed launch cost but is far faster per FLOP,
+# and it amortizes that launch over a full batch of A observations.
+def central_fwd_ms_per_obs(p_mflops, batch):
+    launch = 0.20                     # kernel launch / fixed overhead, ms
+    per_obs = 0.004 * p_mflops        # accelerator ~12x faster per FLOP
+    return (launch + per_obs * batch) / batch
+
+print(f"{'policy':>8} | {'actor-side':>22} | {'centralized (SEED)':>22} | winner")
+print("-" * 72)
+for p in [1, 5, 20, 80, 320]:        # policy size in MFLOPs per forward
+    step_actor = ENV_MS + actor_fwd_ms(p)           # env + own forward, parallel
+    thr_actor = A / step_actor * 1000.0             # steps/sec across all actors
+
+    fwd_amort = central_fwd_ms_per_obs(p, A)        # batched over all A actors
+    step_central = ENV_MS + 2 * NET_MS + fwd_amort  # env + 2 hops + batched fwd
+    thr_central = A / step_central * 1000.0
+
+    win = "centralized" if thr_central &gt; thr_actor else "actor-side"
+    print(f"{p:>5} MF  | {thr_actor:>12.0f} steps/s   | {thr_central:>12.0f} steps/s   | {win}")
+</code></pre>
+<div class="code-caption"><strong>Code 20.6.1:</strong> A from-scratch throughput model of the inference-location axis. The only difference between the two layouts is where the policy forward pass runs and whether it is batched; everything else (env time, actor count) is held equal so the crossover is attributable to inference alone.</div>
+<pre><code class="language-text">  policy |             actor-side |     centralized (SEED) | winner
+------------------------------------------------------------------------
+    1 MF  |        63210 steps/s   |        55594 steps/s   | actor-side
+    5 MF  |        60235 steps/s   |        55402 steps/s   | actor-side
+   20 MF  |        51200 steps/s   |        54692 steps/s   | centralized
+   80 MF  |        32000 steps/s   |        52024 steps/s   | centralized
+  320 MF  |        12800 steps/s   |        43532 steps/s   | centralized</code></pre>
+<div class="code-caption"><strong>Output 20.6.1:</strong> For a tiny policy, actor-side inference wins: there is nothing to batch, and SEED's two network hops are pure overhead. As the policy grows past roughly 20 MFLOPs per forward, centralized batched inference pulls ahead and the gap widens fast; at 320 MFLOPs the actor-side layout collapses to a quarter of SEED's throughput because every actor is grinding a big forward alone.</div>
+<p>The numbers match the intuition exactly. With a 1-MFLOP policy there is nothing to amortize, so SEED's network hops only cost throughput and the actor-side layout wins. The crossover sits near 20 MFLOPs, and beyond it the actor-side throughput falls off a cliff while SEED's barely moves, because SEED was always running one efficient batch regardless of policy size. This is precisely the regime SEED RL was designed for: large policies, many actors, fast networking. It also explains why the earlier systems were content to run inference on the actors; with the small feed-forward networks of Ape-X-era benchmarks, the crossover had not been reached, so there was no inefficiency to fix. SEED did not contradict its predecessors; it identified the regime where their choice stopped paying off.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Actor Fleet That Was Mostly Idle CPUs Holding GPUs</div>
+<p><strong>Who:</strong> An RL infrastructure engineer at a robotics lab training a large vision-based control policy.</p>
+<p><strong>Situation:</strong> Training used 512 actors, each on a machine with a small GPU so it could run the policy, feeding an Ape-X-style replay buffer and a single learner.</p>
+<p><strong>Problem:</strong> Profiling showed every actor GPU sat near 4% utilization; they ran one forward on a batch of one per environment step, and the policy was large enough that even that was slow, capping experience throughput.</p>
+<p><strong>Dilemma:</strong> Buy bigger actor GPUs (scale up 512 machines, expensive and still batch-of-one wasteful), or restructure to SEED-style centralized inference (cheaper CPU-only actors plus one inference accelerator, but adds two network hops per step and needs fast networking).</p>
+<p><strong>Decision:</strong> They moved to centralized batched inference, because the policy sat well past the crossover in Output 20.6.1, where batching all actors on one accelerator dominates per-actor forwards.</p>
+<p><strong>How:</strong> Actors became CPU-only environment steppers sending observations over a low-latency interconnect; one accelerator batched all 512 observations per cycle into a single forward, returned actions, and ran the learner in the same box.</p>
+<p><strong>Result:</strong> Experience throughput rose several-fold at lower total hardware cost, the 512 idle actor GPUs were eliminated, and the single inference accelerator ran near peak batch utilization.</p>
+<p><strong>Lesson:</strong> Where inference runs is a distribution decision with a measurable crossover. Past it, stripping the policy off the actors and batching centrally is both faster and cheaper; before it, the two hops are not worth paying.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Ray RLlib Gives You These Designs as Config</div>
+<p>You do not implement Ape-X, IMPALA, or a SEED-style central-inference loop from scratch. Ray RLlib ships them as named algorithms behind a few lines of configuration; switching the design space coordinate is changing one string, and the framework handles the actor fan-out, the sharded replay buffer, the priority plumbing, and the policy-weight broadcast that <a href="section-20.4.html">Section 20.4</a> built by hand:</p>
+<pre><code class="language-python"># pip install "ray[rllib]"
+from ray.rllib.algorithms.apex_dqn import ApexDQNConfig
+
+config = (
+    ApexDQNConfig()
+    .environment("CartPole-v1")
+    .env_runners(num_env_runners=64)        # 64 actors filling the buffer
+    .training(num_steps_sampled_before_learning_starts=50_000)
+)
+algo = config.build()                        # learner + sharded prioritized replay
+for _ in range(100):
+    algo.train()                             # actors sample, learner drains by priority
+</code></pre>
+<div class="code-caption"><strong>Code 20.6.2:</strong> The Ape-X layout of Section 2 as RLlib configuration. The hundreds of lines of actor management, prioritized replay sharding, and actor-side priority computation collapse to a config object; selecting IMPALA instead is swapping <code>ApexDQNConfig</code> for <code>IMPALAConfig</code>, the same design space, one coordinate moved.</div>
+</div>
+
+<h2>6. Reading a New System Off the Grid <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The payoff of treating these four as a design space rather than a reading list is that the grid keeps working for systems built after them. A modern large-scale RL stack for training language-model policies, for instance, almost always centralizes inference (the policy is enormous, so it sits far past the crossover), almost always streams near-on-policy data corrected like V-trace rather than replaying from a buffer (the policy changes fast and stale samples hurt), and inherits R2D2's lesson that any state the actor carries must be shipped and warmed up. Placing it is a matter of reading three coordinates, not learning a new system from zero. The grid also tells you what is missing: there are unfilled cells, such as centralized inference paired with prioritized replay for a recurrent agent, that a workload might call for, and the design space tells you exactly what that system would have to handle.</p>
+<p>The thread continues. These actor-learner infrastructures return in <a href="../../part-6-multi-agent-systems/module-30-multi-agent-reinforcement-learning/index.html">Chapter 30</a>, where many learning agents share an environment and the single-learner picture splits further, and the next section confronts the question that has hovered under all four designs: should the actors and the learner march in lockstep or run free? That synchronous-versus-asynchronous choice, foreshadowed by the staleness that V-trace and R2D2's burn-in both repair, is the subject of <a href="section-20.7.html">Section 20.7</a>.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Distributed RL for LLM Post-Training (2024 to 2026)</div>
+<p>The hottest current use of this infrastructure is reinforcement learning from human or verifiable feedback to align and reason-tune large language models, and it has revived every axis in Table 20.6.1 at a new scale. Open stacks such as OpenRLHF, NeMo-Aligner, and Hugging Face TRL, together with veRL (HybridFlow) and the inference-batching ideas behind SEED, all wrestle with the same split: generation (policy rollout, which is inference-bound and benefits enormously from centralized batched serving via engines like vLLM) versus learning (the gradient update). The 2024 to 2026 systems literature on PPO and GRPO for LLMs is, read through this section's lens, a re-derivation of SEED's "batch the inference centrally" insight, now with the policy at hundreds of billions of parameters and the rollout engine and trainer often placed on separate accelerator pools. The design space did not change; the policies got large enough that centralized inference is no longer optional.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.6.1: Place a Fifth System <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A new RL stack trains a large recurrent policy by streaming near-on-policy data (no replay buffer) with V-trace-style correction, and it runs inference centrally on a batched accelerator. Using the three axes of Section 1 (inference location, experience path, agent type), give its coordinates and say which one system in Table 20.6.1 it is closest to on each axis. Then name the one R2D2 lesson it must still implement even though it has no replay buffer, and explain why.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.6.2: Find the Crossover Yourself <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 20.6.1 to find the exact policy size (in MFLOPs) where centralized inference overtakes actor-side, for actor counts $A \in \{16, 64, 256, 1024\}$. Plot or print the crossover policy size against $A$. Explain the trend: why does adding more actors move the crossover toward smaller policies, and what does that say about when SEED-style centralization is worth it for a small policy with a very large actor fleet?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.6.3: The Hidden-State Storage Bill <span class="exercise-type analysis">Analysis</span></div>
+<p>An R2D2-style buffer stores sequences of length $L = 80$ transitions, each with an observation of $4{,}096$ bytes, plus one LSTM hidden state of $512$ floats (4 bytes each) per stored sequence for the burn-in seed. Compute the bytes per stored sequence with and without the hidden state, and the percentage overhead the hidden state adds. Then argue, using the distributed-replay traffic model of <a href="section-20.4.html">Section 20.4</a>, whether storing the hidden state or recomputing it from a longer burn-in is the better trade when buffer network bandwidth, not buffer capacity, is the binding constraint.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-20.5.html"><span class="nav-label">Previous</span><span class="nav-num">Section 20.5</span><span class="nav-title">Off-Policy Correction at Scale</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 20</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Reinforcement Learning Infrastructure</span></a>
+<a class="next" href="section-20.7.html"><span class="nav-label">Next</span><span class="nav-num">Section 20.7</span><span class="nav-title">Synchronous vs Asynchronous RL Systems</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

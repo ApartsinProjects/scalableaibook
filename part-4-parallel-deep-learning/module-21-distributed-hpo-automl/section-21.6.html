@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 21.6: Distributed Trial Scheduling and Early Stopping. The master-worker machinery that launches, checkpoints, pauses, resumes, and kills hyperparameter trials on a shared cluster, and reclaims their compute for new ones." name="description"/>
+<title>Section 21.6: Distributed Trial Scheduling and Early Stopping | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: Distributed Hyperparameter Search and AutoML</a></div>
+<h1>Distributed Trial Scheduling and Early Stopping</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I trained for thirty epochs to learn that I was never going to be the best. The scheduler knew it at epoch five and gave my GPU to someone more promising."</p>
+<cite>A Trial That Outlived Its Usefulness</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A production hyperparameter search is a distributed system: a central scheduler decides which trials to start, pause, resume, and kill, while a pool of workers runs them, and the whole machine is judged by how little compute it wastes on configurations that were never going to win.</strong> The search algorithms of the previous sections, random search, Bayesian optimization, Hyperband, population-based training, all assume some component can launch a trial, watch its metrics, stop it mid-flight, and hand its accelerator to the next candidate. That component is the trial scheduler, and building it correctly is what turns a toy parallel loop into a system that finishes a thousand-trial sweep on a shared cluster overnight instead of next week. This section builds the scheduler: the master-worker architecture, the trial lifecycle with checkpoint-based pause and resume, fault tolerance when a worker dies, elastic packing of unequal trials onto shared GPUs, and the early-stopping rule that reclaims compute from underperformers and pours it into new trials.</p>
+</div>
+<p>The earlier sections of this chapter told you <em>which</em> configurations to try and <em>when</em> to stop them. <a href="section-21.4.html">Section 21.4</a> gave Successive Halving and Hyperband, which run many trials for a few epochs and promote only the survivors; <a href="section-21.5.html">Section 21.5</a> gave Population-Based Training, which copies the weights of strong trials onto weak ones mid-run. Both descriptions stayed at the level of the algorithm. Neither said how a trial actually gets paused at epoch five, how its half-trained weights survive on disk while its GPU runs something else, what happens when the machine holding those weights catches fire, or how a trial that needs four GPUs gets packed onto a cluster already running thirty single-GPU trials. Those are systems questions, and they are the difference between a search that works in a notebook and one that works on a cluster. This section answers them.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 880 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A central scheduler at the top streams intermediate metrics from four worker GPUs running trials below it. Two trials are killed by the early-stopping rule, their freed workers are reassigned to waiting trials from a queue, and a survivor is checkpointed and resumed.">
+<defs>
+<marker id="arr216" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arrR216" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b02a2a"/></marker>
+</defs>
+<style>
+.box216 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.wk216 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.dead216 { fill:#fbeaea; stroke:#b02a2a; stroke-width:1.6; }
+.q216 { fill:#eef2ee; stroke:#3a7a4a; stroke-width:1.6; }
+.t216 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s216 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.up216 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr216); }
+.dn216 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr216); }
+.kill216 { fill:none; stroke:#b02a2a; stroke-width:1.8; marker-end:url(#arrR216); stroke-dasharray:5 4; }
+</style>
+<rect class="box216" x="290" y="20" width="300" height="76" rx="10"/>
+<text class="t216" x="440" y="48">Scheduler (master)</text>
+<text class="s216" x="440" y="68">start / pause / resume / stop decisions</text>
+<text class="s216" x="440" y="84">consumes streamed metrics, applies ASHA / median rule</text>
+
+<rect class="q216" x="675" y="24" width="180" height="68" rx="8"/>
+<text class="t216" x="765" y="46">Pending queue</text>
+<text class="s216" x="765" y="66">trial 41, 42, 43 ...</text>
+<text class="s216" x="765" y="82">waiting for a GPU</text>
+<path class="up216" d="M 675 58 L 595 58"/>
+
+<rect class="wk216" x="40" y="200" width="160" height="84" rx="8"/>
+<text class="t216" x="120" y="226">Worker 1 (GPU)</text>
+<text class="s216" x="120" y="246">trial 7 @ rung 4</text>
+<text class="s216" x="120" y="264">checkpointed,</text>
+<text class="s216" x="120" y="278">resumed</text>
+
+<rect class="wk216" x="240" y="200" width="160" height="84" rx="8"/>
+<text class="t216" x="320" y="226">Worker 2 (GPU)</text>
+<text class="s216" x="320" y="246">trial 12 @ rung 5</text>
+<text class="s216" x="320" y="264">promising,</text>
+<text class="s216" x="320" y="278">running</text>
+
+<rect class="dead216" x="440" y="200" width="160" height="84" rx="8"/>
+<text class="t216" x="520" y="226" fill="#b02a2a">Worker 3 (GPU)</text>
+<text class="s216" x="520" y="246" fill="#b02a2a">trial 19 KILLED</text>
+<text class="s216" x="520" y="264">below median</text>
+<text class="s216" x="520" y="278">at rung 2</text>
+
+<rect class="wk216" x="640" y="200" width="160" height="84" rx="8"/>
+<text class="t216" x="720" y="226">Worker 4 (GPU)</text>
+<text class="s216" x="720" y="246">trial 41 (new)</text>
+<text class="s216" x="720" y="264">just launched</text>
+<text class="s216" x="720" y="278">on freed GPU</text>
+
+<path class="dn216" d="M 360 96 L 130 196"/>
+<path class="dn216" d="M 400 96 L 320 196"/>
+<path class="kill216" d="M 480 96 L 510 196"/>
+<path class="dn216" d="M 520 96 L 700 196"/>
+
+<path class="up216" d="M 150 200 L 350 110"/>
+<path class="up216" d="M 340 200 L 410 110"/>
+
+<text class="s216" x="245" y="150">metrics stream up</text>
+<text class="s216" x="635" y="150">stop / start flow down</text>
+
+<rect class="box216" x="440" y="330" width="160" height="64" rx="8"/>
+<text class="t216" x="520" y="356">Reclaimed GPU</text>
+<text class="s216" x="520" y="376">trial 19's compute</text>
+<text class="s216" x="520" y="390">redirected to trial 41</text>
+<path class="kill216" d="M 520 284 L 520 326"/>
+<path class="up216" d="M 600 360 L 690 290"/>
+</svg>
+<figcaption><strong>Figure 21.6.1:</strong> The trial scheduler as a master-worker system. The scheduler (top) holds the global view: it streams intermediate metrics up from every worker, applies an early-stopping rule (here a median rule), and pushes start, pause, resume, and stop commands back down. Trial 19 falls below the median of its peers at rung 2 and is killed (red dashed path); the GPU it freed is immediately handed to trial 41 from the pending queue. Trial 7 is checkpointed and resumed on the same worker. The reclaimed compute (bottom) is the entire point: it is what lets the search finish a large sweep without a proportionally large cluster.</figcaption>
+</figure>
+
+<h2>1. The Scheduler Is a Master-Worker System <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A distributed hyperparameter search has exactly the shape we named in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.9.html">Section 2.9</a> when we first cataloged coordination patterns: one master holds global state and makes decisions, many workers do the heavy compute and report back. The master here is the trial scheduler. It owns the search algorithm (random, Bayesian, ASHA, PBT), the record of every trial's reported metrics, and the authority to start, pause, resume, and stop. The workers are processes, usually one per GPU, that receive a configuration, train a model with it, and stream intermediate validation metrics back to the master after every rung of training. A rung is simply a checkpoint boundary, a fixed number of epochs or steps after which the trial reports its current score and the scheduler gets to decide its fate.</p>
+<p>Concentrating the decisions in one master is what makes the global early-stopping rules of this chapter possible. To know whether trial 19 is below the median of its peers, someone has to hold the scores of all the peers at the same rung; a worker that sees only its own loss cannot make that call. This is the same reason a parameter server (<a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a>) centralizes the weights: some decisions need a global view, and the cost of centralizing is justified when the decision cannot be made locally. The difference is that the scheduler's traffic is tiny. A worker sends a scalar loss per rung, not a gradient vector, so the master is never a bandwidth bottleneck the way a parameter server can be, and a single scheduler comfortably coordinates hundreds of workers.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Scheduler Centralizes Decisions, Not Data</div>
+<p>Trial scheduling is a master-worker system whose master moves almost no data: workers stream a few scalars per rung, and the master streams back one of {start, pause, resume, stop} per trial. This is what lets one scheduler govern a large cluster cheaply. The expensive thing the master holds is not bytes but <em>knowledge</em>: the cross-trial comparison that early stopping needs. Centralize the comparison, distribute the training, and keep the channel between them thin.</p>
+</div>
+
+<h2>2. The Trial Lifecycle: Launch, Checkpoint, Pause, Resume <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A trial in a naive parallel loop has two states: running and finished. A trial in a production scheduler has five, because the scheduler must be able to interrupt a half-trained model and bring it back later without losing progress. The states are pending (configured but not yet on a worker), running, paused (weights and optimizer state saved to durable storage, worker freed), resumed (loaded back onto a worker and continuing from the saved step), and terminated (either completed all rungs or killed early). The transition that makes the others possible is pause, and pause is impossible without checkpointing.</p>
+<p>Checkpointing here is the same operation we built for elastic and fault-tolerant training in <a href="../module-18-elastic-fault-tolerant-training/section-18.2.html">Section 18.2</a>, applied at a different granularity. There, a checkpoint protected a single long training run against a crash. Here, a checkpoint is a routine pause button pressed dozens of times per trial: at every rung boundary the scheduler may decide to pause this trial and run another, so the trial must serialize its full state (model weights, optimizer moments, learning-rate schedule position, RNG state, and the current step) to shared storage, then later load it on possibly a different worker and continue as if nothing happened. A checkpoint that omits the optimizer state or the schedule position produces a trial that resumes with a subtly different trajectory, which silently corrupts the comparison the search depends on. The rule from Chapter 18 carries over unchanged: checkpoint everything the next step reads, or do not call it a checkpoint.</p>
+<p>Population-Based Training from <a href="section-21.5.html">Section 21.5</a> leans on exactly this machinery. When PBT copies a strong trial's weights onto a weak one, it is loading the strong trial's checkpoint into the weak trial's worker and overwriting the configuration; the entire exploit-and-explore step is a checkpoint read followed by a hyperparameter mutation. Pause-and-resume is not an optional optimization for these algorithms, it is the primitive they are written in terms of.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Trial That Came Back Wrong</div>
+<p>A classic scheduler bug: a trial pauses at epoch 10 with a cosine learning-rate schedule, resumes, and the schedule restarts from epoch 0 because the checkpoint saved the weights but not the scheduler's step counter. The trial's loss curve develops a mysterious bump every time it is paused, the early-stopping rule keeps killing it, and an engineer spends an afternoon blaming the GPU. The model was fine. The state was incomplete. Checkpoints have feelings too: save all of them.</p>
+</div>
+
+<h2>3. Fault Tolerance: When a Worker Dies Mid-Trial <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>On a cluster of any size, a worker holding a running trial will eventually vanish: a node reboots, a spot instance is preempted (<a href="../module-18-elastic-fault-tolerant-training/index.html">Chapter 18</a>), a GPU throws an uncorrectable error. The scheduler must treat this as routine, not exceptional. Because the master holds the authoritative record of every trial's last checkpoint and last reported rung, recovery is mechanical: when a worker stops sending heartbeats, the scheduler marks its in-flight trial as interrupted, and reschedules that trial from its most recent checkpoint onto a healthy worker. The only work lost is the partial rung in progress when the worker died, which is bounded by the rung length. This is why short rungs help twice over: they give early stopping more decision points <em>and</em> they shrink the blast radius of a crash.</p>
+<p>The master itself is the single point of failure, and a production scheduler protects it the same way any coordinator does: it persists its own state (the trial table, the metric history, the search algorithm's internal state) to durable storage, so a restarted scheduler can reconstruct the search rather than start it over. This is the recovery story from <a href="../../part-1-foundations/module-02-distributed-systems-concepts/index.html">Chapter 2</a> in miniature. The thin data channel from Section 1 pays off again here: because the master's state is small (scalars and configurations, not weights), checkpointing the master is cheap and frequent.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Checkpointing, Reused at a New Granularity</div>
+<p>Checkpointing entered this book as a fault-tolerance mechanism for a single long training run (<a href="../module-18-elastic-fault-tolerant-training/section-18.2.html">Section 18.2</a>): save state periodically so a crash costs at most one interval. The trial scheduler reuses the very same operation for a different purpose, voluntary pause and migration, dozens of times per trial, and then reuses it a third time to make the search itself crash-recoverable. One primitive, three jobs: survive a crash, free a GPU on demand, and let the master forget nothing. Whenever a distributed AI system needs to move work off a machine without losing it, the answer is almost always a checkpoint.</p>
+</div>
+
+<h2>4. Heterogeneous and Elastic Resources <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Real searches are not made of identical trials. One configuration uses a batch size that needs four GPUs; another fits comfortably on one; a large-model trial wants a whole node while a small probe wants a slice of one. The scheduler therefore does bin-packing: it places trials of different sizes onto a shared cluster so that GPUs stay busy, the same packing problem that cluster schedulers solve in general and that <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/index.html">Chapter 33</a> develops with gang scheduling and fractional GPU allocation. The HPO scheduler usually sits <em>above</em> a cluster manager (Kubernetes, Slurm, Ray), translating "run this trial" into a resource request the cluster manager satisfies, and inheriting the cluster manager's view of what is free.</p>
+<p>Elasticity adds a second dimension: the resources a trial gets can change over its life. Early on, when the search is screening dozens of cheap probes, each trial gets minimal resources. As the field narrows and a few configurations prove themselves, the scheduler can grant survivors more, a larger share of the cluster, more parallel data loaders, even more GPUs if the trial's code supports elastic re-scaling from Chapter 18. This is the systems counterpart of multi-fidelity search: spend little on the many, spend lavishly on the promising few. A scheduler that can only allocate a fixed slab per trial wastes resources on probes that need little and starves finalists that could use more.</p>
+<p>The two ideas combine into the single behavior that defines a production HPO system: <strong>compute reclaimed from a killed trial is immediately repackaged and handed to a waiting one.</strong> When the early-stopping rule kills trial 19, its GPU does not idle until the next scheduling tick; the scheduler pulls the next pending configuration and launches it on that freed GPU in the same step. Reclaim, repack, relaunch. That loop, run thousands of times across a sweep, is what lets a fixed cluster evaluate far more configurations than a static one-trial-per-slot assignment ever could.</p>
+
+<h2>5. Early Stopping Closes the Loop <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Early stopping is where the scheduler's global view and its resource control meet. The scheduler streams intermediate metrics from every running trial, and after each rung it asks a stopping rule: should this trial continue, or has it shown enough to predict it will lose? Two rules dominate practice. The <strong>median stopping rule</strong> (used by Google Vizier) keeps a trial at rung $r$ only if its current metric is at least as good as the median of all trials that have reported at rung $r$; trials below the running median are killed. The <strong>Asynchronous Successive Halving Algorithm</strong> (ASHA), the asynchronous cousin of the Hyperband of <a href="section-21.4.html">Section 21.4</a>, promotes a trial from rung $r$ to rung $r+1$ only if it ranks in the top $1/\eta$ fraction of trials that have reached rung $r$, where $\eta$ is the reduction factor (commonly $\eta = 3$ or $4$).</p>
+<p>The word <em>asynchronous</em> is the systems contribution. Classical Successive Halving is synchronous: it waits for a whole rung's worth of trials to finish before promoting any, which means workers sit idle whenever the rung is unbalanced, the straggler problem from <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>. ASHA removes the barrier. The moment a trial finishes a rung, the scheduler checks whether it ranks in the top fraction of everything reported at that rung so far, and promotes or stops it immediately, with no waiting. A worker never blocks on a barrier; it always either promotes its current trial or grabs a new one. For a fixed promotion quantile $q = 1/\eta$, the probability that a trial reaching rung $r$ survives to rung $r+1$ is approximately $q$, so the expected number of trials surviving from the initial $n$ to the top rung $R$ is about $n \, q^{R}$, and the compute saved over running all $n$ trials to the top grows geometrically in $R$.</p>
+<p>The code below makes the whole loop concrete. It simulates a $K$-worker cluster running $N$ trials with rung-by-rung checkpoint-and-resume, applies a median-stopping rule, immediately repacks each freed worker with a waiting trial, and compares the total compute and wall-clock against a baseline that runs every trial to completion. Figure 21.6.1 is exactly this system: streamed metrics, killed underperformers, reclaimed GPUs.</p>
+<pre><code class="language-python">import heapq, random
+
+random.seed(7)
+
+# A simulated HPO cluster. K workers run N trials. Each trial reports a
+# validation loss after every "rung" of training. A central scheduler streams
+# those metrics, applies a median-stopping rule, checkpoints + pauses
+# survivors, and packs new trials onto freed workers. We compare against a
+# baseline that runs every trial to completion with no early stopping.
+
+N_TRIALS   = 40
+K_WORKERS  = 4
+MAX_RUNGS  = 6          # a full trial = 6 rungs
+EPOCHS_PER_RUNG = 5     # so a full trial = 30 epochs
+GRACE_RUNGS = 2         # never stop before this many rungs reported
+
+# Each trial has a hidden asymptotic loss ("floor"); the scheduler never sees
+# it, only the streamed losses. Good trials keep improving toward a low floor.
+trials = []
+for t in range(N_TRIALS):
+    floor = random.uniform(0.15, 0.95)
+    noise = random.uniform(0.0, 0.05)
+    trials.append({"id": t, "floor": floor, "noise": noise})
+
+def loss_at(trial, rung):
+    # A decreasing curve toward the hidden floor, plus small noise.
+    start, frac = 1.2, rung / MAX_RUNGS
+    base = trial["floor"] + (start - trial["floor"]) * (1.0 - frac) ** 1.6
+    return base + random.uniform(-trial["noise"], trial["noise"])
+
+def run(early_stop):
+    rung_history = {r: [] for r in range(MAX_RUNGS + 1)}  # losses seen per rung
+    completed, stopped = [], []
+    epochs_spent = 0                       # total compute = wall-clock proxy
+    free = list(range(K_WORKERS))          # idle worker ids
+    ready = list(range(N_TRIALS))          # trials not yet started
+    pq = []                                # (finish_time, worker, trial, next_rung)
+    clock = 0
+
+    def launch(trial_idx, rung, worker):
+        # Resume a checkpointed trial at `rung` (rung 0 = fresh) and run one
+        # more rung. finish is when the worker becomes free again.
+        heapq.heappush(pq, (clock + EPOCHS_PER_RUNG, worker, trial_idx, rung + 1))
+
+    while free and ready:                   # prime the cluster: fill every GPU
+        launch(ready.pop(0), 0, free.pop())
+
+    while pq:
+        finish, worker, t_idx, rung = heapq.heappop(pq)
+        clock = max(clock, finish)
+        epochs_spent += EPOCHS_PER_RUNG
+        l = loss_at(trials[t_idx], rung)
+        rung_history[rung].append(l)        # metric streamed up to the master
+
+        keep = True
+        if early_stop and GRACE_RUNGS <= rung < MAX_RUNGS:
+            hist = rung_history[rung]
+            if len(hist) >= 3:
+                med = sorted(hist)[len(hist) // 2]
+                if l > med * 1.05:          # worse than the median peer: kill it
+                    keep = False
+                    stopped.append((t_idx, rung))
+
+        if keep and rung < MAX_RUNGS:
+            launch(t_idx, rung, worker)     # checkpoint, pause, resume same GPU
+        else:
+            if rung >= MAX_RUNGS:
+                completed.append((t_idx, l))
+            if ready:                       # reclaim the freed GPU for a new trial
+                launch(ready.pop(0), 0, worker)
+
+    best = min(completed, key=lambda c: c[1]) if completed else (None, None)
+    return {"epochs": epochs_spent, "wall": clock, "completed": len(completed),
+            "stopped": len(stopped), "best_id": best[0], "best_loss": best[1]}
+
+base = run(early_stop=False)
+asha = run(early_stop=True)
+
+def line(tag, r):
+    print(f"{tag:&lt;22}: epochs={r['epochs']:&gt;4}  wall={r['wall']:&gt;4}  "
+          f"completed={r['completed']:&gt;2}  early_stopped={r['stopped']:&gt;2}  "
+          f"best_loss={r['best_loss']:.3f}")
+
+print(f"cluster: {K_WORKERS} workers, {N_TRIALS} trials, "
+      f"{MAX_RUNGS} rungs x {EPOCHS_PER_RUNG} epochs (full trial = "
+      f"{MAX_RUNGS*EPOCHS_PER_RUNG} epochs)")
+line("baseline (run-all)", base)
+line("median-stop scheduler", asha)
+saved = base["epochs"] - asha["epochs"]
+print(f"compute reclaimed     : {saved} epochs "
+      f"({100*saved/base['epochs']:.0f}% of baseline), "
+      f"wall-clock {base['wall']} -&gt; {asha['wall']} "
+      f"({100*(base['wall']-asha['wall'])/base['wall']:.0f}% faster)")
+print(f"same winner found     : {base['best_id'] == asha['best_id']} "
+      f"(trial #{asha['best_id']})")
+</code></pre>
+<div class="code-caption"><strong>Code 21.6.1:</strong> A from-scratch trial scheduler. The event queue <code>pq</code> is the cluster's worker pool; each pop is one worker finishing a rung and the master deciding the trial's fate. The <code>launch</code> call models checkpoint-based pause and resume; the <code>ready.pop(0)</code> in the <code>else</code> branch is the reclaim-and-repack step that hands a freed GPU to a waiting trial.</div>
+<pre><code class="language-text">cluster: 4 workers, 40 trials, 6 rungs x 5 epochs (full trial = 30 epochs)
+baseline (run-all)    : epochs=1200  wall= 300  completed=40  early_stopped= 0  best_loss=0.146
+median-stop scheduler : epochs= 730  wall= 195  completed=11  early_stopped=29  best_loss=0.146
+compute reclaimed     : 470 epochs (39% of baseline), wall-clock 300 -> 195 (35% faster)
+same winner found     : True (trial #39)</code></pre>
+<div class="code-caption"><strong>Output 21.6.1:</strong> The median-stopping scheduler kills 29 of 40 trials before they finish, spends 39% less compute, and finishes 35% sooner on the same four workers, yet recovers the identical best trial (#39) with the same final loss of 0.146. The reclaimed compute is what shrinks the wall-clock: freed GPUs ran waiting trials instead of idling, so the same four workers cleared the whole sweep in two-thirds of the time.</div>
+<p>The result is the whole section in four numbers. Early stopping did not change the answer, the best configuration is identical, but it reclaimed nearly 40% of the compute and a third of the wall-clock by refusing to finish trials that the streamed metrics had already condemned. A naive parallel loop would have run all forty trials to thirty epochs and found the same winner an hour and a half later (in simulated units). The gap between the two rows is exactly the value a production scheduler adds.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Overnight Sweep That Fit on the Cluster It Had</div>
+<p><strong>Who:</strong> An ML platform engineer at a computer-vision startup managing a shared eight-GPU cluster for a team of six.</p>
+<p><strong>Situation:</strong> Researchers launched 200-trial hyperparameter sweeps, each trial 40 epochs, by submitting 200 jobs to the cluster queue and letting them run to completion one batch at a time.</p>
+<p><strong>Problem:</strong> A single sweep monopolized the cluster for three days, blocking everyone else, and most trials were visibly hopeless by epoch 5 yet ran to epoch 40 anyway.</p>
+<p><strong>Dilemma:</strong> Buy more GPUs (capital the startup did not want to spend) to absorb the wasted trials, or introduce a scheduler that could kill bad trials early but required checkpointing every trial and a central component the team did not yet have.</p>
+<p><strong>Decision:</strong> They added an ASHA-based trial scheduler on top of the existing cluster manager, with $\eta = 4$ and rungs at 2, 5, 12, and 40 epochs, and made every trial checkpoint at each rung.</p>
+<p><strong>How:</strong> The scheduler streamed validation accuracy after each rung, promoted only the top quarter at each, and the instant it killed a trial it launched the next pending configuration on the freed GPU. Spot-preempted trials resumed from their last rung checkpoint on a new node.</p>
+<p><strong>Result:</strong> The same 200-trial sweep finished in under one day on the same eight GPUs, used roughly 70% less GPU-hours, and surfaced the same top configurations the exhaustive run had found, because the trials it killed were the ones already trailing the median.</p>
+<p><strong>Lesson:</strong> The bottleneck was not GPU count but wasted compute on doomed trials. A scheduler that reclaims and repacks turns a fixed cluster into one that evaluates several times more configurations per night.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Ray Tune's ASHAScheduler Replaces the Whole Loop</div>
+<p>Code 21.6.1 hand-built the event queue, the median rule, and the reclaim-and-repack logic in about sixty lines. In practice you declare the stopping rule and let a framework run the master-worker machinery, the metric streaming, the checkpoint-based pause/resume, the fault tolerance, and the cluster packing, for you. Ray Tune (the subject of <a href="section-21.7.html">Section 21.7</a>) is the common choice:</p>
+<pre><code class="language-python">from ray import tune
+from ray.tune.schedulers import ASHAScheduler
+
+scheduler = ASHAScheduler(            # the early-stopping master, fully managed
+    metric="val_loss", mode="min",
+    max_t=30,                         # full trial = 30 epochs (our MAX_RUNGS x EPOCHS)
+    grace_period=10,                  # never stop before 10 epochs (our GRACE_RUNGS)
+    reduction_factor=3,               # promote the top 1/3 at each rung (eta = 3)
+)
+
+tuner = tune.Tuner(
+    train_fn,                         # reports tune.report(val_loss=...) per epoch
+    param_space=search_space,
+    tune_config=tune.TuneConfig(scheduler=scheduler, num_samples=40),
+)
+results = tuner.fit()                 # Ray launches, checkpoints, pauses, kills, repacks
+</code></pre>
+<div class="code-caption"><strong>Code 21.6.2:</strong> The same scheduler as Code 21.6.1 expressed as a Ray Tune configuration. The sixty lines of event loop, median rule, and worker reassignment collapse to one <code>ASHAScheduler</code> object; Ray handles process-group placement, checkpoint serialization, resume-on-a-new-node fault tolerance, and the GPU bin-packing that <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/index.html">Chapter 33</a> describes.</div>
+</div>
+
+<h2>6. Why This Separates Toys From Production <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>It is worth stating plainly what the scheduler buys, because it is easy to mistake a parallel <code>for</code> loop over configurations for a distributed HPO system. The loop launches every trial, waits for all of them, and reports the best. It cannot pause a trial, so it cannot implement Hyperband or PBT. It cannot kill a trial, so it wastes compute on every doomed configuration. It cannot resume after a crash, so one preempted spot instance loses a trial's full progress. It cannot pack unequal trials, so it either over-provisions for the largest or fails on it. Each of those gaps is closed by one piece of machinery this section built: pause and resume by checkpointing, kill-and-reclaim by the streamed-metric stopping rule, crash recovery by master-side state and per-rung checkpoints, and packing by sitting on top of a cluster manager.</p>
+<p>Put differently, the search <em>algorithm</em> (which configurations, which to stop) and the search <em>system</em> (how to actually start, pause, migrate, and reclaim on a real cluster) are separable, and most of the engineering difficulty lives in the system. The next section studies the dominant open-source embodiment of that system, Ray Tune, which packages the master-worker scheduler, the stopping rules of this chapter, and the elastic resource management of <a href="../../part-4-parallel-deep-learning/module-20-distributed-rl-infrastructure/index.html">Chapter 20</a>'s Ray foundation into a single tool you configure rather than build.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Asynchronous, Cost-Aware, and Heterogeneity-Aware Scheduling (2024 to 2026)</div>
+<p>Trial scheduling is an active systems-research area precisely because reclaimed compute is money. The asynchronous Hyperband lineage (ASHA, Li et al.) remains the practical default, and current work pushes it in three directions. First, <em>heterogeneity-aware</em> scheduling places trials with knowledge of which GPU types and interconnects they will land on, so a trial's resource grant reflects the real cluster rather than a uniform abstraction, dovetailing with the fractional-GPU and gang-scheduling advances of <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/index.html">Chapter 33</a>. Second, <em>checkpoint-aware</em> stopping rules weigh the cost of pausing and migrating a trial (non-trivial for large models whose checkpoints are gigabytes) against the compute it would save, since for a billion-parameter trial a pause is no longer free. Third, scheduling for LLM hyperparameter and architecture search has revived interest in cheap proxies and learning-curve extrapolation, predicting a trial's final metric from its first few rungs so the scheduler can stop it even sooner; recent learning-curve and Bayesian-extrapolation methods feed exactly the streamed-metric channel this section built. The unifying theme is that the stopping decision is becoming model-aware and cost-aware, not a fixed quantile applied blindly.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.6.1: Five States, Five Transitions <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Draw the trial lifecycle state machine from Section 2 with its five states (pending, running, paused, resumed, terminated) and label every legal transition with the scheduler action that triggers it and the systems operation it requires (for example, running to paused requires a checkpoint write). Then mark which transitions a naive parallel <code>for</code> loop over configurations <em>cannot</em> perform, and state, for each missing transition, one search algorithm from this chapter that becomes impossible without it.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.6.2: Swap In ASHA <span class="exercise-type coding">Coding</span></div>
+<p>Replace the median-stopping rule in Code 21.6.1 with an ASHA promotion rule: at each rung $r$, promote a trial to rung $r+1$ only if its loss is in the best $1/\eta$ fraction of all losses reported at rung $r$ so far (use $\eta = 3$), otherwise terminate it. Run both rules on the same 40 trials and the same seed and report, for each, the compute reclaimed, the wall-clock, and whether the true best trial survived. Then sweep $\eta \in \{2, 3, 4, 8\}$ and describe the trade-off you observe between compute saved and the risk of killing the eventual winner. Why does a larger $\eta$ save more compute but raise that risk?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.6.3: The Cost of a Pause <span class="exercise-type analysis">Analysis</span></div>
+<p>Code 21.6.1 treats pause and resume as free. Suppose instead each pause writes a checkpoint of $C$ gigabytes to storage at $B$ gigabytes per second, so a pause-and-resume costs $2C/B$ seconds of wall-clock (write then read), while one rung of training takes $T$ seconds. Derive the condition on $C$, $B$, and $T$ under which pausing a trial to run another is actually worthwhile rather than just letting the current trial finish its next rung. For a $7$-billion-parameter model ($C \approx 28$ GB in fp32 plus optimizer state, say $C = 84$ GB), $B = 2$ GB/s, and $T = 120$ s, decide whether per-rung pausing pays off, and explain how this calculation motivates the checkpoint-aware scheduling mentioned in the Research Frontier.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-21.5.html"><span class="nav-label">Previous</span><span class="nav-num">Section 21.5</span><span class="nav-title">Population-Based Training</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 21</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Hyperparameter Search and AutoML</span></a>
+<a class="next" href="section-21.7.html"><span class="nav-label">Next</span><span class="nav-num">Section 21.7</span><span class="nav-title">Ray Tune</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

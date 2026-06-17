@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 26.2: Distributed Data and Training Pipelines. Orchestrating the multi-stage distributed DAG that produces a model, with validation gates, content-addressed caching, retries, and reproducibility." name="description"/>
+<title>Section 26.2: Distributed Data and Training Pipelines | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 26: MLOps for Distributed AI</a></div>
+<h1>Distributed Data and Training Pipelines</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I am not one job. I am six jobs in a trench coat, holding hands, and if the third one trips we all go down together. Please cache me."</p>
+<cite>A Training Pipeline Between Two Failed Runs</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A trained model is not the output of a single program; it is the output of a directed acyclic graph of distributed jobs, each running on its own cluster, each depending on the artifacts of the ones before it.</strong> Ingesting raw data, validating it, preprocessing it on a Spark cluster, training on a GPU fleet, evaluating, and registering the result are separate distributed computations chained into one pipeline. The job of a workflow orchestrator is to schedule that graph across shared compute, run each stage only when its dependencies are ready, retry the stages that fail on flaky hardware, skip the stages whose inputs have not changed, and do all of this reproducibly so that the same inputs always yield the same model. This section builds the pipeline-as-DAG mental model, shows the orchestrator's core responsibilities (dependency ordering, validation gates, caching, retries), and proves the caching idea with a runnable graph runner that skips work it has already done.</p>
+</div>
+<p>The previous section framed MLOps as operating an AI system across a fleet rather than babysitting one model on one box. The first concrete instance of that fleet-wide view is the pipeline that produces the model in the first place. On a single machine, producing a model is a script: load data, preprocess, fit, save. At scale, every one of those verbs is its own distributed job with its own resource profile. Data ingestion touches a distributed object store; preprocessing runs on a <a href="../../part-2-distributed-data/module-07-spark-dataframes/index.html">Spark cluster</a> (Chapter 7); training claims dozens of GPUs for hours; evaluation and registration are short but gate everything downstream. Stitching these heterogeneous jobs into one reliable, repeatable workflow is what this section is about, and the central abstraction is the DAG.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A machine learning pipeline drawn as a directed acyclic graph: ingest leads to validate, which gates into preprocess on a Spark cluster, then train on a GPU cluster, then evaluate, then register into the model registry. An orchestrator band along the top schedules every stage, handling retries and caching.">
+<defs>
+<marker id="arr262" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.box262 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.gpu262 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.orch262 { fill:#eef6ef; stroke:#2f7d4f; stroke-width:1.6; }
+.t262 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s262 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.to262 { font:600 13px sans-serif; fill:#2f7d4f; text-anchor:middle; }
+.l262 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr262); }
+.d262 { fill:none; stroke:#2f7d4f; stroke-width:1.3; stroke-dasharray:4 3; }
+</style>
+<rect class="orch262" x="40" y="20" width="800" height="48" rx="10"/>
+<text class="to262" x="440" y="40">Workflow orchestrator (Airflow / Kubeflow / Flyte)</text>
+<text class="s262" x="440" y="58">schedules the DAG, provisions compute per stage, retries failures, caches unchanged stages</text>
+<g>
+<rect class="box262" x="40" y="160" width="110" height="62" rx="8"/>
+<text class="t262" x="95" y="186">ingest</text>
+<text class="s262" x="95" y="204">object store</text>
+</g>
+<g>
+<rect class="box262" x="190" y="160" width="110" height="62" rx="8"/>
+<text class="t262" x="245" y="186">validate</text>
+<text class="s262" x="245" y="204">schema gate</text>
+</g>
+<g>
+<rect class="box262" x="340" y="160" width="120" height="62" rx="8"/>
+<text class="t262" x="400" y="186">preprocess</text>
+<text class="s262" x="400" y="204">Spark cluster</text>
+</g>
+<g>
+<rect class="gpu262" x="500" y="160" width="120" height="62" rx="8"/>
+<text class="t262" x="560" y="186">train</text>
+<text class="s262" x="560" y="204">GPU cluster</text>
+</g>
+<g>
+<rect class="box262" x="660" y="160" width="100" height="62" rx="8"/>
+<text class="t262" x="710" y="186">evaluate</text>
+<text class="s262" x="710" y="204">metric gate</text>
+</g>
+<g>
+<rect class="box262" x="690" y="270" width="130" height="56" rx="8"/>
+<text class="t262" x="755" y="294">register</text>
+<text class="s262" x="755" y="312">model registry</text>
+</g>
+<line x1="150" y1="191" x2="186" y2="191" class="l262"/>
+<line x1="300" y1="191" x2="336" y2="191" class="l262"/>
+<line x1="460" y1="191" x2="496" y2="191" class="l262"/>
+<line x1="620" y1="191" x2="656" y2="191" class="l262"/>
+<path class="l262" d="M 710 222 L 710 250 L 740 250 L 740 268"/>
+<line x1="95"  y1="160" x2="95"  y2="72" class="d262"/>
+<line x1="245" y1="160" x2="245" y2="72" class="d262"/>
+<line x1="400" y1="160" x2="400" y2="72" class="d262"/>
+<line x1="560" y1="160" x2="560" y2="72" class="d262"/>
+<line x1="710" y1="160" x2="710" y2="72" class="d262"/>
+<line x1="755" y1="270" x2="755" y2="72" class="d262"/>
+</svg>
+<figcaption><strong>Figure 26.2.1:</strong> The model-production pipeline as a directed acyclic graph. Solid arrows are data dependencies between stages; each stage is a distinct distributed job on its own cluster. The green band is the orchestrator, which schedules every node (dashed control links), provisions the right compute for each, and owns retries and caching. The <code>validate</code> and <code>evaluate</code> nodes are gates: the graph does not advance past them unless their checks pass.</figcaption>
+</figure>
+
+<h2>1. The Pipeline Is a DAG of Distributed Jobs <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A directed acyclic graph is the right abstraction because it captures exactly the two facts that matter: which stages must finish before which others can start, and which stages have no ordering between them and may run in parallel. In Figure 26.2.1 the chain ingest, validate, preprocess, train, evaluate, register is linear, but real pipelines fan out (preprocess images and text on separate clusters) and fan in (a training stage that consumes both), and the DAG encodes all of it without the orchestrator having to understand what any stage does. Each node is a black box that reads upstream artifacts and writes its own; each edge is a dependency. This is the same dataflow-graph idea that <a href="../../part-2-distributed-data/module-07-spark-dataframes/index.html">Spark</a> (Chapter 7) uses inside a single job, lifted one level up to coordinate whole jobs.</p>
+<p>What makes these nodes hard is that they are not equal. The preprocess node may run hundreds of Spark executors for twenty minutes; the train node may hold a 64-GPU gang for nine hours; the register node finishes in a second. The orchestrator must provision a different shape of distributed compute for each step and tear it down afterward, which is why scheduling a long GPU training step is itself a placement problem against a shared cluster, the subject of <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/index.html">Chapter 33</a>. The pipeline layer decides <em>when</em> the training job should run and on what inputs; the cluster scheduler decides <em>where</em> its GPUs come from.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Orchestrator Coordinates Jobs, Not Computations</div>
+<p>A distributed-training framework coordinates workers inside one job (it owns the all-reduce). A workflow orchestrator coordinates whole jobs across the lifecycle (it owns the edges between them). These are different layers and they compose: the train node of the DAG is, internally, a data-parallel job running its own collectives. Keeping the two layers distinct is what lets you swap a single-GPU training stage for a 512-GPU one without rewriting the pipeline; only the contents of one node change, not the graph.</p>
+</div>
+
+<h2>2. Validation Gates: Catch Bad Data Before It Costs a GPU-Day <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The most expensive failure in a training pipeline is the one you discover after the train node has run. A corrupted feature column, a silently shifted label distribution, or a schema change upstream can produce a model that trains to convergence and is quietly worthless. The remedy is a validation gate: a cheap stage placed immediately after ingestion that checks the data against an expected schema and against statistical expectations (column types, null rates, value ranges, distribution drift versus the last accepted batch) and refuses to let the graph proceed if the checks fail. In Figure 26.2.1 this is the <code>validate</code> node, and its placement before the costly Spark and GPU stages is deliberate: failing fast is the entire point.</p>
+<p>Gates are where data engineering and reliability meet. The same logic that makes a distributed system tolerate a bad node, fail the unit of work and re-run it rather than corrupting the whole, applies here at the data level: a batch that fails validation is rejected, the pipeline halts or routes to a remediation branch, and no GPU is spent on it. We made the general case for this fail-and-recover discipline in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.4.html">Section 2.4</a>; a validation gate is that discipline applied to data quality.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Schema Change That Almost Shipped a Dead Model</div>
+<p><strong>Who:</strong> An ML platform engineer at a payments company maintaining a nightly fraud-model retrain.</p>
+<p><strong>Situation:</strong> An upstream team renamed a transaction-amount field and changed its units from cents to dollars in the same release.</p>
+<p><strong>Problem:</strong> The preprocess stage happily cast the new column, training ran for its full six GPU-hours, and the model converged on a feature that was now off by a factor of one hundred.</p>
+<p><strong>Dilemma:</strong> Add a heavyweight data-contract system across every upstream producer, slow and political, or put a lightweight statistical gate in the pipeline itself, fast to ship but only catching what it is told to check.</p>
+<p><strong>Decision:</strong> They added a validate node that compared each batch's per-column summary statistics against the last accepted batch and failed the run on a mean shift beyond a set threshold.</p>
+<p><strong>How:</strong> The gate computed column means and null rates during ingestion (cheap, already a distributed scan) and asserted them against a stored baseline before the Spark and GPU stages were allowed to start.</p>
+<p><strong>Result:</strong> The next night's run halted at the gate in under a minute, flagging the amount column's hundredfold mean shift, and no GPU time was spent on the broken batch.</p>
+<p><strong>Lesson:</strong> A cheap gate that runs before the expensive stages converts a six-GPU-hour silent failure into a one-minute loud one. Validate where it is cheap, fail before it is expensive.</p>
+</div>
+
+<h2>3. Caching and Incremental Recomputation <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Most pipeline runs are not the first run. You change a hyperparameter and rerun; you fix a bug in the eval stage and rerun; the nightly schedule fires on data that is mostly unchanged. Recomputing the twenty-minute Spark preprocess and the nine-hour train every time would be ruinous, and most of it is wasted because the inputs to those stages did not change. The fix is content-addressed caching: fingerprint each stage's inputs (the outputs of its upstream stages plus its own configuration), and if a stage has already produced an output for that exact fingerprint, reuse the cached output and skip the work. A stage reruns only when something it actually depends on changes, and the change propagates downstream to exactly the stages it touches.</p>
+<p>This is the same lineage idea that underpins distributed dataflow systems. Spark tracks the lineage of every partition so it can recompute only what a failure lost (<a href="../../part-2-distributed-data/module-07-spark-dataframes/section-7.2.html">Section 7.2</a>), and distributed data loaders cache and reuse materialized shards rather than recomputing them every epoch (<a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/section-8.9.html">Section 8.9</a>). A pipeline cache lifts lineage to the granularity of whole stages: the fingerprint is the lineage key, and a cache hit is the proof that recomputation is unnecessary. Formally, if stage $s$ depends on inputs $I_s$ and we write its fingerprint as a hash $h(I_s)$, then a run reruns $s$ if and only if $h(I_s)$ differs from the fingerprint stored at the last successful run, and a change to a stage propagates to a descendant $d$ exactly when it alters $h(I_d)$.</p>
+<p>The runner below implements this in pure Python: a DAG of six stages, content fingerprinting, skip-on-unchanged caching, and retry-on-failure. The <code>train</code> stage is deliberately flaky on its first attempt (simulating a preempted GPU node) so the retry path is exercised, and we run the pipeline three times to watch caching at work.</p>
+<pre><code class="language-python">import hashlib, json, time
+
+CACHE = {}                       # stage_name -> (input_fingerprint, output)
+ATTEMPTS = {}                    # stage_name -> how many times the body actually ran
+
+def fingerprint(obj):
+    """Stable content hash of a stage's inputs (upstream outputs + config)."""
+    blob = json.dumps(obj, sort_keys=True, default=repr).encode()
+    return hashlib.sha256(blob).hexdigest()[:12]
+
+def run_stage(name, body, inputs, max_retries=3):
+    """Run one stage unless its input fingerprint is unchanged from last run."""
+    fp = fingerprint(inputs)
+    if name in CACHE and CACHE[name][0] == fp:                # cache hit -> skip
+        print(f"  [skip ] {name:&lt;11} inputs unchanged (fp={fp})")
+        return CACHE[name][1]
+    for attempt in range(1, max_retries + 1):                 # retry-on-failure
+        ATTEMPTS[name] = ATTEMPTS.get(name, 0) + 1
+        try:
+            out = body(inputs, attempt)
+            print(f"  [run  ] {name:&lt;11} attempt {attempt} ok (fp={fp})")
+            CACHE[name] = (fp, out)
+            return out
+        except Exception as e:
+            print(f"  [retry] {name:&lt;11} attempt {attempt} failed: {e}")
+    raise RuntimeError(f"stage {name} exhausted {max_retries} retries")
+
+# Each body is a distributed job in production; here it is pure Python.
+def ingest(inp, attempt):     return {"rows": list(range(inp["n_rows"]))}
+def validate(inp, attempt):                                  # data-validation gate
+    rows = inp["upstream"]["rows"]
+    if any(r &lt; 0 for r in rows): raise ValueError("negative ids in batch")
+    return {"rows": rows, "schema_ok": True}
+def preprocess(inp, attempt): return {"features": [r * 2 for r in inp["upstream"]["rows"]]}
+def train(inp, attempt):                                     # long GPU step; flaky once
+    if attempt == 1: raise TimeoutError("GPU node preempted")
+    return {"model": sum(inp["upstream"]["features"]), "epochs": inp["epochs"]}
+def evaluate(inp, attempt):   return {"metric": inp["upstream"]["model"] % 97}
+def register(inp, attempt):   return {"registered": True, "metric": inp["upstream"]["metric"]}
+
+def build_pipeline(n_rows, epochs):
+    """Topologically ordered DAG: ingest->validate->preprocess->train->eval->register."""
+    o = run_stage("ingest",     ingest,     {"n_rows": n_rows})
+    o = run_stage("validate",   validate,   {"upstream": o})
+    o = run_stage("preprocess", preprocess, {"upstream": o})
+    o = run_stage("train",      train,      {"upstream": o, "epochs": epochs})
+    o = run_stage("evaluate",   evaluate,   {"upstream": o})
+    return run_stage("register",   register,   {"upstream": o})
+
+print("=== Run 1: cold cache (train retries once after a preemption) ===")
+print("  result:", build_pipeline(n_rows=1000, epochs=3))
+print("\n=== Run 2: same inputs, warm cache (every stage skipped) ===")
+print("  result:", build_pipeline(n_rows=1000, epochs=3))
+print("\n=== Run 3: epochs changed 3 -> 5 (only train and its descendants rerun) ===")
+print("  result:", build_pipeline(n_rows=1000, epochs=5))
+print("\nstage bodies actually executed:", dict(sorted(ATTEMPTS.items())))
+</code></pre>
+<div class="code-caption"><strong>Code 26.2.1:</strong> A from-scratch pipeline-DAG runner with content-addressed caching and retry-on-failure. The <code>fingerprint</code> of a stage's inputs is its cache key; <code>run_stage</code> skips any stage whose fingerprint matches the last successful run, and retries a failing body up to <code>max_retries</code> times before giving up.</div>
+<pre><code class="language-text">=== Run 1: cold cache (train retries once after a preemption) ===
+  [run  ] ingest      attempt 1 ok (fp=e6e4ed2805fa)
+  [run  ] validate    attempt 1 ok (fp=d5002d909fb4)
+  [run  ] preprocess  attempt 1 ok (fp=c14d31e0b46f)
+  [retry] train       attempt 1 failed: GPU node preempted
+  [run  ] train       attempt 2 ok (fp=dffbe2f8953e)
+  [run  ] evaluate    attempt 1 ok (fp=8058b7afd310)
+  [run  ] register    attempt 1 ok (fp=84a7343cf56e)
+  result: {'registered': True, 'metric': 94}
+
+=== Run 2: same inputs, warm cache (every stage skipped) ===
+  [skip ] ingest      inputs unchanged (fp=e6e4ed2805fa)
+  [skip ] validate    inputs unchanged (fp=d5002d909fb4)
+  [skip ] preprocess  inputs unchanged (fp=c14d31e0b46f)
+  [skip ] train       inputs unchanged (fp=dffbe2f8953e)
+  [skip ] evaluate    inputs unchanged (fp=8058b7afd310)
+  [skip ] register    inputs unchanged (fp=84a7343cf56e)
+  result: {'registered': True, 'metric': 94}
+
+=== Run 3: epochs changed 3 -> 5 (only train and its descendants rerun) ===
+  [skip ] ingest      inputs unchanged (fp=e6e4ed2805fa)
+  [skip ] validate    inputs unchanged (fp=d5002d909fb4)
+  [skip ] preprocess  inputs unchanged (fp=c14d31e0b46f)
+  [retry] train       attempt 1 failed: GPU node preempted
+  [run  ] train       attempt 2 ok (fp=2a7c63d4f364)
+  [run  ] evaluate    attempt 1 ok (fp=50cfbcbf92dc)
+  [skip ] register    inputs unchanged (fp=84a7343cf56e)
+  result: {'registered': True, 'metric': 94}
+
+stage bodies actually executed: {'evaluate': 2, 'ingest': 1, 'preprocess': 1, 'register': 1, 'train': 4, 'validate': 1}</code></pre>
+<div class="code-caption"><strong>Output 26.2.1:</strong> Caching and incremental recomputation in action. Run 1 executes the whole DAG and retries <code>train</code> once after the simulated preemption. Run 2 hits the cache on every stage and runs no work at all. Run 3 changes only <code>epochs</code>, so the fingerprint changes from <code>train</code> onward: <code>ingest</code>, <code>validate</code>, and <code>preprocess</code> stay cached while <code>train</code> and <code>evaluate</code> rerun. The final tally confirms each upstream body ran exactly once across all three invocations.</div>
+<p>Three behaviors in Output 26.2.1 are worth naming. First, the retry: <code>train</code> failed on its first attempt in both runs that executed it and recovered on the second, which is why its body count is four (two attempts in Run 1, two in Run 3) while every other stage that runs costs one attempt. Second, the skip: Run 2 does zero work because nothing changed, exactly what you want when you rerun a pipeline to fix something downstream. Third, the propagation boundary: in Run 3 the change to <code>epochs</code> stops at the stages it actually reaches; <code>register</code> stays cached here because its input fingerprint happened to be unchanged. That last point is the whole value of content addressing: the cache reacts to what the data actually is, not to which stages a human guessed were affected.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Lineage, Scaled Out to Whole Jobs</div>
+<p>The fingerprint-and-skip logic in Code 26.2.1 is the same lineage primitive that recovers lost partitions inside a single Spark job (<a href="../../part-2-distributed-data/module-07-spark-dataframes/section-7.2.html">Section 7.2</a>), now lifted to coordinate whole distributed jobs across a fleet. The book's recurring move, take a mechanism that works inside one machine or one job and scale it out to span many, applies to operations themselves: a pipeline orchestrator is lineage tracking for the model-production graph. When you meet a model registry in <a href="section-26.3.html">Section 26.3</a>, notice that it is the persistent endpoint this DAG writes to, and that the same fingerprint that decided caching here becomes the provenance record there.</p>
+</div>
+
+<h2>4. Orchestrators: Scheduling the Graph on Shared Compute <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Code 26.2.1 ran in one process; a production orchestrator runs each node as a separate distributed job, often in its own container, on a cluster it shares with every other team. The orchestrator's responsibilities are exactly the ones the toy runner sketched, scaled up and made durable: parse the DAG, schedule each node when its upstream dependencies have succeeded, provision the right compute for that node (a Spark pool here, a GPU gang there), persist artifacts and the cache between runs, retry transient failures with backoff, and surface the state of every run for humans. The dominant tools (Apache Airflow, Kubeflow Pipelines, Argo Workflows, Flyte, Metaflow, Prefect) differ in how you express the DAG and how tightly they integrate with the cluster, but they share this core contract.</p>
+<p>The retry behavior matters most for the train node, because the GPU stage is both the longest and the most exposed to hardware failure: a node preempted on a spot instance, a NCCL timeout, a failed health check. The orchestrator's retry is the coarse-grained outer loop that re-runs a whole failed stage, while elastic training frameworks provide the fine-grained inner loop that survives a worker loss without restarting the job (<a href="../../part-4-parallel-deep-learning/module-18-elastic-fault-tolerant-training/index.html">Chapter 18</a>). A robust pipeline uses both: the inner loop absorbs the failures it can, the outer loop catches the ones it cannot, and checkpointing means an outer retry resumes rather than starting the nine-hour run from zero.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Kubeflow, Airflow, and Flyte Express the DAG Declaratively</div>
+<p>The dependency wiring, caching, and retry logic of Code 26.2.1 (about sixty lines, and still missing distributed execution, durable artifacts, and a UI) collapse to a decorated function per stage in a modern orchestrator. The framework infers the DAG from data dependencies, runs each stage as a containerized job on the cluster, caches by content fingerprint, and retries on your policy:</p>
+<pre><code class="language-python"># Flyte: each @task is a containerized distributed job; the @workflow is the DAG.
+from flytekit import task, workflow
+
+@task(cache=True, cache_version="1.0", retries=3)   # content cache + retry built in
+def preprocess(rows: list) -&gt; list:
+    return [r * 2 for r in rows]                     # runs as its own Spark/K8s job
+
+@task(cache=True, cache_version="1.0", retries=3, requests=Resources(gpu="8"))
+def train(features: list, epochs: int) -&gt; int:
+    return sum(features)                             # claims 8 GPUs from the cluster
+
+@workflow                                            # dependencies inferred from args
+def pipeline(n_rows: int, epochs: int) -&gt; int:
+    feats = preprocess(rows=ingest(n_rows=n_rows))
+    return train(features=feats, epochs=epochs)
+</code></pre>
+<div class="code-caption"><strong>Code 26.2.2:</strong> The same DAG, caching, and retries as Code 26.2.1 expressed in Flyte. The <code>cache=True</code> flag replaces the entire <code>fingerprint</code>/<code>CACHE</code> machinery, <code>retries=3</code> replaces the manual retry loop, and <code>requests=Resources(gpu="8")</code> hands the placement problem to the cluster scheduler. Kubeflow Pipelines and Airflow offer equivalent declarative DAGs; the from-scratch runner exists only to show what these flags do underneath.</div>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Pipeline That Was Faster When You Did Nothing</div>
+<p>A team once celebrated cutting their retrain time from nine hours to forty seconds. The secret was not a faster GPU; it was that someone had finally turned on stage caching, and the "retrain" they were timing changed nothing upstream of <code>train</code>, so the whole DAG was a cache hit. The lesson landed twice: caching is a real speedup, and a benchmark that measures a no-op measures your caching, not your training.</p>
+</div>
+
+<h2>5. Reproducibility of the Whole Pipeline <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Caching is only sound if a stage is a deterministic function of its inputs, which is the same property that makes a pipeline reproducible: given the same data, code, configuration, and environment, it must produce the same model. Reproducibility at the pipeline level is more demanding than at the script level because there are more moving parts to pin: the input data version, every stage's code version, the container image and library versions, the random seeds, and the resource topology that can change numerics (a different GPU count changes the reduction order of an all-reduce). The fingerprint that drives caching in Code 26.2.1 is the seed of this discipline: if the fingerprint captures everything that can change the output, then an unchanged fingerprint is a guarantee of an unchanged result, and a changed one is an honest signal that the result may differ.</p>
+<p>In practice you make a pipeline reproducible by versioning each of those inputs and recording the exact set used by each run: an immutable data snapshot, a git commit per stage, a pinned image digest, and the recorded seeds. The orchestrator stores this provenance alongside the artifacts so that any registered model can be traced back to the precise pipeline run, code, and data that produced it. That provenance record is what the model registry in <a href="section-26.3.html">Section 26.3</a> persists, and it is what turns "the model from last Tuesday" into a fully reconstructible object rather than a hope.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Declarative, Incremental, and Data-Centric Pipelines (2024 to 2026)</div>
+<p>Pipeline orchestration is moving from imperative DAG scripts toward declarative, data-aware systems. Airflow 2.x and the 2024 Airflow 3 line push data-driven and asset-based scheduling, where stages fire when the datasets they depend on are updated rather than on a clock, making incremental recomputation a first-class concept rather than a bolt-on cache. Flyte and Kubeflow have hardened content-addressed caching and typed, versioned artifacts so that provenance and skip-on-unchanged are native. On the data-validation front, the lineage of TensorFlow Data Validation and Great Expectations has been joined by contract-style checks and learned drift detectors that gate training automatically. A parallel current is data-centric and incremental learning, where the pipeline retrains only on the slice of data that changed rather than the full corpus, pushing the caching idea of Code 26.2.1 down to the example level and connecting it to the streaming and online-learning machinery of Chapter 9. The throughline is that the orchestrator is becoming a reactive function of data state, not a timer.</p>
+</div>
+<p>We now have the production pipeline as a DAG of distributed jobs, the gates that stop bad data early, the caching that makes reruns cheap, the orchestrator that schedules it all on shared compute, and the provenance that makes the whole thing reproducible. The pipeline's final node, <code>register</code>, hands the model to a system whose job is to version, stage, and serve every model the pipeline ever produces. That system, the model registry, is where <a href="section-26.3.html">Section 26.3</a> begins.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.2.1: Where Does the Gate Belong? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>In Figure 26.2.1 the <code>validate</code> node sits immediately after <code>ingest</code> and before <code>preprocess</code> and <code>train</code>. Argue from cost why this placement is correct, and describe one check that genuinely cannot run there and must instead run after <code>preprocess</code> (for example, a property of the engineered features rather than the raw columns). Then explain what the orchestrator should do when a post-preprocess gate fails: halt, branch to remediation, or proceed with a warning, and why the right answer depends on whether the pipeline is a one-off research run or a scheduled production retrain.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.2.2: Make Caching Honest <span class="exercise-type coding">Coding</span></div>
+<p>Code 26.2.1 fingerprints only a stage's inputs, not its code. Introduce a bug by changing the <code>preprocess</code> body (say, multiply by 3 instead of 2) and rerun with the same <code>n_rows</code>: observe that the stage is wrongly skipped because its input fingerprint did not change. Fix it by folding a code version (a string or a hash of the function source) into the fingerprint so that editing a stage's body invalidates its cache and propagates downstream. Verify that your fix reruns <code>preprocess</code>, <code>train</code>, and <code>evaluate</code> but still skips <code>ingest</code> and <code>validate</code>. Explain why a real orchestrator uses a git commit or image digest for this rather than hashing source text.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.2.3: Cost of the Outer Retry <span class="exercise-type analysis">Analysis</span></div>
+<p>Suppose the <code>train</code> stage runs for nine hours on a 64-GPU gang and a spot preemption hits with probability $p = 0.15$ in any given run, restarting the stage from its last checkpoint. If checkpoints are written every $c$ hours and a restart loses on average $c/2$ hours of work, write the expected wasted GPU-hours per run as a function of $c$ and $p$. Evaluate it for $c \in \{0.5, 1, 3\}$ hours, and discuss the trade-off: frequent checkpoints cut restart waste but add checkpoint-write overhead and storage traffic. Connect your answer to why the orchestrator's coarse outer retry and the framework's fine-grained elastic recovery (<a href="../../part-4-parallel-deep-learning/module-18-elastic-fault-tolerant-training/index.html">Chapter 18</a>) are complementary rather than redundant.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-26.1.html"><span class="nav-label">Previous</span><span class="nav-num">Section 26.1</span><span class="nav-title">Operating AI Across a Fleet</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 26</span><span class="nav-num">Contents</span><span class="nav-title">MLOps for Distributed AI</span></a>
+<a class="next" href="section-26.3.html"><span class="nav-label">Next</span><span class="nav-num">Section 26.3</span><span class="nav-title">Model and Prompt Registries</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 4.3: All-Reduce: Synchronizing Gradients in Data-Parallel SGD. The collective that turns the gradient-averaging identity of Section 1.1 into a single primitive every worker calls, from a hand-built version to torch.distributed.all_reduce and DistributedDataParallel." name="description"/>
+<title>Section 4.3: All-Reduce: Synchronizing Gradients in Data-Parallel SGD | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Distributed AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 4: Communication Primitives for Distributed Training</a></div>
+<h1>All-Reduce: Synchronizing Gradients in Data-Parallel SGD</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Everyone brought a number. I made sure everyone left with the same number. That is the entire job, and somehow it is the hardest one in the building."</p>
+<cite>An All-Reduce That Has Seen Some Gradients</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>All-reduce is the operation in which every machine contributes a vector, the vectors are combined elementwise with one associative reduction (a sum or a mean), and every machine ends up holding the identical combined result.</strong> In data-parallel training that single sentence is the whole synchronization story: each worker computes a gradient from its own shard of the batch, the workers all-reduce those gradients into the averaged gradient, and from that point on every worker holds the same numbers and takes the same optimizer step. <a href="../module-01-scale-out-ai/section-1.1.html">Section 1.1</a> proved that averaging per-worker gradients reproduces the single-machine gradient exactly; this section gives that average its real name, builds it from scratch so the semantics are unambiguous, and then collapses it to the one library call that production training loops actually use. The cost of doing this fast for billion-element vectors across thousands of workers is the subject of the next section.</p>
+</div>
+<p>Chapter 4 opened by arguing that communication, not raw compute, is what bounds distributed training, and <a href="section-4.2.html">Section 4.2</a> separated point-to-point messages from collective operations that the whole group participates in at once. All-reduce is the most important collective in this book, and the reason is specific rather than general: it is the exact shape of the synchronization step in data-parallel stochastic gradient descent. We could introduce all-reduce as an abstract reduction over a process group, the way a parallel-computing textbook would, but that hides why a deep-learning engineer cares. So we introduce it through its defining use. Every worker has just finished a backward pass and is holding a gradient. To take a correct optimizer step, they all need the average of those gradients. The primitive that delivers exactly that, to every worker at once, is all-reduce.</p>
+
+<h2>1. The Operation, Defined Precisely <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Fix a group of $K$ workers, indexed $k = 0, 1, \ldots, K-1$, and suppose each worker $k$ holds a vector $g_k \in \mathbb{R}^{P}$ of the same length $P$. The vectors differ across workers; in training, $g_k$ is the gradient computed on worker $k$'s shard of the batch. An all-reduce with reduction operator $\oplus$ produces a single vector $r$ and leaves a copy of $r$ on every worker:</p>
+$$r = g_0 \oplus g_1 \oplus \cdots \oplus g_{K-1}, \qquad \text{worker } k \text{ ends holding } r \text{ for every } k.$$
+<p>The operator $\oplus$ is applied elementwise and must be associative and commutative so the result does not depend on the order in which the workers' contributions are combined; sum, mean, max, min, and product all qualify. The two facts that make this a collective rather than a plain reduction are worth stating separately. First, the reduction is over all workers: no single worker can compute $r$ from its own data alone. Second, the result is shared with all workers: when the call returns, every worker holds the same $r$, byte for byte. A reduction that left the answer on only one worker would be a <em>reduce</em>; broadcasting that answer back to everyone is what promotes it to an <em>all</em>-reduce, and the name simply concatenates the two halves.</p>
+<p>For gradient synchronization the operator we want is sum, and the mean is one scalar division away. If worker $k$ contributes the sum of gradients over its own $n_k$ examples, then an all-reduce with $\oplus = +$ leaves every worker holding the total gradient sum over the whole batch; dividing by the batch size $N = \sum_k n_k$ gives the averaged gradient that the optimizer needs. This is the same combine-then-divide pattern you performed by hand in <a href="../module-01-scale-out-ai/section-1.1.html">Section 1.1</a>, now recognized as a single named primitive.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three stage diagram of all-reduce: four workers each contribute a different vector on the left, the vectors are summed elementwise in a central reduce step, and on the right every worker holds the identical reduced vector.">
+<defs>
+<marker id="arr43" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.w43 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.r43 { fill:#e9f3ec; stroke:#2e7d4f; stroke-width:1.6; }
+.c43 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.t43 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.m43 { font:12px monospace; fill:#5a4632; text-anchor:middle; }
+.g43 { font:12px monospace; fill:#2e7d4f; text-anchor:middle; }
+.s43 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l43 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr43); }
+</style>
+<text class="t43" x="110" y="24">1. Contribute</text>
+<text class="t43" x="430" y="24">2. Reduce (sum)</text>
+<text class="t43" x="760" y="24">3. Everyone holds the result</text>
+<rect class="w43" x="40" y="44" width="140" height="40" rx="7"/><text class="t43" x="110" y="62">Worker 0</text><text class="m43" x="110" y="78">[2, 0, 1]</text>
+<rect class="w43" x="40" y="104" width="140" height="40" rx="7"/><text class="t43" x="110" y="122">Worker 1</text><text class="m43" x="110" y="138">[1, 3, 0]</text>
+<rect class="w43" x="40" y="164" width="140" height="40" rx="7"/><text class="t43" x="110" y="182">Worker 2</text><text class="m43" x="110" y="198">[0, 1, 4]</text>
+<rect class="w43" x="40" y="224" width="140" height="40" rx="7"/><text class="t43" x="110" y="242">Worker 3</text><text class="m43" x="110" y="258">[1, 2, 2]</text>
+<rect class="c43" x="360" y="124" width="140" height="60" rx="9"/><text class="t43" x="430" y="150">sum across</text><text class="t43" x="430" y="168">all workers</text>
+<path class="l43" d="M 180 64 L 355 140"/>
+<path class="l43" d="M 180 124 L 355 150"/>
+<path class="l43" d="M 180 184 L 355 158"/>
+<path class="l43" d="M 180 244 L 355 168"/>
+<rect class="r43" x="640" y="44" width="180" height="40" rx="7"/><text class="t43" x="700" y="62">Worker 0</text><text class="g43" x="770" y="68">[4, 6, 7]</text>
+<rect class="r43" x="640" y="104" width="180" height="40" rx="7"/><text class="t43" x="700" y="122">Worker 1</text><text class="g43" x="770" y="128">[4, 6, 7]</text>
+<rect class="r43" x="640" y="164" width="180" height="40" rx="7"/><text class="t43" x="700" y="182">Worker 2</text><text class="g43" x="770" y="188">[4, 6, 7]</text>
+<rect class="r43" x="640" y="224" width="180" height="40" rx="7"/><text class="t43" x="700" y="242">Worker 3</text><text class="g43" x="770" y="248">[4, 6, 7]</text>
+<path class="l43" d="M 500 144 L 635 64"/>
+<path class="l43" d="M 500 152 L 635 124"/>
+<path class="l43" d="M 500 160 L 635 184"/>
+<path class="l43" d="M 500 168 L 635 244"/>
+<text class="s43" x="430" y="320">every output vector is identical: the elementwise sum 2+1+0+1=4, 0+3+1+2=6, 1+0+4+2=7</text>
+</svg>
+<figcaption><strong>Figure 4.3.1:</strong> All-reduce in three stages. Each of the four workers contributes a different length-3 vector (left); the vectors are combined with one elementwise reduction, here a sum (center); and the identical result lands on every worker (right). Divide each output by $K = 4$ and the sum becomes the mean, which is exactly what gradient averaging needs.</figcaption>
+</figure>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: All-Reduce Is "Reduce" and "Broadcast" Fused Into One Symmetric Call</div>
+<p>You could synchronize gradients with two asymmetric steps: every worker sends its gradient to a designated leader, the leader sums them, then the leader broadcasts the total back. All-reduce delivers the same result but treats every worker identically, with no leader and no single machine that must hold or move $K$ times the traffic. That symmetry is what lets the clever algorithms of <a href="section-4.4.html">Section 4.4</a> spread the work and the bandwidth evenly across the group, so the time to synchronize need not grow with the number of workers. Whenever you see gradient synchronization in later chapters, you are looking at this one fused primitive.</p>
+</div>
+
+<h2>2. Averaging Gradients Is an All-Reduce <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The link back to <a href="../module-01-scale-out-ai/section-1.1.html">Section 1.1</a> is not an analogy; it is an identity. Recall the loss is an average over $N$ examples, so its gradient is an average of per-example gradients, and an average decomposes across any partition of the examples. Split the batch into $K$ shards, give shard $k$ to worker $k$, and let worker $k$ compute the local sum $s_k = \sum_{i \in \text{shard } k} \nabla \ell(w; x_i, y_i)$. The averaged gradient the optimizer wants is</p>
+$$\nabla L(w) = \frac{1}{N} \sum_{k=0}^{K-1} s_k = \frac{1}{N}\,\big(s_0 + s_1 + \cdots + s_{K-1}\big).$$
+<p>The parenthesized sum is precisely an all-reduce with $\oplus = +$ over the vectors $s_k$. After the all-reduce every worker holds the same total $\sum_k s_k$, divides by $N$, and now holds the identical averaged gradient. Because the workers started with identical model parameters and now apply the identical gradient with the identical optimizer, they remain in lockstep: the model on every worker stays bit-for-bit the same at every step, which is what makes data-parallel training a single coherent training run rather than $K$ diverging ones. The gradient identity of Section 1.1 is the correctness proof; all-reduce is the mechanism that realizes it across machines without ever gathering all the data in one place.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Section 1.1 Average, Now a Named Primitive</div>
+<p>In <a href="../module-01-scale-out-ai/section-1.1.html">Section 1.1</a> we summed one vector per worker and divided, and called the result the seed of the whole book. That seed has a name: all-reduce. From here it grows. <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a> wires this exact call into a real backward pass as <code>DistributedDataParallel</code>; <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a> splits it into reduce-scatter and all-gather for ZeRO and FSDP; and <a href="../../part-4-parallel-deep-learning/module-17-expert-parallelism-moe/index.html">Chapter 17</a> reshapes the same idea into all-to-all when experts live on different machines. Every one of those methods is a relative of the average you first computed by hand, scaled out.</p>
+</div>
+
+<h2>3. Building All-Reduce From Scratch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>To make the semantics concrete and impossible to misread, we simulate $K$ ranks in a single process, each holding its own private vector, and implement all-reduce so that the only way information crosses between ranks is through the explicit combine step. We then check the contract directly: after the call, do all $K$ ranks hold one and the same reduced vector, and does that vector equal the independently computed ground-truth sum? The demonstration below uses the sum reduction and then a mean, mirroring gradient synchronization.</p>
+<pre><code class="language-python">import numpy as np
+
+def all_reduce_sum(rank_buffers):
+    """Simulate all-reduce(SUM) over K ranks, each holding its own vector.
+    Input: a list of K arrays (one private buffer per rank).
+    Output: a list of K arrays, every entry the elementwise sum, so that
+    the SAME result is now resident on every rank (the 'all' in all-reduce)."""
+    total = np.zeros_like(rank_buffers[0])
+    for buf in rank_buffers:          # the only cross-rank data movement
+        total = total + buf           # associative, order-independent
+    return [total.copy() for _ in rank_buffers]   # broadcast a copy to each rank
+
+rng = np.random.default_rng(0)
+K, P = 6, 4                                       # 6 simulated ranks, length-4 vectors
+rank_buffers = [rng.standard_normal(P) for _ in range(K)]   # each rank's private vector
+
+reduced = all_reduce_sum(rank_buffers)            # the collective
+ground_truth = np.sum(rank_buffers, axis=0)       # what every rank SHOULD now hold
+
+# Contract 1: all ranks hold the identical vector after the call.
+all_identical = all(np.array_equal(reduced[0], reduced[k]) for k in range(K))
+# Contract 2: that shared vector equals the true elementwise sum.
+matches_truth = np.allclose(reduced[0], ground_truth)
+
+print("ranks K                 :", K)
+print("all ranks identical     :", all_identical)
+print("equals ground-truth sum :", matches_truth)
+print("shared reduced vector   :", np.array2string(reduced[0], precision=4))
+
+# Gradient synchronization is the same call followed by one division.
+mean_grad = reduced[0] / K
+print("averaged (mean) vector  :", np.array2string(mean_grad, precision=4))
+</code></pre>
+<div class="code-caption"><strong>Code 4.3.1:</strong> All-reduce built from a single explicit combine step over $K$ simulated ranks. The two printed booleans check the defining contract: every rank ends with the identical vector, and that vector is the true elementwise sum. The final division turns the sum into the mean gradient that data-parallel SGD applies.</div>
+<p>Running this with the project Python interpreter produces the output below.</p>
+<pre><code class="language-text">ranks K                 : 6
+all ranks identical     : True
+equals ground-truth sum : True
+shared reduced vector   : [-4.1115 -0.2046 -0.1783  1.7551]
+averaged (mean) vector  : [-0.6852 -0.0341 -0.0297  0.2925]
+</code></pre>
+<div class="code-caption"><strong>Output 4.3.1:</strong> Real output from Code 4.3.1. Both contracts hold: all six ranks reach the identical reduced vector, and it equals the independently computed ground-truth sum. The mean vector is that sum divided by $K = 6$, the form a training step uses.</div>
+<p>Two booleans both reading <code>True</code> is the entire semantics of all-reduce on display: consensus (every rank holds the same vector) and correctness (it is the right reduction). Our implementation gathered the buffers into one running total, which is fine for a teaching simulation but is exactly the asymmetric, leader-centric pattern that real systems avoid. A production all-reduce never funnels every contribution through one place; it arranges the communication so each worker moves only a small share of the data and the bandwidth load is balanced. How that is done, and why the ring all-reduce in particular reshaped deep-learning systems, is the whole of <a href="section-4.4.html">Section 4.4</a>.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Word Hides the Broadcast</div>
+<p>Newcomers often read "all-reduce" as a louder kind of reduce and miss that the prefix is doing real work. A plain reduce is a meeting where one person takes notes; all-reduce is a meeting where everyone walks out with a photocopy of the same notes. The photocopier (the broadcast half) is usually the expensive part, which is why so much engineering goes into not actually making $K$ separate copies the slow way.</p>
+</div>
+
+<h2>4. The Library Shortcut and Automatic Synchronization <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>In a real multi-machine job you never gather buffers into one Python list, because the buffers live on different machines. PyTorch exposes all-reduce as a single collective over a process group, and each worker calls it on its own local tensor; when the call returns, that tensor has been overwritten in place with the reduced result, identical on every worker. The manual loop of Code 4.3.1 collapses to one line.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: torch.distributed.all_reduce, and DDP Calling It for You</div>
+<p>The hand-built reduction-plus-broadcast of Code 4.3.1 is exactly <code>torch.distributed.all_reduce</code>. Each worker passes its local gradient tensor; the library performs the network transport, runs an efficient algorithm (Section 4.4), and writes the summed result back into every worker's tensor in place:</p>
+<pre><code class="language-python"># Launch with: torchrun --nproc_per_node=6 thisfile.py
+import torch, torch.distributed as dist
+
+dist.init_process_group("nccl")                 # join the group of K workers
+local_grad = compute_shard_gradient()           # this worker's gradient tensor (length P)
+
+dist.all_reduce(local_grad, op=dist.ReduceOp.SUM)   # every worker now holds the SUM
+local_grad /= dist.get_world_size()                 # divide by K to get the mean gradient
+# local_grad is now the averaged gradient, identical on every worker
+</code></pre>
+<div class="code-caption"><strong>Code 4.3.2:</strong> The same collective as Code 4.3.1, now one <code>all_reduce</code> call over a real process group. The roughly ten lines of manual gather-and-copy reduce to a single line, and the library owns the network transport, the algorithm choice, and the in-place write-back to every worker.</div>
+<p>In practice you rarely call it yourself. Wrapping a model in <code>torch.nn.parallel.DistributedDataParallel</code> registers hooks on the parameters so that, during <code>loss.backward()</code>, each gradient is all-reduced the instant it is ready and overlapped with the rest of the backward pass. By the time <code>backward()</code> returns, every worker already holds the averaged gradient and <code>optimizer.step()</code> just works. <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a> builds this DDP training loop in full, including the gradient bucketing that batches many small tensors into a few large all-reduces.</p>
+</div>
+<p>So the same primitive appears at three altitudes: the explicit combine you can read in Code 4.3.1, the one-line collective in Code 4.3.2, and the invisible hook that fires automatically inside DDP's backward pass. They compute the identical averaged gradient; they differ only in how much machinery the framework hides. What none of them changes is the cost, which is set by how the bytes actually move across the interconnect, and that is what we turn to next.</p>
+
+<h2>5. Why the Algorithm Still Matters <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The naive picture of all-reduce, every worker ships its full gradient to one place that sums and rebroadcasts, has a fatal scaling property: the central node must send and receive roughly $K$ times the gradient, so synchronization time grows with the number of workers even though the useful answer is the same size regardless of $K$. For a billion-parameter model and hundreds of workers, that central bottleneck would dominate the step and erase the speedup that distribution was supposed to buy, exactly the communication tax that <a href="index.html">Chapter 4</a> opened with and that the alpha-beta cost model of <a href="../module-03-scalability-performance-models/index.html">Chapter 3</a> lets you quantify. The fix is to choose an all-reduce <em>algorithm</em> whose cost does not grow with $K$, by spreading the data movement evenly so no single worker is the funnel. That is why a primitive with a one-line interface still gets a whole section of algorithmic attention.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The All-Reduce That Refused to Scale Past Eight GPUs</div>
+<p><strong>Who:</strong> A deep-learning engineer scaling a vision-model training job from one node to a multi-node cluster.</p>
+<p><strong>Situation:</strong> Eight GPUs on one machine trained at a healthy rate; moving to four machines with thirty-two GPUs barely improved throughput.</p>
+<p><strong>Problem:</strong> A profiler showed the workers idling on the gradient synchronization, with one rank moving far more bytes than the others each step.</p>
+<p><strong>Dilemma:</strong> Accept the poor multi-node scaling and rent fewer, bigger single boxes, or find why the all-reduce itself stopped scaling once the group spanned the slower cross-machine network.</p>
+<p><strong>Decision:</strong> They inspected the collective and found the framework had fallen back to a parameter-server-style reduction with one rank acting as the central summer, the very pattern Code 4.3.1 uses for teaching.</p>
+<p><strong>How:</strong> They switched the backend to one using a bandwidth-optimal ring all-reduce (Section 4.4) and enabled gradient bucketing so the small per-layer tensors were fused into a few large transfers.</p>
+<p><strong>Result:</strong> Synchronization time stopped growing with the worker count, and the thirty-two-GPU run reached close to four times the eight-GPU throughput, the scaling the math had promised.</p>
+<p><strong>Lesson:</strong> All-reduce semantics are fixed, but its performance is an algorithm choice; a collective that funnels through one rank will throttle a cluster no matter how fast the GPUs are.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Cheaper Gradient Synchronization (2024 to 2026)</div>
+<p>Because the all-reduce is the per-step tax on data-parallel training, recent work attacks its cost from several directions. Gradient compression in the lineage of PowerSGD and 1-bit Adam shrinks the bytes each all-reduce must move, and low-precision collectives that reduce directly in FP8 or BF16 are now common in large training runs. Communication-avoiding optimizers such as local SGD and its DiLoCo-style descendants (Douillard et al., 2024) let workers take several local steps between all-reduces, trading a little statistical efficiency for far fewer synchronizations, and have been pushed toward genuinely geo-distributed, over-the-internet training where the all-reduce crosses data centers. In parallel, frameworks overlap the all-reduce so aggressively with the backward pass that the synchronization nearly disappears behind computation. We pick these ideas up with the cost machinery to judge them in <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a>; for now, note the field treats the all-reduce of Code 4.3.2 not as fixed overhead but as a quantity to engineer down.</p>
+</div>
+<p>We have defined all-reduce, tied it by identity to the gradient average of <a href="../module-01-scale-out-ai/section-1.1.html">Section 1.1</a>, built it from scratch with its contract verified, and reduced it to one library call that <code>DistributedDataParallel</code> fires automatically. What remains is the part the practical example just foreshadowed: the algorithms that make all-reduce fast enough to be worth using, and why the ring all-reduce in particular changed how deep learning is trained. That is <a href="section-4.4.html">Section 4.4</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.3.1: Reduce Versus All-Reduce <span class="exercise-type conceptual">Conceptual</span></div>
+<p>State in one sentence each how an all-reduce differs from (a) a plain reduce that leaves the result on a single worker and (b) a broadcast that copies one worker's vector to all others. Then explain why gradient synchronization in data-parallel SGD needs the <em>all</em> in all-reduce specifically, that is, why every worker, not just one, must end the step holding the averaged gradient. What would go wrong with the model replicas if only one worker received the result?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.3.2: Sum-Then-Divide Versus Mean-of-Means <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 4.3.1 so each rank also holds a count $n_k$ of examples and the per-rank vector is the sum of that rank's gradients. Compute the correct averaged gradient two ways: (a) all-reduce the per-rank sums, then divide by $N = \sum_k n_k$; and (b) average the per-rank mean gradients with an unweighted mean. Make the counts unequal (for example one large rank and several tiny ones) and show numerically that the two answers disagree. Explain which one matches the single-machine gradient and why, connecting back to the exactness argument of <a href="../module-01-scale-out-ai/section-1.1.html">Section 1.1</a>.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.3.3: The Cost of the Central Funnel <span class="exercise-type analysis">Analysis</span></div>
+<p>Consider the naive all-reduce of Code 4.3.1, where one designated worker receives every other worker's gradient, sums them, and sends the result back. For a gradient of $P = 10^9$ four-byte floats and $K$ workers connected to that central worker by a link moving 10 gigabytes per second, estimate the number of bytes the central worker must receive and send, and the resulting synchronization time, as a function of $K$. Now argue qualitatively why an algorithm that moves only about $2P$ bytes per worker regardless of $K$ (the target of <a href="section-4.4.html">Section 4.4</a>) is the only way to keep synchronization time flat as the cluster grows. You may reuse the alpha-beta framing of <a href="../module-03-scalability-performance-models/index.html">Chapter 3</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-4.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 4.2</span><span class="nav-title">The Communication Substrate</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 4</span><span class="nav-num">Contents</span><span class="nav-title">Communication Primitives for Distributed Training</span></a>
+<a class="next" href="section-4.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 4.4</span><span class="nav-title">All-Reduce Algorithms, and Why Ring All-Reduce Mattered</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

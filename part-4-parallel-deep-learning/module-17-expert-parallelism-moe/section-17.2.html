@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 17.2: The Mixture-of-Experts Layer. How replacing the dense feed-forward sublayer with many expert FFNs plus a gate turns a transformer block into a sparse, conditionally computed layer, with a from-scratch top-2 router." name="description"/>
+<title>Section 17.2: The Mixture-of-Experts Layer | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 17: Expert Parallelism and Sparse Distributed Models</a></div>
+<h1>The Mixture-of-Experts Layer</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They built me a room with eight specialists and a receptionist who reads two words of your problem before deciding which two of us you get. I am the specialist nobody's two words ever point to."</p>
+<cite>An Expert Nobody Routed To</cite>
+</blockquote>
+<figure class="mental-model">
+<img src="images/mm-moe-routing.png" alt="Mental model: Mixture-of-Experts Routing" loading="lazy">
+<figcaption><strong>Mental model.</strong> A gating router sends each token to only one or two of many expert subnetworks, so most experts stay idle for any given token. Sparse routing buys capacity without paying dense compute.</figcaption>
+</figure>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A Mixture-of-Experts layer replaces the single dense feed-forward sublayer of a transformer with many parallel expert feed-forward networks and a small gating network that, for each token, selects only a few experts to run.</strong> The layer holds the parameters of all experts but spends compute on only the chosen handful, so the parameter count grows while the work per token stays nearly flat. That decoupling of capacity from cost is the entire reason sparse models exist, and it is what <a href="section-17.1.html">Section 17.1</a> framed as dense versus sparse scaling. The mental model above captures the whole idea in one image: a router sends each token to only one or two of many experts, so most experts stay idle for any given token. This section dissects that picture into one MoE layer: what an expert is, how the gate picks experts, how the chosen outputs are combined into one vector, and why the feed-forward sublayer is the natural place to do all of this. The selected experts will later live on different machines, which is what turns this local layer into the distributed problem the rest of the chapter solves.</p>
+</div>
+<p>In <a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a> every worker held a full copy of the same dense model and the only thing that differed across machines was the data. A Mixture-of-Experts model breaks that symmetry: the model itself contains parts that most tokens never touch. To see how, we zoom all the way in to a single transformer block and change exactly one sublayer. Recall that a transformer block alternates an attention sublayer, which mixes information across positions, with a position-wise feed-forward network (FFN) that transforms each token independently. The FFN is where Mixture-of-Experts does its work, because it is both the heaviest part of the block and the part that already treats every token on its own.</p>
+
+<h2>1. From One Feed-Forward Network to Many Experts <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The dense feed-forward sublayer applies the same two-layer network to every token vector $x \in \mathbb{R}^{d}$, expanding to a hidden width $h$ and projecting back: $\mathrm{FFN}(x) = \sigma(x W_1) W_2$, with $W_1 \in \mathbb{R}^{d \times h}$ and $W_2 \in \mathbb{R}^{h \times d}$. Because $h$ is typically four times $d$, this one sublayer holds roughly two thirds of the parameters in a transformer block, and every token pays for all of them on every forward pass. That is the cost a Mixture-of-Experts layer attacks.</p>
+<p>The construction is direct. Instead of one FFN, install $E$ separate feed-forward networks, called experts, each with its own weights $W_1^{(e)}, W_2^{(e)}$ and identical shape. Add a small gating network $g$ that reads the token and decides which experts should handle it. The layer's output for a token is then a weighted sum over the experts the gate selected, not over all of them. With $E$ experts the layer stores $E$ times as many feed-forward parameters as a dense block, yet if the gate picks only $k$ of them per token, the compute per token rises by a factor of $k$, not $E$. Choosing $k = 2$ while $E = 64$ buys thirty-two times the feed-forward capacity for twice the feed-forward compute.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Capacity and Compute Are Decoupled by Conditional Routing</div>
+<p>A dense layer ties parameters to compute: every parameter is multiplied for every token. An MoE layer cuts that tie. Total capacity scales with the number of experts $E$, but compute per token scales with the number selected $k$, and $k$ is held small and fixed (usually 1 or 2). You add knowledge to the model by adding experts, which costs memory and, once experts span machines, communication, but you do not add floating-point work per token. Every distributed challenge in this chapter (sharding experts, routing tokens, balancing load) is the price of keeping that decoupling intact at scale.</p>
+</div>
+
+<h2>2. The Gate: Scoring and Top-k Selection <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The gating network is deliberately tiny, usually a single linear layer. For a token $x$ it produces one score per expert, $s = x W_g$ with $W_g \in \mathbb{R}^{d \times E}$, giving a vector of $E$ logits. The gate then keeps the $k$ largest of those logits, the token's top-$k$ experts, and discards the rest. Crucially, the softmax that turns scores into combination weights is taken over only the selected experts, not all $E$, so the weights of the chosen experts sum to one and the unchosen experts contribute nothing. Writing $\mathcal{T}(x)$ for the set of top-$k$ expert indices, the gate weight for a selected expert $e$ is</p>
+$$ G_e(x) = \frac{\exp\!\big(s_e\big)}{\sum_{j \in \mathcal{T}(x)} \exp\!\big(s_j\big)}, \qquad e \in \mathcal{T}(x), $$
+<p>and $G_e(x) = 0$ for every expert outside $\mathcal{T}(x)$. The layer output is the gate-weighted combination of the selected experts' feed-forward outputs,</p>
+$$ y = \sum_{e \in \mathcal{T}(x)} G_e(x)\, \mathrm{FFN}_e(x) = \sum_{e \in \mathcal{T}(x)} G_e(x)\, \sigma\!\big(x W_1^{(e)}\big) W_2^{(e)}. $$
+<p>This is the gated combination at the heart of the layer, and it is worth reading carefully. The sum runs over only $k$ experts, so only $k$ feed-forward networks are ever evaluated for this token. The weights $G_e(x)$ are produced by the gate from the same token, so the routing is learned end to end: the gradient flows back through $G_e(x)$ into $W_g$, teaching the gate which experts serve which tokens. We treat the design of that learning signal, including how to stop the gate from collapsing onto a few favorite experts, as its own subject in <a href="section-17.3.html">Section 17.3</a>. Here the gate is just the mechanism that selects and weights.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Dataflow for one token through a Mixture-of-Experts layer: the token enters a gate, the gate scores four experts and selects the top two, the token is dispatched only to those two experts, and their outputs are combined by a gate-weighted sum into the layer output.">
+<defs>
+<marker id="arr172" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b172 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.on172 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.8; }
+.off172 { fill:#eef0f2; stroke:#aeb6bf; stroke-width:1.4; stroke-dasharray:4 3; }
+.t172 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.toff172 { font:600 14px sans-serif; fill:#8a9099; text-anchor:middle; }
+.s172 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l172 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr172); }
+.lo172 { fill:none; stroke:#aeb6bf; stroke-width:1.4; stroke-dasharray:4 3; }
+</style>
+<text class="t172" x="70" y="150">token x</text>
+<rect class="b172" x="30" y="160" width="80" height="44" rx="8"/>
+<text class="s172" x="70" y="187">d-vector</text>
+<line x1="110" y1="182" x2="160" y2="182" class="l172"/>
+<rect class="b172" x="160" y="150" width="96" height="64" rx="8"/>
+<text class="t172" x="208" y="178">Gate</text>
+<text class="s172" x="208" y="196">x &#183; W_g</text>
+<text class="s172" x="208" y="140">scores E experts, keeps top-2</text>
+<line x1="256" y1="172" x2="330" y2="96" class="l172"/>
+<line x1="256" y1="178" x2="330" y2="178" class="l172"/>
+<line x1="256" y1="190" x2="330" y2="262" class="lo172"/>
+<line x1="256" y1="196" x2="330" y2="330" class="lo172"/>
+<rect class="off172" x="330" y="70" width="150" height="48" rx="8"/>
+<text class="toff172" x="365" y="99">E0</text>
+<rect class="on172" x="330" y="154" width="150" height="48" rx="8"/>
+<text class="t172" x="365" y="183">E1</text>
+<text class="s172" x="430" y="178">FFN, G=0.30</text>
+<rect class="on172" x="330" y="238" width="150" height="48" rx="8"/>
+<text class="t172" x="365" y="267">E2</text>
+<text class="s172" x="430" y="262">FFN, G=0.70</text>
+<rect class="off172" x="330" y="312" width="150" height="40" rx="8"/>
+<text class="toff172" x="365" y="337">E3</text>
+<text class="s172" x="405" y="58">selected experts run; greyed experts are skipped</text>
+<line x1="480" y1="178" x2="640" y2="178" class="l172"/>
+<line x1="480" y1="262" x2="600" y2="262" class="l172"/>
+<line x1="600" y1="262" x2="600" y2="196" class="l172"/>
+<rect class="b172" x="640" y="150" width="120" height="64" rx="8"/>
+<text class="t172" x="700" y="176">Weighted</text>
+<text class="t172" x="700" y="194">sum</text>
+<text class="s172" x="700" y="234">y = 0.30&#183;FFN&#8321; + 0.70&#183;FFN&#8322;</text>
+<line x1="760" y1="182" x2="820" y2="182" class="l172"/>
+<text class="t172" x="830" y="178">y</text>
+</svg>
+<figcaption><strong>Figure 17.2.1:</strong> One token through an MoE layer with $E = 4$ experts and top-$k = 2$ routing. The gate scores all four experts but dispatches the token only to its two highest, here E1 and E2; the greyed, dashed experts E0 and E3 are skipped entirely. Their feed-forward outputs are combined by the gate-weighted sum of Section 2 into the single output vector $y$. Different tokens light up different pairs of experts.</figcaption>
+</figure>
+
+<h2>3. Why the Feed-Forward Sublayer Is the Place to Sparsify <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>One might ask why the experts replace the feed-forward sublayer rather than the attention sublayer. Three properties of the FFN make it the natural target. First, it carries the parameters: with hidden width $h \approx 4d$, the two feed-forward matrices dominate the block's weight count, so multiplying that sublayer by $E$ is where extra capacity actually lands. Second, it is already position-wise. The FFN transforms each token independently of the others, so routing each token to its own experts changes nothing about the layer's structure; attention, by contrast, mixes tokens together, and splitting it per token would break the very communication it exists to provide. Third, the routing decision is cheap relative to the FFN it gates. A single linear gate over $E$ experts costs $d \cdot E$ multiplies per token, negligible beside the $\mathcal{O}(d h)$ of even one expert, so selection adds almost nothing to the bill it controls.</p>
+<p>The result is a layer that is a drop-in replacement: the surrounding attention, residual connections, and normalization are untouched, and only the FFN becomes a routed set of FFNs. A common pattern places an MoE layer in every other transformer block, leaving the rest dense, so a model is sparse where capacity pays off and dense where it does not. This is the same partition-the-heavy-part instinct that drove sharding in <a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>; there we split one big matrix across devices, here we split capacity across many specialized matrices and route to a few.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Receptionist and the Specialists</div>
+<p>Picture a clinic. The dense FFN is one exhausted generalist who sees every patient and must know everything. The MoE layer hires a panel of specialists and a fast receptionist who reads the first line of each complaint and waves the patient toward the two most relevant doctors. The clinic now holds far more expertise, yet each patient still sees only two people, so no visit takes longer. The receptionist is the gate, and the whole trick is that the panel can grow without lengthening anyone's appointment.</p>
+</div>
+
+<h2>4. Shared and Routed Experts <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Pure top-$k$ routing has a subtle inefficiency: knowledge that every token needs, basic grammar, common formatting, must be relearned and duplicated inside many experts, because no single expert is guaranteed to be on the route for any given token. Several recent designs fix this by splitting the experts into two kinds. A small number of shared experts are always active, run for every token regardless of the gate, and absorb the common knowledge. The remaining routed experts are selected top-$k$ as before and specialize. The layer output adds the shared contribution to the routed combination,</p>
+$$ y = \sum_{e \in \mathcal{S}} \mathrm{FFN}_e(x) \;+\; \sum_{e \in \mathcal{T}(x)} G_e(x)\, \mathrm{FFN}_e(x), $$
+<p>where $\mathcal{S}$ is the fixed set of shared experts and $\mathcal{T}(x)$ the token's routed top-$k$. The DeepSeek family popularized this shared-plus-routed structure, isolating common patterns in the always-on experts so the routed experts are free to specialize harder. The cost is modest, one or two extra FFN evaluations per token for the shared experts, and in exchange the routed experts stop wasting capacity on redundancy. We will see in <a href="section-17.3.html">Section 17.3</a> that this also stabilizes the gate, since the shared path keeps gradients flowing even to tokens whose routing is briefly poor.</p>
+
+<h2>5. The Forward Pass, Token by Token <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>It is worth tracing the whole forward pass once at the level of a single token, because every later complication is a distributed version of these four steps. A token vector arrives. The gate scores all $E$ experts and selects the top $k$ (gate). Those $k$ expert FFNs are evaluated on the token, and no others (select and dispatch). Their outputs are scaled by the gate weights and summed (combine). The result replaces what the dense FFN would have produced, and the block continues as usual. The code below builds exactly this on a small batch with pure NumPy, four experts and top-2 routing, so the routing and the combine are fully visible rather than hidden behind a framework.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+T, d, h, E, k = 6, 8, 16, 4, 2        # tokens, model dim, hidden dim, experts, top-k
+
+# One small FFN expert: x -> relu(x W1) W2, each expert has its OWN weights.
+W1 = rng.standard_normal((E, d, h)) * 0.3   # per-expert first layer
+W2 = rng.standard_normal((E, h, d)) * 0.3   # per-expert second layer
+
+def expert_forward(e, x):                    # FFN of expert e on row-batch x
+    return np.maximum(x @ W1[e], 0.0) @ W2[e]
+
+# The gate: a single linear scorer shared by all tokens, one logit per expert.
+Wg = rng.standard_normal((d, E)) * 0.5
+X = rng.standard_normal((T, d))              # a batch of T token vectors
+
+logits = X @ Wg                              # (T, E) raw expert scores per token
+# Top-k selection: keep the k highest logits per token, softmax over JUST those.
+topk_idx = np.argsort(-logits, axis=1)[:, :k]          # (T, k) chosen expert ids
+topk_logits = np.take_along_axis(logits, topk_idx, 1)  # (T, k) their scores
+g = np.exp(topk_logits - topk_logits.max(1, keepdims=True))
+gate_w = g / g.sum(1, keepdims=True)                   # (T, k) softmax gate weights
+
+# Forward pass: each token is dispatched ONLY to its k experts, then combined.
+Y = np.zeros((T, d))
+for t in range(T):
+    for j in range(k):
+        e = topk_idx[t, j]
+        Y[t] += gate_w[t, j] * expert_forward(e, X[t:t+1])[0]
+
+# A dense baseline would run ALL E experts for every token. Count the saving.
+sparse_calls = T * k
+dense_calls = T * E
+
+print("tokens T, experts E, top-k :", T, E, k)
+print("expert-FFN evals (sparse)  :", sparse_calls)
+print("expert-FFN evals (dense)   :", dense_calls,
+      f"  -> {sparse_calls/dense_calls:.0%} of dense work")
+print()
+print("per-token routing (expert: gate-weight):")
+for t in range(T):
+    parts = ", ".join(f"E{topk_idx[t,j]}:{gate_w[t,j]:.2f}" for j in range(k))
+    print(f"  token {t}  ->  {parts}")
+print()
+print("output norms per token     :", np.round(np.linalg.norm(Y, axis=1), 3))
+</code></pre>
+<div class="code-caption"><strong>Code 17.2.1:</strong> A complete Mixture-of-Experts layer from scratch: per-expert FFN weights, a linear gate, top-2 selection with a softmax over the chosen experts, and the gate-weighted combine. Each token touches only its two experts, so the layer does half the feed-forward work of running all four.</div>
+<pre><code class="language-text">tokens T, experts E, top-k : 6 4 2
+expert-FFN evals (sparse)  : 12
+expert-FFN evals (dense)   : 24   -> 50% of dense work
+
+per-token routing (expert: gate-weight):
+  token 0  ->  E2:0.70, E1:0.30
+  token 1  ->  E1:0.85, E3:0.15
+  token 2  ->  E3:0.76, E2:0.24
+  token 3  ->  E3:0.79, E1:0.21
+  token 4  ->  E3:0.93, E0:0.07
+  token 5  ->  E2:0.54, E0:0.46
+
+output norms per token     : [1.197 1.095 2.692 1.186 1.313 2.454]
+</code></pre>
+<div class="code-caption"><strong>Output 17.2.1:</strong> Every token routes to a different pair of experts with different gate weights, and the run uses 12 expert evaluations where a dense layer would use 24. The two gate weights per token sum to one, so each output is a proper convex blend of exactly its two experts.</div>
+<p>The output makes the layer's character concrete. Token 0 leans on expert 2 with weight 0.70 and expert 1 with 0.30; token 4 sends almost all of its weight, 0.93, to expert 3. No token runs all four experts, the evaluation count is exactly $T \times k = 12$ rather than $T \times E = 24$, and each token's output is a convex combination of just its two specialists. Notice already a hint of the load problem this chapter must solve: expert 3 appears on four of the six tokens while some experts appear rarely, an imbalance that becomes a real cost once experts sit on separate machines and a popular expert's machine is swamped. That is the thread <a href="section-17.6.html">Section 17.6</a> picks up with load-balancing losses.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Data Parallelism's Sparse Cousin</div>
+<p>Chapter 15 distributed one computation across machines that all held the same model. Mixture-of-Experts distributes the model itself: the experts are different parameters, and at scale they live on different machines, so a token's forward pass becomes a journey across the cluster to reach its chosen experts and back. The combine step you just wrote as a local weighted sum becomes a network operation. In <a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a> the binding collective was all-reduce over identical gradients; for routed experts the binding collective is all-to-all, because each machine must hand every other machine the tokens destined for the experts it hosts. The gate in Code 17.2.1 is, quietly, a router that decides who talks to whom, and that is the bridge from this local layer to the distributed system of Sections 17.4 and 17.5.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: An MoE Block in a Few Lines with a Modern Framework</div>
+<p>The hand-written gate, top-$k$ selection, and combine loop in Code 17.2.1 are the parts a production library implements once and tunes hard. In a framework such as PyTorch the same routed layer is a few lines, and the dispatch is vectorized rather than looped:</p>
+<pre><code class="language-python">import torch, torch.nn as nn, torch.nn.functional as F
+
+class MoE(nn.Module):
+    def __init__(self, d, h, E, k):
+        super().__init__()
+        self.k = k
+        self.gate = nn.Linear(d, E, bias=False)                 # the router
+        self.experts = nn.ModuleList(                           # E independent FFNs
+            nn.Sequential(nn.Linear(d, h), nn.ReLU(), nn.Linear(h, d))
+            for _ in range(E))
+
+    def forward(self, x):                                       # x: (tokens, d)
+        w, idx = self.gate(x).topk(self.k, dim=-1)              # top-k scores + ids
+        w = F.softmax(w, dim=-1)                                # gate weights over k
+        y = torch.zeros_like(x)
+        for j in range(self.k):                                 # one slot at a time
+            for e in range(len(self.experts)):
+                m = idx[:, j] == e                              # tokens routed to e
+                if m.any():
+                    y[m] += w[m, j:j+1] * self.experts[e](x[m])
+        return y
+</code></pre>
+<div class="code-caption"><strong>Code 17.2.2:</strong> The same layer as Code 17.2.1 in PyTorch, with autograd through the gate. Production stacks (DeepSpeed-MoE, Megatron-Core, the Mixtral and DeepSeek reference implementations, and Hugging Face <code>transformers</code>) replace this per-expert loop with a single batched-dispatch kernel and add the expert sharding and all-to-all that <a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>'s machinery and Section 17.5 develop, collapsing hundreds of lines of routing, capacity, and communication code into a configured module.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Tripling Capacity Without Tripling the FLOPs</div>
+<p><strong>Who:</strong> A model engineer on a small team training a domain-specific code-and-prose assistant.</p>
+<p><strong>Situation:</strong> A dense 7-billion-parameter model trained within budget but plateaued in quality; the obvious fix, a 20-billion-parameter dense model, tripled the training and serving FLOPs and blew past the team's GPU-hour allowance.</p>
+<p><strong>Problem:</strong> They needed substantially more model capacity to absorb a large, diverse corpus, but the compute bill scaled with parameters in a dense model and they could not afford it.</p>
+<p><strong>Dilemma:</strong> Stay dense and accept the quality ceiling at 7B, or grow dense to 20B and accept the compute they could not pay for. Neither fit.</p>
+<p><strong>Decision:</strong> They converted the feed-forward sublayers in alternate blocks to MoE layers with $E = 16$ experts and top-$k = 2$ routing, plus one always-on shared expert, raising total parameters near 20B while keeping active parameters per token close to the original 7B.</p>
+<p><strong>How:</strong> They swapped each chosen FFN for the framework's MoE module (Code 17.2.2's production cousin), kept the gate small and linear, and added the load-balancing loss of <a href="section-17.6.html">Section 17.6</a> so no expert was starved or swamped.</p>
+<p><strong>Result:</strong> Quality matched a dense model far larger than 7B while the per-token compute, and therefore the training and inference cost, stayed close to the 7B baseline; the extra parameters lived as memory and routing traffic, not as FLOPs.</p>
+<p><strong>Lesson:</strong> When capacity is the ceiling and compute is the budget, sparsity buys what dense scaling cannot. The expense moves from arithmetic to memory and communication, which is precisely the bill the rest of this chapter teaches you to manage.</p>
+</div>
+
+<h2>6. What the Layer Sets Up for the Rest of the Chapter <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>We now have the anatomy: an MoE layer is $E$ expert FFNs, a linear gate, top-$k$ selection, and a gate-weighted combine, optionally with a few always-on shared experts. Two questions follow immediately, and each owns a later section. First, how should the gate learn to route, and how do we keep it from sending nearly every token to the same few experts? That is routing and gating, the subject of <a href="section-17.3.html">Section 17.3</a>. Second, what happens when the experts are too numerous to fit on one machine and must be spread across the cluster? Then a token's trip to its experts crosses the network, the combine becomes a collective, and load imbalance becomes a hot-machine problem. That is expert parallelism, developed in Sections 17.4 and 17.5, where the all-to-all foreshadowed above becomes the engine of token routing. The local layer in this section is the unit that those sections replicate, shard, and connect.</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Sparse MoE in Open Models (2024 to 2026)</div>
+<p>Mixture-of-Experts moved from research curiosity to the default for frontier-scale open models in this period. Mixtral 8x7B (Jiang et al., 2024) made the top-2-of-8 routed FFN a widely studied baseline, with roughly 47B total parameters but only about 13B active per token. The DeepSeek-V2 and DeepSeek-V3 line (2024 to 2025) pushed fine-grained experts and the shared-plus-routed structure of Section 4, training models with hundreds of billions of total parameters while keeping active parameters small, and reported that isolating common knowledge in shared experts measurably improves the specialization of the routed ones. Qwen and other families shipped MoE variants over the same window. A parallel research thread asks where the gains really come from: studies of expert specialization, of how many experts a token truly needs, and of routing stability question whether top-$k$ is optimal and propose alternatives such as expert-choice routing, which we meet in <a href="section-17.3.html">Section 17.3</a>. The open question driving the field is how far total capacity can outrun active compute before routing quality, not arithmetic, becomes the limit.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.2.1: Counting Parameters and FLOPs <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Consider a transformer block whose dense FFN has model dimension $d = 4096$ and hidden width $h = 16384$. (a) How many parameters are in the two feed-forward matrices $W_1$ and $W_2$ of this dense FFN? (b) Replace it with an MoE layer of $E = 64$ experts, each the same shape, and top-$k = 2$ routing. How many feed-forward parameters does the layer now hold, and by what factor did capacity grow? (c) Ignoring the gate, by what factor did the feed-forward FLOPs per token grow relative to the dense FFN? (d) Explain in one sentence why the answers to (b) and (c) differ, and connect that gap to the Key Insight of Section 1.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.2.2: Add Shared Experts to the Layer <span class="exercise-type coding">Coding</span></div>
+<p>Starting from Code 17.2.1, designate expert 0 as an always-on shared expert: it runs for every token in addition to the routed top-$k$, and its output is added to the routed combination as in the equation of Section 4 (you may give it gate weight 1 rather than a softmax weight). Keep top-$k = 2$ routing over the remaining experts. Re-run the batch and report, for each token, which experts it used and the new output norms. Then count expert-FFN evaluations and compare against both the pure-sparse count from Output 17.2.1 and the dense count. Comment on how much extra compute the shared expert costs and what it buys.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.2.3: Measuring Expert Load Imbalance <span class="exercise-type analysis">Analysis</span></div>
+<p>Extend Code 17.2.1 to draw a larger batch, say $T = 2000$ tokens, and tally how many tokens each of the $E$ experts received across the top-$k$ routes. Report the counts, the maximum-to-mean ratio, and the fraction of total load carried by the single busiest expert. Now imagine each expert lives on its own machine. Argue from your numbers how this imbalance would translate into idle and overloaded machines, and estimate how much faster the layer could run if the load were perfectly even. This is the quantity the load-balancing loss of <a href="section-17.6.html">Section 17.6</a> and the capacity factors of Section 17.7 exist to control.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-17.1.html"><span class="nav-label">Previous</span><span class="nav-num">Section 17.1</span><span class="nav-title">Dense vs Sparse Scaling</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 17</span><span class="nav-num">Contents</span><span class="nav-title">Expert Parallelism and Sparse Distributed Models</span></a>
+<a class="next" href="section-17.3.html"><span class="nav-label">Next</span><span class="nav-num">Section 17.3</span><span class="nav-title">Routing and Gating</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

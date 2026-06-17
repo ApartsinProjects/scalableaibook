@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 33.6: Multi-Tenant GPU Sharing: MIG, MPS, and Time-Slicing. How one accelerator is split across many tenants, and how MIG hardware partitions, MPS spatial sharing, and time-slicing trade isolation against utilization." name="description"/>
+<title>Section 33.6: Multi-Tenant GPU Sharing: MIG, MPS, and Time-Slicing | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Cluster, Edge, and Reliable Infrastructure</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 33: Cluster Infrastructure and Scheduling</a></div>
+<h1>Multi-Tenant GPU Sharing: MIG, MPS, and Time-Slicing</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They sliced me into seven strangers who refuse to talk. One runs a notebook nobody opened, and the other six are very polite about not noticing each other."</p>
+<cite>A GPU, Partitioned Against Its Will</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The previous section spread one job across many accelerators; this section does the opposite, packing many tenants onto one accelerator, because a single modern GPU is far too large for most of the jobs that want it.</strong> A small inference model, a Jupyter notebook, or a student exercise uses a sliver of an A100 or H100 and leaves the rest of the card idle, which at cloud prices is pure waste. The cluster's answer is to share the device, and there are exactly three mechanisms to do it: hardware partitioning (NVIDIA MIG) that cuts the silicon into isolated instances, spatial co-scheduling (MPS) that lets processes run side by side on the whole chip, and time-slicing that hands the whole chip to one tenant after another. Each buys utilization at a different price in isolation, and choosing among them is a scheduling decision the cluster makes on your behalf. This section shows what each mechanism actually does to the hardware, quantifies the isolation-versus-utilization trade with a queueing simulation, and explains why training almost never shares while inference almost always should.</p>
+</div>
+<p>Section 33.5 treated the accelerator as the scarce unit that one large job consumes in bulk: a foundation-model training run that wants all eight GPUs in a node, and a thousand nodes besides, scheduled together by gang scheduling so that no GPU idles on a barrier waiting for a peer that was never placed. That is the many-GPUs-one-job end of the cluster. This section lives at the other end. A great deal of real GPU demand is small: a fraud classifier with a few million parameters, a retrieval reranker, a notebook a data scientist left running, a per-course teaching environment. None of these comes close to filling the compute units or the memory of a contemporary data-center GPU, and giving each its own card would leave most of every card dark. Multi-tenant sharing is the discipline of packing several such tenants onto one accelerator so that the silicon is busy, while keeping them from corrupting or starving one another.</p>
+<p>The tension is the same one that runs through every shared resource in this book, stated now for a single chip. More sharing raises utilization and lowers cost per tenant, but it also lets tenants interfere: one greedy job slows its neighbors, a memory leak in one process crashes the device for all, a bursty workload steals the compute that a latency-sensitive service was counting on. Isolation suppresses interference but costs flexibility and, often, utilization, because reserved-but-idle capacity cannot be lent out. NVIDIA's three sharing mechanisms sit at three points on that curve, and the cluster scheduler, through the Kubernetes device plugin of <a href="section-33.3.html">Section 33.3</a>, exposes whichever one the operator has configured as an allocatable resource.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 880 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three panels showing one GPU shared three ways: MIG cuts the die into seven walled instances, MPS overlays many processes on the whole shared die, and time-slicing hands the whole die to one tenant per time quantum.">
+<defs>
+<marker id="arr336" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.gpu336 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.8; }
+.mig336 { fill:#e9f2e9; stroke:#2f7d32; stroke-width:1.4; }
+.proc336 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.4; }
+.slot336 { fill:#f0eef9; stroke:#6a4ea0; stroke-width:1.4; }
+.h336 { font:600 15px sans-serif; fill:#14385c; text-anchor:middle; }
+.t336 { font:600 11px sans-serif; fill:#14385c; text-anchor:middle; }
+.s336 { font:10.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.wall336 { stroke:#2f7d32; stroke-width:2.2; stroke-dasharray:0; }
+.ax336 { fill:none; stroke:#6a4ea0; stroke-width:1.6; marker-end:url(#arr336); }
+</style>
+
+<!-- MIG panel -->
+<text class="h336" x="150" y="26">MIG</text>
+<text class="s336" x="150" y="42">hardware partition, walled</text>
+<rect class="gpu336" x="40" y="56" width="220" height="190" rx="8"/>
+<rect class="mig336" x="52" y="68" width="98" height="50" rx="4"/>
+<rect class="mig336" x="152" y="68" width="96" height="50" rx="4"/>
+<rect class="mig336" x="52" y="120" width="98" height="50" rx="4"/>
+<rect class="mig336" x="152" y="120" width="96" height="50" rx="4"/>
+<rect class="mig336" x="52" y="172" width="62" height="62" rx="4"/>
+<rect class="mig336" x="116" y="172" width="62" height="62" rx="4"/>
+<rect class="mig336" x="180" y="172" width="68" height="62" rx="4"/>
+<line class="wall336" x1="150" y1="64" x2="150" y2="238"/>
+<line class="wall336" x1="44" y1="118" x2="256" y2="118"/>
+<text class="t336" x="101" y="97">SM+mem</text>
+<text class="t336" x="200" y="97">SM+mem</text>
+<text class="s336" x="150" y="262">7 isolated instances</text>
+<text class="s336" x="150" y="278">fixed SM and memory slices</text>
+
+<!-- MPS panel -->
+<text class="h336" x="440" y="26">MPS</text>
+<text class="s336" x="440" y="42">spatial co-schedule, shared</text>
+<rect class="gpu336" x="330" y="56" width="220" height="190" rx="8"/>
+<rect class="proc336" x="350" y="80" width="150" height="30" rx="4" opacity="0.92"/>
+<rect class="proc336" x="372" y="116" width="150" height="30" rx="4" opacity="0.92"/>
+<rect class="proc336" x="356" y="152" width="150" height="30" rx="4" opacity="0.92"/>
+<rect class="proc336" x="378" y="188" width="150" height="30" rx="4" opacity="0.92"/>
+<text class="t336" x="425" y="100">proc A</text>
+<text class="t336" x="447" y="136">proc B</text>
+<text class="t336" x="431" y="172">proc C</text>
+<text class="t336" x="453" y="208">proc D</text>
+<text class="s336" x="440" y="262">all share SMs and memory</text>
+<text class="s336" x="440" y="278">weak isolation, high overlap</text>
+
+<!-- Time-slice panel -->
+<text class="h336" x="730" y="26">Time-slicing</text>
+<text class="s336" x="730" y="42">temporal multiplex, in turns</text>
+<rect class="gpu336" x="620" y="56" width="220" height="150" rx="8"/>
+<rect class="slot336" x="636" y="96" width="40" height="70" rx="3"/>
+<rect class="slot336" x="682" y="96" width="40" height="70" rx="3"/>
+<rect class="slot336" x="728" y="96" width="40" height="70" rx="3"/>
+<rect class="slot336" x="774" y="96" width="40" height="70" rx="3"/>
+<text class="t336" x="656" y="135">A</text>
+<text class="t336" x="702" y="135">B</text>
+<text class="t336" x="748" y="135">C</text>
+<text class="t336" x="794" y="135">A</text>
+<line class="ax336" x1="630" y1="186" x2="828" y2="186"/>
+<text class="s336" x="730" y="224">whole GPU, one tenant per quantum</text>
+<text class="s336" x="730" y="240">no memory isolation, context-switch tax</text>
+</svg>
+<figcaption><strong>Figure 33.6.1:</strong> One accelerator, three sharing mechanisms. MIG (left) cuts the die into fixed instances separated by hardware walls (the dashed green lines): each tenant gets a guaranteed slice of streaming multiprocessors (SMs) and memory and cannot see the others. MPS (center) overlays many processes on the entire shared die at once, maximizing overlap but providing only soft isolation. Time-slicing (right) gives the whole GPU to one tenant per time quantum and rotates, so tenants never run together but pay a context-switch tax and queue behind each other.</figcaption>
+</figure>
+
+<h2>1. Why a Whole A100 Is the Wrong Unit for Small Jobs <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>An NVIDIA A100 carries 108 streaming multiprocessors and 40 or 80 gigabytes of high-bandwidth memory; an H100 carries more of both. Those numbers were chosen so that a single device can hold a sizable model and saturate its compute with a large batch during training. A small inference model inverts every one of those assumptions. A 100-million-parameter classifier in half precision occupies roughly 200 megabytes of weights, leaves tens of gigabytes of memory untouched, and at a modest request rate keeps only a handful of the 108 SMs busy at any instant. Run that service alone on an A100 and you are renting a mansion to store a bicycle. The per-node efficiency techniques of <a href="../../part-5-distributed-inference/module-22-per-node-inference-efficiency/index.html">Chapter 22</a>, such as quantization and batching, shrink the bicycle further but do nothing about the empty rooms; only sharing fills them.</p>
+<p>Define the realized efficiency of a card as the fraction of its peak useful work that the resident tenants actually extract. If a single small service drives utilization $u_1$ and the card can hold $n$ such tenants without exceeding its memory or compute, the upper bound on packed utilization is</p>
+$$u_{\text{packed}} \le \min\!\bigl(1,\; n \cdot u_1\bigr), \qquad n \le \min\!\Bigl(\frac{M_{\text{gpu}}}{m_{\text{tenant}}},\; \frac{C_{\text{gpu}}}{c_{\text{tenant}}}\Bigr),$$
+<p>where $M_{\text{gpu}}$ and $C_{\text{gpu}}$ are the card's memory and compute budgets and $m_{\text{tenant}}, c_{\text{tenant}}$ are one tenant's demands. The packing factor $n$ is whichever resource runs out first, memory or compute. For a tiny model that is memory-light and compute-light, $n$ can be large, and a card sitting at $u_1 = 8\%$ alone can be driven toward full utilization by seven or eight co-residents. The whole point of multi-tenant sharing is to make $n$ large without letting the tenants destroy each other's latency, and the three mechanisms differ precisely in how they police that coexistence.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Sharing Is the Inference-Side Twin of Data Parallelism</div>
+<p>Data parallelism (<a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>) takes one workload too big for a device and spreads it across many devices. Multi-tenant sharing takes many workloads too small for a device and folds them onto one. They are mirror images on the same scarce resource: parallelism fights a ceiling by adding hardware, sharing fights a floor by subtracting it. Training, which is large and bursty and wants every SM, lives in the first world and almost never shares a card. Inference, which is small and steady and latency-bound, lives in the second and almost always should. Knowing which side of the mirror a job is on tells you immediately whether to reach for the scheduler of <a href="section-33.5.html">Section 33.5</a> or the partitioner of this section.</p>
+</div>
+
+<h2>2. MIG: Cutting the Silicon Into Isolated Instances <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Multi-Instance GPU (MIG), introduced with the A100 and carried forward on the H100, partitions the physical device into as many as seven independent GPU instances. Each instance receives a fixed, hardware-enforced fraction of the streaming multiprocessors, a dedicated slice of L2 cache, dedicated memory controllers, and its own portion of the high-bandwidth memory. The partition is real silicon, not a software promise: a tenant in one instance cannot read another instance's memory, cannot steal its compute, and cannot crash it. A page fault, a memory leak, or a runaway kernel in one MIG instance is contained inside that instance and leaves the other six running. This is the strongest isolation any of the three mechanisms offers, and it is the only one that isolates memory bandwidth and capacity as well as compute.</p>
+<p>The profiles are fixed sizes named by their compute and memory shares, such as <code>1g.10gb</code> (one of seven compute slices, ten gigabytes of memory) up to <code>7g.80gb</code> (the whole card as one instance). An operator chooses a layout, for example seven <code>1g.10gb</code> instances for seven low-QPS replicas, or one <code>3g.40gb</code> plus one <code>4g.40gb</code> for two medium services, and the card presents those instances to the cluster as separate allocatable devices. The cost of this rigidity is granularity: you can only partition along the supported profile boundaries, an idle instance cannot lend its SMs to a busy neighbor, and reconfiguring the layout requires draining the card. MIG trades flexibility and peak burst performance for guarantees, which is exactly the trade a multi-tenant inference platform or a shared teaching cluster wants, where predictable per-tenant latency matters more than letting one tenant occasionally sprint.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: nvidia-smi and the Device Plugin Do the Partitioning</div>
+<p>You do not hand-wire MIG instances into your job. The operator enables MIG and creates instances with two <code>nvidia-smi</code> calls, and the Kubernetes device plugin of <a href="section-33.3.html">Section 33.3</a> then advertises each instance as a schedulable resource that a pod requests by name, exactly as it would request a whole GPU:</p>
+<pre><code class="language-bash"># Operator, once per node: enable MIG and carve seven 1g.10gb instances.
+sudo nvidia-smi -mig 1                       # turn MIG mode on for the card
+sudo nvidia-smi mig -cgi 1g.10gb,1g.10gb,1g.10gb,1g.10gb,1g.10gb,1g.10gb,1g.10gb -C
+nvidia-smi -L                                # lists the 7 MIG UUIDs now present
+</code></pre>
+<div class="code-caption"><strong>Code 33.6.1:</strong> Enabling MIG and creating seven equal instances with <code>nvidia-smi</code>. The <code>-cgi</code> flag creates the GPU instances and <code>-C</code> creates the matching compute instances; after this the card reports seven MIG UUIDs.</div>
+<pre><code class="language-yaml"># A pod then asks for ONE MIG slice, not a whole GPU. With the
+# mixed-strategy NVIDIA device plugin, the slice profile is the resource name.
+resources:
+  limits:
+    nvidia.com/mig-1g.10gb: 1     # scheduler places this pod on one 1g.10gb instance
+</code></pre>
+<div class="code-caption"><strong>Code 33.6.2:</strong> A pod requesting a single MIG instance. The device plugin reports seven <code>mig-1g.10gb</code> units per card to the scheduler, so seven such pods pack onto one A100 with hardware isolation and no application change. Compare the dozens of lines of cgroup and CUDA-context wiring this replaces.</div>
+</div>
+
+<h2>3. MPS: Spatial Sharing Without the Walls <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The Multi-Process Service (MPS) takes the opposite stance. Instead of walling the die, it lets multiple processes submit work to the whole GPU concurrently, merging their CUDA contexts so that kernels from different tenants execute side by side on the shared streaming multiprocessors. Without MPS, two processes time-share the GPU at a coarse grain and each leaves SMs idle whenever its own kernels are too small to fill the device; with MPS, their kernels interleave spatially and the idle SMs of one tenant are filled by another. For many small inference processes that individually underfill the card, MPS delivers the highest aggregate throughput of the three mechanisms, because it maximizes overlap and pays no partition tax.</p>
+<p>What it does not deliver is isolation. All MPS clients share one address space on the device and one pool of memory bandwidth, so a tenant that allocates too much memory can starve or crash its neighbors, and a compute-heavy tenant steals SM cycles from latency-sensitive ones. MPS offers a coarse execution-resource cap (a percentage limit on the active thread share per client) that blunts the worst noisy-neighbor effects, but it is a software throttle, not a wall: there is no memory protection between clients, and a fatal fault in one client can take down the MPS daemon and every client with it. MPS is therefore the right choice when the co-resident tenants trust each other and the goal is raw packing efficiency, for example many replicas of the same model owned by one team, and the wrong choice for hostile multi-tenancy where one tenant's bug must not become everyone's outage.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Packing a Teaching Cluster Onto Eight Cards</div>
+<p><strong>Who:</strong> A platform engineer running the shared GPU cluster for a university deep-learning course with 120 enrolled students.</p>
+<p><strong>Situation:</strong> Each student needed a GPU-backed notebook for weekly assignments, but the department owned only eight A100 cards, and a one-student-per-card policy served fifteen students at a time while 105 waited.</p>
+<p><strong>Problem:</strong> Student notebooks are almost always idle, a few seconds of compute between minutes of typing, yet an idle notebook held an entire A100 hostage under whole-card allocation.</p>
+<p><strong>Dilemma:</strong> Enable MPS for maximum packing and risk one student's runaway allocation crashing a card full of classmates, or use MIG for hard isolation at the cost of capping each notebook to one seventh of a card and a fixed memory ceiling.</p>
+<p><strong>Decision:</strong> They chose MIG with the <code>1g.10gb</code> profile, turning eight cards into fifty-six isolated instances, because student code is untrusted and a single crashing notebook must never take down a classmate's running experiment.</p>
+<p><strong>How:</strong> They ran Code 33.6.1 on each node, configured the device plugin to advertise <code>mig-1g.10gb</code> units, and set each notebook pod to request exactly one, as in Code 33.6.2.</p>
+<p><strong>Result:</strong> Fifty-six students worked simultaneously instead of fifteen; a memory-overflow bug that previously crashed a whole card now failed only the offending notebook, and the ten-gigabyte ceiling per instance taught students to right-size their batches.</p>
+<p><strong>Lesson:</strong> When tenants do not trust each other, hard isolation is worth the capacity it reserves. MIG's rigidity is a feature precisely when one tenant's failure must stay one tenant's failure.</p>
+</div>
+
+<h2>4. Time-Slicing: Taking Turns on the Whole Device <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The simplest mechanism predates the other two. Time-slicing hands the entire GPU to one tenant for a quantum, then context-switches to the next, round-robin, the way an operating system time-shares a CPU. Each tenant, while it runs, has the full compute and memory bandwidth of the card; between turns it is suspended and another tenant runs. The Kubernetes device plugin can expose this by oversubscribing a single physical GPU as several logical replicas, so that more pods schedule onto a card than there are cards. Time-slicing needs no special hardware (it works on consumer and older data-center GPUs that lack MIG) and no trust assumptions about kernel cooperation (the scheduler enforces the turns).</p>
+<p>Its weaknesses are the mirror of its simplicity. There is no memory isolation: all time-sliced tenants share the card's single memory pool, so their resident footprints must sum to fit, and one tenant can still exhaust memory for the others. Every switch costs a context save and restore, a tax that grows as quanta shrink, and because only one tenant runs at a time, a latency-sensitive request can wait behind a full quantum of someone else's work. Time-slicing maximizes neither isolation (MIG wins that) nor concurrent throughput (MPS wins that); it is the fallback that works everywhere, ideal for development, bursty notebooks, and any setting where cards lack MIG and tenants tolerate jitter. Figure 33.6.1 places it as the rightmost panel, the whole die rotating through tenants one quantum at a time.</p>
+
+<h2>5. Quantifying the Trade: Isolation, Utilization, Latency <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The three mechanisms are not better or worse in the abstract; they occupy three corners of a trade-off among isolation, realized utilization, and tail latency, and the right corner depends on the workload. To make the trade concrete rather than rhetorical, the simulation below offers the same load (seven low-QPS inference tenants, each sending Poisson traffic for a service that needs ten milliseconds of full-card compute per request) to all three mechanisms and measures what each delivers. MIG runs each tenant on a one-seventh slice, so its per-request service time inflates by $7\times$ but every tenant is perfectly isolated. MPS runs all tenants on the whole card with a soft slowdown that grows with the number concurrently active, modeling SM contention. Time-slicing runs one tenant at a time at full speed but queues the rest and pays a context-switch tax on every swap.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+N_TENANTS = 7              # seven inference replicas / students / notebooks
+SERVICE_S = 0.010         # 10 ms of compute per request on a full slice
+DURATION_S = 60.0
+LAMBDA = 12.0             # offered requests/sec per tenant (low-QPS each)
+
+def arrivals(lmbda, T):                       # Poisson arrival times in [0, T)
+    t, out = 0.0, []
+    while t < T:
+        t += rng.exponential(1.0 / lmbda)
+        if t < T: out.append(t)
+    return np.array(out)
+
+streams = [arrivals(LAMBDA, DURATION_S) for _ in range(N_TENANTS)]
+offered = sum(len(s) for s in streams)
+
+# MIG: hardware partition. Each tenant owns 1/7 of the SMs => 7x slower per
+# request, but runs in total isolation (no neighbor can touch its latency).
+mig_service = SERVICE_S * N_TENANTS
+mig_lat = []
+for s in streams:                             # each instance is its own queue
+    busy = 0.0
+    for a in s:
+        start = max(a, busy); busy = start + mig_service
+        if busy < DURATION_S: mig_lat.append((start - a) + mig_service)
+
+# MPS: spatial co-schedule on the WHOLE card. Fast when light, but service time
+# inflates with the count of concurrently active tenants (soft contention).
+events = sorted([(a, i) for i, s in enumerate(streams) for a in s])
+mps_lat, active = [], {}
+for a, i in events:
+    concurrent = sum(1 for e in active.values() if e > a)
+    svc = SERVICE_S * (1.0 + 0.18 * concurrent)        # noisy-neighbor slowdown
+    start = max(a, active.get(i, 0.0)); active[i] = start + svc
+    if active[i] < DURATION_S: mps_lat.append((start - a) + svc)
+
+# Time-slicing: one tenant at a time at full speed, queue behind everyone,
+# pay a context-switch tax on every change of tenant.
+SWITCH_S = 0.0008
+ts_lat, free, last = [], 0.0, -1
+for a, i in sorted([(a, i) for i, s in enumerate(streams) for a in s]):
+    start = max(a, free) + (SWITCH_S if (i != last and last != -1) else 0.0)
+    free = start + SERVICE_S; last = i
+    if free < DURATION_S: ts_lat.append((start - a) + SERVICE_S)
+
+def row(name, lat):
+    lat = np.array(lat) * 1e3
+    print(f"{name:&lt;12} {len(lat):&gt;6}   {100*len(lat)/offered:5.1f}%   "
+          f"{np.percentile(lat,50):6.2f}   {np.percentile(lat,99):7.2f}")
+
+print(f"offered requests/min : {offered}   ({N_TENANTS} tenants x {LAMBDA:.0f} rps)\n")
+print(f"{'mode':&lt;12} {'served':&gt;6}  {'served%':&gt;7}  {'p50ms':&gt;6}  {'p99ms':&gt;7}")
+print("-" * 48)
+for name, lat in [("MIG", mig_lat), ("MPS", mps_lat), ("time-slice", ts_lat)]:
+    row(name, lat)
+</code></pre>
+<div class="code-caption"><strong>Code 33.6.3:</strong> A discrete-event comparison of the three sharing mechanisms under identical offered load. Each mode is a different queueing discipline on the same arrivals: MIG is seven independent slow queues, MPS is one fast queue with contention-dependent service, time-slicing is one full-speed queue with switch overhead.</div>
+<pre><code class="language-text">offered requests/min : 5067   (7 tenants x 12 rps)
+
+mode         served  served%   p50ms    p99ms
+------------------------------------------------
+MIG            5039    99.4%   200.92   1029.04
+MPS            5065   100.0%    11.80     30.47
+time-slice     5063    99.9%    39.92    208.21
+</code></pre>
+<div class="code-caption"><strong>Output 33.6.3:</strong> At this low per-tenant load all three keep up (near 100% served), but the latency profiles diverge sharply. MPS is fastest because every tenant runs on the full card with little contention; time-slicing sits in the middle, paying queueing and switch costs; MIG is slowest per request because each tenant is capped at one seventh of the card, yet it is the only mode whose latency a noisy neighbor cannot touch.</div>
+<p>The numbers make the trade legible. MPS extracts the most performance from the silicon, a p99 of about 30 milliseconds against time-slicing's 208 and MIG's 1029, because it never reserves capacity it is not using; its hidden cost, invisible in this benign run, appears the moment one tenant turns hostile and the soft slowdown becomes a hard collapse with no wall to stop it. MIG's p50 is an order of magnitude worse because a one-seventh slice is genuinely a one-seventh-speed device, but that slowness is constant and contention-proof: the same number would hold if a neighbor were running a crypto miner. Time-slicing lands between them, full speed when it runs but queued the rest of the time. The realized utilization bound of Section 1, $u_{\text{packed}} \le \min(1, n\,u_1)$, is what all three are chasing; they differ only in what they charge to approach it. A platform serving mutually distrustful tenants pays MIG's latency tax for its guarantees; a single team packing its own replicas takes MPS's throughput and accepts the shared fate.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Scheduler Decides Where on the Curve You Sit</div>
+<p>Multi-tenant sharing is a scheduling problem, and it connects directly to the scheduling arc this book has been building. The gang scheduler of <a href="section-33.5.html">Section 33.5</a> places one job across many GPUs; the device plugin of <a href="section-33.3.html">Section 33.3</a> places many jobs onto fractions of one GPU. Both are the cluster deciding how the scarce accelerator is carved, and both feed the fleet-sizing arithmetic of <a href="../../part-5-distributed-inference/module-23-distributed-inference-systems/index.html">Chapter 23</a>: the per-node packing factor $n$ from this section is exactly the multiplier that turns a per-replica QPS target into a count of physical cards. Sharing is not a hardware curiosity bolted onto the side of the cluster; it is the bottom of the same placement stack that gang scheduling sits at the top of.</p>
+</div>
+
+<h2>6. Interference, Noisy Neighbors, and QoS <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The reason isolation is worth paying for is the noisy-neighbor problem, and it is sharper on a GPU than on a CPU. Co-resident tenants contend not only for SMs but for the shared memory bandwidth, the L2 cache, and the PCIe or NVLink path to host memory, and a single bandwidth-hungry tenant can throttle every neighbor even while leaving SMs idle. Under MPS and time-slicing this contention is unbounded by hardware: a batch-inference job that saturates memory bandwidth will inflate the tail latency of a co-resident real-time service without either job exceeding any explicit quota. The effect compounds in inference serving, where a service-level objective is usually written on the tail, a p99 or p999 latency, precisely the percentile that interference attacks first, because contention shows up as occasional long stalls rather than a shift in the median.</p>
+<p>Quality-of-service in a shared accelerator therefore means choosing a mechanism whose isolation matches the strictness of the objective. A hard latency SLO on a hostile multi-tenant platform demands MIG, because only a hardware wall makes the tail predictable regardless of what neighbors do. A best-effort batch workload, or replicas of one trusted model, can take MPS and recover the capacity MIG would have reserved. A common production pattern combines them: pin latency-critical replicas to MIG instances for guaranteed tails, and pack best-effort or batch jobs with MPS or time-slicing onto whatever fractional capacity remains, so the card serves a strict tier and a scavenger tier at once. This mirrors the preemptible-versus-guaranteed tiering that elastic training uses on spot instances in <a href="../../part-4-parallel-deep-learning/module-18-elastic-fault-tolerant-training/index.html">Chapter 18</a>, applied now within a single chip rather than across a fleet.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Fine-Grained and Adaptive GPU Sharing (2024 to 2026)</div>
+<p>The fixed-profile rigidity of MIG and the unisolated freedom of MPS have left an obvious gap, and current systems research is filling it. Production fractional-GPU layers such as Run:ai and the open-source HAMi expose sub-card allocation with software-enforced memory and compute limits that are finer than MIG profiles yet stronger than raw MPS, letting a scheduler hand out, say, a third of a card with a real memory ceiling. On the serving side, the disaggregated and SLO-aware schedulers around vLLM and projects in the lineage of Clockwork and Paella co-locate latency-critical and best-effort inference on shared accelerators while protecting the strict tier's tail, treating the sharing decision as a continuous control problem rather than a static partition. A parallel thread pushes MIG itself toward dynamic reconfiguration, repartitioning a card on the fly as the tenant mix shifts, which would dissolve the drain-to-reconfigure cost that makes today's MIG layouts static. We meet the serving side of these schedulers again in <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>; for now, read the field as converging on adaptive isolation, the missing middle of the curve in Output 33.6.3.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Seven Strangers Who Refuse to Talk</div>
+<p>The epigraph is almost literally accurate. Seven <code>1g.10gb</code> MIG instances on one A100 cannot exchange a single byte through the GPU; as far as each instance's CUDA runtime is concerned, the other six do not exist, and a profiler attached to one sees a quiet, lightly loaded device even while the card as a whole is at full tilt. The isolation that makes MIG safe also makes it slightly lonely: the one resource the seven strangers do share, the card's power and thermal budget, is the only way they can ever influence one another, and even that the firmware manages so the strangers never have to negotiate.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.6.1: Match the Mechanism to the Tenant <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each scenario, state which of MIG, MPS, or time-slicing you would deploy and justify it in terms of the isolation-versus-utilization trade: (a) a hosted inference API where each tenant is a different paying customer running untrusted models with a contractual p99 latency SLO; (b) twelve replicas of a single recommendation model owned by one team, optimizing for total throughput on a fixed card budget; (c) a research lab's interactive development cluster on older V100 cards that lack MIG, where users tolerate jitter but the cards must be oversubscribed. Explain what specifically goes wrong if you pick the mechanism from a different row.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.6.2: Stress the Sharing Modes <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 33.6.3 with one hostile tenant whose requests need ten times the normal service time and arrive twice as fast. Under MIG, confine the hostile tenant to its own instance and confirm the other six tenants' p99 latencies are unchanged. Under MPS, let the hostile tenant inflate every co-resident's service time (raise the contention coefficient while it is active) and measure how far the well-behaved tenants' p99 degrades. Report the gap between the two modes' p99 for the well-behaved tenants, and explain why that gap is the quantitative price of MPS's missing wall.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.6.3: Size the Packing Factor <span class="exercise-type analysis">Analysis</span></div>
+<p>An 80-gigabyte A100 is to host replicas of a 2-billion-parameter model served in INT8 (one byte per parameter), each replica also needing 4 gigabytes of KV-cache and activation headroom, and each replica saturating roughly 12% of the card's compute at its target QPS. Using the packing bound $n \le \min(M_{\text{gpu}}/m_{\text{tenant}},\, C_{\text{gpu}}/c_{\text{tenant}})$ from Section 1, compute the memory-limited and compute-limited values of $n$ and state which binds. Then argue which sharing mechanism can actually realize that $n$: can seven MIG instances hold this model, or does the per-instance memory ceiling force MPS or time-slicing? Tie your answer to the fleet-sizing use of $n$ in <a href="../../part-5-distributed-inference/module-23-distributed-inference-systems/index.html">Chapter 23</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-33.5.html"><span class="nav-label">Previous</span><span class="nav-num">Section 33.5</span><span class="nav-title">Gang Scheduling and Collective-Aware Placement</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 33</span><span class="nav-num">Contents</span><span class="nav-title">Cluster Infrastructure and Scheduling</span></a>
+<a class="next" href="section-33.7.html"><span class="nav-label">Next</span><span class="nav-num">Section 33.7</span><span class="nav-title">Ray Clusters and the Object Store</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

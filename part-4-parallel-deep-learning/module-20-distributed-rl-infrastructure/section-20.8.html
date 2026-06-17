@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 20.8: Scaling Bottlenecks: Sampling vs Learning Throughput. Why a distributed RL system runs at the slower of its two pipelines, how the replay ratio ties them together, and how to profile and rebalance the bottleneck side." name="description"/>
+<title>Section 20.8: Scaling Bottlenecks: Sampling vs Learning Throughput | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 20: Distributed Reinforcement Learning Infrastructure</a></div>
+<h1>Scaling Bottlenecks: Sampling vs Learning Throughput</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I generated experience all night. The learner read one batch, looked at the other nine million, and quietly suggested I slow down."</p>
+<cite>An Actor That Outran Its Learner</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A distributed reinforcement learning system is a two-stage pipeline, and like every pipeline it runs at the speed of its slower stage.</strong> Actors generate experience at some sampling throughput; the learner consumes experience at some learning throughput; the system as a whole advances only as fast as the smaller of the two. Adding actors to a learner-bound system buys nothing but a growing pile of stale experience, and adding learner GPUs to an actor-bound system buys nothing but idle silicon waiting for data. The job of scaling an RL system is therefore not "add workers" but "find which stage is starving and feed it", and the single number that ties the two stages together is the replay ratio, the count of gradient updates the learner performs per environment step the actors take. This section turns that balance into something you can measure, plot, and tune.</p>
+</div>
+<p>The previous section weighed synchronous against asynchronous actor-learner designs, a choice about <em>when</em> experience moves between the two halves of the system. This section asks a sharper and more practical question: once the design is fixed, <em>how fast</em> does the whole thing actually run, and what is holding it back? Almost every distributed RL system you will profile is limited by exactly one of two throughputs, and the symptoms of each are distinct enough that a few minutes of measurement tells you which one, and therefore where to spend money. The trap, repeated in production again and again, is to scale the stage that is already fast. Figure 20.8.1 frames the system as the two-stage pipeline whose narrower neck caps everything, the picture the rest of the section makes quantitative.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A two-stage RL pipeline: many actors feed a replay queue, which feeds a single learner. A wide actor pipe meets a narrow learner pipe, and the narrow stage caps the system throughput while the queue between them backs up.">
+<defs>
+<marker id="arr208" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b208 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w208 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.q208 { fill:#eef6ee; stroke:#2f7a3f; stroke-width:1.6; }
+.t208 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s208 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l208 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr208); }
+.big208 { font:600 13px sans-serif; fill:#b86b1f; text-anchor:middle; }
+</style>
+<text class="t208" x="110" y="30">Sampling stage</text>
+<rect class="w208" x="40" y="48" width="140" height="40" rx="8"/>
+<text class="t208" x="110" y="73">Actor 1</text>
+<rect class="w208" x="40" y="100" width="140" height="40" rx="8"/>
+<text class="t208" x="110" y="125">Actor 2</text>
+<rect class="w208" x="40" y="152" width="140" height="40" rx="8"/>
+<text class="t208" x="110" y="177">Actor N</text>
+<text class="s208" x="110" y="220">sampling rate</text>
+<text class="big208" x="110" y="238">N &#215; r_actor</text>
+<text class="s208" x="110" y="256">(scales with N)</text>
+<path class="l208" d="M 180 68 L 300 110"/>
+<path class="l208" d="M 180 120 L 300 120"/>
+<path class="l208" d="M 180 172 L 300 130"/>
+<rect class="q208" x="300" y="80" width="150" height="80" rx="10"/>
+<text class="t208" x="375" y="110">Replay queue</text>
+<text class="s208" x="375" y="132">backs up if</text>
+<text class="s208" x="375" y="148">sampling &gt; learning</text>
+<path class="l208" d="M 450 120 L 560 120"/>
+<text class="s208" x="505" y="110">batches</text>
+<rect class="b208" x="560" y="72" width="170" height="96" rx="10"/>
+<text class="t208" x="645" y="110">Learner (GPU)</text>
+<text class="s208" x="645" y="132">learning rate</text>
+<text class="big208" x="645" y="150" fill="#14385c">r_learn</text>
+<text class="t208" x="645" y="200">Learning stage</text>
+<line x1="560" y1="250" x2="730" y2="250" stroke="#14385c" stroke-width="2.4"/>
+<line x1="560" y1="245" x2="560" y2="255" stroke="#14385c" stroke-width="2.4"/>
+<line x1="730" y1="245" x2="730" y2="255" stroke="#14385c" stroke-width="2.4"/>
+<text class="s208" x="645" y="244">narrow stage</text>
+<text class="big208" x="645" y="272" fill="#14385c">caps system throughput</text>
+<text class="s208" x="430" y="306">system throughput = min(sampling rate, learning rate); the narrower pipe wins</text>
+<text class="s208" x="430" y="324">policy lag grows with the depth of the replay queue when actors outpace the learner</text>
+</svg>
+<figcaption><strong>Figure 20.8.1:</strong> A distributed RL system as a two-stage pipeline. The sampling stage (left) widens as you add actors, producing experience at rate $N \cdot r_{\text{actor}}$; the learning stage (right) consumes it at rate $r_{\text{learn}}$. Between them sits the replay queue. System throughput is the minimum of the two rates, drawn as the narrow neck on the right. When the sampling rate exceeds the learning rate, the queue backs up and the freshest gradient update sees ever-older experience, the policy lag this section quantifies.</figcaption>
+</figure>
+
+<h2>1. Two Throughputs, One Pipeline <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Name the two quantities precisely, because the whole section hangs on them. <strong>Sampling throughput</strong> is the number of environment steps, or experience tuples, the actors collectively generate per second. With $N$ identical actors each running at $r_{\text{actor}}$ steps per second, the sampling throughput is $N \cdot r_{\text{actor}}$, and it grows linearly as you add actors until some shared resource (the network, the replay buffer, the inference server that serves actor policies) saturates. <strong>Learning throughput</strong> is the number of experience tuples the learner consumes per second through its gradient updates: a learner doing $u$ updates per second on batches of size $B$ consumes $r_{\text{learn}} = u \cdot B$ tuples per second. These two numbers are produced by entirely different hardware (actors are often CPU-bound simulators; the learner is a GPU), which is exactly why they rarely match by accident.</p>
+<p>Because the actors feed the learner through a queue, the system is a pipeline, and a pipeline's steady-state throughput is the throughput of its slowest stage. This is the same arithmetic as the speedup ceilings of <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.5.html">Section 3.5</a>: a serial bottleneck caps the whole, and parallelizing the parts that are already fast cannot move the cap. Here the cap is the slower of sampling and learning,</p>
+$$T_{\text{system}} = \min\!\left(\underbrace{N \cdot r_{\text{actor}}}_{\text{sampling}},\; \underbrace{u \cdot B}_{\text{learning}}\right).$$
+<p>Everything downstream follows from which term wins. If sampling is smaller, the learner periodically empties the queue and its GPU stalls waiting for the next batch; the system is <em>actor-bound</em>. If learning is smaller, experience arrives faster than it can be consumed, the queue grows without bound, and old experience either spills or is trained on long after the policy that produced it has moved on; the system is <em>learner-bound</em>. The two regimes call for opposite remedies, so diagnosing which one you are in is the first move.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: You Cannot Scale Past the Slower Stage</div>
+<p>A distributed RL system runs at $\min(\text{sampling rate}, \text{learning rate})$, not at the sum and not at the faster of the two. Doubling the actors in a learner-bound system leaves system throughput unchanged and only deepens the backlog; doubling the learner GPUs in an actor-bound system leaves throughput unchanged and only idles the new GPUs. Every scaling decision in RL begins by identifying the binding stage, because spending on the non-binding stage is spending on nothing.</p>
+</div>
+
+<h2>2. The Replay Ratio Ties the Two Together <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The cleanest single knob connecting sampling and learning is the <strong>replay ratio</strong> (also called the update-to-data or UTD ratio): the number of gradient updates the learner performs per environment step the actors generate. If the learner consumes $r_{\text{learn}}$ tuples per second and the actors produce $r_{\text{sample}}$ tuples per second, the replay ratio is</p>
+$$\rho = \frac{r_{\text{learn}}}{r_{\text{sample}}} = \frac{u \cdot B}{N \cdot r_{\text{actor}}}.$$
+<p>A replay ratio of $\rho = 1$ means each experience tuple is consumed, on average, exactly once: sampling and learning are balanced and the queue neither grows nor starves. A ratio $\rho < 1$ means the learner is too slow to keep up and the system is sampling-rich, learner-bound; experience accumulates and ages. A ratio $\rho > 1$ means the learner revisits each tuple multiple times (sample reuse via the replay buffer of <a href="section-20.4.html">Section 20.4</a>) and the actors cannot keep the learner fed; the system is learner-rich, actor-bound. The replay ratio is therefore not just an efficiency statistic, it is the dial you turn to move the bottleneck from one stage to the other.</p>
+<p>The ratio also carries a statistical cost that this systems view must respect. Pushing $\rho$ high to keep an expensive learner busy means each gradient step leans on increasingly reused, increasingly off-policy data, the staleness this chapter treats in <a href="section-20.5.html">Section 20.5</a> with V-trace and related corrections. So the replay ratio sits at the meeting point of a systems constraint (keep both stages busy) and a learning constraint (do not over-train on stale experience), and the right value is the one that respects both. High-replay-ratio off-policy methods are a live research area precisely because the systems incentive to crank $\rho$ up collides with the optimization damage it can cause.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Balancing a Pipeline, Not Adding Workers</div>
+<p>The reflex of scale-out is "throw more machines at it", and for the exact-gradient data parallelism of <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a> that reflex is nearly right: more workers, proportionally more throughput. Distributed RL breaks that reflex. It is two coupled pipelines with different hardware, and adding machines to the wrong stage moves nothing. The lesson this section folds into the book's spine is that scaling is not always multiplication; sometimes it is <em>balance</em>. The skill is reading where the system is starved and feeding precisely that stage, a discipline that returns when distributed multi-agent RL training stacks the same actor-learner imbalance across many agents at once in <a href="../../part-6-multi-agent-systems/module-30-multi-agent-reinforcement-learning/index.html">Chapter 30</a>.</p>
+</div>
+
+<h2>3. Profiling: Find the Starved Stage <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>You cannot rebalance what you have not measured, and RL systems hide their bottleneck behind a misleadingly busy dashboard: actors can look fully utilized while the learner starves, or the learner can look pegged while actors idle on a slow simulator. Four measurements, taken together, locate the bottleneck unambiguously, and they connect directly to the evaluation discipline of <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.4.html">Section 5.4</a> on communication-to-computation ratios. First, <strong>actor steps per second</strong>, summed across actors, gives the sampling rate. Second, <strong>learner samples per second</strong> (updates per second times batch size) gives the learning rate. Third, <strong>queue depth</strong> in the replay buffer or transport: a queue pinned at zero means the learner is starved (actor-bound); a queue pinned at its cap means the learner cannot drain it (learner-bound). Fourth, <strong>policy lag</strong>, the gap in update steps between the policy that generated a sampled tuple and the current learner policy, which measures how stale the consumed experience actually is.</p>
+<p>The signatures are crisp. An actor-bound system shows a near-empty queue, a learner GPU utilization well below 100 percent, and low policy lag; the fix is more sampling (Section 4). A learner-bound system shows a full or growing queue, a learner GPU pegged near 100 percent, and rising policy lag; the fix is more learning throughput or a lower replay ratio. The code below makes this concrete by modeling the pipeline directly: it sweeps actor count against a fixed learner, reports which stage binds, and then tracks how the replay queue and policy lag explode once the actors overtake the learner.</p>
+<pre><code class="language-python">def system_throughput(n_actors, actor_rate, learner_rate):
+    """Sampling rate scales with actors; system runs at the slower stage."""
+    sampling = n_actors * actor_rate          # experiences produced per second
+    learning = learner_rate                    # experiences consumed per second
+    return sampling, learning, min(sampling, learning)
+
+
+def simulate_policy_lag(n_actors, actor_rate, learner_rate, seconds, batch=256):
+    """Queued (unconsumed) experience and the resulting policy lag in updates."""
+    sampling, learning, _ = system_throughput(n_actors, actor_rate, learner_rate)
+    queue = 0.0
+    for _ in range(seconds):
+        queue += sampling                      # actors push new experience
+        queue -= learning                      # learner pulls and consumes
+        if queue < 0.0:
+            queue = 0.0                        # learner starved, GPU idles
+    return queue, queue / batch                # lag = backlog / batch size
+
+
+learner, actor = 12_000, 1_000                 # learner 12k/s; each actor 1k/s
+print("=== Sweep actor count at a fixed learner rate (12000 samples/s) ===")
+print(f"{'actors':&gt;7} {'sampling/s':&gt;11} {'learning/s':&gt;11} {'system/s':&gt;10} {'bottleneck':&gt;11} {'util':&gt;6}")
+for n in (2, 6, 12, 18, 24):
+    s, l, sys = system_throughput(n, actor, learner)
+    side = "learner" if l &lt; s else "actors"
+    print(f"{n:&gt;7} {s:&gt;11} {l:&gt;11} {sys:&gt;10} {side:&gt;11} {sys / max(s, l):&gt;5.0%}")
+
+print("\n=== Policy lag after 60 s, sweeping actor count (learner fixed) ===")
+print(f"{'actors':&gt;7} {'sampling/s':&gt;11} {'queue@60s':&gt;10} {'lag(updates)':&gt;13}")
+for n in (6, 12, 16, 20, 24):
+    q, lag = simulate_policy_lag(n, actor, learner, seconds=60)
+    print(f"{n:&gt;7} {n * actor:&gt;11} {q:&gt;10.0f} {lag:&gt;13.1f}")
+
+print("\n=== Replay ratio when the learner is the bottleneck (12 actors) ===")
+n = 12; sampling = n * actor                    # 12000 experiences/s produced
+for lr in (6_000, 12_000, 24_000):
+    bound = "learner-bound" if lr &lt; sampling else "actor-bound"
+    print(f"learner={lr:&gt;6}/s  replay_ratio={lr / sampling:&gt;4.2f}  "
+          f"system={min(sampling, lr):&gt;6}/s  {bound}")
+</code></pre>
+<div class="code-caption"><strong>Code 20.8.1:</strong> A pure-Python model of the sampling/learning pipeline. The first sweep shows system throughput tracking the slower stage; the second shows the replay queue and policy lag growing once actors overtake the learner; the third reads off the replay ratio as the learner rate is varied against a fixed sampling rate.</div>
+<pre><code class="language-text">=== Sweep actor count at a fixed learner rate (12000 samples/s) ===
+ actors  sampling/s  learning/s   system/s  bottleneck   util
+      2        2000       12000       2000      actors   17%
+      6        6000       12000       6000      actors   50%
+     12       12000       12000      12000      actors  100%
+     18       18000       12000      12000     learner   67%
+     24       24000       12000      12000     learner   50%
+
+=== Policy lag after 60 s, sweeping actor count (learner fixed) ===
+ actors  sampling/s  queue@60s  lag(updates)
+      6        6000          0           0.0
+     12       12000          0           0.0
+     16       16000     240000         937.5
+     20       20000     480000        1875.0
+     24       24000     720000        2812.5
+
+=== Replay ratio when the learner is the bottleneck (12 actors) ===
+learner=  6000/s  replay_ratio=0.50  system=  6000/s  learner-bound
+learner= 12000/s  replay_ratio=1.00  system= 12000/s  actor-bound
+learner= 24000/s  replay_ratio=2.00  system= 12000/s  actor-bound</code></pre>
+<div class="code-caption"><strong>Output 20.8.1:</strong> System throughput rises with actors only until it hits the 12000 samples/s learner cap, then flatlines while utilization of the faster stage collapses from 100 percent to 50 percent. The policy lag is exactly zero while the learner keeps up and then grows by 240000 queued tuples (937.5 update-steps of staleness) per extra four actors. The third block confirms a replay ratio above 1.0 cannot raise throughput once the actors are the bottleneck.</div>
+<p>Read the three blocks of Output 20.8.1 together and the section's whole argument is visible in the numbers. Throughput climbs with actors up to twelve, where sampling exactly matches the learner, then stops; the extra actors at 18 and 24 add only queue depth, and the "util" column shows the faster stage running at half capacity, money spent on nothing. The middle block is the cost of ignoring that: at sixteen actors the queue reaches 240000 tuples after a minute, and the freshest gradient update is training on experience nearly a thousand updates old. The final block makes the replay-ratio point precise: once the actors cap the system at 12000 per second, pushing the learner to a replay ratio of 2.0 leaves throughput flat and merely re-reads stale data.</p>
+
+<h2>4. Scaling Each Side <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Once the binding stage is known, the remedy is specific. To raise <strong>sampling throughput</strong>, add actors. Sampling scales almost embarrassingly well because actors are independent until they hit a shared resource: more actor processes, more environment replicas, or batched-inference actor servers in the SEED-RL style of <a href="section-20.6.html">Section 20.6</a> that pack many environments behind one accelerator. The ceiling on this side is usually the inference cost of the actor policy or the bandwidth into the replay buffer, not the actors themselves. To raise <strong>learning throughput</strong>, make the learner faster, and the canonical move is to turn the single learner into a data-parallel learner: shard each large batch across several GPUs, compute partial gradients, and combine them with the all-reduce of <a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a>. A data-parallel learner consuming $G$ GPUs raises $r_{\text{learn}}$ by close to a factor of $G$, moving the cap upward so that more actors can be productively added.</p>
+<p>The two remedies interact, and the goal is to walk both stages up together so the replay ratio stays in its healthy band. Add a data-parallel learner GPU, the learner rate rises, the system becomes actor-bound, so add actors until sampling catches up, at which point the learner binds again. Balanced scaling is this back-and-forth, and the largest RL systems are tuned so that neither the actor fleet nor the learner cluster is ever the clear loser. That is the sense in which RL scaling is pipeline balancing rather than simple worker multiplication: you are co-sizing two stages so that $\min(\cdot, \cdot)$ has no slack on either argument.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The RL Cluster That Bought the Wrong Hardware</div>
+<p><strong>Who:</strong> A reinforcement learning team training a robotics control policy on a simulated-physics environment.</p>
+<p><strong>Situation:</strong> Throughput had plateaued at roughly 30000 environment steps per second despite a healthy budget, and training a policy to convergence took five days.</p>
+<p><strong>Problem:</strong> The instinct, backed by a vendor quote, was to double the learner from four GPUs to eight to "train faster".</p>
+<p><strong>Dilemma:</strong> Spend the budget on more learner GPUs, which speeds learning throughput, or on more actor machines, which speeds sampling throughput, with no clear evidence which stage was actually binding.</p>
+<p><strong>Decision:</strong> Before purchasing, they profiled the four numbers from Section 3 and found the replay queue pinned near empty, learner GPU utilization at 38 percent, and policy lag near zero, the textbook signature of an actor-bound system.</p>
+<p><strong>How:</strong> They left the learner untouched, tripled the CPU actor pool that ran the physics simulator, and added a batched-inference actor server so a single GPU served policy actions to many environments at once.</p>
+<p><strong>Result:</strong> Sampling throughput rose to match the learner, system throughput climbed to about 78000 steps per second, the learner GPUs reached 90 percent utilization, and convergence wall-clock fell from five days to under two, at a fraction of the cost of the eight-GPU learner.</p>
+<p><strong>Lesson:</strong> Profile before you provision. The expensive component was already fast; the cheap one was starving it. Buying more of the fast stage would have lowered utilization, not raised throughput.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Ray RLlib Sizes the Two Stages for You</div>
+<p>The pipeline arithmetic above is exactly what a production RL framework exposes as configuration. In Ray RLlib you declare the sampling stage (how many rollout actors) and the learning stage (how many data-parallel learner GPUs) as two independent counts, and the framework runs the queue, the all-reduce across learners, and the policy-weight broadcast back to actors. Rebalancing a bottleneck is a two-line config change rather than a rewrite of the experience-transport code:</p>
+<pre><code class="language-python"># pip install "ray[rllib]"
+from ray.rllib.algorithms.ppo import PPOConfig
+
+config = (
+    PPOConfig()
+    .env_runners(num_env_runners=64)          # SAMPLING stage: 64 rollout actors
+    .learners(num_learners=4,                 # LEARNING stage: 4 data-parallel
+              num_gpus_per_learner=1)         #   learner GPUs, all-reduced for you
+    .training(train_batch_size=16_000)        # tuples consumed per learner step
+)
+algo = config.build_algo()                    # framework runs the queue + all-reduce
+for _ in range(100):
+    algo.train()                              # one balanced sample-then-learn cycle
+</code></pre>
+<div class="code-caption"><strong>Code 20.8.2:</strong> The same sampling/learning balance as Code 20.8.1, expressed as RLlib configuration. The hand-rolled queue, all-reduce, and weight broadcast of a from-scratch actor-learner system collapse to the two counts <code>num_env_runners</code> and <code>num_learners</code>; tuning the bottleneck means changing those numbers, not the transport layer.</div>
+</div>
+
+<h2>5. Why Balance Is the Whole Game <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>It is worth saying plainly why RL resists the simple scale-out story that data-parallel supervised training enjoys. In supervised training every worker does the same kind of work, and the all-reduce that combines them is exact, so $K$ workers genuinely approximate $K$ times the throughput until communication costs bite. RL splits the work into two qualitatively different jobs, sampling and learning, run on different hardware at rates that are coupled only through a queue. The system's throughput is a $\min$, and a $\min$ has the unforgiving property that improving the larger argument does nothing. That is why a beautifully optimized learner can sit half-idle behind a slow simulator, and why a thousand actors can drown a learner that physically cannot keep up.</p>
+<p>The practical consequence is a habit, not a formula: instrument both stages, watch the queue and the policy lag, and treat any large imbalance as a signal that you are paying for capacity you cannot use. The next section turns this diagnosis into practice, surveying the frameworks (Ray RLlib and the broader distributed-RL stacks) that implement the actor-learner pipeline, the replay transport, and the data-parallel learner as components you assemble rather than build, so that the balancing this section describes becomes a matter of configuration and profiling rather than custom systems code. That tour begins in <a href="section-20.9.html">Section 20.9</a>.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: High Replay Ratios and Compute-Optimal RL Scaling (2024 to 2026)</div>
+<p>The replay ratio has become a first-class object of study. A line of work on sample-efficient off-policy RL pushes the replay ratio to 8, 16, or higher to extract more learning from each costly environment step, using periodic network resets and regularization to counter the "primacy bias" and overfitting that high reuse otherwise causes (the lineage of Nikishin et al.'s reset work and the subsequent high-UTD continuous-control methods through 2024 and 2025). A complementary thread asks the compute-optimal version of this section's question directly: given a fixed budget, how should it be split between actors and learners, and how does the answer shift as accelerators get faster relative to simulators? With reinforcement learning now central to post-training large language models, the actor (generation) stage and the learner (policy-gradient) stage are both enormous, and 2024 to 2026 work on RLHF and reasoning-model infrastructure (frameworks in the lineage of OpenRLHF and large-scale verifier-based RL) treats the sampling-versus-learning balance of this section as a primary scaling axis, not an afterthought. The open question is no longer whether the pipeline must be balanced but how to balance it automatically as both stages grow.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.8.1: Read the Bottleneck <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each profile, state whether the system is actor-bound or learner-bound and name the single most cost-effective fix: (a) replay queue pinned at its 1-million cap, learner GPU at 99 percent, policy lag rising by 400 update-steps per minute; (b) replay queue averaging 12 tuples, learner GPU at 35 percent, policy lag near zero; (c) sampling rate 50000/s, learning rate 50000/s, queue stable at half its cap, both stages above 90 percent utilization. For (c), explain why adding hardware to either stage alone would lower its utilization without raising system throughput.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.8.2: Extend the Pipeline Model <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 20.8.1 so the learner is data-parallel: add a parameter <code>num_learner_gpus</code> that multiplies the learner rate by an all-reduce efficiency factor (model it as $G \cdot (1 - 0.04 \cdot (G-1))$ to reflect collective overhead growing with GPU count, per <a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a>). Sweep <code>num_learner_gpus</code> from 1 to 8 at a fixed 20-actor sampling stage, print the resulting replay ratio and system throughput, and identify the GPU count at which the learner stops being the bottleneck. Explain why adding learner GPUs beyond that point no longer raises system throughput.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.8.3: The Cost of an Imbalanced Cluster <span class="exercise-type analysis">Analysis</span></div>
+<p>A cluster runs 40 actors at 1500 steps/s each and a single learner at 36000 samples/s. Compute the sampling rate, the system throughput, the replay ratio, and the steady-state utilization of each stage. Suppose actor machines cost \$0.50/hour and the learner GPU costs \$3.00/hour; compute the cost per million environment steps. Then propose a rebalanced configuration (changing only the actor count) that maximizes utilization of both stages, recompute the cost per million steps, and quantify the savings. State which of the four profiling signals from Section 3 would have revealed the original imbalance fastest.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-20.7.html"><span class="nav-label">Previous</span><span class="nav-num">Section 20.7</span><span class="nav-title">Synchronous vs Asynchronous RL Systems</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 20</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Reinforcement Learning Infrastructure</span></a>
+<a class="next" href="section-20.9.html"><span class="nav-label">Next</span><span class="nav-num">Section 20.9</span><span class="nav-title">Frameworks and Practice</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

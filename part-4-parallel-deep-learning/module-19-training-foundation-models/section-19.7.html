@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 19.7: Distributed Fine-Tuning. Why full fine-tuning needs the same model-parallel machinery as pretraining, how LoRA and QLoRA cut trainable parameters and communication, and when to choose parameter-efficient fine-tuning over full fine-tuning." name="description"/>
+<title>Section 19.7: Distributed Fine-Tuning | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 19: Training Foundation Models at Scale</a></div>
+<h1>Distributed Fine-Tuning</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They spent ten thousand GPU-hours teaching me everything. Then they asked me to learn one new thing, and reached for the same ten thousand GPUs. I suggested a smaller meeting."</p>
+<cite>A Base Model Asked to Specialize</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Fine-tuning takes a model that already knows almost everything and teaches it one more thing, and the central question for distribution is how much of the model actually has to change.</strong> If you update every weight, fine-tuning is just a shorter pretraining run and it inherits all of pretraining's distribution machinery: the model still must fit and update across many devices, so you still need the sharded and pipelined parallelism of the previous chapters. But most adaptation does not need every weight to move. Parameter-efficient fine-tuning freezes the enormous base and trains a tiny set of new parameters, which shrinks optimizer memory, gradient volume, and communication all at once. That single change is what lets a model that took a thousand GPUs to pretrain be specialized on a handful, and lets one shared base serve hundreds of task-specific variants at once. This section shows why the choice between full and parameter-efficient fine-tuning is, at heart, a distribution decision.</p>
+</div>
+<p>By this point in the chapter you have seen what it takes to pretrain a foundation model: data, model, and optimizer state spread across thousands of accelerators, held together by the collectives of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> and the sharding of <a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>. Pretraining, though, is something most teams do once or never. The far more common act is fine-tuning: taking a released base model and adapting it to a specific task, domain, or instruction style with a comparatively small dataset. The pretrained weights are the expensive asset; fine-tuning is the cheap, frequent operation layered on top. The interesting question is whether adapting a model forces you back into the full pretraining apparatus, or whether the fact that the model already knows so much lets you distribute the adaptation far more cheaply. The answer depends entirely on how many parameters you allow to change.</p>
+
+<h2>1. Full Fine-Tuning Is Pretraining, Shortened <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The simplest way to adapt a model is to continue training it on the new data and let every weight move. This is full fine-tuning, and from a systems perspective it is indistinguishable from pretraining. The whole model must still reside in device memory, every parameter still carries gradients and optimizer state, and the update still touches all of it. A model that needed sharding across devices to be pretrained needs exactly the same sharding to be fully fine-tuned, because the memory footprint has not changed: parameters, gradients, and the Adam moments together still dwarf any single accelerator.</p>
+<p>That means full fine-tuning of a large base inherits the entire toolkit of the previous chapters. You still reach for fully sharded data parallelism (FSDP) or ZeRO to split parameters, gradients, and optimizer state across the data-parallel group, exactly as built in <a href="../module-16-model-pipeline-sharded-parallelism/section-16.5.html">Section 16.5</a>; you still pay for the reduce-scatter and all-gather that sharding implies on every step. The only differences from pretraining are that the dataset is smaller, the learning rate is lower, and the run is shorter. None of those changes the distribution strategy. If the model did not fit on one device for pretraining, it does not fit for full fine-tuning, and the same model-parallel machinery is mandatory.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Full Fine-Tuning Inherits Pretraining's Distribution, Because the Memory Did Not Shrink</div>
+<p>The thing that forces model and sharded parallelism is the model's memory footprint, not the number of training tokens. Full fine-tuning leaves the footprint untouched: every parameter still needs gradients and optimizer state, so a model that required FSDP or ZeRO to pretrain requires it to fully fine-tune. The shorter dataset buys you wall-clock time, not a simpler distribution strategy. To make fine-tuning cheaper to distribute, you must change how many parameters are trainable, which is what the rest of this section is about.</p>
+</div>
+
+<h2>2. Freeze the Base, Train a Sliver <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Parameter-efficient fine-tuning (PEFT) starts from an empirical observation: adapting a pretrained model to a new task usually requires only a small, low-dimensional change to its weights. If the necessary change is small, why allocate gradients and optimizer state for every parameter? PEFT freezes the entire pretrained base and inserts a small number of new, trainable parameters, training only those. The base weights, which are the overwhelming majority, never receive a gradient and never appear in the optimizer.</p>
+<p>The dominant PEFT method is low-rank adaptation, or LoRA. Take any weight matrix $W_0 \in \mathbb{R}^{d_\text{out} \times d_\text{in}}$ in the frozen base. Instead of learning a full update $\Delta W$ of the same shape, LoRA constrains the update to be low rank, writing it as a product of two thin matrices:</p>
+$$W = W_0 + \Delta W = W_0 + \frac{\alpha}{r}\, B A, \qquad B \in \mathbb{R}^{d_\text{out} \times r},\; A \in \mathbb{R}^{r \times d_\text{in}},\; r \ll \min(d_\text{out}, d_\text{in}).$$
+<p>Here $r$ is the rank, a small number such as 8 or 16, and $\alpha$ is a scaling constant. Only $A$ and $B$ are trainable; $W_0$ stays frozen. A full update of an $d_\text{out} \times d_\text{in}$ matrix has $d_\text{out} d_\text{in}$ parameters, while the LoRA adapter has only $r(d_\text{out} + d_\text{in})$, which for large matrices and small $r$ is a tiny fraction. Because $B$ is initialized to zero, $\Delta W$ starts at zero and the adapted model begins identical to the base, so fine-tuning never has to first recover what the base already knew.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="On the left, one large frozen base weight matrix with two small trainable low-rank adapter matrices attached to it. On the right, one shared frozen base serving three different task adapters at once.">
+<defs>
+<marker id="arr197" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.frozen197 { fill:#eef1f5; stroke:#5a626c; stroke-width:1.6; }
+.train197 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.8; }
+.t197 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s197 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.o197 { font:600 12px sans-serif; fill:#b86b1f; text-anchor:middle; }
+.l197 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr197); }
+</style>
+<text class="t197" x="215" y="26">One layer with a LoRA adapter</text>
+<rect class="frozen197" x="120" y="48" width="120" height="150" rx="6"/>
+<text class="t197" x="180" y="118">W<tspan dy="4" font-size="10">0</tspan></text>
+<text class="s197" x="180" y="140">frozen base</text>
+<text class="s197" x="180" y="216">d<tspan dy="3" font-size="9">out</tspan><tspan dy="-3"> &#215; </tspan>d<tspan dy="3" font-size="9">in</tspan></text>
+<rect class="train197" x="300" y="48" width="40" height="150" rx="5"/>
+<text class="o197" x="320" y="126">B</text>
+<rect class="train197" x="300" y="214" width="120" height="34" rx="5"/>
+<text class="o197" x="360" y="236">A</text>
+<text class="o197" x="320" y="36">trainable</text>
+<text class="t197" x="370" y="290">W = W<tspan dy="4" font-size="10">0</tspan><tspan dy="-4"> + (&#945;/r) B A</tspan></text>
+<text class="s197" x="370" y="312">base unchanged, only A, B get gradients</text>
+<line x1="600" y1="60" x2="600" y2="320" stroke="#cdd3da" stroke-width="1.5"/>
+<text class="t197" x="730" y="26">Multi-LoRA over one shared base</text>
+<rect class="frozen197" x="640" y="48" width="180" height="56" rx="6"/>
+<text class="t197" x="730" y="82">Shared frozen base W<tspan dy="4" font-size="10">0</tspan></text>
+<rect class="train197" x="640" y="150" width="52" height="40" rx="5"/>
+<text class="o197" x="666" y="174">law</text>
+<rect class="train197" x="704" y="150" width="52" height="40" rx="5"/>
+<text class="o197" x="730" y="174">med</text>
+<rect class="train197" x="768" y="150" width="52" height="40" rx="5"/>
+<text class="o197" x="794" y="174">code</text>
+<path class="l197" d="M 700 104 L 666 146"/>
+<path class="l197" d="M 730 106 L 730 146"/>
+<path class="l197" d="M 760 104 L 794 146"/>
+<text class="s197" x="730" y="232">three task adapters, one copy of the base</text>
+<text class="s197" x="730" y="252">swap adapters per request at serving time</text>
+</svg>
+<figcaption><strong>Figure 19.7.1:</strong> Left, a single layer under LoRA: the large base matrix $W_0$ is frozen (grey), and only the thin adapter matrices $A$ and $B$ (orange) receive gradients, so the trainable update is the low-rank product $\frac{\alpha}{r} B A$. Right, the serving payoff: because every task shares the identical frozen base, one resident copy of $W_0$ backs many small adapters (law, medicine, code), and the server swaps the relevant adapter per request rather than loading a whole fine-tuned model.</figcaption>
+</figure>
+<p>As Figure 19.7.1 shows on the left, the base matrix dominates the parameter count and stays frozen, while the trainable adapters are slivers attached to it. The demonstration below builds exactly this construction by hand on a single linear layer in pure NumPy. It adapts a frozen base to a task that needs a low-rank correction, trains only the adapter, and reports how few parameters changed and how few gradient bytes the step produced compared with updating the whole matrix.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+d_in, d_out, r = 256, 256, 8        # layer dims, LoRA rank
+N = 4000                            # training examples
+
+# A frozen "pretrained" base layer W0. The task needs a LOW-RANK correction on top
+# of it, which is exactly the regime LoRA is designed for.
+W0 = rng.standard_normal((d_out, d_in)) / np.sqrt(d_in)   # frozen base weights
+U  = rng.standard_normal((d_out, r)) / np.sqrt(r)
+V  = rng.standard_normal((r, d_in)) / np.sqrt(d_in)
+Delta_task = U @ V                                         # the task's true (rank-r) update
+X  = rng.standard_normal((N, d_in))
+Y  = X @ (W0 + Delta_task).T                              # task targets
+
+# LoRA: freeze W0, learn a low-rank update Delta = (alpha/r) B A.
+alpha = 16.0
+A = rng.standard_normal((r, d_in)) * 0.01     # trainable
+B = np.zeros((d_out, r))                       # trainable, init 0 so Delta starts at 0
+scale = alpha / r
+lr = 0.5
+
+def loss(x, y):
+    pred = x @ W0.T + scale * (x @ A.T) @ B.T   # W0 frozen; only A, B adapt
+    return float(np.mean((pred - y) ** 2))
+
+start = loss(X, Y)
+bs = 256
+for step in range(2000):
+    idx = rng.integers(0, N, bs)
+    x, y = X[idx], Y[idx]
+    h = x @ A.T                       # (bs, r)
+    pred = x @ W0.T + scale * h @ B.T
+    err = (pred - y) * (2.0 / (bs * d_out))
+    gB = scale * err.T @ h            # grad wrt B
+    gA = scale * (err @ B).T @ x      # grad wrt A
+    B -= lr * gB
+    A -= lr * gA
+end = loss(X, Y)
+
+full_params = d_out * d_in
+lora_params = r * d_in + d_out * r
+print(f"task loss before adaptation : {start:.4f}")
+print(f"task loss after  adaptation : {end:.6f}")
+print(f"full fine-tune trainable params : {full_params:,}")
+print(f"LoRA trainable params           : {lora_params:,}")
+print(f"trainable-parameter fraction    : {lora_params/full_params:.3%}")
+print(f"gradient bytes per step  full   : {full_params*4:,}")
+print(f"gradient bytes per step  LoRA   : {lora_params*4:,}")
+print(f"gradient-volume reduction       : {full_params/lora_params:.1f}x")
+</code></pre>
+<div class="code-caption"><strong>Code 19.7.1:</strong> A LoRA adapter on one linear layer, from first principles. The base $W_0$ is never updated; only the rank-8 matrices $A$ and $B$ receive gradients, and the closed-form gradients <code>gA</code>, <code>gB</code> are the only tensors a real job would communicate.</div>
+<pre><code class="language-text">task loss before adaptation : 1.0107
+task loss after  adaptation : 0.000000
+full fine-tune trainable params : 65,536
+LoRA trainable params           : 4,096
+trainable-parameter fraction    : 6.250%
+gradient bytes per step  full   : 262,144
+gradient bytes per step  LoRA   : 16,384
+gradient-volume reduction       : 16.0x
+</code></pre>
+<div class="code-caption"><strong>Output 19.7.1:</strong> The adapter drives the task loss to zero while training 4,096 of the layer's 65,536 weights, just 6.25 percent. The gradient that a distributed step would synchronize shrinks by the same factor, 16x here, and the proportion grows far more dramatic on the wide matrices of a real transformer.</div>
+<p>The adapter fully solved the task while leaving the base untouched, and Output 19.7.1 quantifies the saving twice over: 6.25 percent of the parameters were trainable, and the gradient that a data-parallel step would all-reduce shrank by 16x. On this deliberately small layer the ratio is modest; on a transformer whose matrices are thousands of dimensions wide and where $r$ stays at 8 or 16, LoRA routinely trains well under one percent of the model's parameters. Optimizer memory falls in the same proportion, because Adam keeps two moment tensors per trainable parameter and there are now almost none.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Initialized to Do Nothing, on Purpose</div>
+<p>Setting $B$ to zero so the adapter starts as an exact no-op is the rare case where shipping a component that does literally nothing is the correct design. The base model walks in already competent, the adapter contributes zero on step one, and every gradient step after that is pure specialization rather than damage control. It is the polite houseguest of neural network modules: it changes nothing until invited.</p>
+</div>
+
+<h2>3. The Distributed Payoff: Fewer GPUs, and Many Adapters on One Base <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The per-node saving from LoRA is real on its own: less trainable-parameter memory, less optimizer state, a smaller forward and backward footprint, the kind of single-node efficiency that <a href="../../part-5-distributed-inference/module-22-per-node-inference-efficiency/index.html">Chapter 22</a> studies in depth. But the saving compounds the moment you distribute. Two distributed payoffs follow directly from freezing the base.</p>
+<p>The first is that fine-tuning becomes feasible on far fewer GPUs. Full fine-tuning's memory is dominated by gradients and optimizer state, the two costs LoRA almost eliminates. With only a sliver trainable, the optimizer footprint nearly vanishes, and a model that needed a large sharded cluster to fully fine-tune can often be adapted on a single node, sometimes a single GPU. The gradient that a data-parallel job must synchronize on every step also shrinks in proportion, so the communication tax that <a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a> spends its length minimizing is paid on kilobytes instead of gigabytes. Fewer devices, less memory per device, and a tiny all-reduce: the distribution problem that pretraining made enormous becomes almost ordinary.</p>
+<p>The second payoff is at serving time, and it is the one that reshapes deployment. Because the base is frozen and shared, one resident copy of the multi-gigabyte model can back many adapters at once, each a few megabytes. Instead of loading a separate fully fine-tuned model per task, a server keeps one base in memory and swaps the relevant adapter per request, as the right side of Figure 19.7.1 illustrates. This multi-LoRA serving pattern collapses the memory cost of offering hundreds of specialized variants down to one base plus a stack of tiny adapters, and it is the foundation of how modern systems serve many fine-tuned models economically, a pattern we develop fully in <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: A Per-Node Efficiency That Multiplies Across the Fleet</div>
+<p>LoRA looks at first like a single-node trick: shrink the trainable parameters, shrink the optimizer state. But every scale-up saving in this book is interesting because of how it multiplies once distributed, and LoRA is a clean example. The shrunken gradient becomes a shrunken all-reduce across the data-parallel group; the shared frozen base becomes one copy serving many adapters across a fleet. The same low-rank structure that saves memory on one GPU (the per-node concern of <a href="../../part-5-distributed-inference/module-22-per-node-inference-efficiency/index.html">Chapter 22</a>) is what makes thousand-tenant adapter serving affordable (the distributed concern of <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>). Per-node and distributed are not separate stories; the first is the seed of the second.</p>
+</div>
+
+<h2>4. When the Base Itself Is Too Big: Distributed PEFT <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>PEFT removes the optimizer and gradient costs, but it does not remove the base. The frozen weights still have to live somewhere, and for the largest models the base alone exceeds one device's memory even when nothing about it is trainable. In that regime you combine the two ideas: shard the frozen base across devices with FSDP or ZeRO exactly as in <a href="../module-16-model-pipeline-sharded-parallelism/section-16.5.html">Section 16.5</a>, while keeping only the tiny adapters trainable. The sharding handles the base's footprint; the adapters keep the trainable, communicated, and optimizer-tracked state minuscule. This is the common shape of fine-tuning a frontier-scale base: full sharding of frozen weights, plus a featherweight set of LoRA adapters riding on top.</p>
+<p>The other axis is precision. Quantized LoRA, or QLoRA, observes that since the base is frozen and only read during the forward and backward pass, it does not need full precision: store it in 4-bit and dequantize on the fly. That cuts the base's resident memory by roughly four times, often enough to keep the whole frozen base on a single device and skip cross-device sharding entirely, while the adapters train in higher precision. QLoRA and full sharded PEFT are two answers to the same question of where the frozen base lives: compress it to fit on one device, or shard it across several. Which you choose is a memory-budget decision, not a correctness one, and the demo's accounting in Output 19.7.1 holds either way because the adapter math is unchanged.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: HuggingFace PEFT Wraps Any Model in LoRA</div>
+<p>Code 19.7.1 implemented one adapter by hand to expose the mechanism. In practice you never write the adapter math; the HuggingFace <code>peft</code> library injects LoRA into every targeted layer of an existing model and leaves the rest frozen, and it composes directly with sharded and quantized loading:</p>
+<pre><code class="language-python">from transformers import AutoModelForCausalLM
+from peft import LoraConfig, get_peft_model
+
+base = AutoModelForCausalLM.from_pretrained("a-base-model", load_in_4bit=True)  # QLoRA: 4-bit frozen base
+config = LoraConfig(r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"])    # rank-8 adapters on attention
+model = get_peft_model(base, config)            # freezes the base, adds trainable adapters
+model.print_trainable_parameters()              # e.g. "trainable: 0.06% of all params"
+# ... then train `model` with an ordinary Trainer / FSDP loop; only the adapters update.
+</code></pre>
+<div class="code-caption"><strong>Code 19.7.2:</strong> The whole of Code 19.7.1, plus QLoRA's 4-bit base and per-layer injection, in five lines. The library handles freezing, adapter placement, the scaling factor $\frac{\alpha}{r}$, and (with <code>load_in_4bit</code>) the dequantize-on-the-fly path, leaving you to write only a standard training loop.</div>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Beyond Plain LoRA (2024 to 2026)</div>
+<p>Parameter-efficient fine-tuning is a fast-moving field. QLoRA (Dettmers et al., 2023) made 4-bit frozen bases practical and remains the default recipe for fine-tuning large models on modest hardware. DoRA (Weight-Decomposed Low-Rank Adaptation, Liu et al., 2024) splits each weight into a magnitude and a direction and applies the low-rank update only to the direction, closing much of the remaining quality gap to full fine-tuning at the same parameter budget. A separate thread targets long-context fine-tuning: adapting a base to far longer sequences than it was pretrained on stresses memory through the attention activations rather than the parameters, so methods combine LoRA with sequence and context parallelism and with position-embedding extension to fit the long-context forward pass across devices. The common direction is to push the trainable fraction down while pushing the achievable task quality and context length up, so that more of fine-tuning lands in the cheap-to-distribute regime.</p>
+</div>
+
+<h2>5. Choosing Between Full Fine-Tuning and PEFT <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The choice is mostly a question of how large a change the task demands and how many variants you will serve. Reach for full fine-tuning when the adaptation is substantial: a large in-domain dataset, a shift the base never saw during pretraining, or a target where the last fraction of quality matters enough to justify updating every weight and paying the full sharded-training cost. Reach for PEFT, which means LoRA or QLoRA in most cases today, when the dataset is modest, the task is close to what the base already does, you have limited hardware, or you intend to serve many task-specific variants from one base. The last condition is decisive on its own: if you need dozens or hundreds of specialized models, multi-LoRA over a shared base is not merely cheaper to train, it is the only deployment that fits in memory.</p>
+<p>The two are not exclusive. A common pattern is one round of light full fine-tuning to move the base into a new domain, followed by per-customer or per-task LoRA adapters on top of that shared, domain-adapted base. The systems decision underneath every one of these choices is the same one this section opened with: how many parameters change, and therefore how much memory, optimizer state, gradient traffic, and per-variant serving cost the distribution must carry. Fine-tuning a foundation model well, like aligning one in <a href="section-19.8.html">Section 19.8</a>, is the discipline of making that change as small as the task allows.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: One Base, Forty Tenants</div>
+<p><strong>Who:</strong> A platform engineer at a vertical SaaS company offering a writing assistant tuned per customer.</p>
+<p><strong>Situation:</strong> Forty enterprise tenants each wanted the assistant to match their house style and terminology, and the team had fine-tuned a separate copy of a 13-billion-parameter base for each.</p>
+<p><strong>Problem:</strong> Forty full copies could not fit in the serving cluster's memory, and each full fine-tune needed a multi-GPU sharded job that took most of a day, so onboarding a tenant was slow and expensive.</p>
+<p><strong>Dilemma:</strong> Keep full fine-tuning for maximum per-tenant quality but accept that only a few tenants fit per server and onboarding stays heavy, or switch to LoRA adapters that serve many tenants from one base but might give up a little quality on the most demanding accounts.</p>
+<p><strong>Decision:</strong> They moved to QLoRA: a single 4-bit shared base plus one small adapter per tenant, with the rare demanding account kept on a full fine-tune.</p>
+<p><strong>How:</strong> Each tenant's adapter trained with HuggingFace <code>peft</code> on a single GPU in under an hour, touching well under one percent of the parameters, and the serving layer loaded the one shared base and swapped adapters per request as in Figure 19.7.1.</p>
+<p><strong>Result:</strong> All forty tenants now fit on one server's memory, onboarding a new tenant dropped from most of a day to under an hour, and blind reviews rated the adapter outputs indistinguishable from the full fine-tunes for all but two specialized accounts.</p>
+<p><strong>Lesson:</strong> When you must serve many variants, the question is not which single model is best but how many models fit at once. Freezing a shared base turns "forty models" into "one base plus forty slivers," and that is a distribution win before it is a quality trade-off.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.7.1: Where Did the Memory Go? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For full fine-tuning with the Adam optimizer, a rough memory model is: parameters, gradients, and two optimizer moments, each the size of the parameters, plus activations. Explain which of these four terms LoRA nearly eliminates and which it leaves untouched, and why the frozen base still dominates resident memory even though it contributes nothing to the optimizer. Then state in one sentence what QLoRA changes about the one term LoRA could not shrink, and why that term is safe to store in low precision.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.7.2: Push the Rank <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 19.7.1 so the task's true update <code>Delta_task</code> has rank 32 instead of 8, while the LoRA adapter stays at rank $r = 8$. Measure the final loss and explain why the adapter can no longer drive it to zero. Then raise the adapter rank to 32 and confirm the loss recovers. Report, for each adapter rank you try, the trainable-parameter fraction and the gradient-volume reduction, and describe the trade-off between adapter rank and the two distributed costs (optimizer memory and synchronized gradient size).</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.7.3: Adapters Per Server <span class="exercise-type analysis">Analysis</span></div>
+<p>A 13-billion-parameter base occupies about 26 gigabytes in 16-bit precision, and a single LoRA adapter at $r = 8$ over the attention projections is about 25 megabytes. A serving node has 80 gigabytes of accelerator memory, and you must reserve 20 gigabytes for the KV cache and activations. Estimate how many tenant adapters fit on one node under multi-LoRA serving, then estimate how many full 26-gigabyte fine-tuned copies fit on the same node. Express the ratio, and explain in terms of Figure 19.7.1 why the shared frozen base is what creates it. How does the answer change if you first apply QLoRA to store the base in 4-bit?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-19.6.html"><span class="nav-label">Previous</span><span class="nav-num">Section 19.6</span><span class="nav-title">Orchestrating Distributed Pretraining</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 19</span><span class="nav-num">Contents</span><span class="nav-title">Training Foundation Models at Scale</span></a>
+<a class="next" href="section-19.8.html"><span class="nav-label">Next</span><span class="nav-num">Section 19.8</span><span class="nav-title">Distributed Alignment: A Systems View</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

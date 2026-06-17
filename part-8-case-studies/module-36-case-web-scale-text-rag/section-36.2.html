@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 36.2: Distributed Crawling. The data-ingestion front of a web-scale RAG pipeline: a sharded URL frontier, politeness-bounded fetcher fleets, Bloom-filter dedup, and the throughput math that bounds everything downstream." name="description"/>
+<title>Section 36.2: Distributed Crawling | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Case Studies and Capstone Projects</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 36: Web-Scale Text Processing and Distributed RAG</a></div>
+<h1>Distributed Crawling</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I am a crawler, politely knocking on a billion doors. I remember which ones I have already opened, I wait my turn at every house, and I never forget that someone downstream has to read everything I drag home."</p>
+<cite>A Fetcher Worker, Pacing Itself Behind a Per-Host Token Bucket</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Every retrieval-augmented system begins with an act of data ingestion, and at web scale that act is a distributed crawl: a fleet of fetcher workers draining a shared, sharded URL frontier under strict politeness limits, deduplicating what they have already seen, and writing the harvested pages into distributed storage for the rest of the pipeline to clean, chunk, embed, and index.</strong> The crawl is not a preliminary chore; it is the source whose coverage and freshness silently bound the quality of every answer the RAG system will ever give. A document the crawler never fetched cannot be retrieved, cannot be cited, and cannot correct a hallucination. This section builds the crawl as a distributed system in its own right, names its coordination hazards, and does the throughput arithmetic that tells you how many machines a target corpus actually requires.</p>
+</div>
+<p>The previous section framed the web-scale RAG pipeline end to end: crawl, clean, chunk, embed, index, retrieve, generate. We now zoom into the first stage, because it is the one stage whose failure modes are invisible from the answer side. A retriever that returns nothing useful looks the same whether the relevant page was poorly embedded or simply never fetched, and only one of those is fixable downstream. Crawling is also the stage that most resembles the classic distributed-systems problems of this book: a shared data structure (the frontier) read and written by many workers, a partitioning of work across machines, a deduplication problem solved with a probabilistic set, and a coordination discipline (politeness) that the system must honor against external parties it does not control. Treating the crawl casually, as a script that loops over URLs, is the surest way to either miss most of the web or get every worker's IP address blocked.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Distributed crawler architecture: seed URLs enter a sharded frontier queue partitioned by host hash; fetcher workers pull from their shard, consult a robots cache and a per-host rate limiter before fetching, check a distributed Bloom filter for already-seen URLs, write fetched pages to distributed storage, and feed newly extracted links back into the frontier.">
+<defs>
+<marker id="arr362" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b362 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w362 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g362 { fill:#eef6ee; stroke:#2f7d32; stroke-width:1.6; }
+.t362 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s362 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l362 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr362); }
+.d362 { fill:none; stroke:#b86b1f; stroke-width:1.6; stroke-dasharray:5 4; marker-end:url(#arr362); }
+</style>
+<rect class="b362" x="20" y="160" width="92" height="48" rx="8"/>
+<text class="t362" x="66" y="182">Seed</text>
+<text class="s362" x="66" y="198">URLs</text>
+<rect class="b362" x="150" y="120" width="150" height="130" rx="10"/>
+<text class="t362" x="225" y="146">Sharded frontier</text>
+<text class="s362" x="225" y="168">shard = hash(host) % S</text>
+<rect class="b362" x="168" y="182" width="114" height="20" rx="4"/>
+<text class="s362" x="225" y="196">shard 0 queue</text>
+<rect class="b362" x="168" y="208" width="114" height="20" rx="4"/>
+<text class="s362" x="225" y="222">shard 1 queue</text>
+<text class="s362" x="225" y="244">. . . shard S-1</text>
+<rect class="w362" x="350" y="60" width="160" height="70" rx="9"/>
+<text class="t362" x="430" y="86">Fetcher worker A</text>
+<text class="s362" x="430" y="104">robots cache +</text>
+<text class="s362" x="430" y="118">per-host rate limit</text>
+<rect class="w362" x="350" y="160" width="160" height="70" rx="9"/>
+<text class="t362" x="430" y="186">Fetcher worker B</text>
+<text class="s362" x="430" y="204">robots cache +</text>
+<text class="s362" x="430" y="218">per-host rate limit</text>
+<rect class="w362" x="350" y="260" width="160" height="60" rx="9"/>
+<text class="t362" x="430" y="290">Fetcher worker C</text>
+<text class="s362" x="430" y="308">. . . W workers</text>
+<rect class="g362" x="560" y="150" width="140" height="60" rx="9"/>
+<text class="t362" x="630" y="176">Seen-URL set</text>
+<text class="s362" x="630" y="194">Bloom filter</text>
+<rect class="b362" x="740" y="60" width="120" height="70" rx="9"/>
+<text class="t362" x="800" y="90">Distributed</text>
+<text class="t362" x="800" y="108">storage</text>
+<text class="s362" x="800" y="124">raw pages</text>
+<rect class="b362" x="740" y="250" width="120" height="70" rx="9"/>
+<text class="t362" x="800" y="280">Downstream</text>
+<text class="s362" x="800" y="298">clean / chunk</text>
+<text class="s362" x="800" y="314">embed / index</text>
+<line x1="112" y1="184" x2="146" y2="184" class="l362"/>
+<line x1="300" y1="150" x2="346" y2="100" class="l362"/>
+<line x1="300" y1="185" x2="346" y2="190" class="l362"/>
+<line x1="300" y1="220" x2="346" y2="285" class="l362"/>
+<line x1="510" y1="180" x2="556" y2="180" class="l362"/>
+<line x1="510" y1="95" x2="736" y2="95" class="l362"/>
+<path class="d362" d="M 560 175 C 480 270, 360 270, 300 240"/>
+<text class="s362" x="430" y="350">new links rejoin frontier (dedup against Bloom filter first)</text>
+<line x1="800" y1="130" x2="800" y2="246" class="l362"/>
+</svg>
+<figcaption><strong>Figure 36.2.1:</strong> The distributed crawl as the ingestion front of the RAG pipeline. Seed URLs enter a frontier partitioned into $S$ shards by host hash; $W$ fetcher workers pull from their shards, consult a robots cache and a per-host rate limiter before each fetch, write raw pages to distributed storage, and extract new links. Every extracted link is tested against a shared Bloom filter (the dashed loop) so already-seen URLs are dropped before they re-enter the frontier. Storage then feeds the clean/chunk/embed/index stages of <a href="section-36.3.html">Section 36.3</a>.</figcaption>
+</figure>
+
+<h2>1. The Frontier Is a Distributed Queue <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The heart of a crawler is the frontier: the set of URLs discovered but not yet fetched. On one machine the frontier is just a queue; at web scale it is a distributed data structure that many workers consume concurrently, and almost every design decision in a crawler is really a decision about how that queue is partitioned, ordered, and kept consistent. The frontier holds billions of entries, far more than one machine's memory, so it must be sharded across nodes; and because the entries flow in faster than any single coordinator could hand them out one at a time, workers pull batches from their assigned shards rather than from a single global head.</p>
+<p>The natural partition key is the host. We assign each URL to shard $\text{hash}(\text{host}) \bmod S$, so every URL belonging to <code>example.com</code> lands in the same shard regardless of which worker discovered it. This host-based sharding, the same partition-by-key idea introduced as a coordination concept in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/index.html">Chapter 2</a> and used for data shards in <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/index.html">Chapter 8</a>, is what makes politeness tractable: if one shard owns all of a host's URLs, then the worker draining that shard is the single place where that host's request rate is enforced, and no cross-worker coordination is needed to avoid hammering the host. The frontier is therefore not partitioned for storage reasons alone; the partition key is chosen so that the hardest coordination constraint, per-host politeness, becomes a local property of a single shard.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Partition by Host So Politeness Becomes Local</div>
+<p>Crawling has one global constraint that cannot be relaxed: you must not overload any single host. If URLs were sharded by a hash of the full URL, every host's pages would be scattered across all workers, and enforcing a per-host rate limit would require global coordination on every fetch. Partitioning the frontier by host hash collapses that global constraint into a local one: each host lives in exactly one shard, drained by one worker, which can throttle that host with a simple in-process token bucket. The right partition key turns a distributed-coordination problem into a single-machine bookkeeping problem.</p>
+</div>
+
+<h2>2. Politeness Is the Constraint That Shapes Everything <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A crawler that fetches as fast as its workers allow is a denial-of-service attack with good intentions. Two disciplines keep it civil. The first is <code>robots.txt</code>: before fetching any URL on a host, the crawler retrieves and caches that host's robots file, which declares the paths the site owner permits or forbids and may specify a crawl delay. Honoring it is both an ethical and a practical necessity, because the alternative is a blocked IP range and a corpus with holes where the most valuable, most actively defended sites used to be. The second is rate limiting: even on permitted paths, the crawler spaces its requests to a single host, typically allowing only one in-flight request and a fixed gap between requests, so that the host sees a trickle rather than a flood.</p>
+<p>These two disciplines interact with sharding to set the crawler's real throughput. A worker draining a shard cannot simply fetch as fast as its CPU and network allow; it is rate-limited per host, so its useful throughput depends on how many distinct hosts live in its shard. A shard dominated by one enormous host (a content farm, a wiki with millions of pages) is throttled to that one host's polite rate no matter how much hardware you give the worker, while a shard spread across thousands of small hosts can keep many fetches in flight concurrently. This is the crawler's version of the load-skew problem that haunts every partitioned system in this book, and it is why the host count per shard, not the URL count, is the quantity to watch.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Crawl That Throttled Itself to a Trickle</div>
+<p><strong>Who:</strong> A data engineer building the ingestion corpus for an internal documentation RAG assistant.</p>
+<p><strong>Situation:</strong> The crawl targeted twelve million pages across roughly forty thousand hosts, with a fleet of sixty-four fetcher workers provisioned to finish overnight.</p>
+<p><strong>Problem:</strong> After twelve hours the crawl was only forty percent done, and most workers sat idle while a handful ran flat out.</p>
+<p><strong>Dilemma:</strong> Add more workers, which the idle majority suggested was pointless, or rebalance the frontier, which meant re-sharding mid-crawl.</p>
+<p><strong>Decision:</strong> They measured host-per-shard distribution and found three hosts (a large knowledge base and two forums) held sixty percent of all URLs, so three shards were politeness-bound to a crawl while the rest had long since drained.</p>
+<p><strong>How:</strong> They split the three hot hosts across multiple sub-shards keyed by a path prefix, so several workers could fetch different sections of the same giant host while still respecting a shared per-host token bucket that they moved into a small coordination service.</p>
+<p><strong>Result:</strong> Worker utilization rose from under thirty percent to over eighty, and the crawl finished in five hours; adding workers before the rebalance would have changed nothing, because the binding constraint was host skew, not worker count.</p>
+<p><strong>Lesson:</strong> In a polite crawl the limiting resource is distinct hosts, not machines. Diagnose the partition before you scale the fleet.</p>
+</div>
+
+<h2>3. Deduplicating the URL Space with a Bloom Filter <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The web is densely cross-linked, so the same URL is discovered again and again from different pages. If the crawler re-enqueues every discovered link, the frontier explodes and workers waste their politeness budget re-fetching pages they already have. The crawler therefore maintains a set of already-seen URLs and tests every newly extracted link against it before enqueueing. At web scale this set holds tens of billions of URLs, far too many to store as exact strings in memory, so crawlers use a Bloom filter: a bit array with $k$ hash functions that answers set membership in constant time and constant memory per element, at the price of a tunable false-positive rate.</p>
+<p>The trade is worth understanding precisely because it sets a memory budget. A Bloom filter of $m$ bits holding $n$ elements with $k$ hash functions has false-positive probability</p>
+$$p \approx \left(1 - e^{-kn/m}\right)^{k},$$
+<p>minimized by choosing $k = (m/n)\ln 2$ hash functions, which gives the clean relation $p \approx (0.6185)^{\,m/n}$. The crucial consequence is that the memory cost is a function of the false-positive rate you are willing to tolerate and the number of elements, not of the length of the URLs: at the optimal $k$, holding $p$ fixed costs roughly $m/n = -\log_2 p / \ln 2 \approx 1.44 \log_2(1/p)$ bits per URL. Ten billion URLs at a one-percent false-positive rate cost about $1.44 \cdot \log_2(100) \approx 9.6$ bits each, near twelve gigabytes, which is why the seen-set is itself distributed: sharded by the same host hash as the frontier, so the worker that owns a host also owns the dedup decisions for that host.</p>
+<p>A false positive in this filter is benign in a specific way: it causes the crawler to wrongly believe it has already seen a URL and skip it, so a small false-positive rate means a small fraction of pages silently never fetched. That is a coverage loss, and coverage loss is exactly the kind of downstream-invisible damage this section warns about, so the budget is chosen with the RAG corpus in mind, not as a generic data-structures default. The code below builds a Bloom filter for seen-URL dedup, measures its actual false-positive rate against the theory at four memory budgets, and then confirms that host-hash partitioning balances the frontier across shards.</p>
+<pre><code class="language-python">import hashlib, math, random
+
+class BloomFilter:
+    def __init__(self, n_bits, n_hashes):
+        self.m = n_bits
+        self.k = n_hashes
+        self.bits = bytearray((n_bits + 7) // 8)
+
+    def _idx(self, item, i):                       # i-th hash via a personalized BLAKE2b
+        h = hashlib.blake2b(item.encode(), digest_size=16,
+                            person=i.to_bytes(2, "little")).digest()
+        return int.from_bytes(h, "little") % self.m
+
+    def add(self, item):
+        for i in range(self.k):
+            j = self._idx(item, i)
+            self.bits[j >> 3] |= (1 << (j &amp; 7))   # set the bit
+
+    def __contains__(self, item):
+        for i in range(self.k):
+            j = self._idx(item, i)
+            if not (self.bits[j >> 3] &amp; (1 << (j &amp; 7))):
+                return False                       # a clear bit proves "never seen"
+        return True
+
+n = 200_000                                        # distinct URLs already crawled
+rng = random.Random(0)
+seen  = [f"https://site{rng.randrange(50_000)}.com/page/{i}" for i in range(n)]
+probe = [f"https://other{i}.net/path/{i}" for i in range(200_000)]   # never inserted
+
+print(f"{'bits/url':&gt;9} {'mem (MiB)':&gt;10} {'k':&gt;3} {'measured FPR':&gt;13} {'theory FPR':&gt;11}")
+for bits_per_url in (4, 8, 12, 16):
+    m = bits_per_url * n
+    k = max(1, round((m / n) * math.log(2)))       # optimal hash count
+    bf = BloomFilter(m, k)
+    for u in seen:
+        bf.add(u)
+    fp = sum(1 for u in probe if u in bf)          # false positives among never-seen URLs
+    measured = fp / len(probe)
+    theory   = (1 - math.exp(-k * n / m)) ** k
+    print(f"{bits_per_url:&gt;9} {m/8/2**20:&gt;10.2f} {k:&gt;3} {measured:&gt;13.5f} {theory:&gt;11.5f}")
+
+def host_of(url):  return url.split("//", 1)[1].split("/", 1)[0]
+def shard_of(host, S):
+    h = hashlib.blake2b(host.encode(), digest_size=8).digest()
+    return int.from_bytes(h, "little") % S         # same partition key as the frontier
+
+S = 16
+counts = [0] * S
+for u in seen:
+    counts[shard_of(host_of(u), S)] += 1
+mean, maxc = sum(counts) / S, max(counts)
+print(f"\nshards={S}  urls={n}  mean/shard={mean:.0f}"
+      f"  max/shard={maxc}  imbalance(max/mean)={maxc/mean:.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 36.2.1:</strong> A seen-URL Bloom filter and a host-hash sharder, the two data structures at the core of Figure 36.2.1. The filter is measured against the closed-form false-positive rate at four memory budgets; the sharder confirms that hashing on host spreads URLs evenly across shards.</div>
+<pre><code class="language-text"> bits/url  mem (MiB)   k  measured FPR  theory FPR
+        4       0.10   3       0.14708     0.14689
+        8       0.19   6       0.02184     0.02158
+       12       0.29   8       0.00287     0.00314
+       16       0.38  11       0.00044     0.00046
+
+shards=16  urls=200000  mean/shard=12500  max/shard=12970  imbalance(max/mean)=1.038
+</code></pre>
+<div class="code-caption"><strong>Output 36.2.1:</strong> The measured false-positive rate tracks the theory to within rounding at every budget, and each doubling of memory cuts the rate by an order of magnitude: eight bits per URL buys roughly two percent, sixteen bits buys under one in two thousand. The host-hash partition is near-perfectly balanced (max shard only 3.8 percent above the mean), confirming that politeness can be enforced shard-locally without creating load skew from the partition itself.</div>
+
+<h2>4. The Throughput Arithmetic of a Crawl <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>How many machines does a target crawl need? The aggregate fetch rate of the fleet is the per-worker rate times the worker count, capped by the politeness ceiling. If each of $W$ workers sustains $r$ fetches per second, the fleet's nominal rate is</p>
+$$R = W \cdot r,$$
+<p>and the wall-clock time to fetch a corpus of $N$ pages is $T = N / R = N / (W r)$. A concrete reading: at $r = 50$ pages per second per worker, a fleet of $W = 200$ workers fetches $R = 10{,}000$ pages per second, and a corpus of $N = 10^{9}$ pages takes $T = 10^{9} / 10^{4} = 10^{5}$ seconds, a little over a day. That arithmetic is necessary but not sufficient, because politeness imposes a second, independent ceiling. If the crawler allows at most one request every $\delta$ seconds to a host, then a single host yields at most $1/\delta$ pages per second, and a corpus concentrated on $H$ distinct hosts cannot be fetched faster than</p>
+$$R_{\text{polite}} = \frac{H}{\delta},$$
+<p>regardless of how many workers you provision. The achievable rate is the smaller of the two, $R_{\text{eff}} = \min(W r,\; H/\delta)$. With a one-second politeness gap, fetching ten thousand pages per second requires drawing from at least ten thousand distinct hosts at any moment; a crawl of a few large hosts is host-bound, and adding workers past that point only raises cost. This is the same lesson as the practical example, now as an inequality you can evaluate before provisioning: count your hosts, not just your pages.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Ingestion Front Is Where Coverage Is Won or Lost</div>
+<p>The crawl is the first place the book's thesis bites in this case study: the corpus quality is set by a distributed system, not a single machine, and the binding ceiling is a coordination constraint (politeness) rather than raw compute. Every later stage of the RAG pipeline, the cleaning and chunking of <a href="section-36.3.html">Section 36.3</a>, the distributed embedding and indexing it feeds, and ultimately the retrieval the model relies on, operates only on documents this stage chose to fetch. Coverage and freshness decided here propagate forward and cannot be recovered downstream, which is why the crawl earns the same architectural care as the training and serving systems in the rest of the book.</p>
+</div>
+
+<h2>5. Coordination Hazards and Continuous Recrawl <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>A shared frontier read and written by hundreds of workers raises every consistency question of <a href="../../part-1-foundations/module-02-distributed-systems-concepts/index.html">Chapter 2</a>. Two workers can extract the same new URL at the same instant and both pass the Bloom-filter test before either inserts it, briefly enqueueing a duplicate; the seen-set therefore tolerates a small rate of duplicate fetches rather than serializing every insertion behind a global lock, trading exactness for throughput in exactly the way distributed systems usually must. A worker can crash mid-shard, so the frontier must record which URLs are leased to which worker and re-lease them on a timeout, the same lease-and-recover discipline that makes MapReduce re-execute failed tasks in <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a>. And the robots cache must be coherent enough that a forbidden path is not fetched by one worker just because another worker's cache had not yet refreshed.</p>
+<p>Once the harvested pages land in distributed storage, the rest of the ingestion pipeline reads them as a batch: extracting text, deduplicating near-identical documents, and computing the cleaned corpus is a textbook MapReduce job, mapping over raw pages and reducing by content fingerprint, exactly the batch model of <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a>, and the raw and cleaned crawls live in the distributed object store of <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/index.html">Chapter 8</a>. A crawl is never finished, though. The web changes, and a corpus frozen at one crawl grows stale, so production systems run a continuous recrawl: a stream of re-fetch tasks prioritized by how often each page changes, processed by the stream-processing machinery of <a href="../../part-2-distributed-data/module-09-stream-processing-online-ai/index.html">Chapter 9</a>. Freshness is the temporal half of coverage, and for a RAG system answering questions about a moving world it is just as load-bearing as breadth.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Scrapy Gives You the Frontier, Politeness, and Dedup For Free</div>
+<p>The frontier queue, the per-host throttle, the robots check, and the seen-URL filter are not things you should hand-roll for a production crawl. Scrapy provides all four behind a handful of settings and a spider that yields requests; the scheduler maintains the frontier, the autothrottle and download-delay machinery enforce politeness, the robots middleware reads <code>robots.txt</code>, and a dupefilter (Bloom-backed in the <code>scrapy-bloom</code> and Frontera ecosystems) handles URL dedup:</p>
+<pre><code class="language-python">import scrapy
+
+class CorpusSpider(scrapy.Spider):
+    name = "corpus"
+    start_urls = ["https://example.com/"]
+    custom_settings = {
+        "ROBOTSTXT_OBEY": True,            # read and honor robots.txt
+        "AUTOTHROTTLE_ENABLED": True,      # adapt the per-host rate to latency
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 1,
+        "DOWNLOAD_DELAY": 1.0,             # the politeness gap, delta = 1 s
+        "DUPEFILTER_CLASS":                # seen-URL dedup (Bloom-backed)
+            "scrapy_bloom.BloomDupeFilter",
+    }
+
+    def parse(self, response):
+        yield {"url": response.url, "html": response.text}   # to distributed storage
+        for href in response.css("a::attr(href)").getall():  # discovered links
+            yield response.follow(href, self.parse)           # re-enter the frontier
+</code></pre>
+<div class="code-caption"><strong>Code 36.2.2:</strong> A polite, deduplicating crawl in roughly a dozen lines. The four hand-built mechanisms of Sections 1 to 3 (frontier, per-host rate limit, robots check, Bloom dedup) collapse into Scrapy settings; for multi-machine crawls, Frontera distributes the same frontier across workers with a Kafka or HBase backend.</div>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Crawling for Retrieval Quality, Not Just Coverage (2024 to 2026)</div>
+<p>As the web fills with machine-generated text, raw coverage is no longer the only goal; the frontier of crawling research has shifted toward fetching what a retrieval system can actually use. Large open crawls in the lineage of Common Crawl now ship aggressively filtered derivatives (the RefinedWeb and FineWeb pipelines of 2023 to 2024 document quality and deduplication filters applied at crawl-corpus scale), and 2024 to 2025 work on detecting and down-weighting synthetic or low-quality pages aims to keep model-generated sludge out of the retrieval corpus before it ever reaches the embedder. A parallel line studies freshness-aware and learned recrawl scheduling, predicting per-page change rates so the continuous recrawl of Section 5 spends its politeness budget where the web is actually moving. The common thread is that the crawler is being treated as the first quality filter of the RAG system, optimized jointly with the retrieval objective rather than as an undifferentiated firehose; we meet the retrieval side of this coupling in <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a>.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Politest Denial-of-Service in the World</div>
+<p>A crawler with a bug in its politeness logic does not look malicious; it looks enthusiastic. The classic incident is a single misconfigured worker that ignores <code>DOWNLOAD_DELAY</code> and discovers a calendar widget, then follows "next month" forever, fetching an infinite sequence of empty pages from one unlucky host at full speed. The host's operator sees a relentless, perfectly well-formed flood of requests for the year 2147 and reasonably concludes they are under attack. The lesson the whole industry learned the hard way: a crawler's most important feature is the brake, not the engine.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 36.2.1: Why Host Hash, Not URL Hash <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Suppose a colleague proposes sharding the frontier by $\text{hash}(\text{full URL}) \bmod S$ instead of by host, arguing it gives perfect load balance across shards. They are right about balance. Explain, referring to Section 2, why this partition makes per-host politeness require global coordination on every fetch, and describe the specific extra machinery (and its cost) you would need to enforce a one-request-per-second per-host limit under URL-hash sharding. Then state the one situation in which URL-hash sharding is nonetheless preferable.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 36.2.2: Tune the Dedup Budget <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 36.2.1 so that, for a target corpus of $N = 10^{10}$ URLs and a desired false-positive rate of $p = 0.005$, it computes the optimal bits per URL, the total filter memory in gigabytes, and the optimal $k$, using $m/n = -\log_2 p / \ln 2$. Then empirically verify the bits-per-URL formula at the smaller scale of the demo by inserting $n$ URLs into a filter sized for several target rates and confirming the measured rate matches $p$. Report how much memory you would save by accepting $p = 0.02$ instead, and argue in two sentences whether that coverage loss is acceptable for a RAG corpus.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 36.2.3: Which Ceiling Binds Your Crawl <span class="exercise-type analysis">Analysis</span></div>
+<p>You must fetch $N = 5 \times 10^{8}$ pages drawn from $H = 20{,}000$ distinct hosts, with a politeness gap of $\delta = 1$ second per host. Each worker sustains $r = 40$ fetches per second. Using $R_{\text{eff}} = \min(W r,\; H/\delta)$ from Section 4, find the worker count $W^\star$ beyond which adding workers no longer speeds the crawl, compute the wall-clock time at $W^\star$, and state which ceiling (worker throughput or politeness) binds. Then recompute if the corpus is instead concentrated on $H = 500$ hosts, and explain in terms of the case study why the second scenario is the more dangerous one for downstream RAG coverage.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-36.1.html"><span class="nav-label">Previous</span><span class="nav-num">Section 36.1</span><span class="nav-title">Problem Definition</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 36</span><span class="nav-num">Contents</span><span class="nav-title">Web-Scale Text Processing and Distributed RAG</span></a>
+<a class="next" href="section-36.3.html"><span class="nav-label">Next</span><span class="nav-num">Section 36.3</span><span class="nav-title">Distributed Cleaning and Deduplication</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

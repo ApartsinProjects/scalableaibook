@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 8.4: Data Layout, Partitioning, and Compaction. How physical file layout (partition pruning, target file size, compaction, clustering, and min/max statistics) decides whether a distributed read is fast or slow." name="description"/>
+<title>Section 8.4: Data Layout, Partitioning, and Compaction | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Distributed Data Processing for AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 8: Distributed Storage and Data Loading</a></div>
+<h1>Data Layout, Partitioning, and Compaction</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They gave me thirty million rows and asked one day's worth. I read all thirty million. Nobody told me the answer was sitting in one file the whole time."</p>
+<cite>A Full Scan That Could Have Been a Lookup</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A distributed table is not an abstract relation; it is a concrete set of files on object storage, and where you put the bytes decides how fast every reader can find them.</strong> The previous section gave us columnar files and a lakehouse table format that tracks which files belong to a table. This section is about the layout decision underneath: how to group rows into directories and files so that a query, or a training epoch, touches as few bytes as possible. Two levers do almost all the work. <em>Partitioning</em> sorts rows into directories by a column so a reader can skip whole directories it does not need (partition pruning), and per-file <em>statistics</em> let it skip individual files whose values cannot match (data skipping). Both levers are defeated by the same mistake: splitting the data into too many tiny files, where the per-file open cost swamps any saving. The craft of layout is choosing a partition column, a target file size, and a sort order so that pruning and skipping fire while the file count stays small, and running <em>compaction</em> to keep it that way.</p>
+</div>
+<p>In <a href="section-8.3.html">Section 8.3</a> we settled on columnar files (Parquet) gathered into a lakehouse table that tracks its own file list and statistics. That gives a reader the ability to read one column without the others, and to consult a manifest instead of listing a directory. What it does not yet give is a reason to read only some of the files. A table stored as one giant heap of files still forces every query and every training loader to scan everything, because nothing tells the reader which files are irrelevant. Physical layout is the missing ingredient: by deciding which rows land in which files, and recording cheap summaries of each file, we let readers prove that most files cannot contain what they want and skip them without opening them. The payoff is large and the failure modes are sharp, so this section treats layout as a first-class engineering decision rather than a default.</p>
+<p>The stakes are highest for AI workloads precisely because they read the same table over and over. A SQL analyst runs a query once; a training job sweeps the entire dataset every epoch, for dozens or hundreds of epochs, with many parallel workers each opening files. A layout that wastes a factor of ten on bytes read costs that factor on every epoch and every worker, turning a layout mistake into the dominant line in the training bill. The same partitioning idea that makes a query prune directories is the one that, in the next section, lets each <a href="section-8.5.html">DataLoader</a> worker claim a disjoint set of shards without coordinating with its peers.</p>
+
+<h2>1. Partitioning: Sort Rows Into Directories So Readers Can Skip Them <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Partitioning is the oldest and bluntest layout lever: choose a column, and write all rows that share a value of that column into the same directory. A table of training events partitioned by <code>event_date</code> becomes a tree of directories, <code>event_date=2026-01-01/</code>, <code>event_date=2026-01-02/</code>, and so on, each holding the files for that day. The value is encoded in the directory path itself, which is why this scheme is sometimes called Hive-style partitioning after the system that popularized it. The encoding is what makes it cheap: a reader that wants only January 1st does not open a single file from any other day, because it can see from the path alone that those directories are irrelevant. Eliminating whole directories before reading their files is called <strong>partition pruning</strong>, and it is the single most effective layout optimization there is when the query filters on the partition column.</p>
+<p>This is the same partitioning concept introduced abstractly in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.3.html">Section 2.3</a>, where partitioning a key space across nodes let a request go straight to the node that owns its key. Here the "nodes" are directories on object storage and the "request" is a query predicate, but the principle is identical: a good partition function turns a search over everything into a lookup over a known subset. Choose the partition column to match how the data is actually filtered. Event data is almost always filtered by time, so partitioning by date is the canonical choice; a multi-region service that always queries one region at a time might partition by region, or by both (<code>region=eu/event_date=2026-01-01/</code>) to prune along two axes at once.</p>
+<p>The danger is the mirror image of the benefit. Partition by a high-cardinality column, say <code>user_id</code> with millions of distinct values, and you create millions of directories, most holding a handful of rows in a tiny file. The pruning still works in principle, but the table has been shattered into so many fragments that listing and opening them costs more than the scan you were trying to avoid. This is over-partitioning, and it is the most common way a well-intentioned layout makes reads slower. The rule of thumb is to partition only on low-to-moderate cardinality columns that appear in filters, and to keep each partition large enough to hold files of a healthy size, the topic of the next subsection.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Partitioning Trades a Scan for a Lookup, but Only on the Partition Column</div>
+<p>Partition pruning is free speed when the query filters on the partition column and pays nothing, or costs you dearly, otherwise. A table partitioned by date answers "give me yesterday" by touching one directory and "give me everything for user 42" by touching every directory, because nothing in the path tells it where user 42 lives. You get at most one or two cheap pruning axes, so spend them on the columns your readers filter most. Everything else is handled by the finer-grained, statistics-based skipping we add next, not by adding more partition columns.</p>
+</div>
+
+<h2>2. The Small-Files Problem and the Target File Size <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Object stores and distributed schedulers both have a strong opinion about file size, and it is the opposite of what a naive writer produces. Every file carries fixed overhead independent of its contents: a request round-trip to open it (tens of milliseconds of latency on an object store), metadata to track it in the table manifest, and a unit of work for the scheduler to assign. When files are large, that overhead is amortized over millions of rows and disappears. When files are tiny, the overhead is paid per handful of rows and dominates everything. A dataset stored as one million 1-megabyte files and the same dataset stored as a few thousand 256-megabyte files hold identical bytes, but the first is slower to read by orders of magnitude because the reader spends its life opening files instead of scanning rows. This is the <strong>small-files problem</strong>, and it is the layout failure that bites distributed AI pipelines hardest, because both object storage and the data loader punish file count directly.</p>
+<p>The remedy is to aim for a <strong>target file size</strong>, typically in the range of one hundred megabytes to a gigabyte, with a few hundred megabytes a common default. Files in this range are large enough that open overhead is negligible against scan time, and small enough that a single worker can read one without blowing its memory budget or becoming a straggler that holds up the others. Writers should be configured to roll over to a new file when the current one reaches the target, and to coalesce small outputs rather than emit one file per input partition. Let $B$ be the total bytes in a table and $s$ the target file size; then the file count is roughly $B / s$, and the per-query fixed cost scales with the number of those files a reader must open. Shrinking $s$ to chase finer pruning increases that count linearly, which is why "more, smaller files" is almost never the right move past the target.</p>
+<p>The cost model makes this concrete. If opening a file costs a fixed $c_{\text{open}}$ and scanning a row costs $c_{\text{row}}$, a query that must read $f$ files holding $r$ rows in total takes</p>
+$$T \approx f \cdot c_{\text{open}} + r \cdot c_{\text{row}}.$$
+<p>Pruning and skipping shrink both $f$ and $r$ together by eliminating whole files. Over-partitioning shrinks $r$ per file but multiplies $f$, and once $f \cdot c_{\text{open}}$ exceeds the scan it was meant to save, the layout has made things worse. The demo in Section 4 evaluates exactly this expression on a synthetic table to show both effects with real numbers.</p>
+
+<h2>3. Compaction, Clustering, and File Statistics <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Real tables drift toward small files whether you want them to or not. Streaming ingestion appends a little file every few minutes; many parallel writers each emit their own output; incremental updates leave behind fragments. Left alone, a healthy table slowly degrades into the small-files problem. <strong>Compaction</strong> is the lakehouse maintenance operation that fixes this: a background job periodically reads the small files in a partition, merges them, and rewrites the data as a smaller number of files at the target size, then atomically swaps the new files for the old in the table manifest. Because the lakehouse table format from <a href="section-8.3.html">Section 8.3</a> tracks the file list transactionally, readers see either the old layout or the new one, never a half-rewritten mess, and the compaction can run concurrently with reads and writes. Compaction is to a lakehouse table what defragmentation was to a disk: a routine you schedule, not a one-time setup.</p>
+<p>While compaction is rewriting files anyway, it is the natural moment to also fix the order of rows within them, and the order is what makes file statistics useful. Every columnar file records cheap per-column <strong>statistics</strong>, at minimum the minimum and maximum value of each column in that file. A reader can consult these stats and skip any file whose range cannot satisfy the predicate: a query for <code>user_id = 42</code> opens only files whose recorded <code>[min, max]</code> for <code>user_id</code> straddles 42. This is <strong>data skipping</strong>, the finer-grained cousin of partition pruning that works on any column with statistics, not just the partition column. Crucially, skipping only helps if values that are queried together also live together. If every file's <code>user_id</code> range is <code>[0, 1\,000\,000]</code>, no file can be skipped; if the table is sorted so that each file owns a narrow band, almost all of them can.</p>
+<p>Arranging rows so co-queried values are co-located is <strong>clustering</strong>, and its simplest form is a plain sort order: sort the table by <code>user_id</code> and each file ends up with a tight, non-overlapping range, making min/max skipping devastatingly effective. A plain sort optimizes one column at the expense of the others. When readers filter on several columns, <strong>Z-ordering</strong> (a space-filling-curve interleaving of multiple columns) gives every clustering column a usefully narrow per-file range at once, so skipping fires whichever of those columns a query happens to filter on. Partition pruning, clustering, and file statistics form a layered defense: pruning eliminates directories, clustering tightens the per-file ranges, and statistics turn those tight ranges into skipped files. Figure 8.4.1 shows the layered structure and the contrast with a shattered, un-compacted table.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 860 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A partitioned directory tree on the left where a query prunes to one date directory and then skips to one file via min/max statistics, contrasted on the right with a healthy compacted partition of four target-size files versus an over-partitioned partition shattered into many tiny files.">
+<defs>
+<marker id="arr84" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.dir84 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.5; }
+.dirX84 { fill:#f4f7fb; stroke:#aeb7c2; stroke-width:1.2; stroke-dasharray:4 3; }
+.hit84 { fill:#e7f3ea; stroke:#2f7d46; stroke-width:1.8; }
+.file84 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.4; }
+.fileX84 { fill:#f6f6f6; stroke:#aeb7c2; stroke-width:1; }
+.t84 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s84 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.g84 { font:600 11px sans-serif; fill:#2f7d46; text-anchor:middle; }
+.l84 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr84); }
+.hd84 { font:600 13px sans-serif; fill:#14385c; text-anchor:start; }
+</style>
+<text class="hd84" x="20" y="24">Query: event_date = D17 AND user_id in [250k, 500k]</text>
+
+<!-- partition tree -->
+<rect class="dir84" x="20" y="44" width="120" height="30" rx="6"/>
+<text class="t84" x="80" y="63">events/ (table)</text>
+<rect class="dirX84" x="20" y="98" width="96" height="26" rx="5"/>
+<text class="s84" x="68" y="115">date=D16</text>
+<rect class="hit84" x="124" y="98" width="96" height="26" rx="5"/>
+<text class="g84" x="172" y="115">date=D17</text>
+<rect class="dirX84" x="228" y="98" width="96" height="26" rx="5"/>
+<text class="s84" x="276" y="115">date=D18</text>
+<path class="l84" d="M 80 74 L 80 90 L 172 90 L 172 96"/>
+<line x1="80" y1="74" x2="80" y2="90" stroke="#aeb7c2" stroke-width="1.2"/>
+<line x1="68" y1="90" x2="68" y2="96" stroke="#aeb7c2" stroke-width="1.2"/>
+<line x1="276" y1="90" x2="276" y2="96" stroke="#aeb7c2" stroke-width="1.2"/>
+<text class="g84" x="300" y="90">prune: skip other days</text>
+
+<!-- files inside the hit partition, with min/max ranges -->
+<text class="s84" x="172" y="150">files in date=D17 (min/max user_id)</text>
+<rect class="fileX84" x="40" y="160" width="60" height="40" rx="5"/>
+<text class="s84" x="70" y="178">f0</text><text class="s84" x="70" y="192">[0,250k]</text>
+<rect class="hit84" x="110" y="160" width="60" height="40" rx="5"/>
+<text class="g84" x="140" y="178">f1</text><text class="s84" x="140" y="192">[250k,500k]</text>
+<rect class="fileX84" x="180" y="160" width="60" height="40" rx="5"/>
+<text class="s84" x="210" y="178">f2</text><text class="s84" x="210" y="192">[500k,750k]</text>
+<rect class="fileX84" x="250" y="160" width="60" height="40" rx="5"/>
+<text class="s84" x="280" y="178">f3</text><text class="s84" x="280" y="192">[750k,1M]</text>
+<text class="g84" x="172" y="222">data skipping: open only f1</text>
+<path class="l84" d="M 140 200 L 140 230"/>
+<rect class="hit84" x="100" y="234" width="144" height="30" rx="6"/>
+<text class="g84" x="172" y="253">1 file opened, not 4</text>
+
+<!-- right column: compacted vs shattered -->
+<line x1="430" y1="44" x2="430" y2="300" stroke="#dde3ea" stroke-width="1.5"/>
+<text class="hd84" x="470" y="62">Compacted partition</text>
+<text class="s84" x="600" y="80">4 files at the target size (~256 MB)</text>
+<rect class="file84" x="470" y="92" width="58" height="44" rx="5"/>
+<rect class="file84" x="538" y="92" width="58" height="44" rx="5"/>
+<rect class="file84" x="606" y="92" width="58" height="44" rx="5"/>
+<rect class="file84" x="674" y="92" width="58" height="44" rx="5"/>
+<text class="g84" x="600" y="152">few opens, low overhead</text>
+
+<text class="hd84" x="470" y="196">Over-partitioned / un-compacted</text>
+<text class="s84" x="600" y="214">same bytes shattered into many tiny files</text>
+<g>
+<rect class="fileX84" x="470" y="226" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="488" y="226" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="506" y="226" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="524" y="226" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="542" y="226" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="560" y="226" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="578" y="226" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="596" y="226" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="614" y="226" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="632" y="226" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="650" y="226" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="668" y="226" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="470" y="244" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="488" y="244" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="506" y="244" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="524" y="244" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="542" y="244" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="560" y="244" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="578" y="244" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="596" y="244" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="614" y="244" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="632" y="244" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="650" y="244" width="14" height="14" rx="2"/>
+<rect class="fileX84" x="668" y="244" width="14" height="14" rx="2"/>
+</g>
+<text class="s84" x="600" y="282" fill="#b8431f">thousands of opens dominate the cost</text>
+<path class="l84" d="M 600 226 L 600 196" stroke="#b86b1f"/>
+<text class="s84" x="690" y="214" fill="#2f7d46">compaction</text>
+</svg>
+<figcaption><strong>Figure 8.4.1:</strong> The layered skip. On the left, a query filtering on the partition column prunes to one date directory, then uses per-file <code>[min, max]</code> statistics on a clustered <code>user_id</code> column to open just one file out of four. On the right, the same partition stored well (four files at the target size, few opens) versus shattered into many tiny files, where compaction is the operation that merges the bottom layout back into the top.</figcaption>
+</figure>
+
+<h2>4. A Cost Model You Can Run <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The argument so far is quantitative, so let us quantify it. The program below builds a synthetic lakehouse table of thirty million training events, partitioned by date, with a range-clustered <code>user_id</code> column so each file records a non-overlapping <code>[min, max]</code> band. It then prices a single query, "one day, a quarter of the user-id space", under three strategies using the cost model $T \approx f \cdot c_{\text{open}} + r \cdot c_{\text{row}}$ from Section 2: a full scan, partition pruning alone, and pruning plus min/max data skipping. Finally it rebuilds the same bytes as an over-partitioned table with thousands of tiny files per day and reprices the pruned query, isolating the small-files penalty. No external libraries are used; the file descriptors and their statistics are plain Python objects, so the logic of pruning and skipping is visible rather than hidden inside an engine.</p>
+<pre><code class="language-python">import random
+random.seed(7)
+
+N_DATES, N_FILES, ROWS_FILE = 30, 4, 250_000   # 30 days, 4 files/day, ~rows/file
+OPEN_COST, ROW_COST = 12.0, 4e-6               # ms to open a file; ms to scan a row
+
+def build_layout(files_per_day):
+    """Files carry a partition (date) and a clustered user_id [min,max] band."""
+    rows = (N_DATES * N_FILES * ROWS_FILE) // (N_DATES * files_per_day)
+    files = []
+    for d in range(N_DATES):
+        for f in range(files_per_day):                  # range-clustered band
+            lo = f * (1_000_000 // files_per_day)
+            hi = (f + 1) * (1_000_000 // files_per_day) - 1
+            files.append(dict(date=d, lo=lo, hi=hi, rows=rows))
+    return files
+
+def query_cost(files, want_date, uid_lo, uid_hi, use_pruning, use_skipping):
+    opened = rows_scanned = 0
+    for fl in files:
+        if use_pruning and fl["date"] != want_date:      # partition pruning
+            continue
+        if use_skipping and (fl["hi"] &lt; uid_lo or fl["lo"] &gt; uid_hi):  # data skipping
+            continue
+        opened += 1
+        rows_scanned += fl["rows"]
+    return opened, rows_scanned, opened * OPEN_COST + rows_scanned * ROW_COST
+
+good = build_layout(N_FILES)                  # compacted: 4 files/day
+qd, lo, hi = 17, 250_000, 499_999             # one day, a quarter of the keys
+
+scan  = query_cost(good, qd, lo, hi, False, False)
+prune = query_cost(good, qd, lo, hi, True,  False)
+both  = query_cost(good, qd, lo, hi, True,  True)
+print(f"layout: {len(good)} files, {len(good)*ROWS_FILE:,} rows total")
+for name, r in [("full scan", scan), ("partition pruning", prune),
+                ("pruning + data skipping", both)]:
+    print(f"{name:&lt;26}{r[0]:&gt;7}{r[1]:&gt;14,}{r[2]:&gt;11.0f}")
+print(f"speedup (both vs scan)    : {scan[2]/both[2]:.0f}x")
+
+tiny = build_layout(4000)                      # over-partitioned: 4000 files/day
+t = query_cost(tiny, qd, lo, hi, True, False)  # same pruned query
+print(f"\nsmall-files layout        : {len(tiny):,} files for the same data")
+print(f"pruned query opens        : {t[0]:,} files, cost {t[2]:.0f} ms")
+print(f"open-overhead penalty     : {t[2]/prune[2]:.0f}x slower than compacted")
+</code></pre>
+<div class="code-caption"><strong>Code 8.4.1:</strong> A from-scratch cost model for layout. Files are dictionaries carrying a partition key and a clustered <code>[lo, hi]</code> statistic; <code>query_cost</code> applies partition pruning and min/max data skipping by simply not counting files it can prove are irrelevant, then prices the survivors with the open-plus-scan model.</div>
+<pre><code class="language-text">layout: 120 files, 30,000,000 rows total
+strategy                    files     rows read    cost ms
+full scan                     120    30,000,000       1560
+partition pruning               4     1,000,000         52
+pruning + data skipping         1       250,000         13
+speedup (both vs scan)    : 120x
+
+small-files layout        : 120,000 files for the same data
+pruned query opens        : 4,000 files, cost 48004 ms
+open-overhead penalty     : 923x slower than compacted</code></pre>
+<div class="code-caption"><strong>Output 8.4.1:</strong> Pruning cuts the query from 120 files to 4, and clustered min/max skipping cuts it further to a single file, a 120x speedup over the full scan. The same data shattered into 120,000 tiny files opens 4,000 files even after pruning and runs roughly 923x slower than the compacted layout, the small-files problem in one number.</div>
+<p>Two lessons fall straight out of Output 8.4.1. First, pruning and skipping compound: directories drop the file count by the number of partitions, and clustering plus statistics drop it again within the surviving partition, so the final read touches a single file instead of the whole table. Second, the small-files penalty is not a rounding error but the dominant cost; the over-partitioned table reads the right rows yet pays nearly a thousand times more because it opens four thousand files to do it. Compaction exists precisely to keep a table on the fast row of that output and off the slow one.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Streaming Table That Got Slower Every Week</div>
+<p><strong>Who:</strong> A data platform engineer maintaining the event lakehouse behind a recommendation model's nightly training.</p>
+<p><strong>Situation:</strong> Clickstream events streamed into a Parquet table partitioned by <code>event_date</code>, with a micro-batch landing a new file every two minutes around the clock.</p>
+<p><strong>Problem:</strong> Each partition accumulated roughly 700 files of a few megabytes each, and the nightly training loader, sweeping the last 30 days, spent most of its wall-clock opening files rather than reading rows.</p>
+<p><strong>Dilemma:</strong> Slow the ingestion to write larger files (hurting freshness for the online features), or leave the layout alone and throw more loader workers at the open latency (more cost, same waste).</p>
+<p><strong>Decision:</strong> Keep ingestion fast and small, but add a daily compaction job that merges each closed day's micro-files into a handful of target-size files and sorts them by <code>user_id</code> so min/max skipping would fire.</p>
+<p><strong>How:</strong> A scheduled lakehouse maintenance task ran <code>OPTIMIZE</code> with a Z-order on <code>user_id</code> over partitions older than one day, swapping the compacted files into the manifest atomically while readers kept running.</p>
+<p><strong>Result:</strong> File count per partition fell from about 700 to 5, the nightly loader's file-open time dropped by more than 100x, and per-user evaluation queries gained data skipping for free; freshness was untouched because only sealed partitions were compacted.</p>
+<p><strong>Lesson:</strong> Fast ingestion and read-friendly layout are not in conflict if you separate them in time: write small for freshness, compact later for reads.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One OPTIMIZE Statement Does the Compaction and Clustering</div>
+<p>Code 8.4.1 modeled the effect of layout; it did not perform it. In a real lakehouse you never write a compaction loop by hand. The table format from <a href="section-8.3.html">Section 8.3</a> exposes compaction and clustering as a single maintenance command that reads the small files, rewrites them at the target size, optionally Z-orders the rows, recomputes the file statistics, and commits the new file list transactionally, all while concurrent readers and writers continue:</p>
+<pre><code class="language-python"># Delta Lake on Spark: compact a partition and cluster it for data skipping.
+from delta.tables import DeltaTable
+
+dt = DeltaTable.forPath(spark, "s3://lake/events")
+(dt.optimize()
+   .where("event_date >= '2026-01-01'")   # only sealed partitions
+   .executeZOrderBy("user_id"))           # bin-pack to target size + cluster
+
+# Apache Iceberg exposes the same operation as a maintenance action:
+#   CALL catalog.system.rewrite_data_files(table => 'events',
+#        strategy => 'sort', sort_order => 'user_id')
+</code></pre>
+<div class="code-caption"><strong>Code 8.4.2:</strong> The compaction-plus-clustering work modeled in Code 8.4.1, now one call. Roughly the entire rewrite-merge-restat-commit loop collapses to <code>optimize().executeZOrderBy(...)</code>; the engine handles bin-packing files to the target size, recomputing min/max statistics, and the atomic manifest swap that keeps readers consistent.</div>
+</div>
+
+<h2>5. Layout Is the Contract Between the Writer and Every Reader <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>A layout decision made once at write time is paid back, or punished, on every read for the life of the table. That asymmetry is what makes layout worth careful thought in an AI pipeline: the writer is a single job, but the readers are every training epoch, every evaluation pass, every feature-backfill, each fanned out across many workers. A partition column that matches the dominant filter, a target file size that amortizes open cost, a sort order that tightens min/max ranges, and a compaction schedule that holds the line: these four choices together decide whether the table is a fast lookup or a slow scan for thousands of reads to come. None of them changes a single value in the data; they change only where the bytes sit, which is exactly why they are pure engineering leverage.</p>
+<p>This layout also sets up the next section directly. Once a training table is partitioned and compacted into target-size files, those files are the natural unit of <strong>sharding</strong>: each <a href="section-8.5.html">DataLoader</a> worker can claim a disjoint subset of files and read them independently, no two workers touching the same bytes, no coordination needed beyond the initial assignment. The same partitioning that prunes a query is what lets a distributed loader split an epoch without overlap or omission, the partitioning-and-sharding arc that runs from <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.3.html">Section 2.3</a> through this chapter and on into model sharding later in the book. Good layout is not only about reading less; it is about reading in parallel without stepping on your peers.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Learned and Liquid Layout (2024 to 2026)</div>
+<p>Static partitioning forces you to pick the partition column and file size up front, before you know the query and training-access patterns the table will actually face. Recent lakehouse work makes layout adaptive instead. Databricks' <em>liquid clustering</em> (general availability progressing through 2024 to 2025) replaces fixed Hive-style partitioning and rigid Z-order with a clustering scheme that lets the engine re-cluster incrementally as data and access patterns shift, avoiding both over-partitioning and full rewrites. Apache Iceberg's continued evolution of hidden partitioning and partition evolution lets a table change its partition spec without rewriting history, so a layout mistake is no longer permanent. In parallel, a research thread on <em>learned data layout</em> and instance-optimized storage (in the lineage of learned-index and cracking work, extended to columnar lakes through 2024 to 2026) trains lightweight models or uses query feedback to choose clustering keys and file boundaries that minimize bytes scanned for the observed workload. The common direction is the same: treat layout as a continuously optimized, workload-aware decision rather than a one-time guess, which matters precisely because AI training reads the same table thousands of times.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Million-File Directory Nobody Could List</div>
+<p>A classic way to discover the small-files problem is to try to delete the table. A pipeline that partitioned by <code>user_id</code> once produced a few million single-row files, and the cleanup job that tried to <code>LIST</code> the prefix before deleting timed out, repeatedly, because listing several million keys on an object store is itself a slow paginated crawl. The data was a few gigabytes; the file count made it un-listable. The fix, ironically, was a compaction job to merge the files down to a few hundred before anything could be done with them at all, including throwing them away.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.4.1: Pick the Partition Column <span class="exercise-type conceptual">Conceptual</span></div>
+<p>You are laying out a 5-terabyte table of model-inference logs with columns <code>request_ts</code> (timestamp), <code>region</code> (5 distinct values), <code>model_id</code> (40 distinct values), and <code>request_id</code> (unique per row). Two query patterns dominate: "all requests in one region on one day" and "trace one <code>request_id</code>". Propose a partition scheme (which columns, in which order) and justify it using partition pruning. Explain specifically why partitioning by <code>request_id</code> would be a disaster, and how you would still make the single-<code>request_id</code> trace reasonably fast without partitioning on it.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.4.2: Find the Break-Even File Size <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 8.4.1 to sweep <code>files_per_day</code> over a range (for example 1, 4, 16, 64, 256, 1024, 4096) while holding the total bytes fixed, and for each value compute the cost of the pruned-and-skipped query. Plot or print cost against file count and identify the file size at which open overhead starts to dominate scan time. Then change <code>OPEN_COST</code> from 12 ms to 1 ms (a warm local cache instead of cold object storage) and rerun. Explain how the break-even target file size shifts with open latency, and what that implies for choosing a target on fast local NVMe versus on S3.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.4.3: When Skipping Stops Helping <span class="exercise-type analysis">Analysis</span></div>
+<p>In Code 8.4.1 the <code>user_id</code> column is perfectly range-clustered, so each file owns a disjoint band and skipping eliminates all but one file. Modify <code>build_layout</code> so each file instead gets a <em>random</em> <code>[min, max]</code> band that spans most of the key space (simulating an unsorted table), and rerun the skipping query. Quantify how many files now survive skipping and why. Use the result to argue, in two or three sentences, why compaction must usually <em>sort or cluster</em> the rows it merges, not merely bin-pack them, for data skipping to be worth its statistics.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-8.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 8.3</span><span class="nav-title">Columnar Formats and the Lakehouse</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 8</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Storage and Data Loading</span></a>
+<a class="next" href="section-8.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 8.5</span><span class="nav-title">Sharded Training Data and the DataLoader Bottleneck</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

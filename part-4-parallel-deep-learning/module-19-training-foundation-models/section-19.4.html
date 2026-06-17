@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 19.4: Distributed Deduplication and Data Quality. Removing exact and near-duplicates from a trillion-token corpus with distributed MinHash and LSH, and decontaminating training data against benchmarks." name="description"/>
+<title>Section 19.4: Distributed Deduplication and Data Quality | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 19: Training Foundation Models at Scale</a></div>
+<h1>Distributed Deduplication and Data Quality</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I read the same cookie banner four hundred million times. I can recite it in my sleep, and now, apparently, so can the model."</p>
+<cite>A Foundation Model Memorizing Boilerplate</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A raw web corpus is mostly repetition, and training on repetition is a triple waste: it burns compute on text the model has already seen, it teaches the model to memorize verbatim strings instead of generalizing, and it quietly smuggles benchmark answers into the training set.</strong> The cure is deduplication: strip exact copies with a hash, strip near-copies with MinHash and locality-sensitive hashing, and decontaminate the corpus against every benchmark you intend to evaluate on. None of this fits on one machine. A trillion-token crawl has billions of documents, and the naive "compare every pair" check is quadratic and hopeless. This section turns the MinHash and LSH machinery of <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/section-6.7.html">Chapter 6</a> into a distributed data-cleaning job that runs once, before the first training step, and pays for itself many times over.</p>
+</div>
+<p>The previous section built a corpus: it pulled documents from many shards of a web crawl, filtered the obvious garbage, and laid the result out for distributed loading. What it did not do is ask whether those documents are distinct. They are not. Real web crawls are saturated with duplication: the same news article syndicated across a hundred outlets, the same documentation page mirrored on a dozen hosts, the same license text and cookie banner and navigation menu stamped onto millions of unrelated pages. Studies of large open corpora routinely find that a substantial fraction of documents are exact or near-exact copies of other documents. If you train on the corpus as-is, the model spends a measurable share of its compute budget re-reading text it has already mastered, and the most-duplicated strings are exactly the ones it learns to reproduce word for word.</p>
+<p>Deduplication is therefore not a cosmetic cleanup; it is a data-quality intervention that changes what the model learns. Removing duplicates reduces verbatim memorization (a privacy and a quality problem), it frees compute for genuinely novel text, and it removes a large class of accidental train-on-test leakage. The challenge is scale. We must find duplicates among billions of documents without ever materializing the quadratic set of all document pairs, and we must do it across a cluster because no single machine holds the corpus. The rest of this section shows how, then closes with the related and equally important job of decontaminating against benchmarks.</p>
+
+<h2>1. Why Duplicates Hurt a Trained Model <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The first instinct is that a few repeated documents cannot matter much against a trillion tokens, but the arithmetic says otherwise. Under stochastic gradient descent, every appearance of a document contributes its gradient again, so a string that occurs $c$ times is effectively up-weighted by a factor of $c$ relative to a string that occurs once. A passage duplicated ten thousand times across mirrored pages is not background noise; it is a training signal the model sees ten thousand times more often than a unique sentence, and the model obliges by memorizing it exactly. This is the mechanism behind verbatim regurgitation, where a prompt's opening words trigger the model to reproduce a long copyrighted or private passage it saw many times during training.</p>
+<p>Duplication also distorts the loss landscape in a subtler way. Held-out evaluation assumes the test distribution is disjoint from training, but if a near-duplicate of a held-out document sits in the training set, the model's apparent generalization is partly memorization, and your validation loss flatters the model. Deduplicating the corpus before splitting off a validation set is the only way to trust the split. Three distinct harms, then, all flow from the same root: wasted compute proportional to the duplication factor, memorization that scales with repetition count, and contaminated evaluation that hides the first two.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Repetition Is Reweighting, and Reweighting Is Memorization</div>
+<p>A document that appears $c$ times in the corpus receives $c$ times the gradient updates of a unique document, exactly as if you had set its sample weight to $c$. Deduplication is the act of resetting every weight back to one. That is why removing duplicates does more than save compute: it changes the effective training distribution from "weighted by how often the web copied this" to "weighted by how often this content genuinely occurs", which is the distribution you actually wanted to learn.</p>
+</div>
+
+<h2>2. Exact Deduplication Is a Hash Away <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Exact duplicates are the easy case and you should remove them first, because they are cheap to find and they are the bulk of the volume. Compute a strong content hash of each document (a 64-bit or 128-bit digest of the normalized text), then group documents by their hash. Every group with more than one member is a set of exact copies; keep one representative and drop the rest. This is a single distributed group-by, the same shuffle-by-key pattern that <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/section-6.7.html">Chapter 6</a> built MapReduce around: map each document to its hash, shuffle so identical hashes land on the same reducer, and emit one survivor per key. The cost is linear in the number of documents, and the only communication is the hash plus a document pointer, not the document text itself.</p>
+<p>Exact dedup alone is never enough, though, because the web does not produce exact copies, it produces near-copies. A mirrored page adds a different header; a syndicated article gains a publisher's footer; a forum post is quoted with one word changed. The content hashes of these documents differ completely even though a human would call them the same text. Catching them requires a notion of similarity, and a way to find similar documents without comparing every pair. That is the job MinHash and LSH were built for.</p>
+
+<h2>3. Near-Deduplication with MinHash and LSH <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>We represent each document as a set: the collection of its word $k$-shingles, the overlapping windows of $k$ consecutive words. Two documents are near-duplicates when their shingle sets overlap heavily, measured by the Jaccard similarity</p>
+$$J(A, B) = \frac{|A \cap B|}{|A \cup B|}.$$
+<p>Computing $J$ for all pairs is the quadratic trap: a corpus of $n$ documents has $\binom{n}{2} \approx n^2/2$ pairs, which for a billion documents is half a quintillion comparisons. MinHash and LSH dismantle this in two moves. First, MinHash replaces each large shingle set with a small fixed-length signature whose agreement rate estimates $J$ without storing the sets. For a random hash function $h$, the probability that the minimum hash value over set $A$ equals the minimum over set $B$ is exactly the Jaccard similarity,</p>
+$$\Pr\bigl[\min_{x \in A} h(x) = \min_{y \in B} h(y)\bigr] = J(A, B),$$
+<p>so concatenating the per-hash minima from $m$ independent hashes gives an $m$-dimensional signature whose fraction of matching coordinates is an unbiased estimate of $J$. Second, LSH banding turns those signatures into a candidate generator. Split each signature into $b$ bands of $r$ rows ($m = b \cdot r$), and hash each band into a bucket. Two documents become a candidate pair if they collide in any band. The probability that a pair with similarity $s$ becomes a candidate is</p>
+$$\Pr[\text{candidate}] = 1 - (1 - s^{\,r})^{b},$$
+<p>an S-shaped curve whose threshold you tune through the choice of $b$ and $r$: more rows per band sharpen the cutoff, more bands lower it. Only candidate pairs are ever compared in full, so the all-pairs cost collapses to roughly the number of true near-duplicate pairs plus a controllable trickle of false candidates. Figure 19.4.1 traces the whole path, from signatures through bands to the duplicate clusters that get collapsed, and on to the benchmark check that follows.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 860 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Pipeline diagram: documents become MinHash signatures, signatures are split into LSH bands that route into buckets, colliding documents form duplicate clusters that are collapsed to one representative, and a separate benchmark set is matched against the survivors to remove contaminated documents.">
+<defs>
+<marker id="arr194" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b194 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w194 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g194 { fill:#eef7ee; stroke:#2f7a36; stroke-width:1.6; }
+.r194 { fill:#fbeef0; stroke:#a8324a; stroke-width:1.6; }
+.t194 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s194 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l194 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr194); }
+.h194 { font:700 13px sans-serif; fill:#14385c; text-anchor:middle; }
+</style>
+<text class="h194" x="90" y="24">Documents</text>
+<rect class="b194" x="30" y="38" width="120" height="34" rx="6"/><text class="s194" x="90" y="59">doc A (article)</text>
+<rect class="b194" x="30" y="80" width="120" height="34" rx="6"/><text class="s194" x="90" y="101">doc A' (mirror)</text>
+<rect class="b194" x="30" y="122" width="120" height="34" rx="6"/><text class="s194" x="90" y="143">doc B (unique)</text>
+
+<text class="h194" x="290" y="24">MinHash signatures</text>
+<rect class="w194" x="210" y="38" width="160" height="34" rx="6"/><text class="s194" x="290" y="59">[7, 2, 9, 4, 1, 8, ...]</text>
+<rect class="w194" x="210" y="80" width="160" height="34" rx="6"/><text class="s194" x="290" y="101">[7, 2, 9, 4, 5, 8, ...]</text>
+<rect class="w194" x="210" y="122" width="160" height="34" rx="6"/><text class="s194" x="290" y="143">[3, 6, 1, 0, 2, 7, ...]</text>
+<line x1="152" y1="55" x2="206" y2="55" class="l194"/>
+<line x1="152" y1="97" x2="206" y2="97" class="l194"/>
+<line x1="152" y1="139" x2="206" y2="139" class="l194"/>
+
+<text class="h194" x="540" y="24">LSH bands &#8594; buckets</text>
+<rect class="b194" x="450" y="38" width="180" height="48" rx="6"/><text class="s194" x="540" y="57">band 1: A, A' collide</text><text class="s194" x="540" y="74">(same bucket)</text>
+<rect class="b194" x="450" y="98" width="180" height="48" rx="6"/><text class="s194" x="540" y="117">band 1: B alone</text><text class="s194" x="540" y="134">(own bucket)</text>
+<line x1="372" y1="55" x2="446" y2="58" class="l194"/>
+<line x1="372" y1="97" x2="446" y2="62" class="l194"/>
+<line x1="372" y1="139" x2="446" y2="118" class="l194"/>
+
+<text class="h194" x="540" y="190">Candidate pair confirmed</text>
+<rect class="g194" x="430" y="204" width="220" height="40" rx="6"/><text class="s194" x="540" y="222">est. Jaccard(A, A') = 0.95 &#8805; 0.8</text><text class="s194" x="540" y="237">&#8594; near-duplicate</text>
+<line x1="540" y1="148" x2="540" y2="200" class="l194"/>
+
+<text class="h194" x="220" y="300">Duplicate cluster collapsed</text>
+<rect class="g194" x="120" y="314" width="200" height="56" rx="6"/><text class="t194" x="220" y="338">keep A, drop A'</text><text class="s194" x="220" y="356">one representative per cluster</text>
+<path class="l194" d="M 430 224 L 330 224 L 330 312"/>
+
+<text class="h194" x="650" y="300">Benchmark decontamination</text>
+<rect class="r194" x="540" y="314" width="220" height="40" rx="6"/><text class="s194" x="650" y="333">match survivors vs. test set</text><text class="s194" x="650" y="349">drop any doc &#8805; threshold</text>
+<rect class="b194" x="540" y="366" width="220" height="30" rx="6"/><text class="s194" x="650" y="386">benchmark / held-out questions</text>
+<line x1="650" y1="366" x2="650" y2="358" class="l194"/>
+<path class="l194" d="M 320 342 L 400 342 L 400 334 L 536 334"/>
+
+<rect class="g194" x="120" y="410" width="640" height="40" rx="6"/>
+<text class="t194" x="440" y="434">clean, deduplicated, decontaminated corpus &#8594; tokenization (Section 19.5)</text>
+<path class="l194" d="M 220 370 L 220 408"/>
+<path class="l194" d="M 650 396 L 650 408"/>
+</svg>
+<figcaption><strong>Figure 19.4.1:</strong> The distributed dedup-and-decontaminate pipeline. Each document becomes a MinHash signature; LSH bands route similar signatures into shared buckets so only colliding documents (A and its mirror A') are compared in full; confirmed near-duplicates collapse into clusters that keep one representative; finally the survivors are matched against a benchmark set and any contaminated document is dropped before the clean corpus flows on to tokenization in <a href="section-19.5.html">Section 19.5</a>.</figcaption>
+</figure>
+
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: MinHash and LSH Return, Now at Corpus Scale</div>
+<p>The MinHash signatures and LSH banding you met as a similarity-search primitive in <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/section-6.7.html">Chapter 6</a> return here as the engine of a trillion-token cleaning job. The structure is identical, only the scale and the purpose changed: in Chapter 6 LSH found similar items to recommend or link; here it finds similar documents to delete. The banding step is a distributed group-by, the very shuffle that <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a> made the heart of MapReduce, so the same partition-and-reduce machinery that powered analytics powers data quality. A primitive built for search, scaled out, becomes a primitive for curation.</p>
+</div>
+
+<h2>4. Running Dedup as a Distributed Job <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>At corpus scale the three stages map cleanly onto a cluster. Signature computation is embarrassingly parallel: each worker reads its shard of documents and emits a signature per document, with no cross-worker communication. The LSH banding is the shuffle: workers emit (band-bucket key, document id) pairs, and the framework partitions by key so every document sharing a bucket lands on the same reducer. The reducer enumerates candidate pairs within each bucket, confirms them with the signature-agreement estimate, and emits the near-duplicate edges. A final connected-components pass over those edges groups documents into duplicate clusters, and one representative per cluster survives. Only signatures and document identifiers cross the network; the document text stays put on the shard that owns it, which keeps the communication volume small even when the corpus is enormous.</p>
+<p>The sharding deserves care for two reasons. First, popular boilerplate produces gigantic buckets: a license string shared by ten million documents would dump ten million ids into one reducer and explode its candidate-pair count back toward quadratic. Production pipelines cap bucket sizes or pre-strip the worst boilerplate so no single key becomes a hot shard, the same skew problem that haunts every distributed group-by. Second, the connected-components step is itself a distributed graph computation when the duplicate graph spans shards, linking it to the distributed graph machinery of later parts. The code below implements the full pipeline in one process so you can watch every stage, then we name the libraries that run it across thousands of machines.</p>
+
+<pre><code class="language-python">import hashlib, random, re
+
+random.seed(7)
+NUM_HASHES = 128            # signature length m
+B, R = 32, 4               # LSH bands and rows, b*r = m; tunes the S-curve threshold
+
+def shingles(text, k=3):
+    """Word k-shingles: the set of overlapping k-word windows in a document."""
+    words = re.findall(r"\w+", text.lower())
+    if len(words) &lt; k:
+        return {" ".join(words)}
+    return {" ".join(words[i:i + k]) for i in range(len(words) - k + 1)}
+
+MAXH = (1 &lt;&lt; 61) - 1                                        # a large Mersenne prime
+coeffs = [(random.randrange(1, MAXH), random.randrange(0, MAXH)) for _ in range(NUM_HASHES)]
+stable_hash = lambda s: int(hashlib.blake2b(s.encode(), digest_size=8).hexdigest(), 16)
+
+def minhash_signature(shingle_set):
+    base = [stable_hash(s) for s in shingle_set]            # hash each shingle once
+    return tuple(min((a * h + b) % MAXH for h in base)      # per-hash minimum
+                 for a, b in coeffs)
+
+# --- LSH banding: emit (band, band-slice) keys; documents that share a key collide.
+buckets = {}
+for doc_id, sig in signatures.items():                     # signatures: doc_id -> tuple
+    for band in range(B):
+        key = (band, sig[band * R:(band + 1) * R])
+        buckets.setdefault(key, []).append(doc_id)
+
+# Only documents sharing a bucket are ever compared; confirm with signature agreement.
+candidate_pairs = {tuple(sorted((ids[i], ids[j])))
+                   for ids in buckets.values()
+                   for i in range(len(ids)) for j in range(i + 1, len(ids))}
+</code></pre>
+<div class="code-caption"><strong>Code 19.4.1:</strong> The core of the dedup job: MinHash signatures and the LSH banding that generates candidate pairs without ever touching the all-pairs set. The full runnable script wraps this with shingling, candidate confirmation, union-find clustering, and the decontamination pass.</div>
+
+<p>Running the complete pipeline on a small corpus with deliberately injected near-duplicates, exact copies, and one boilerplate-padded mirror produces the output below. The corpus has twelve documents, so the all-pairs check would be sixty-six comparisons; LSH proposes only five candidates, confirms four genuine duplicate pairs, and the token count drops by nearly a third.</p>
+
+<pre><code class="language-text">=== MinHash + LSH near-dedup ===
+documents in corpus      : 12
+all-pairs comparisons     : 66 (LSH skipped these)
+LSH candidate pairs       : 5
+confirmed duplicate pairs : 4
+    base-1    ~ mirror-3   est_jaccard=0.67  true_jaccard=0.64
+    base-2    ~ exact-1    est_jaccard=1.00  true_jaccard=1.00
+    base-3    ~ mirror-2   est_jaccard=0.54  true_jaccard=0.52
+    base-5    ~ exact-2    est_jaccard=1.00  true_jaccard=1.00
+documents kept            : 8  (base-0, base-4, exact-1, exact-2, mirror-1, mirror-2, mirror-3, unique-1)
+documents removed         : 4  (base-1, base-2, base-3, base-5)
+tokens before / after     : 185 / 131
+token reduction           : 29.2%
+
+=== Benchmark decontamination ===
+benchmark items            : 1
+training docs scanned      : 9
+contaminated docs removed  : 2  (exact-2, leak-1)
+    exact-2   overlap with benchmark = 1.00
+    leak-1    overlap with benchmark = 0.62
+clean training docs kept   : 7</code></pre>
+<div class="code-caption"><strong>Output 19.4.1:</strong> Real output from the from-scratch pipeline. LSH replaced sixty-six all-pairs comparisons with five candidate checks, the MinHash estimates track the true Jaccard values closely, and near-dedup cut the corpus by 29.2% of its tokens. The decontamination pass then catches the planted leak (<code>leak-1</code>) and a survivor that verbatim-matches the benchmark (<code>exact-2</code>).</div>
+
+<p>Two details in the output reward a second look. The estimated Jaccard column sits within a few hundredths of the true Jaccard column, which is the MinHash guarantee in action: a 128-dimensional signature estimates similarity well enough to make confident keep-or-drop decisions without ever storing the shingle sets. And the candidate count, five against sixty-six possible pairs, is the whole point of LSH at scale: the comparison work shrank by an order of magnitude even on this toy corpus, and the gap widens enormously as the corpus grows.</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: datasketch and text-dedup Do This in a Few Lines</div>
+<p>Code 19.4.1 spells out MinHash and LSH so the mechanism is visible, but you would never hand-roll it in production. The <code>datasketch</code> library implements MinHash and an LSH index directly, and the <code>text-dedup</code> toolkit wraps the entire near-dedup pipeline (shingling, signatures, banding, clustering) with Spark and Ray backends built for trillion-token corpora:</p>
+<pre><code class="language-python"># pip install datasketch
+from datasketch import MinHash, MinHashLSH
+
+lsh = MinHashLSH(threshold=0.8, num_perm=128)      # S-curve cutoff and signature length
+sigs = {}
+for doc_id, text in corpus:                        # corpus: iterable of (id, text)
+    m = MinHash(num_perm=128)
+    for sh in shingles(text):                      # update with each k-shingle
+        m.update(sh.encode())
+    lsh.insert(doc_id, m)                           # index handles the banding
+    sigs[doc_id] = m
+
+near_dups = {d: lsh.query(sigs[d]) for d, _ in corpus}   # candidates per document
+</code></pre>
+<div class="code-caption"><strong>Code 19.4.2:</strong> The same near-dedup as Output 19.4.1, now in roughly ten lines with <code>datasketch</code>. The library owns the band-bucket index, the signature math, and the threshold-to-(b, r) calibration; <code>text-dedup</code> adds the distributed Spark or Ray driver that runs it across a cluster, so the only thing you choose is the similarity threshold and the shingle size.</div>
+</div>
+
+<h2>5. Decontamination: Keeping the Test Set Out <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Deduplication removes copies within the corpus; decontamination removes a specific, dangerous subset: documents that overlap with the benchmarks you will use to evaluate the model. If a copy of a benchmark question and its answer has been scraped into the training data, the model can memorize it, and your reported score measures recall of training data rather than genuine capability. This is the train-test leakage problem of <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/section-8.8.html">Chapter 8</a>, raised to corpus scale, and it is exactly the benchmark-contamination pitfall that <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.6.html">Chapter 5</a> warns makes leaderboard numbers untrustworthy. As benchmarks and web crawls both grow, the odds that some test item already lives somewhere in the crawl approach certainty, so decontamination is now a mandatory step, not an optional courtesy.</p>
+<p>Mechanically, decontamination reuses the near-dedup machinery with the benchmark set as the reference. Build signatures for every benchmark item, then flag any training document whose similarity to a benchmark item exceeds a threshold and drop it before training. The second half of Output 19.4.1 shows this on the deduplicated corpus: a planted <code>leak-1</code> document (a benchmark answer padded with site text) is caught at overlap 0.62, and <code>exact-2</code>, a survivor that verbatim-matches the benchmark string, is caught at overlap 1.00. Both leave the corpus, and the evaluation that follows is honest. The choice of threshold and shingle size is a policy decision: too loose and you delete legitimately related training text, too tight and you let paraphrased leaks through. Published recipes lean toward aggressive removal, on the principle that a slightly smaller training set is a cheap price for a trustworthy benchmark.</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Dedup, Data Quality, and Contamination (2024 to 2026)</div>
+<p>Data curation has become a first-class research subject rather than a preprocessing footnote. The open data efforts behind RefinedWeb, the Dolma corpus, and FineWeb (Penedo et al., 2024) publish their exact and near-dedup recipes and show that aggressive deduplication, not just more raw tokens, is what lifts downstream model quality; FineWeb's ablations make the dedup-versus-quality trade-off explicit. A parallel line studies benchmark contamination directly, building detectors that estimate whether a given test set already appeared in a model's pretraining data and documenting how contamination inflates leaderboard scores; the LLM Decontaminator and related membership-inference probes are active here. A third thread asks how much deduplication is too much, since over-aggressive removal can strip genuinely diverse rephrasings, and tunes the similarity threshold against measured downstream loss. The common message across all three: the cleaning job in this section is one of the highest-leverage decisions in the entire training pipeline, and it is increasingly studied with the same rigor as the model architecture.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Benchmark Score That Was Too Good</div>
+<p><strong>Who:</strong> A data engineer on a team pretraining a code-generation model on a multi-terabyte scrape of public repositories.</p>
+<p><strong>Situation:</strong> A new checkpoint posted a startlingly high score on a popular coding benchmark, well above what the team's scaling curve predicted for that compute budget.</p>
+<p><strong>Problem:</strong> The benchmark's reference solutions, it turned out, were hosted in public repositories that the crawl had swept up verbatim, so the model had seen the answers during training.</p>
+<p><strong>Dilemma:</strong> Trust the inflated number and ship a model whose real-world coding ability was unknown, or rebuild the corpus with a decontamination pass and re-run a costly pretraining job from scratch.</p>
+<p><strong>Decision:</strong> They decontaminated, treating the suspicious score as a contamination alarm rather than a win, because a benchmark the team could not trust was worse than no benchmark at all.</p>
+<p><strong>How:</strong> They ran a MinHash-LSH match of every training document against the benchmark items at a deliberately loose threshold, dropped the few thousand contaminated files, and retrained on the cleaned corpus.</p>
+<p><strong>Result:</strong> The benchmark score fell back onto the scaling curve, the model's measured ability now matched its real coding behavior, and an internal audit of three other benchmarks found two more contaminated sources the same pass had already removed.</p>
+<p><strong>Lesson:</strong> A benchmark score that beats your scaling law is a contamination smell, not a triumph. Decontaminate before you celebrate, and use the same MinHash machinery that deduplicated the corpus to do it.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Model That Learned the Cookie Banner</div>
+<p>Among the most-duplicated strings in any web crawl are the cookie-consent banners and "all rights reserved" footers that appear on millions of unrelated pages. Train without dedup and a model will happily complete one from memory, having seen it more often than most famous quotations. It is a harmless example of a serious failure mode: the strings a model memorizes first are simply the ones the web copied most, which is rarely the knowledge you were hoping to instill.</p>
+</div>
+
+<p>With duplicates removed and benchmarks held out, the corpus is finally ready to become model input. The next step turns clean text into the integer token streams a transformer consumes, a job that is itself distributed when the vocabulary is trained on a trillion tokens. <a href="section-19.5.html">Section 19.5</a> takes up tokenization at scale, picking up the clean corpus this section produced and the data-parallel all-reduce that <a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a> will feed it into.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.4.1: Tune the LSH S-Curve <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the candidate probability $\Pr[\text{candidate}] = 1 - (1 - s^{\,r})^{b}$ with a signature length of $m = b \cdot r = 128$, compare two configurations: $(b, r) = (32, 4)$ and $(b, r) = (16, 8)$. For each, compute the candidate probability at similarity $s = 0.5$ and $s = 0.9$. Which configuration has the sharper threshold, and which would you choose if your goal is to catch near-duplicates above $0.8$ similarity while admitting as few false candidates as possible? Explain how the choice trades recall of true duplicates against the volume of pairs each reducer must confirm.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.4.2: Measure the Token Savings <span class="exercise-type coding">Coding</span></div>
+<p>Extend the from-scratch pipeline so that instead of one boilerplate string it injects the same cookie-banner sentence into a tunable fraction $p$ of the documents, then re-runs near-dedup. Plot the token-reduction percentage as a function of $p$ from $0$ to $0.5$. Confirm that the savings grow roughly linearly with the duplication fraction, and relate the slope back to the Key Insight that a document appearing $c$ times is reweighted by $c$. State what this implies for the compute saved on a real corpus where popular boilerplate appears in millions of documents.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.4.3: The Hot-Bucket Skew <span class="exercise-type analysis">Analysis</span></div>
+<p>Suppose a single license string appears in $10$ million of a corpus's documents, and all of them share one LSH band-bucket. Estimate how many candidate pairs that one bucket alone generates, and argue why this re-creates the quadratic blow-up that LSH was supposed to avoid. Propose two mitigations from Section 4 (bucket-size caps and boilerplate pre-stripping), and for each, describe what it costs and which kind of duplicate it might miss. Connect the skew to the distributed group-by hot-key problem you would also meet in a Spark shuffle.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-19.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 19.3</span><span class="nav-title">Distributed Dataset Construction</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 19</span><span class="nav-num">Contents</span><span class="nav-title">Training Foundation Models at Scale</span></a>
+<a class="next" href="section-19.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 19.5</span><span class="nav-title">Tokenization at Scale</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

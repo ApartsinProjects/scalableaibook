@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 23.2: Replicas, Load Balancing, and Batch-Aware Routing. How replicating an optimized model node behind a router scales inference throughput, and why GPU load balancing must keep batches full and route stateful requests to the replica holding the KV cache." name="description"/>
+<title>Section 23.2: Replicas, Load Balancing, and Batch-Aware Routing | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 23: Distributed Inference Systems</a></div>
+<h1>Replicas, Load Balancing, and Batch-Aware Routing</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They told me to balance the load evenly. So I gave every replica exactly one request, and now every GPU is running a batch of one and hating me equally."</p>
+<cite>A Round-Robin Router With Good Intentions</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>You scale inference throughput by replicating one optimized model node across many GPUs behind a router, but the router cannot be a plain web load balancer: it must keep each replica's GPU batch efficiently full and send stateful requests back to the replica that already holds their KV cache.</strong> The previous section established why model serving differs from web serving: a GPU is most efficient when it runs a large batch, and generation is stateful because each conversation carries a growing KV cache. Those two facts turn load balancing from a solved problem into the central design question of a serving fleet. Spread requests too evenly and every replica runs half-empty batches, wasting most of the hardware you paid for. Ignore the KV cache and every routed request recomputes a prefix that already exists somewhere else. This section builds the router that gets both right: replicate the node, fill the batches, respect the cache, and protect the tail.</p>
+</div>
+<p>The single-node work is done. In <a href="../module-22-per-node-inference-efficiency/index.html">Chapter 22</a> we made one model run as fast as one GPU allows: quantized weights, a paged KV cache, fused attention kernels, and continuous batching that keeps the accelerator busy. That gives us a node with a known throughput, a known latency curve, and a known memory budget. It is not enough. A node that answers 300 requests per second cannot serve a product that receives 3,000. The remedy for a throughput ceiling is the one named in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>: replicate the service across more machines. This section is about doing that replication well for GPU inference specifically, where the naive answer (round-robin across identical replicas) quietly wastes most of the fleet.</p>
+<p>The architecture is simple to draw and subtle to operate. A router (sometimes called a gateway or a serving frontend) sits in front of $R$ identical replicas, each a full copy of the optimized model node. Every incoming request is assigned to one replica, joins that replica's queue, and is eventually folded into a batch that the GPU executes. Total fleet throughput is, in the best case, $R$ times one replica's throughput. The router's job is to make the common case the best case, and Figure 23.2.1 shows the two ideas that get it there: batch-aware fill and prefix affinity.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A router receives a stream of requests, some tagged with session prefixes, and distributes them to four replicas. Two replicas show full GPU batches via batch-aware routing; session-tagged requests are routed by prefix affinity to the replica already holding their KV cache.">
+<defs>
+<marker id="arr232" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b232 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.r232 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g232 { fill:#eaf5ec; stroke:#2f7d46; stroke-width:1.6; }
+.t232 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.tw232 { font:600 13px sans-serif; fill:#b86b1f; text-anchor:middle; }
+.s232 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l232 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr232); }
+.lg232 { fill:none; stroke:#2f7d46; stroke-width:1.9; marker-end:url(#arr232); stroke-dasharray:5 3; }
+.slot { fill:#cfe0f0; stroke:#14385c; stroke-width:1; }
+.slotE { fill:#ffffff; stroke:#b9c4d0; stroke-width:1; }
+</style>
+<text class="t232" x="120" y="30">Request stream</text>
+<rect class="b232" x="40" y="46" width="160" height="34" rx="6"/>
+<text class="s232" x="120" y="68">req &#183; req &#183; req(S7) &#183; req &#183; req(S7)</text>
+<rect class="b232" x="250" y="180" width="120" height="60" rx="10"/>
+<text class="t232" x="310" y="206">Router</text>
+<text class="s232" x="310" y="225">batch-aware +</text>
+<text class="s232" x="310" y="238">prefix affinity</text>
+<path class="l232" d="M 200 63 L 232 63 L 232 195 L 248 195"/>
+<g>
+<rect class="r232" x="470" y="40" width="190" height="70" rx="8"/>
+<text class="tw232" x="497" y="60">Replica 1</text>
+<rect class="slot" x="470" y="74" width="22" height="28"/>
+<rect class="slot" x="494" y="74" width="22" height="28"/>
+<rect class="slot" x="518" y="74" width="22" height="28"/>
+<rect class="slot" x="542" y="74" width="22" height="28"/>
+<rect class="slot" x="566" y="74" width="22" height="28"/>
+<rect class="slot" x="590" y="74" width="22" height="28"/>
+<rect class="slot" x="614" y="74" width="22" height="28"/>
+<rect class="slot" x="638" y="74" width="22" height="28"/>
+<text class="s232" x="565" y="62">full batch (efficient)</text>
+</g>
+<g>
+<rect class="r232" x="470" y="130" width="190" height="70" rx="8"/>
+<text class="tw232" x="497" y="150">Replica 2</text>
+<rect class="slot" x="470" y="164" width="22" height="28"/>
+<rect class="slot" x="494" y="164" width="22" height="28"/>
+<rect class="slot" x="518" y="164" width="22" height="28"/>
+<rect class="slot" x="542" y="164" width="22" height="28"/>
+<rect class="slot" x="566" y="164" width="22" height="28"/>
+<rect class="slot" x="590" y="164" width="22" height="28"/>
+<rect class="slotE" x="614" y="164" width="22" height="28"/>
+<rect class="slotE" x="638" y="164" width="22" height="28"/>
+<text class="s232" x="565" y="152">nearly full</text>
+</g>
+<g>
+<rect class="g232" x="470" y="220" width="190" height="70" rx="8"/>
+<text class="t232" x="565" y="240" style="fill:#2f7d46">Replica 3 (holds S7 KV cache)</text>
+<rect class="slot" x="470" y="254" width="22" height="28"/>
+<rect class="slot" x="494" y="254" width="22" height="28"/>
+<rect class="slotE" x="518" y="254" width="22" height="28"/>
+<rect class="slotE" x="542" y="254" width="22" height="28"/>
+<text class="s232" x="540" y="276" style="fill:#2f7d46">session S7 stays here</text>
+</g>
+<g>
+<rect class="r232" x="470" y="310" width="190" height="70" rx="8"/>
+<text class="tw232" x="497" y="330">Replica R</text>
+<rect class="slot" x="470" y="344" width="22" height="28"/>
+<rect class="slot" x="494" y="344" width="22" height="28"/>
+<rect class="slot" x="518" y="344" width="22" height="28"/>
+<rect class="slot" x="542" y="344" width="22" height="28"/>
+<rect class="slot" x="566" y="344" width="22" height="28"/>
+<rect class="slotE" x="590" y="344" width="22" height="28"/>
+<rect class="slotE" x="614" y="344" width="22" height="28"/>
+<rect class="slotE" x="638" y="344" width="22" height="28"/>
+</g>
+<path class="l232" d="M 372 200 L 420 80 L 466 75"/>
+<path class="l232" d="M 372 205 L 420 165 L 466 165"/>
+<path class="lg232" d="M 372 215 L 420 255 L 466 255"/>
+<path class="l232" d="M 372 222 L 420 345 L 466 345"/>
+<text class="s232" x="430" y="305" style="fill:#2f7d46">S7 routed by affinity</text>
+</svg>
+<figcaption><strong>Figure 23.2.1:</strong> The distributed-serving architecture. One router fronts $R$ replicas, each a full copy of the Chapter 22 optimized node. Stateless requests are placed to keep batches full (batch-aware routing, blue arrows), so a replica runs eight-wide batches rather than batches of one. Session-tagged requests (here session S7) are routed by prefix affinity (green dashed arrow) to the replica that already holds their KV cache, so the prefix is not recomputed. The empty slots on the lower replicas show the waste that round-robin balancing would create everywhere.</figcaption>
+</figure>
+
+<h2>1. Replicate the Node, Multiply the Throughput <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The replicated-service pattern is the oldest move in distributed systems and the one we already named as an axis of distribution. To serve more requests than one server can handle, you run many identical servers and put a load balancer in front. We met this pattern abstractly in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.9.html">Section 2.9</a>, where a stateless replica plus a balancer gives throughput that grows linearly with the replica count and availability that survives any single replica's failure. For ordinary web services, that is essentially the whole story: requests are independent and cheap, so any replica will do, and round-robin or random placement is close to optimal.</p>
+<p>GPU inference inherits the pattern and breaks the assumption that makes round-robin optimal. A replica here is not a cheap stateless web worker; it is a full copy of the optimized model node from <a href="../module-22-per-node-inference-efficiency/index.html">Chapter 22</a>, holding billions of parameters in GPU memory and most efficient only when it processes many requests together in a batch. Two properties follow, and they are the entire reason this section exists. First, a replica's throughput depends on how it is fed: feed it one request at a time and it runs far below its rated capacity. Second, a replica accumulates state, the KV cache of every active generation, so the replicas are not interchangeable for a request that is mid-conversation. A web balancer assumes replicas are stateless and requests are uniform. Neither holds here, which is why a serving router needs ideas that a web balancer does not have.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Serving Router Optimizes Batch Occupancy, Not Request Spread</div>
+<p>A web load balancer minimizes per-replica request count, spreading load as evenly as possible. A GPU serving router maximizes per-replica batch occupancy, because the cost of a GPU step is paid per step regardless of how full the batch is. The two objectives conflict: perfectly even spreading produces many small batches, which is the worst case for GPU efficiency. The router's real job is to consolidate enough requests onto each replica to fill its batch, while staying inside the latency budget and respecting which replica holds each session's cache. Spread is a constraint; occupancy is the objective.</p>
+</div>
+
+<h2>2. Why Round-Robin Is the Wrong Default <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Consider $R$ replicas, each running a GPU step that handles up to $B$ requests and takes time $\tau$ regardless of how many requests are actually in the batch. The fleet's peak throughput is</p>
+$$\Lambda_{\max} = \frac{R \cdot B}{\tau},$$
+<p>achieved only when every step runs a full batch of $B$. The cost the hardware bills you, on the other hand, is one GPU-step of $\tau$ per fired batch, full or not. So the quantity that decides whether you are wasting money is the mean batch occupancy $\bar{b}/B$, where $\bar{b}$ is the average number of requests per fired step. A fleet running at 45 percent occupancy is paying for more than twice the hardware its workload needs.</p>
+<p>Round-robin maximizes the wrong thing. By spreading each arriving request to the next replica in rotation, it minimizes the number of requests waiting at any one replica, which sounds desirable until you remember that a replica fires a step as soon as it has any backlog at all. Thin, evenly-spread queues mean every replica frequently fires a batch of one or two, the GPU pays the full $\tau$ for a nearly empty batch, and effective throughput collapses toward $R/\tau$ instead of $R \cdot B / \tau$. The fix is batch-aware routing: deliberately let a small queue accumulate at a replica, and let the replica wait a bounded time for its batch to fill before firing. This is the fleet-level generalization of the continuous batching from <a href="../module-22-per-node-inference-efficiency/section-22.7.html">Section 22.7</a>, where a single node forms batches from its own queue; here the router shapes which requests land in which queue so that batches can fill at all.</p>
+<p>For the placement decision itself, the serving world borrows two ideas from classical load balancing and adapts them to batched work. <strong>Least-outstanding-requests</strong> routes each request to the replica with the shortest current backlog, which keeps queues balanced without the blindness of round-robin. <strong>Power-of-two-choices</strong> is the cheap approximation: sample two replicas at random and send the request to the less-loaded of the two. This avoids the herd behavior where every request rushes to the single least-loaded replica (a thundering herd that the global least-loaded rule can cause), and it provably keeps the maximum queue length close to balanced with only two probes per request. Both are adapted for GPU work by measuring "load" as queued-plus-in-flight requests against the batch capacity $B$, not raw connection count.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Tyranny of the Empty Batch</div>
+<p>A GPU running a batch of one is the most expensive way to be idle ever invented. It is fully powered, fully clocked, drawing its entire thermal budget, and doing one customer's worth of work in a slot sized for eight. Round-robin under light load turns an entire fleet into this state simultaneously, which is how a team can watch their dashboard show every GPU at 100 percent utilization while their throughput-per-dollar quietly falls through the floor. Utilization is not occupancy, and the bill knows the difference.</p>
+</div>
+
+<h2>3. Prefix Affinity: Routing to the Cache <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Batch occupancy is only half of the routing problem. The other half comes from statefulness. When a model generates text token by token, it builds a KV cache holding the attention keys and values for every token seen so far, the structure we sized and paged in <a href="../module-22-per-node-inference-efficiency/section-22.5.html">Section 22.5</a>. That cache lives in the GPU memory of one specific replica. If a follow-up turn in the same conversation, or a new request that shares a long system prompt, is routed to a different replica, that replica has no cache for the shared prefix and must recompute it from scratch, paying the full prefill cost again. Route the request back to the replica that already holds the prefix, and the prefill is nearly free.</p>
+<p>This is prefix affinity (also called session affinity or sticky routing). The router keeps a small table mapping each session id or prompt-prefix hash to the replica currently holding its cache, and routes matching requests there. The tension with batch-aware balancing is real: affinity pins a request to a possibly-busy replica, which can hurt load balance, so production routers blend the two, preferring the cache-holding replica unless its backlog exceeds a threshold, in which case they evict and re-route. The payoff is large for workloads with shared prefixes (multi-turn chat, retrieval-augmented prompts with a common context, agent loops that re-send a long tool-description preamble), because the saved prefill is often the dominant cost of the request.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: A Single-Node Optimization Becomes a Fleet-Level Routing Decision</div>
+<p>The KV cache began in <a href="../module-22-per-node-inference-efficiency/section-22.5.html">Chapter 22</a> as a within-the-node memory optimization: store the attention state so you never recompute it. Scaled out across a fleet, that same cache becomes a routing constraint, because the saved computation only exists on the one replica that built it. The per-node economics of the cache (its memory cost, its hit value) do not disappear when you replicate; they multiply across the fleet and turn into the affinity policy of the router. This is the recurring shape of the whole book: a primitive perfected on one machine returns, transformed, as a coordination decision among many. It returns again, multiplied further, when we shard the cache itself across machines in <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a>.</p>
+</div>
+
+<h2>4. Queueing and Admission Control for the Tail <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Filling batches has a cost, and that cost is latency. A request that waits for its batch to fill, or that lands behind a long backlog, experiences a delay that the mean throughput number hides entirely. The metric that matters for a user-facing service is the tail: the p99 latency we made precise in <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.3.html">Section 5.3</a>, the time below which 99 percent of requests complete. A serving fleet can have excellent mean latency and a catastrophic tail if a few requests sit behind a saturated replica's queue.</p>
+<p>Two mechanisms protect the tail. The first is a bounded fill wait: a replica waits for its batch to fill only up to a deadline, then fires whatever it has, so no request is held hostage to an arrival that never comes. This caps the latency cost of batch-aware routing directly. The second is admission control. When the whole fleet is saturated, queues grow without bound and every request's latency climbs together; it is better to reject or shed a fraction of requests immediately (returning a fast error or a degraded response) than to accept all of them and blow the SLO for everyone. Admission control trades a small drop in completion rate for a bounded tail, and the threshold is usually set on queue depth: if the shortest replica queue already exceeds the point where the SLO is at risk, the router stops accepting new work rather than queueing it. We make the saturation point a control signal for autoscaling in Section 23.4; here it is a control signal for protecting the requests already in flight.</p>
+
+<h2>5. Simulating the Three Policies <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The argument so far is qualitative; the simulation below makes it quantitative. It models a fleet of $R = 4$ replicas, each running GPU steps of fixed cost $\tau$ that process up to $B = 8$ requests. Requests arrive as a Poisson stream, each tagged with a session prefix, and we hold the offered load fixed while swapping the routing-and-batching policy. The three policies are exactly the ones developed above: plain round-robin with greedy firing, batch-aware power-of-two routing with a bounded fill wait, and prefix-affinity on top of batch-aware. We report sustained throughput, mean batch fill (the occupancy that decides GPU efficiency), total GPU busy-seconds (what the hardware actually bills, including the KV-recompute penalty on cache misses), and the p99 queue wait.</p>
+<pre><code class="language-python">import random, statistics
+
+# Discrete-time fleet simulator (1 ms ticks). R replicas each run one GPU "step"
+# at a time. A step processes up to B queued requests and costs STEP_MS regardless
+# of how full the batch is, so a half-empty batch burns a full GPU slot for half
+# the useful work. Offered load is held fixed; the three policies differ only in
+# how the ROUTER assigns each arrival and WHEN each replica fires its batch.
+#
+#   round_robin : even spread; a replica fires the instant it is idle and holds
+#                 >=1 request -> many tiny batches -> poor GPU efficiency.
+#   batch_aware : route to the shorter of two sampled backlogs (power-of-two) AND
+#                 let a replica wait up to FILL_WAIT_MS for the batch to fill.
+#   prefix_affinity : batch_aware PLUS pin each session to the replica already
+#                 holding its KV cache, avoiding a per-step recompute penalty.
+
+R, B          = 4, 8         # replicas, max batch size per step
+STEP_MS       = 40           # one GPU step, fixed cost regardless of fill
+HORIZON_MS    = 60000        # simulated wall-clock
+ARRIVAL_RATE  = 0.30         # requests per ms (~300 req/s); capacity = R*B/STEP = 800
+N_PREFIX      = 50
+FILL_WAIT_MS  = 25           # how long a batch-aware replica waits to fill
+KV_MISS_MS    = 3            # extra step cost PER uncached prefix in a batch
+CACHE_CAP     = 12           # prefixes a replica can keep KV cache for
+random.seed(7)
+
+def simulate(policy):
+    queues   = [[] for _ in range(R)]     # lists of (arrive_ms, prefix)
+    busy_to  = [0] * R                     # tick until which replica is busy
+    wait_since = [None] * R                # when current batch-aware wait started
+    cached   = [set() for _ in range(R)]
+    affinity = {}
+    rr = [0]
+    fills, waits = [], []
+    gpu_ms = 0
+    batch_aware  = policy in ("batch_aware", "prefix_affinity")
+    use_affinity = policy == "prefix_affinity"
+
+    def route(pfx):
+        if policy == "round_robin":
+            r = rr[0] % R; rr[0] += 1; return r
+        if use_affinity and pfx in affinity:
+            return affinity[pfx]                  # session's KV cache lives here
+        a, b = random.randrange(R), random.randrange(R)   # power-of-two-choices
+        r = a if len(queues[a]) &lt;= len(queues[b]) else b
+        if use_affinity:
+            affinity[pfx] = r
+        return r
+
+    def fire(r, now):
+        nonlocal gpu_ms
+        q = queues[r]
+        batch = q[:B]; del q[:len(batch)]
+        pset = {p for (_, p) in batch}
+        # KV-cache misses cost extra per uncached prefix (recompute the prefix).
+        # Each replica keeps a bounded cache of recently seen prefixes.
+        misses = len(pset - cached[r])
+        cost = STEP_MS + KV_MISS_MS * misses
+        cached[r] |= pset
+        if len(cached[r]) &gt; CACHE_CAP:                 # bounded cache, drop overflow
+            cached[r] = set(list(cached[r])[-CACHE_CAP:])
+        for (arr, _) in batch:
+            waits.append(now - arr)
+        fills.append(len(batch))
+        gpu_ms += cost
+        busy_to[r] = now + cost
+        wait_since[r] = None
+
+    for now in range(HORIZON_MS):
+        # Poisson arrivals: at most one per tick at this rate (rate &lt; 1/ms)
+        if random.random() &lt; ARRIVAL_RATE:
+            pfx = random.randrange(N_PREFIX)
+            queues[route(pfx)].append((now, pfx))
+        # each idle replica decides whether to fire
+        for r in range(R):
+            if busy_to[r] &gt; now or not queues[r]:
+                wait_since[r] = None
+                continue
+            if not batch_aware:
+                fire(r, now)                      # greedy: fire on any backlog
+            elif len(queues[r]) &gt;= B:
+                fire(r, now)                      # batch full
+            else:
+                if wait_since[r] is None:
+                    wait_since[r] = now
+                if now - wait_since[r] &gt;= FILL_WAIT_MS:
+                    fire(r, now)                  # waited long enough, fire partial
+
+    served = len(waits)
+    thr = served / (HORIZON_MS / 1000)
+    util = statistics.mean(fills) / B
+    waits.sort()
+    p99 = waits[int(0.99 * len(waits)) - 1]
+    gpu_busy_s = gpu_ms / 1000
+    return thr, util, gpu_busy_s, p99
+
+print(f"offered load ~{ARRIVAL_RATE*1000:.0f} req/s, fleet capacity {R*B*1000//STEP_MS} req/s\n")
+print(f"{'policy':&lt;18}{'thrupt(req/s)':&gt;14}{'gpu_fill':&gt;10}{'gpu_busy(s)':&gt;12}{'p99_wait(ms)':&gt;14}")
+print("-" * 68)
+for pol in ("round_robin", "batch_aware", "prefix_affinity"):
+    thr, util, steps, p99 = simulate(pol)
+    print(f"{pol:&lt;18}{thr:&gt;14.0f}{util*100:&gt;9.0f}%{steps:&gt;12.1f}{p99:&gt;14.0f}")
+</code></pre>
+<div class="code-caption"><strong>Code 23.2.1:</strong> A pure-Python fleet simulator that swaps only the routing-and-batching policy while holding the offered load, replica count, batch size, and step cost fixed. The <code>route</code> function carries the placement policy (round-robin, power-of-two, or affinity lookup); the firing logic inside the tick loop carries the batching policy (greedy versus bounded fill wait).</div>
+<pre><code class="language-text">offered load ~300 req/s, fleet capacity 800 req/s
+
+policy             thrupt(req/s)  gpu_fill gpu_busy(s)  p99_wait(ms)
+--------------------------------------------------------------------
+round_robin                  303       45%       240.1            49
+batch_aware                  299       71%       164.9            80
+prefix_affinity              299       61%       150.4            64
+</code></pre>
+<div class="code-caption"><strong>Output 23.2.1:</strong> All three policies serve the same ~300 req/s, but at very different cost. Round-robin runs 45 percent-full batches and burns 240 GPU-seconds; batch-aware lifts occupancy to 71 percent and cuts the GPU bill by a third to 165 seconds; prefix-affinity lowers it further to 150 seconds by avoiding KV recompute, and recovers tail latency (p99 64 ms versus 80 ms) by keeping each session on one warm replica.</div>
+<p>Read the table by column. Throughput is the same across all three because the offered load is well inside fleet capacity; what differs is the price paid to serve it. Round-robin has the lowest p99 (49 ms) precisely because it never waits to fill a batch, but it pays for that with 45 percent occupancy and the highest GPU bill (240 seconds), more than half the hardware doing nothing useful. Batch-aware routing trades a slower tail (80 ms, from the fill wait) for a 31 percent cut in GPU-seconds. Prefix-affinity then improves on batch-aware along two axes at once: it cuts the GPU bill further (150 versus 165 seconds) by turning cache misses into hits, and it pulls the tail back down (64 versus 80 ms) because affinity-routed sessions skip the expensive recompute that was inflating their step cost. The lesson is not that one policy dominates; it is that the router's policy is the knob that sets your throughput-per-dollar and your tail at the same time.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Chatbot Fleet That Was Paying for Empty Batches</div>
+<p><strong>Who:</strong> An inference platform engineer running a customer-support chat assistant on a fleet of GPU replicas.</p>
+<p><strong>Situation:</strong> Traffic was comfortably within capacity, every GPU dashboard read near 100 percent utilization, yet the cloud bill was roughly double what the request volume seemed to justify.</p>
+<p><strong>Problem:</strong> The serving frontend used the cloud load balancer's default round-robin policy, inherited from the team's web services, and the replicas were firing GPU steps on batches of one or two most of the time.</p>
+<p><strong>Dilemma:</strong> Add more replicas to chase the latency they thought they had a capacity problem with (more cost), or change the router to fill the batches they already had (more engineering, and a small latency cost from waiting to fill).</p>
+<p><strong>Decision:</strong> They changed the router, because the simulation in Output 23.2.1 matched their symptom exactly: high utilization, low occupancy, a doubled bill. The problem was occupancy, not capacity, so more replicas would only have spread the waste thinner.</p>
+<p><strong>How:</strong> They switched placement to power-of-two-choices on queue depth, gave each replica a 20 ms bounded fill wait, and added session affinity keyed on the conversation id so multi-turn chats stuck to one warm replica.</p>
+<p><strong>Result:</strong> Mean batch occupancy rose from the low 40s to the low 70s percent, the fleet served the same traffic on 40 percent fewer GPUs, and p99 rose by under 30 ms, inside the product's SLO. The KV-cache hit rate on follow-up turns went from near zero to most turns, removing repeated prefill.</p>
+<p><strong>Lesson:</strong> When utilization is high but the bill is wrong, the router, not the replica count, is almost always the cause. Fill the batches and route to the cache before you buy more hardware.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Prefix-Aware Routing in One Config Block</div>
+<p>Code 23.2.1 builds the router by hand to expose the mechanism. In production you do not write a tick-level simulator; modern serving frameworks expose batch-aware and prefix-aware routing as configuration. A Ray Serve or SGLang router fronting replicas of a vLLM engine reduces the whole policy to a few declarative lines, and the framework handles queue measurement, the fill wait, the affinity table, and the eviction-on-overload that our simulator only sketches:</p>
+<pre><code class="language-python"># A prefix-aware router fronting several model replicas (SGLang-style).
+# The framework tracks each replica's KV-cache contents and routes by longest
+# matching prefix, falling back to load balance when no replica holds the prefix.
+from sglang import Runtime, Router
+
+replicas = [Runtime(model_path="my-model", base_gpu_id=i) for i in range(4)]
+router = Router(
+    replicas,
+    policy="cache_aware",     # longest-prefix-match affinity, else load balance
+    max_wait_ms=20,           # bounded fill wait that caps the tail (Section 4)
+    balance_threshold=1.5,    # evict affinity when a replica is 1.5x over the mean
+)
+router.serve(port=8000)       # one endpoint; clients never see the fleet
+</code></pre>
+<div class="code-caption"><strong>Code 23.2.2:</strong> The same three ideas as Output 23.2.1 (fill the batch, cap the wait, route to the cache) expressed as a handful of router options. Roughly eighty lines of hand-rolled simulator collapse to one <code>Router</code> construction; the framework owns the load measurement, the affinity table, and the overload eviction.</div>
+</div>
+
+<h2>6. What the Router Buys You <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Stepping back, the router converts a pile of identical replicas into a single coherent service whose throughput scales with the replica count and whose efficiency depends almost entirely on three decisions: how full it keeps the batches, whether it respects the KV cache, and how aggressively it protects the tail. Round-robin gets the first two wrong by default, which is why a serving fleet is one of the few places where the obvious load-balancing answer is actively harmful. The replicated-service pattern from <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.9.html">Section 2.9</a> still gives you the linear throughput scaling and the failure tolerance; the GPU-specific routing is what keeps that scaling from costing twice what it should.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Prefix-Cache-Aware Routing (2024 to 2026)</div>
+<p>The idea that a fleet router should route by KV-cache contents, not just by load, has become an active research and systems line. SGLang's RadixAttention (Zheng et al., 2024) organizes cached prefixes in a radix tree and routes each request to the replica whose tree holds the longest matching prefix, turning prefix affinity from a coarse session id into fine-grained longest-prefix-match across the whole fleet. The vLLM project and its production router add prefix-cache-aware scheduling and a routing layer (the vLLM production stack and "router" components) that track per-replica cache state and balance affinity against load. Parallel work studies the scheduling theory underneath: how to weigh cache-hit value against queue imbalance, how to evict affinity under bursty load, and how prefill/decode disaggregation (which we take up in <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a>) changes what "route to the cache" even means when prefill and decode live on different machines. The throughline is that the router is no longer a dumb balancer; it is a cache-aware scheduler, and getting its policy right is now a measurable fraction of total serving cost.</p>
+</div>
+<p>We have replicated the node, fronted it with a router that fills batches and respects the cache, and protected the tail with bounded waits and admission control. That gives us a fleet that serves a steady stream of low-latency requests efficiently. But not all inference is a steady stream of small requests: some workloads are enormous offline jobs that score billions of records overnight, where latency does not matter and throughput is everything. Serving those well on the same fleet, and knowing when to separate them, is a different optimization with its own routing and batching rules. <a href="section-23.3.html">Section 23.3</a> takes up online versus batch inference across a fleet.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.2.1: Occupancy Versus Utilization <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A teammate points at a dashboard showing every GPU in the fleet at 98 percent utilization and concludes the fleet is at capacity and needs more replicas. Using the distinction between utilization and batch occupancy from Section 2, explain how this conclusion can be wrong, and describe one additional metric you would put on the dashboard to tell "genuinely at capacity" apart from "running tiny batches at full clock". Relate your answer to the gap between the <code>gpu_fill</code> and the implied utilization in Output 23.2.1's round-robin row.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.2.2: Tune the Fill Wait <span class="exercise-type coding">Coding</span></div>
+<p>Starting from Code 23.2.1, sweep <code>FILL_WAIT_MS</code> over the values 0, 5, 10, 20, 40, and 80 for the <code>batch_aware</code> policy, and plot (or tabulate) mean batch fill, GPU busy-seconds, and p99 wait against the fill wait. Identify the knee where increasing the wait stops improving occupancy but keeps raising the tail. Then raise <code>ARRIVAL_RATE</code> to 0.6 req/ms (near capacity) and repeat: explain why the best fill wait is smaller under heavy load, using the fact that batches fill on their own when the queue is already deep.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.2.3: When Does Affinity Stop Helping? <span class="exercise-type analysis">Analysis</span></div>
+<p>Prefix-affinity wins in Output 23.2.1 because requests share a small pool of 50 prefixes and a cache miss costs <code>KV_MISS_MS</code> per uncached prefix. Reason about (and then verify in code) the two regimes where affinity stops paying: first, when <code>N_PREFIX</code> is very large so almost every request is a unique prefix (no reuse to exploit); second, when the offered load is so high that pinning sessions to specific replicas causes severe queue imbalance. For the second case, modify the affinity router to fall back to load balancing when the affinity target's backlog exceeds a threshold, and measure how much tail latency you recover and how much GPU efficiency you give back. Connect the trade-off to the admission-control discussion in Section 4.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-23.1.html"><span class="nav-label">Previous</span><span class="nav-num">Section 23.1</span><span class="nav-title">Why Model Serving Differs from Web Serving</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 23</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Inference Systems</span></a>
+<a class="next" href="section-23.3.html"><span class="nav-label">Next</span><span class="nav-num">Section 23.3</span><span class="nav-title">Online vs Batch Inference Across a Fleet</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

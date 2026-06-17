@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 16.1: When the Model No Longer Fits on One Device. Why data parallelism cannot cross the memory wall, the true training-memory budget of parameters, gradients, optimizer state, and activations, and the taxonomy of model-sharding fixes this chapter develops." name="description"/>
+<title>Section 16.1: When the Model No Longer Fits on One Device | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 16: Model, Pipeline, and Sharded Parallelism</a></div>
+<h1>When the Model No Longer Fits on One Device</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I held the whole model with room to spare. Then someone whispered the word 'optimizer,' and suddenly I was renting space I did not have."</p>
+<cite>A Shard That Believes It Is the Whole Model</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Data parallelism makes every worker faster, but it makes no worker bigger; the instant one copy of the model plus its training state exceeds a single accelerator's memory, replication stops working and the model itself has to be cut into pieces that live on different devices.</strong> Training memory is not just the parameters. It is the parameters, a gradient for every parameter, the optimizer's bookkeeping (which for Adam is two extra full-size tensors), and the activations saved for the backward pass, and that sum is roughly an order of magnitude larger than the weights alone. This section measures that budget exactly, shows precisely where it crosses the 40 GB and 80 GB lines of real accelerators, and lays out the four remedies this chapter develops: split the operators, split the layers, shard the state, and trade compute for memory.</p>
+</div>
+<p><a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a> gave us a powerful move: replicate the model on every worker, hand each worker a different slice of the batch, and combine the gradients with an all-reduce that is mathematically exact. That move scales throughput beautifully, and for any model that fits on one device it is usually the right first tool. It has one hard limit, and the limit has nothing to do with how many workers you own. Data parallelism keeps a full copy of the model, its gradients, and its optimizer state on each and every device. If that full copy does not fit on one device, adding a thousand more devices does not help at all, because each of those devices must still hold the whole thing. You have hit the memory wall, and crossing it is what this chapter is about.</p>
+<p>The confusion that traps newcomers is the gap between how big a model "is" and how much memory it takes to train. A model is often quoted by its parameter count, and a parameter in half precision is two bytes, so a seven-billion-parameter model sounds like a fourteen-gigabyte object that should slot comfortably into an 80 GB accelerator. It does not, and the reason is that training drags along several more tensors the size of the model, plus a pile of activations that grows with the batch and the sequence length. Before we name a single sharding technique, we have to see that budget clearly, because the budget is what forces every technique that follows.</p>
+
+<h2>1. The Wall Data Parallelism Cannot Cross <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Recall the structure of data-parallel training. There are $K$ workers; worker $k$ holds an identical replica of the model, computes a gradient on its own shard of the batch, and the workers all-reduce their gradients so that every replica takes the same optimizer step. The elegance is that the replicas stay in lockstep and the math is exact. The cost, the one that matters here, is that the per-device memory footprint of data parallelism is independent of $K$. Eight workers and eight thousand workers each store one complete copy of the parameters, the gradients, and the optimizer state. Data parallelism buys speed by spreading the batch; it buys nothing on the memory axis.</p>
+<p>This is why a model that overflows one device cannot be rescued by data parallelism alone. The remedy has to reduce what a single device must hold, and there are only a few ways to do that: give each device a different part of the model rather than the whole thing, or split the per-device state itself so no device stores all of any tensor. Both ideas require the model to be physically partitioned across devices, which is the defining feature of every method in this chapter and the reason model parallelism is a genuinely different discipline from the data parallelism of the previous chapter.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Data Parallelism Scales Speed, Not Capacity</div>
+<p>Adding data-parallel workers shrinks the time per epoch but never shrinks the memory each worker needs, because every worker stores a full replica of the model and its training state. The moment that replica exceeds one device's memory, you are out of the regime data parallelism can serve, and no number of additional workers changes that. Crossing the memory wall always means partitioning the model itself, never replicating it more.</p>
+</div>
+
+<h2>2. The Real Memory Budget of Training <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Let a model have $P$ parameters and let us train it with mixed precision and the Adam optimizer, the standard recipe for large models. Four distinct things consume accelerator memory, and it pays to count each one in bytes per parameter. First, the parameters used in the forward pass are stored in half precision, $2$ bytes each. Second, a gradient is produced for every parameter, also in half precision, another $2$ bytes. Third, the optimizer state: mixed-precision training keeps a full-precision master copy of the weights ($4$ bytes) so that tiny updates are not lost to rounding, and Adam additionally tracks a first moment $m$ and a second moment $v$, each a full-precision tensor the size of the model ($4 + 4$ bytes). That is $12$ bytes per parameter of optimizer and master state, the part that surprises people. Summing the model-state pieces,</p>
+$$M_{\text{state}} = \underbrace{2P}_{\text{weights (fp16)}} + \underbrace{2P}_{\text{grads (fp16)}} + \underbrace{12P}_{\text{master + Adam } m,\,v \text{ (fp32)}} = 16\,P \text{ bytes}.$$
+<p>So the model state alone is about $16$ bytes per parameter, eight times the naive "two bytes per parameter" intuition. A seven-billion-parameter model therefore needs roughly $112$ GB just for state, before a single activation is stored, which already overflows an 80 GB accelerator. The fourth consumer is the activations: the intermediate tensors saved during the forward pass so the backward pass can reuse them. Unlike the first three, activation memory does not scale with $P$; it scales with how much data is in flight. For a transformer it grows with the batch size $B$, the sequence length $S$, the hidden width $H$, and the number of layers $L$,</p>
+$$M_{\text{act}} \approx c \cdot B \cdot S \cdot H \cdot L,$$
+<p>where the constant $c$ collects the several intermediate tensors a transformer block keeps per token (a common rule of thumb puts $c$ near $34$ for a standard block without recomputation). The full training budget is $M_{\text{total}} = M_{\text{state}} + M_{\text{act}} = 16P + c\,BSHL$. The figure below draws this budget as four stacked bars against the capacity lines of real accelerators, so you can see at a glance which models cross which wall.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Stacked bar chart of training memory for four model sizes, each bar split into parameters, gradients, optimizer state, and activations, with horizontal dashed lines marking the 40 gigabyte and 80 gigabyte device capacities. Larger models tower far above both lines.">
+<defs>
+<style>
+.ax16 { stroke:#9aa3ad; stroke-width:1.2; }
+.cap16 { stroke:#c0392b; stroke-width:1.6; stroke-dasharray:7 5; }
+.t16 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s16 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.cl16 { font:600 11px sans-serif; fill:#c0392b; text-anchor:start; }
+.lg16 { font:11.5px sans-serif; fill:#14385c; text-anchor:start; }
+.par16 { fill:#4c78a8; } .grad16 { fill:#72b7b2; } .opt16 { fill:#e4a93c; } .act16 { fill:#b07aa1; }
+</style>
+</defs>
+<!-- y axis: 0 at y=300, scale 0.85 px per GB, clipped at 320 GB -->
+<line class="ax16" x1="70" y1="40" x2="70" y2="300"/>
+<line class="ax16" x1="70" y1="300" x2="760" y2="300"/>
+<!-- capacity lines: 40GB -> 300-34=266 ; 80GB -> 300-68=232 -->
+<line class="cap16" x1="70" y1="266" x2="760" y2="266"/>
+<text class="cl16" x="764" y="270">40 GB</text>
+<line class="cap16" x1="70" y1="232" x2="760" y2="232"/>
+<text class="cl16" x="764" y="236">80 GB</text>
+<text class="s16" x="34" y="304">0</text>
+<text class="s16" x="30" y="236">80</text>
+<text class="s16" x="26" y="180" transform="rotate(-90 26 180)">memory (GB)</text>
+<!-- 125M total 6.6: par .2 grad .2 opt 1.4 act 4.8 ; px=0.85 -->
+<g>
+<rect class="par16" x="120" y="299.83" width="70" height="0.17"/>
+<rect class="grad16" x="120" y="299.66" width="70" height="0.17"/>
+<rect class="opt16" x="120" y="298.47" width="70" height="1.19"/>
+<rect class="act16" x="120" y="294.39" width="70" height="4.08"/>
+<text class="t16" x="155" y="316">125 M</text>
+<text class="s16" x="155" y="330">6.6 GB</text>
+</g>
+<!-- 1.3B total 44.9: par 2.4 grad 2.4 opt 14.5 act 25.5 -->
+<g>
+<rect class="par16" x="230" y="297.96" width="70" height="2.04"/>
+<rect class="grad16" x="230" y="295.92" width="70" height="2.04"/>
+<rect class="opt16" x="230" y="283.59" width="70" height="12.33"/>
+<rect class="act16" x="230" y="261.91" width="70" height="21.68"/>
+<text class="t16" x="265" y="316">1.3 B</text>
+<text class="s16" x="265" y="330">44.9 GB</text>
+</g>
+<!-- 6.7B total 167.8 -> clipped. par 12.5 grad 12.5 opt 74.9 act 68.0 . draw to top y=40, mark clip -->
+<g>
+<rect class="par16" x="340" y="289.38" width="70" height="10.62"/>
+<rect class="grad16" x="340" y="278.76" width="70" height="10.62"/>
+<rect class="opt16" x="340" y="215.10" width="70" height="63.66"/>
+<rect class="act16" x="340" y="155.30" width="70" height="59.80"/>
+<rect class="act16" x="340" y="48" width="70" height="100" opacity="0.45"/>
+<text class="t16" x="375" y="316">6.7 B</text>
+<text class="s16" x="375" y="330">167.8 GB</text>
+<text class="s16" x="375" y="44">&#8593;</text>
+</g>
+<!-- 70B total 1383 -> far clipped -->
+<g>
+<rect class="opt16" x="450" y="48" width="70" height="252" opacity="0.75"/>
+<rect class="act16" x="450" y="48" width="70" height="80" opacity="0.45"/>
+<text class="t16" x="485" y="316">70 B</text>
+<text class="s16" x="485" y="330">1383 GB</text>
+<text class="s16" x="485" y="44">&#8593;</text>
+</g>
+<!-- legend -->
+<rect class="par16" x="600" y="60" width="14" height="14"/><text class="lg16" x="620" y="71">parameters (fp16)</text>
+<rect class="grad16" x="600" y="82" width="14" height="14"/><text class="lg16" x="620" y="93">gradients (fp16)</text>
+<rect class="opt16" x="600" y="104" width="14" height="14"/><text class="lg16" x="620" y="115">optimizer + master</text>
+<rect class="act16" x="600" y="126" width="14" height="14"/><text class="lg16" x="620" y="137">activations</text>
+<text class="s16" x="668" y="166" text-anchor="start" style="text-anchor:start">bars above the dashed</text>
+<text class="s16" x="668" y="180" text-anchor="start" style="text-anchor:start">lines cannot be trained</text>
+<text class="s16" x="668" y="194" text-anchor="start" style="text-anchor:start">on one device at all.</text>
+</svg>
+<figcaption><strong>Figure 16.1.1:</strong> The training-memory budget for four model sizes, each bar stacked into parameters, gradients, optimizer state, and activations, against the $40$ GB and $80$ GB capacity lines (dashed). The $125$ M model fits easily. The $1.3$ B model already overflows $40$ GB. The $6.7$ B and $70$ B bars (arrows mark where they run off the top) tower far above both lines, and notice how the orange optimizer slab dominates: it is the $12P$ bytes of master weights and Adam moments, not the parameters themselves, that drives the wall.</figcaption>
+</figure>
+
+<h2>3. Counting It Exactly, in Code <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The formula is more convincing when you watch it cross the device lines for real model sizes. The program below applies $M_{\text{total}} = 16P + 34\,BSHL$ to a ladder of transformer configurations, from a $125$ M model up to $70$ B, prints the four components in gigabytes, and flags whether each total fits on a $40$ GB or an $80$ GB accelerator. It closes by contrasting the naive two-bytes-per-parameter guess against the real training footprint for one model, to make the inflation factor concrete. It is pure Python and uses no accelerator; it is doing arithmetic on the same budget Figure 16.1.1 draws.</p>
+<pre><code class="language-python">GB = 1024 ** 3
+
+def breakdown(P, batch, seq, layers, hidden, bytes_per_param=2):
+    # Mixed-precision + Adam training-memory model, in bytes.
+    params_b = P * bytes_per_param   # fp16 weights used in the forward pass
+    grads_b  = P * 2                 # fp16 gradient, one per parameter
+    optim_b  = P * 12                # fp32 master weight + Adam m + Adam v (4+4+4)
+    # Activations of a transformer scale with batch * seq * hidden * layers.
+    act_b    = 34 * batch * seq * hidden * layers
+    total = params_b + grads_b + optim_b + act_b
+    return params_b, grads_b, optim_b, act_b, total
+
+configs = [   # name,    P,           layers, hidden, batch, seq
+    ("125 M",   125_000_000,   12,   768,  8, 2048),
+    ("1.3 B",  1_300_000_000,  24,  2048,  8, 2048),
+    ("6.7 B",  6_700_000_000,  32,  4096,  8, 2048),
+    ("13 B",   13_000_000_000, 40,  5120,  8, 2048),
+    ("30 B",   30_000_000_000, 48,  7168,  8, 2048),
+    ("70 B",   70_000_000_000, 80,  8192,  8, 2048),
+]
+
+for name, P, L, H, B, S in configs:
+    p, g, o, a, t = breakdown(P, B, S, L, H)
+    f40 = "yes" if t < 40 * GB else "NO"      # fits an A100-40GB?
+    f80 = "yes" if t < 80 * GB else "NO"      # fits an A100/H100-80GB?
+    print(f"{name:>7} | {p/GB:6.1f}G {g/GB:6.1f}G {o/GB:7.1f}G "
+          f"{a/GB:7.1f}G {t/GB:7.1f}G |  {f40:>3}   {f80:>3}")
+
+# The naive guess versus the truth, for the 6.7B model.
+_, _, _, _, t = breakdown(6_700_000_000, 8, 2048, 32, 4096)
+print(f"\nnaive 2B/param : {6_700_000_000*2/GB:.2f} GB")
+print(f"real training  : {t/GB:.2f} GB  ({t/(6_700_000_000*2):.1f}x larger)")
+</code></pre>
+<div class="code-caption"><strong>Code 16.1.1:</strong> A pure-Python training-memory calculator. Each row sums the four consumers from Section 2 and tests the total against the two capacity lines; the closing block exposes how far the real footprint sits above the two-bytes-per-parameter intuition.</div>
+<pre><code class="language-text">  125 M |    0.2G    0.2G     1.4G     4.8G     6.6G |  yes   yes
+  1.3 B |    2.4G    2.4G    14.5G    25.5G    44.9G |   NO   yes
+  6.7 B |   12.5G   12.5G    74.9G    68.0G   167.8G |   NO    NO
+   13 B |   24.2G   24.2G   145.3G   106.2G   300.0G |   NO    NO
+   30 B |   55.9G   55.9G   335.3G   178.5G   625.5G |   NO    NO
+   70 B |  130.4G  130.4G   782.3G   340.0G  1383.1G |   NO    NO
+
+naive 2B/param : 12.48 GB
+real training  : 167.84 GB  (13.4x larger)
+</code></pre>
+<div class="code-caption"><strong>Output 16.1.1:</strong> Only the $125$ M model fits on either device; the $1.3$ B model already overflows $40$ GB, and everything from $6.7$ B up overflows even $80$ GB by a wide margin. The $6.7$ B model that "should" be a $12.5$ GB object actually needs $167.8$ GB to train, $13.4$ times the naive guess, because optimizer state and activations dwarf the weights.</div>
+<p>Read the columns and the wall comes into focus. The optimizer column is the single largest contributor for every model above a billion parameters, exactly the $12P$ bytes the formula predicted, which is why simply sharding the optimizer state across devices (the subject of Section 16.4) buys the largest single win. Activations are the second giant, and they are the one term you can shrink by spending extra compute rather than extra memory, which is the trade Section 16.8 makes. The parameters and gradients, the parts people think of as "the model," are the two smallest slivers. A serious large-model training run is mostly storing the machinery of optimization, not the model.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Model Is the Smallest Thing in the Room</div>
+<p>It feels backwards, but in Output 16.1.1 the actual weights of the $70$ B model take $130$ GB while the optimizer takes $782$ GB. If the parameters were a person, the Adam moments and master copy would be that person's moving truck, packing crates, and inventory spreadsheet. Training is less about carrying the model and more about carrying everything you need to keep improving it.</p>
+</div>
+
+<h2>4. The Taxonomy of Fixes This Chapter Develops <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Every term in the budget $16P + 34\,BSHL$ points at a different way to fit a model that does not fit. There are four families of remedy, and the rest of this chapter is one family per cluster of sections. Table 16.1.1 names them, ties each to the part of the budget it attacks, and points to where the book develops it. The unifying idea is that each remedy partitions some tensor across devices so that no single device must hold all of it.</p>
+<div class="table-caption"><strong>Table 16.1.1:</strong> The four families of model-fitting remedy, the memory term each one attacks, and where this chapter develops it. Real large-model training stacks several of these together with the data parallelism of Chapter 15.</div>
+<table>
+<thead>
+<tr><th scope="col">Remedy</th><th scope="col">What it partitions</th><th scope="col">Budget term it attacks</th><th scope="col">Where</th></tr>
+</thead>
+<tbody>
+<tr><td>Tensor (operator) parallelism</td><td>Each layer's matrices, split across devices</td><td>Parameters, grads, activations of a layer</td><td><a href="section-16.2.html">Section 16.2</a></td></tr>
+<tr><td>Pipeline parallelism</td><td>Whole layers grouped into stages on different devices</td><td>Parameters, grads, optimizer per stage</td><td><a href="section-16.3.html">Section 16.3</a></td></tr>
+<tr><td>Sharded state (ZeRO / FSDP)</td><td>Optimizer, gradients, then parameters, sharded across data-parallel ranks</td><td>The $12P$ optimizer state first, then all $16P$</td><td>Sections 16.4 to 16.5</td></tr>
+<tr><td>Activation checkpointing</td><td>Nothing; recompute activations instead of storing them</td><td>The $34\,BSHL$ activation term</td><td>Section 16.8</td></tr>
+</tbody>
+</table>
+<p>The first remedy splits the operators. A single matrix multiply inside a layer is cut so that each device computes a slice of the output, and the slices are stitched with a collective; this is tensor parallelism, and <a href="section-16.2.html">Section 16.2</a> builds it from the matrix algebra up. The second remedy splits the layers: assign the first group of layers to device one, the next group to device two, and stream micro-batches through the resulting pipeline so the stages stay busy. The third remedy keeps the data-parallel structure of <a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a> but refuses to replicate the state; instead it shards the optimizer state, then the gradients, then the parameters across the data-parallel ranks, gathering each tensor only when a layer needs it. This is the ZeRO idea behind FSDP, and it is the direct descendant of the parameter-server sharding from <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a>. The fourth remedy is different in kind: it stores almost no activations and recomputes them during the backward pass, paying extra compute to reclaim the $34\,BSHL$ term.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Replication Gives Way to Partition</div>
+<p>Chapter 15 distributed training by replicating the model and partitioning the data; the collective that held it together was all-reduce. This chapter turns the dial the other way. To cross the memory wall we partition the model and accept that no device holds the whole thing, which makes new collectives essential: reduce-scatter and all-gather to shard and regather state in ZeRO and FSDP (Section 16.4), and point-to-point sends to pass activations between pipeline stages (Section 16.3). The primitives first met in <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> are exactly the tools that make a partitioned model behave like one coherent model, just as all-reduce made replicated workers behave like one.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: estimate_zero_per_gpu_memory in One Call</div>
+<p>The hand calculation in Code 16.1.1 is the same arithmetic production tooling does for you before you launch. DeepSpeed ships a memory estimator that reports, for a given parameter count and number of GPUs, how much memory each ZeRO stage would need per device, so you can pick a sharding strategy without trial and error:</p>
+<pre><code class="language-python"># pip install deepspeed
+from deepspeed.runtime.zero.stage3 import estimate_zero3_model_states_mem_needs_all_live
+import torch.nn as nn
+
+model = nn.Transformer(d_model=4096, num_encoder_layers=32, num_decoder_layers=0)
+# Prints per-GPU memory for ZeRO-3 across 1, 8, 64 ... GPUs, with and
+# without optimizer/parameter offload to CPU.
+estimate_zero3_model_states_mem_needs_all_live(model, num_gpus_per_node=8, num_nodes=1)
+</code></pre>
+<div class="code-caption"><strong>Code 16.1.2:</strong> The roughly twenty lines of budget arithmetic in Code 16.1.1 collapse to a single DeepSpeed call that sweeps the same $16P$ state across ZeRO stages and device counts. The library handles the per-stage sharding math, the offload accounting, and the gradient-bucket overhead that Sections 16.4 and 16.5 unpack.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The 7B Model That Refused to Load</div>
+<p><strong>Who:</strong> A research engineer at a startup fine-tuning an open-weights $6.7$ B language model on domain text.</p>
+<p><strong>Situation:</strong> The team had a single node with eight $40$ GB A100s and assumed that, since the half-precision weights were only about $13$ GB, the model would train comfortably on one GPU with the rest free for a big batch.</p>
+<p><strong>Problem:</strong> The job hit an out-of-memory error before the first step finished, even with a batch size of one. The $13$ GB model was demanding far more than $40$ GB the moment the optimizer was constructed.</p>
+<p><strong>Dilemma:</strong> Rent $80$ GB GPUs at a premium and hope one is enough, drop to a worse optimizer to save state, or partition the model across the eight GPUs they already owned.</p>
+<p><strong>Decision:</strong> They ran the Code 16.1.1 budget first and saw the real footprint was about $168$ GB, more than four $40$ GB GPUs even before a generous batch. No single $80$ GB GPU would have fixed it either. The numbers said partition, not upgrade.</p>
+<p><strong>How:</strong> They wrapped the model in FSDP (the ZeRO-3 idea of Section 16.5) to shard the $16P$ state across all eight GPUs, and turned on activation checkpointing to cut the $34\,BSHL$ term, exactly the two remedies Table 16.1.1 points at for the optimizer and activation columns.</p>
+<p><strong>Result:</strong> The sharded job fit with room for a batch of $16$, on the hardware they already had, at no extra rental cost. The per-GPU state dropped to roughly one eighth of the unsharded figure.</p>
+<p><strong>Lesson:</strong> Compute the full $16P + 34\,BSHL$ budget before you reach for a bigger GPU. The bottleneck is almost never the weights, so the fix is almost always to partition the optimizer state and activations, not to buy more memory per device.</p>
+</div>
+
+<h2>5. Why This Is the Right Time to Pay the Cost <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Partitioning a model is not free, and it is worth being honest about what it costs so the remedies do not look like magic. Splitting a layer's matrices across devices (tensor parallelism) inserts a collective into the forward and backward pass of every layer, so it demands a fast intra-node interconnect and usually stays inside one machine. Splitting layers into pipeline stages introduces idle time, the "bubble" while the pipeline fills and drains, which Section 16.3 quantifies and works to shrink. Sharding the state with ZeRO and FSDP trades memory for extra all-gather traffic, because a parameter sharded away must be gathered back before the layer that needs it can run. Activation checkpointing trades memory for recomputation, typically adding around a third more compute. Every remedy moves load off the memory axis and onto the communication or compute axis, which is the same fundamental tradeoff the performance models of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a> taught you to weigh.</p>
+<p>The reason to pay these costs is simply that the alternative is not training the model at all. For any model past a few billion parameters the budget in Output 16.1.1 makes data parallelism impossible on its own, so the question is never "partition or replicate?" but "which partition, and how do they combine?" Real foundation-model training, the subject of <a href="../module-19-training-foundation-models/index.html">Chapter 19</a>, stacks all four remedies of Table 16.1.1 together with the data parallelism of Chapter 15 into a single configuration, often called 3D or 4D parallelism. This chapter builds those remedies one at a time so that, by the end, that stacked configuration reads as a deliberate set of choices rather than a wall of acronyms.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Pushing the Wall Outward (2024 to 2026)</div>
+<p>Because the memory wall sets the ceiling on what a given cluster can train, several active lines work to lower the budget itself. Fully Sharded Data Parallel matured into PyTorch's native <code>FSDP2</code> with per-parameter sharding and cleaner composition with tensor parallelism, narrowing the gap to DeepSpeed ZeRO. On the optimizer term specifically, memory-efficient optimizers such as GaLore (Zhao et al., 2024), which projects gradients into a low-rank subspace, and the Adam-Mini family report training large models while storing a small fraction of the $12P$ Adam state, attacking the orange slab that dominates Figure 16.1.1. On the activation term, FlashAttention-style fused kernels keep the attention activation footprint near linear in sequence length, and selective recomputation chooses which activations to checkpoint by cost. The throughline is that the $16P + 34\,BSHL$ budget of this section is treated as an engineering target to be driven down, not a constant of nature; we revisit the optimizer side with the machinery to evaluate it in <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a>.</p>
+</div>
+<p>We now have the wall (data parallelism cannot grow a device), the measurement (the $16P + 34\,BSHL$ budget, crossing $40$ GB and $80$ GB exactly where Output 16.1.1 says), and the map (the four remedies of Table 16.1.1). The first remedy reaches inside a single layer and splits its matrices across devices so that even one layer too large for one accelerator can run. That is tensor parallelism, and it begins in <a href="section-16.2.html">Section 16.2</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.1.1: Which Remedy for Which Term? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the budget $16P + 34\,BSHL$ and Table 16.1.1, decide which remedy you would reach for first in each case, and say which budget term binds: (a) a model whose parameters alone are too large for one device even at a batch size of one; (b) a model that fits but only if you could halve the optimizer state; (c) a model that fits at a short sequence length but overflows when you quadruple the sequence length with the batch held fixed. Explain why applying the wrong remedy would leave the binding term untouched.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.1.2: Shard the Budget <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 16.1.1 with a function <code>per_device(P, batch, seq, layers, hidden, world_size, stage)</code> that returns the per-device memory under ideal ZeRO sharding, where <code>stage=1</code> shards only the $12P$ optimizer state across <code>world_size</code> devices, <code>stage=2</code> additionally shards the $2P$ gradients, and <code>stage=3</code> shards all of the $16P$ state (activations stay per device). For the $6.7$ B configuration, print the per-device total for stages $1$, $2$, $3$ at <code>world_size</code> in $\{8, 16, 64\}$, and report the smallest world size at each stage that brings the per-device total under $40$ GB. Comment on which stage first makes the model trainable on $40$ GB hardware.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.1.3: The Cost of Recomputation <span class="exercise-type analysis">Analysis</span></div>
+<p>Activation checkpointing replaces the $34\,BSHL$ activation term with a much smaller stored footprint (roughly the activations at stage boundaries) at the price of recomputing the forward pass during the backward pass, adding about $33\%$ more compute. For the $13$ B configuration in Output 16.1.1, estimate the new total memory if checkpointing cuts the activation term to one tenth of its stored value, and state whether that alone brings the model under $80$ GB. Then argue, using the compute-versus-memory framing of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>, when paying $33\%$ more compute to save activation memory is worthwhile and when it is not.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html"><span class="nav-label">Chapter Overview</span><span class="nav-num">Chapter 16</span><span class="nav-title">Model, Pipeline, and Sharded Parallelism</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 16</span><span class="nav-num">Contents</span><span class="nav-title">Model, Pipeline, and Sharded Parallelism</span></a>
+<a class="next" href="section-16.2.html"><span class="nav-label">Next</span><span class="nav-num">Section 16.2</span><span class="nav-title">Tensor Parallelism</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

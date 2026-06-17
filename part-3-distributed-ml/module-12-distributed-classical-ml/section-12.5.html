@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 12.5: Distributed Gradient Boosting. Why boosted trees cannot be parallelized across trees, how XGBoost and LightGBM all-reduce gradient and Hessian histograms within each round to find splits, and why gradient-boosted trees still win on tabular data." name="description"/>
+<title>Section 12.5: Distributed Gradient Boosting | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Distributed Machine Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 12: Distributed Classical Machine Learning</a></div>
+<h1>Distributed Gradient Boosting</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Each of us learns only what the trees before us got wrong. You cannot rush ahead and fix a mistake that has not been made yet."</p>
+<cite>A Boosting Round Waiting Its Turn</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Gradient-boosted decision trees are the workhorse of tabular machine learning, and they scale in a way that is the exact opposite of the random forest you just met: the trees cannot be built in parallel, so all the parallelism has to happen inside each tree.</strong> Boosting adds trees one at a time, and every tree is fit to the residual mistakes of the ensemble so far. That sequential dependence kills the embarrassingly parallel trick that made random forests (Section 12.4) easy to distribute. The systems that conquered this, XGBoost and LightGBM, instead parallelize <em>within</em> a round: each worker holds a shard of the data, builds a histogram of gradients and Hessians over its rows, and the cluster all-reduces those histograms so every worker picks the same split from the same global statistics. This section shows why the math forces that design, proves with a runnable demo that the distributed answer equals the single-machine one, and explains why these models still beat deep networks on most tables of numbers.</p>
+</div>
+<p>The previous section built random forests, where hundreds of trees are grown independently on bootstrap samples and then averaged. Independence is what made them trivial to distribute: hand each worker a subset of trees, grow them in isolation, collect the forest at the end, and never communicate during training. Gradient boosting throws that gift away. It also grows many trees, but it grows them in a strict sequence, each one correcting the ensemble that precedes it. You cannot grow tree number fifty until trees one through forty-nine exist, because tree fifty is defined entirely by their collective error. The parallelism that distributes boosting therefore lives at a completely different level, and finding it is the whole story of this section.</p>
+
+<h2>1. Why Boosting Refuses to Parallelize Across Trees <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Gradient boosting builds an additive model. After $t-1$ rounds the ensemble predicts a score $F_{t-1}(x)$, and round $t$ adds one more tree $f_t$ scaled by a learning rate $\eta$, so that $F_t(x) = F_{t-1}(x) + \eta\, f_t(x)$. The new tree is not fit to the labels; it is fit to how wrong the current ensemble is. Concretely, for a differentiable loss $\ell(y, F)$ we compute, for every training example, the first and second derivatives of the loss with respect to the current score,</p>
+$$g_i = \frac{\partial \ell(y_i, F_{t-1}(x_i))}{\partial F_{t-1}(x_i)}, \qquad h_i = \frac{\partial^2 \ell(y_i, F_{t-1}(x_i))}{\partial F_{t-1}(x_i)^2},$$
+<p>the gradient $g_i$ and the Hessian $h_i$. The tree $f_t$ is then grown to predict a step that reduces a second-order Taylor approximation of the loss around the current scores. The dependence is total: $g_i$ and $h_i$ are functions of $F_{t-1}$, which is the sum of every tree built so far. Change one earlier tree and every later gradient changes. This is exactly the sequential structure of the synchronous-versus-asynchronous trade-off introduced in <a href="../module-10-distributed-optimization/index.html">Chapter 10</a>, except here the sequence is intrinsic to the algorithm rather than a choice about how to schedule updates.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Parallelism Moved Down a Level</div>
+<p>Random forests parallelize across trees because the trees are independent; boosting cannot, because each tree depends on all previous trees through the gradient. So distributed boosting moves the parallelism down one level: trees are still built one after another, but the construction of <em>each single tree</em> is distributed across the cluster. The unit of parallel work is no longer "a tree" but "a split-finding pass within a tree", and the way you parallelize that pass is the distributed histogram method from Section 12.3, run once per boosting round.</p>
+</div>
+
+<h2>2. Splitting on Gradients: the Histogram Inside Each Round <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Inside one round, growing the tree means repeatedly choosing the best feature and threshold to split a node. Boosting scores a candidate split not by Gini impurity or variance, as an ordinary decision tree would, but by how much it reduces the second-order loss. If a node holds a set of examples and a candidate split sends some to the left child and the rest to the right, define $G = \sum g_i$ and $H = \sum h_i$ summed over the examples in a child. The standard XGBoost split gain is</p>
+$$\text{gain} = \frac{1}{2}\left[\frac{G_L^2}{H_L + \lambda} + \frac{G_R^2}{H_R + \lambda} - \frac{(G_L + G_R)^2}{H_L + H_R + \lambda}\right] - \gamma,$$
+<p>where $\lambda$ is an $L_2$ regularizer on leaf weights and $\gamma$ is a complexity penalty per split. The optimal weight assigned to a leaf holding totals $(G, H)$ is $w^\star = -G / (H + \lambda)$. The crucial observation for distribution is that the gain depends on the data only through the sums $G_L, H_L, G_R, H_R$. To evaluate every candidate threshold for a feature, you do not need the raw rows; you need the gradient sum and Hessian sum in each bin of that feature. That is precisely a histogram: bin the feature values once, then accumulate $g_i$ and $h_i$ into per-bin buckets. Sweeping the bins left to right gives every candidate split's $(G_L, H_L)$ as a running prefix sum, so one pass over a histogram of $B$ bins evaluates all $B-1$ thresholds.</p>
+<p>This is where the data-parallel structure of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> reappears. A histogram is additive: the global gradient/Hessian histogram over all rows equals the sum of the per-shard histograms, exactly as the global gradient in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a> was the sum of per-shard partial gradients. So each worker bins its own shard, builds a small local histogram of size (number of features $\times$ number of bins), and the cluster all-reduces those histograms. After the all-reduce every worker holds the identical global histogram and therefore independently picks the identical best split, with no further communication. Figure 12.5.1 traces the full pattern: trees in sequence, and within each tree a single all-reduce of histograms across the shards.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 860 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram showing gradient boosting as a left-to-right sequence of tree-building rounds, with one round expanded to reveal three data shards each building a local gradient and Hessian histogram, an all-reduce step summing them into one global histogram, and a split chosen from that global histogram.">
+<defs>
+<marker id="arr125" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b125 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w125 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.r125 { fill:#eaf3ec; stroke:#2f6b46; stroke-width:1.6; }
+.t125 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s125 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l125 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr125); }
+.d125 { fill:none; stroke:#9aa3ad; stroke-width:1.4; stroke-dasharray:4 3; }
+</style>
+<text class="t125" x="430" y="24">Boosting is sequential across rounds: each tree fits the gradient of the ensemble so far</text>
+<rect class="b125" x="40" y="44" width="92" height="46" rx="8"/>
+<text class="t125" x="86" y="64">Tree 1</text>
+<text class="s125" x="86" y="80">round 1</text>
+<line x1="132" y1="67" x2="172" y2="67" class="l125"/>
+<rect class="b125" x="172" y="44" width="92" height="46" rx="8"/>
+<text class="t125" x="218" y="64">Tree 2</text>
+<text class="s125" x="218" y="80">round 2</text>
+<line x1="264" y1="67" x2="304" y2="67" class="l125"/>
+<rect class="b125" x="304" y="44" width="92" height="46" rx="8" style="stroke-width:2.4"/>
+<text class="t125" x="350" y="64">Tree t</text>
+<text class="s125" x="350" y="80">round t</text>
+<line x1="396" y1="67" x2="436" y2="67" class="l125"/>
+<text class="t125" x="470" y="71">...</text>
+<line x1="490" y1="67" x2="530" y2="67" class="l125"/>
+<rect class="b125" x="530" y="44" width="92" height="46" rx="8"/>
+<text class="t125" x="576" y="64">Tree T</text>
+<text class="s125" x="576" y="80">round T</text>
+<line x1="350" y1="92" x2="350" y2="120" class="d125"/>
+<line x1="430" y1="92" x2="430" y2="120" class="d125"/>
+<text class="s125" x="430" y="112">one round, expanded: parallelism lives inside the tree</text>
+<rect class="w125" x="60" y="150" width="150" height="70" rx="8"/>
+<text class="t125" x="135" y="174">Worker 1 / shard 1</text>
+<text class="s125" x="135" y="194">bin rows, build local</text>
+<text class="s125" x="135" y="210">(g, h) histogram</text>
+<rect class="w125" x="240" y="150" width="150" height="70" rx="8"/>
+<text class="t125" x="315" y="174">Worker 2 / shard 2</text>
+<text class="s125" x="315" y="194">bin rows, build local</text>
+<text class="s125" x="315" y="210">(g, h) histogram</text>
+<rect class="w125" x="420" y="150" width="150" height="70" rx="8"/>
+<text class="t125" x="495" y="174">Worker K / shard K</text>
+<text class="s125" x="495" y="194">bin rows, build local</text>
+<text class="s125" x="495" y="210">(g, h) histogram</text>
+<rect class="r125" x="230" y="280" width="200" height="56" rx="8"/>
+<text class="t125" x="330" y="304">All-reduce histograms</text>
+<text class="s125" x="330" y="322">sum per-bin g and h across shards</text>
+<path class="l125" d="M 135 220 L 135 258 L 318 258 L 318 278"/>
+<path class="l125" d="M 315 220 L 315 278"/>
+<path class="l125" d="M 495 220 L 495 258 L 342 258 L 342 278"/>
+<rect class="b125" x="600" y="282" width="200" height="52" rx="8"/>
+<text class="t125" x="700" y="304">Pick split by gain</text>
+<text class="s125" x="700" y="322">same global histogram, same split</text>
+<line x1="430" y1="308" x2="596" y2="308" class="l125"/>
+<path class="d125" d="M 700 282 L 700 110 L 396 110 L 372 90"/>
+<text class="s125" x="700" y="360">every worker holds the identical global histogram, so all pick the same threshold</text>
+<text class="s125" x="700" y="378">no raw rows are ever shipped, only the small per-feature histograms</text>
+</svg>
+<figcaption><strong>Figure 12.5.1:</strong> Distributed gradient boosting has two nested loops. The outer loop (top) is strictly sequential: tree $t$ cannot start until tree $t-1$ has updated the ensemble, because the gradients of round $t$ depend on it. The inner loop (bottom, one round expanded) is where the cluster parallelizes: each of the $K$ workers builds a local gradient/Hessian histogram over its data shard, a single all-reduce sums them into one global histogram, and every worker then picks the identical split. Only the compact histograms cross the network, never the raw rows.</figcaption>
+</figure>
+
+<h2>3. A Runnable Distributed Boosting Round <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The code below implements a few rounds of gradient boosting from scratch in pure NumPy, with the split-finding step distributed exactly as Figure 12.5.1 describes. To keep the geometry visible we use a single numeric feature, bin it into a shared quantile sketch once, and grow a one-split stump per round (the depth-one case shows the all-reduce without burying it in tree-recursion bookkeeping). Each round computes the log-loss gradient $g_i = p_i - y_i$ and Hessian $h_i = p_i(1-p_i)$ at the current scores, every shard builds its local histogram, the histograms are summed (the all-reduce), and the global histogram drives the split gain and leaf weights from Section 2. A second function repeats the same boosting over all the data in one pass, with no shards, so we can check the two agree.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+N, K, ROUNDS, BINS = 4000, 4, 6, 16
+LR, LAMBDA = 0.3, 1.0
+
+# One numeric feature, a non-linear target -> binary labels.
+x = rng.uniform(-3.0, 3.0, N)
+prob = 1.0 / (1.0 + np.exp(-(1.5 * np.sin(1.3 * x) + 0.6 * x)))
+y = (rng.uniform(size=N) &lt; prob).astype(np.float64)
+
+# Shared bin edges (a pre-agreed quantile sketch). Each example -> a bin id.
+edges = np.quantile(x, np.linspace(0, 1, BINS + 1))
+bin_id = np.clip(np.digitize(x, edges[1:-1]), 0, BINS - 1)
+shards = np.array_split(np.arange(N), K)             # K disjoint data shards
+
+def best_split_from_hist(g_hist, h_hist, lam):       # sweep bins, max the gain
+    G_tot, H_tot = g_hist.sum(), h_hist.sum()
+    best_b, best_gain, GL, HL = -1, -np.inf, 0.0, 0.0
+    for b in range(BINS - 1):
+        GL += g_hist[b]; HL += h_hist[b]
+        GR, HR = G_tot - GL, H_tot - HL
+        gain = GL*GL/(HL+lam) + GR*GR/(HR+lam) - G_tot*G_tot/(H_tot+lam)
+        if gain > best_gain: best_gain, best_b = gain, b
+    return best_b, best_gain
+
+def fit_distributed():
+    F = np.zeros(N)                                  # ensemble score, all examples
+    for r in range(ROUNDS):
+        p = 1.0 / (1.0 + np.exp(-F))
+        grad, hess = p - y, p * (1 - p)              # log-loss gradient and Hessian
+        # ---- each shard builds a LOCAL gradient/Hessian histogram over bins ----
+        g_local = np.zeros((K, BINS)); h_local = np.zeros((K, BINS))
+        for k, s in enumerate(shards):
+            np.add.at(g_local[k], bin_id[s], grad[s])
+            np.add.at(h_local[k], bin_id[s], hess[s])
+        # ---- ALL-REDUCE: sum the per-shard histograms into ONE global one ----
+        g_hist, h_hist = g_local.sum(axis=0), h_local.sum(axis=0)
+        b, gain = best_split_from_hist(g_hist, h_hist, LAMBDA)
+        GL, HL = g_hist[:b+1].sum(), h_hist[:b+1].sum()
+        GR, HR = g_hist[b+1:].sum(), h_hist[b+1:].sum()
+        wL, wR = -GL/(HL+LAMBDA), -GR/(HR+LAMBDA)    # optimal leaf weights
+        F = F + LR * np.where(bin_id &lt;= b, wL, wR)   # add the stump to the ensemble
+        p = np.clip(1/(1+np.exp(-F)), 1e-12, 1-1e-12)
+        loss = float(np.mean(-(y*np.log(p) + (1-y)*np.log(1-p))))
+        print(f"round {r+1}: split@bin {b:2d}  gain {gain:8.2f}  "
+              f"leaf(L,R)=({wL:+.3f},{wR:+.3f})  log-loss {loss:.5f}")
+    return F</code></pre>
+<div class="code-caption"><strong>Code 12.5.1:</strong> One distributed boosting round, from scratch. The only communication is <code>g_local.sum(axis=0)</code> and <code>h_local.sum(axis=0)</code>, which stand in for the all-reduce of the per-shard histograms; on a real cluster those two sums travel over the network and every other line runs locally on each worker.</div>
+<p>Running it prints the per-round log-loss and then compares the distributed final scores against a single-machine baseline that boosts over all the rows in one pass.</p>
+<pre><code class="language-text">data N=4000  shards K=4  rounds=6  bins=16
+start log-loss      : 0.69315
+
+round 1: split@bin  7  gain  1597.03  leaf(L,R)=(-1.287,+1.238)  log-loss 0.59115
+round 2: split@bin  8  gain   821.44  leaf(L,R)=(-0.832,+1.025)  log-loss 0.53857
+round 3: split@bin  6  gain   490.42  leaf(L,R)=(-0.846,+0.636)  log-loss 0.50717
+round 4: split@bin  7  gain   288.66  leaf(L,R)=(-0.598,+0.569)  log-loss 0.48867
+round 5: split@bin  8  gain   167.70  leaf(L,R)=(-0.409,+0.522)  log-loss 0.47794
+round 6: split@bin  6  gain   101.94  leaf(L,R)=(-0.439,+0.312)  log-loss 0.47141
+
+final log-loss (K=4 shards, all-reduced) : 0.47141
+final log-loss (single machine)            : 0.47141
+max abs score difference                   : 1.78e-15</code></pre>
+<div class="code-caption"><strong>Output 12.5.1:</strong> The log-loss drops every round as boosting corrects its own residuals, and the four-shard all-reduced model matches the single-machine model to $1.78 \times 10^{-15}$, the floating-point rounding floor. Summing histograms across shards changes the result by nothing that matters, just as summing partial gradients did in Section 1.1.</div>
+<p>The agreement to fifteen decimal places is the same exactness guarantee that data parallelism gave us for gradient descent, now riding on the additivity of histograms instead of the additivity of gradients. The workers never share rows; they share a sum of small per-bin statistics, and the resulting splits are bit-for-bit the ones a single machine would have chosen. That is what lets a distributed XGBoost or LightGBM job claim it produces the same model as its single-node counterpart, only faster and on data that would never fit on one box.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: One All-Reduce, A Third Method Built On It</div>
+<p>The all-reduce of Section 1.1 keeps earning its keep. It summed partial gradients for data-parallel training, <a href="../module-10-distributed-optimization/index.html">Chapter 10</a> formalized that synchronous step for distributed optimization, and here it sums partial <em>histograms</em> so that boosted trees pick splits from global statistics. Three different learning algorithms, one collective. When you meet a distributed classical-ML method, the productive question is always the same one Section 1.1 posed: which quantity is additive across shards, and therefore which collective combines it? For boosting the answer is the gradient/Hessian histogram, all-reduced once per round.</p>
+</div>
+
+<h2>4. Data-Parallel and Feature-Parallel Modes <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Code 12.5.1 distributes by rows, the <strong>data-parallel</strong> mode: each worker owns a shard of examples, builds histograms over its rows, and the cluster all-reduces. This is the default in distributed XGBoost and LightGBM because the communication volume per round depends only on the histogram size (features $\times$ bins), not on the number of rows, so it scales to enormous datasets. There is a second axis. In <strong>feature-parallel</strong> mode each worker owns a subset of the columns, finds the best split among its own features, and the workers exchange only their local best splits to agree on a global winner; the chosen split then has to be broadcast so everyone can partition their rows. Feature parallelism helps when there are very many features but it forces the workers to communicate row-partitioning information every split, which is why row partitioning dominates in practice. Real systems combine both, and they overlap the histogram all-reduce with computation just as the communication-avoiding training of <a href="../module-10-distributed-optimization/index.html">Chapter 10</a> overlaps gradient all-reduce with the backward pass.</p>
+<p>The two flagship systems made boosting scale through a stack of complementary ideas. <strong>XGBoost</strong> introduced an approximate split-finding algorithm that proposes candidate thresholds from a weighted quantile sketch (weighting each example by its Hessian $h_i$, because high-Hessian points matter more to the second-order objective), plus a sparsity-aware split finder that learns a default direction for missing values and skips absent entries, which is what lets it tear through sparse one-hot and click data. <strong>LightGBM</strong> pushed the histogram idea further with leaf-wise (best-first) tree growth instead of level-wise, gradient-based one-side sampling (GOSS), which keeps all the large-gradient examples and subsamples the small-gradient ones to shrink the per-round work, and exclusive feature bundling (EFB), which packs mutually-exclusive sparse features into a single column to cut the histogram cost. All of these accelerate the same inner loop: build histograms, all-reduce them, split.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Fraud Model That Outgrew One Machine</div>
+<p><strong>Who:</strong> A data scientist on the risk team at a payments processor.</p>
+<p><strong>Situation:</strong> A gradient-boosted fraud model trained on a single 64-core machine with single-node XGBoost, on 40 million transactions with 300 engineered features.</p>
+<p><strong>Problem:</strong> The training table grew past 400 million rows after a merger, and the histograms plus the feature matrix no longer fit in one machine's memory; training started swapping to disk and a single fit ballooned past nine hours.</p>
+<p><strong>Dilemma:</strong> Subsample the data back down to what one machine could hold, accepting a weaker model on the rare fraud cases, or move to distributed training across a cluster and keep every row.</p>
+<p><strong>Decision:</strong> They kept every row and switched to data-parallel distributed boosting across eight workers, because fraud lives in the tail and subsampling would have thrown away the positive examples that mattered most.</p>
+<p><strong>How:</strong> They sharded the transactions across eight nodes, switched the XGBoost training call to its distributed backend, and let the framework all-reduce the gradient/Hessian histograms each round; the feature engineering and scoring code did not change.</p>
+<p><strong>Result:</strong> A full fit dropped to about 70 minutes, the model used all 400 million rows, and a held-out check confirmed the distributed model scored identically to a single-machine fit on a subset, exactly as Output 12.5.1 predicts for the split decisions.</p>
+<p><strong>Lesson:</strong> When the binding ceiling is data volume and the model is a boosted tree, do not subsample to fit one machine; all-reduce the histograms across many and keep the tail your model is there to catch.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: xgboost and lightgbm Distribute the Histogram for You</div>
+<p>Code 12.5.1 built and summed histograms by hand. In production you describe the data and ask for a distributed fit; the framework shards the rows, builds the per-worker histograms, all-reduces them every round, and grows full multi-level trees with regularization, early stopping, and missing-value handling. Both major libraries expose a one-call distributed mode (illustrative usage shown here):</p>
+<pre><code class="language-python"># XGBoost on a Dask cluster: rows are sharded, histograms all-reduced per round.
+import xgboost as xgb
+from xgboost import dask as dxgb
+
+dtrain = dxgb.DaskDMatrix(client, X, y)            # X, y are distributed Dask arrays
+out = dxgb.train(client, {"tree_method": "hist", "objective": "binary:logistic",
+                          "eta": 0.3, "lambda": 1.0},
+                 dtrain, num_boost_round=200)       # cluster all-reduces histograms
+
+# LightGBM in data-parallel mode (one process per worker):
+import lightgbm as lgb
+params = {"objective": "binary", "tree_learner": "data",   # data-parallel histograms
+          "num_leaves": 63, "learning_rate": 0.05}
+booster = lgb.train(params, lgb.Dataset(X_local, y_local), num_boost_round=200)</code></pre>
+<div class="code-caption"><strong>Code 12.5.2:</strong> The roughly thirty lines of manual histogram building, all-reduce, and split scoring in Code 12.5.1 collapse to a single <code>train</code> call. The library owns the histogram all-reduce, the quantile sketch, the sparsity-aware splits, and the tree recursion that Section 2 only sketched at depth one.</div>
+</div>
+
+<h2>5. Why Boosted Trees Still Beat Deep Nets on Tables <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>It is worth asking why this fifteen-year-old family of models remains the default for tabular problems when deep learning has swept image, text, and audio. Tabular data is heterogeneous: columns mix scales, units, and meanings, many features are uninformative, and the useful signal often sits in sharp, axis-aligned thresholds ("flag the transaction if amount exceeds X and the account age is under Y"). Decision trees model exactly those axis-aligned, non-smooth interactions natively, while a neural network must learn them through smooth compositions of weighted sums, which is a harder fit on the modest dataset sizes typical of tabular problems. Boosting then squeezes the residual signal out greedily, round after round. The result is a model that needs little preprocessing, tolerates irrelevant and correlated features, handles missing values directly, and trains fast. For the great majority of business tables, that combination still wins on accuracy per unit of engineering effort, which is why distributing boosting well, rather than replacing it, is the high-value move.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Leaderboard Tells On Us</div>
+<p>For years the running joke at tabular-data competitions was that the winning solution is a gradient-boosted tree, the second place is a different gradient-boosted tree, and the elaborate deep-learning entry is somewhere on page two of the leaderboard wondering where its embeddings went wrong. The joke endures because it keeps being roughly true on structured data.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Deep Tabular Learning and In-Context Tables (2024 to 2026)</div>
+<p>The "trees still win on tables" verdict is under active, well-funded assault. Large benchmark studies (Grinsztajn et al. and follow-ups through 2024 to 2025) keep finding that tuned gradient-boosted trees match or beat deep tabular networks on most medium-sized datasets, while a parallel line tries to close the gap. The most striking recent entry is <strong>TabPFN</strong> (Hollmann et al., the v2 published in <em>Nature</em>, 2025), a transformer pre-trained on millions of synthetic tabular tasks that performs Bayesian-style in-context prediction in a single forward pass, no per-dataset training, and reports state-of-the-art accuracy on small and medium tables, with active 2025 work extending it past its original size limits and toward distributed and out-of-core inference. Whether such foundation-model-for-tables approaches finally dethrone boosting on large data, where the all-reduced histogram machinery of this section still rules, is one of the open empirical questions of distributed classical ML right now.</p>
+</div>
+<p>With boosting distributed by all-reducing histograms inside each round, we have now covered the three big supervised tree families: single trees (Section 12.3), forests of independent trees (Section 12.4), and the sequential, communication-coupled boosted ensemble here. The chapter turns next from supervised prediction to unsupervised structure. <a href="section-12.6.html">Section 12.6</a> distributes clustering, where the quantity that becomes additive across shards is no longer a gradient or a histogram but the per-cluster point sums that define each centroid.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 12.5.1: Why Not Just Distribute the Trees? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Random forests (Section 12.4) distribute by handing each worker a subset of trees to grow independently, with no communication during training. Explain precisely why the identical strategy fails for gradient boosting: which quantity that worker $k$ needs to grow "its" tree is unavailable until the other workers' trees exist? Then state what boosting distributes <em>instead</em> of trees, and identify the one collective operation it relies on per round, naming the additive quantity that collective combines.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 12.5.2: Grow a Real Tree, Not a Stump <span class="exercise-type coding">Coding</span></div>
+<p>Code 12.5.1 grows a depth-one stump each round. Extend <code>fit_distributed</code> to grow a depth-two tree per round: after the root split, build a fresh gradient/Hessian histogram for each child node (over only the rows that fall into it), all-reduce each child's histogram across the shards, and pick a second-level split per child. Confirm that your distributed depth-two model still matches a single-machine depth-two baseline to floating-point precision, and report how the per-round log-loss compares to the stump version. Explain why the number of all-reduces per round now grows with the number of nodes at the deepest level being split.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 12.5.3: Communication Cost of a Boosting Round <span class="exercise-type analysis">Analysis</span></div>
+<p>A data-parallel boosting round all-reduces one gradient histogram and one Hessian histogram, each of size (number of features) $\times$ (number of bins). For $F = 500$ features, $B = 256$ bins, 8-byte accumulators, and $T = 1000$ rounds, estimate the total bytes each worker sends and receives across a full fit, treating one all-reduce as moving roughly twice the histogram size. Compare that to the cost of shipping a 400-million-row, 500-feature table even once. Argue from these two numbers why the histogram all-reduce, not the data size, sets the communication budget, and why halving the bin count $B$ is a cheaper lever than reducing rows. Relate your estimate to the alpha-beta communication model of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-12.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 12.4</span><span class="nav-title">Random Forests at Scale</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 12</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Classical Machine Learning</span></a>
+<a class="next" href="section-12.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 12.6</span><span class="nav-title">Distributed Clustering</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

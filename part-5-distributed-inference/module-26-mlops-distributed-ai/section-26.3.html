@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 26.3: Model and Prompt Registries. The system of record for trained models and prompts, why it is a consistency-critical distributed service, and how lineage, stage transitions, and a single production pointer keep the serving fleet coherent." name="description"/>
+<title>Section 26.3: Model and Prompt Registries | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 26: MLOps for Distributed AI</a></div>
+<h1>Model and Prompt Registries</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Half the fleet was serving version 7, the other half version 9, and nobody could tell me which one was production. We did not have a model; we had a rumor."</p>
+<cite>A Serving Replica Loading the Wrong Weights</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A model registry is the system of record for an ML platform: a consistency-critical shared service that names every trained artifact, records exactly which data and code produced it, and holds the single agreed answer to the question every serving node keeps asking, "which version am I supposed to run?"</strong> Once a model is served from more than one machine, "the production model" stops being a file on someone's laptop and becomes shared distributed state that the whole fleet must read and agree on. Getting two replicas to disagree about which weights are live is not a cosmetic bug; it splits your traffic across two different models and quietly poisons every metric downstream. This section treats the registry as what it is, a small control-plane service with a consensus problem at its heart, and builds one from scratch so the moving parts (versions, lineage, stage transitions, and one authoritative production pointer) are concrete before you reach for a managed tool.</p>
+</div>
+<p>The previous section built the distributed data and training pipelines that turn raw data into trained weights. Those pipelines produce artifacts, and an artifact with no record of where it came from is a liability rather than an asset. A multi-gigabyte checkpoint sitting in a bucket tells you nothing on its own: not which dataset version trained it, not which code commit, not what accuracy it reached, not whether it is allowed to serve real traffic. The model registry is the service that attaches all of that to the artifact and makes it queryable, auditable, and, above all, agreed upon across every machine that serves the model. In a single-process notebook none of this matters. Across a fleet it is the difference between an ML platform and a pile of files.</p>
+<p>We treat the registry as a distributed-systems object for two concrete reasons. First, the production pointer (the mapping from a model name to the one version that should be live) is shared mutable state that many serving nodes read concurrently and that a deployment must update atomically, which is the control-plane consensus problem of <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.6.html">Chapter 2</a> wearing an MLOps hat. Second, the data it manages is split by nature: the heavy artifacts live in object storage (<a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/section-8.2.html">Chapter 8</a>) while the lightweight metadata and lineage live in a database, so a single logical "model version" is really a coordinated record spanning two very different storage systems.</p>
+
+<h2>1. The Registry as the System of Record <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A registry stores three things that a bare artifact store does not. It stores <em>versioned metadata</em>: for every model version, the training data snapshot, the code commit, the hyperparameters, the evaluation metrics, and the timestamp and author. It stores a <em>lifecycle</em>: each version moves through stages, typically <code>staging</code>, then <code>production</code>, then <code>archived</code>, and those transitions are gated by approvals rather than happening by accident. And it stores a <em>pointer</em>: the single authoritative binding from a model name to the version currently serving production traffic. The artifact bytes themselves usually do not live in the registry at all; the registry holds a reference (a URI into object storage) and owns the metadata, the lifecycle, and the pointer.</p>
+<p>This separation is deliberate and it mirrors the storage split from <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/section-8.2.html">Chapter 8</a>. Model checkpoints are large, immutable, and written once; object storage is exactly the right home for blobs with those properties. Metadata is small, queried constantly ("show me every production model trained on data older than thirty days"), and mutated on every stage transition; a transactional database is exactly the right home for that. The registry is the service that keeps these two stores consistent so that a version record never points at a checkpoint that does not exist, and a checkpoint is never silently promoted without a corresponding metadata update.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Production Pointer Is Consensus, Not Configuration</div>
+<p>The most important field in the entire registry is one tiny pointer: model name to production version. It looks like a configuration value, but it behaves like distributed consensus. Every serving replica reads it, and a deployment writes it; if two replicas can observe different values at the same instant, your traffic is silently split across two different models and every metric you collect becomes an average of two systems. Updating that pointer is therefore an atomic, agreed, control-plane operation (<a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.6.html">Chapter 2</a>), not a casual write. Treat "which version is production?" with the same seriousness you would treat a leader election, because functionally it is one.</p>
+</div>
+
+<h2>2. Lineage: Pinning a Model to Its Exact Inputs <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Reproducibility and audit both reduce to one requirement: given a model version, you can recover the exact inputs that produced it. We capture lineage by hashing the things a model depends on. If a version records the content hash of its training-data snapshot and the commit hash of its training code, then "reproduce version 7" becomes a deterministic recipe rather than an archaeology project. Let a version $v$ depend on a data snapshot $D_v$ and a code state $C_v$. We store the pair</p>
+$$\text{lineage}(v) = \big(\,h(D_v),\; h(C_v)\,\big),$$
+<p>where $h$ is a collision-resistant hash. Two versions are reproducibly identical in their inputs exactly when both hashes match, and any drift in data or code shows up immediately as a changed hash. This is the same data-versioning-and-lineage discipline developed in <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/section-8.9.html">Chapter 8</a>, now anchored to a deployable model rather than to a dataset. The probability that two genuinely different snapshots collide to the same hash is negligible: for a $b$-bit hash it is on the order of $2^{-b}$, so a 256-bit hash makes accidental confusion a non-issue.</p>
+<p>Lineage is what turns a registry from a convenience into a governance instrument. When a regulator, a customer, or your own incident review asks "what produced this prediction?", a registry with lineage answers with a data hash, a code commit, a metric set, and an approval trail; a registry without it shrugs. Figure 26.3.1 shows how the pieces fit together and where the fleet plugs in.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 880 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of a model registry. Versioned artifacts in object storage on the left link to metadata and lineage records in a database in the middle; stage transitions move versions from staging to production to archived; a single production pointer is read by every node in the serving fleet on the right.">
+<defs>
+<marker id="arr263" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b263 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.a263 { fill:#eef6ee; stroke:#2f7d32; stroke-width:1.6; }
+.w263 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.p263 { fill:#fbecec; stroke:#b2342f; stroke-width:1.8; }
+.t263 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s263 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l263 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr263); }
+.lp263 { fill:none; stroke:#b2342f; stroke-width:1.8; marker-end:url(#arr263); }
+</style>
+<text class="t263" x="120" y="24">Object storage (Ch 8)</text>
+<rect class="b263" x="40" y="40" width="160" height="40" rx="7"/>
+<text class="s263" x="120" y="65">checkpoint v1 (3.2 GB)</text>
+<rect class="b263" x="40" y="92" width="160" height="40" rx="7"/>
+<text class="s263" x="120" y="117">checkpoint v2 (3.2 GB)</text>
+<rect class="b263" x="40" y="144" width="160" height="40" rx="7"/>
+<text class="s263" x="120" y="169">checkpoint v3 (3.4 GB)</text>
+<text class="t263" x="430" y="24">Registry metadata + lineage (DB)</text>
+<rect class="a263" x="300" y="40" width="260" height="48" rx="7"/>
+<text class="t263" x="430" y="60">v2 &#8594; data_hash, code_commit</text>
+<text class="s263" x="430" y="78">params, metrics, stage = production</text>
+<rect class="w263" x="300" y="100" width="260" height="44" rx="7"/>
+<text class="t263" x="430" y="120">v3 &#8594; data_hash, code_commit</text>
+<text class="s263" x="430" y="137">stage = staging (awaiting approval)</text>
+<rect class="b263" x="300" y="156" width="260" height="40" rx="7"/>
+<text class="t263" x="430" y="180">v1 &#8594; stage = archived</text>
+<line class="l263" x1="204" y1="60" x2="296" y2="62"/>
+<line class="l263" x1="204" y1="112" x2="296" y2="118"/>
+<line class="l263" x1="204" y1="164" x2="296" y2="174"/>
+<text class="s263" x="250" y="210">artifact URI references</text>
+<text class="t263" x="430" y="252">Stage transitions (approval-gated)</text>
+<rect class="w263" x="300" y="266" width="80" height="34" rx="6"/>
+<text class="s263" x="340" y="287">staging</text>
+<rect class="a263" x="410" y="266" width="90" height="34" rx="6"/>
+<text class="s263" x="455" y="287">production</text>
+<rect class="b263" x="530" y="266" width="80" height="34" rx="6"/>
+<text class="s263" x="570" y="287">archived</text>
+<line class="l263" x1="380" y1="283" x2="406" y2="283"/>
+<line class="l263" x1="500" y1="283" x2="526" y2="283"/>
+<rect class="p263" x="350" y="332" width="180" height="44" rx="8"/>
+<text class="t263" x="440" y="352" style="fill:#b2342f;">production pointer</text>
+<text class="s263" x="440" y="369" style="fill:#b2342f;">ranker &#8594; v2</text>
+<line class="l263" x1="455" y1="300" x2="445" y2="330"/>
+<text class="t263" x="770" y="252">Serving fleet</text>
+<rect class="b263" x="700" y="268" width="140" height="30" rx="6"/>
+<text class="s263" x="770" y="288">node 1 loads v2</text>
+<rect class="b263" x="700" y="306" width="140" height="30" rx="6"/>
+<text class="s263" x="770" y="326">node 2 loads v2</text>
+<rect class="b263" x="700" y="344" width="140" height="30" rx="6"/>
+<text class="s263" x="770" y="364">node K loads v2</text>
+<path class="lp263" d="M 532 354 L 690 300"/>
+<path class="lp263" d="M 532 356 L 690 320"/>
+<path class="lp263" d="M 532 358 L 690 356"/>
+<text class="s263" x="620" y="404">every node reads the same authoritative pointer</text>
+</svg>
+<figcaption><strong>Figure 26.3.1:</strong> Anatomy of a model registry. Large artifacts live in object storage (left); the registry database (center top) holds one metadata-and-lineage record per version, each referencing its artifact by URI. Versions move through approval-gated stages (center). A single production pointer (red) names the live version, and every node in the serving fleet (right) resolves that one pointer, so the whole fleet loads identical weights.</figcaption>
+</figure>
+
+<h2>3. A Registry From Scratch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The clearest way to see why the production pointer is the heart of the design is to build a registry with nothing but a dictionary and a hash function. The implementation below registers three versions (each with a data hash and a code commit for lineage), exposes stage transitions, and keeps exactly one production pointer that a simulated fleet resolves. It then performs a promotion sequence and a rollback, the two operations every real deployment depends on. The key invariant: whatever the production pointer says, every node in <code>fleet_resolve</code> reads the same value, so the fleet never splits.</p>
+<pre><code class="language-python">import hashlib, json
+
+def _h(s):                                  # 12 hex chars of SHA-256 is plenty for a demo
+    return hashlib.sha256(s.encode()).hexdigest()[:12]
+
+class ModelRegistry:
+    def __init__(self, name):
+        self.name = name
+        self.versions = {}                  # version -> metadata + lineage record
+        self._next = 1
+        self.production = None              # THE single source of truth pointer
+
+    def register(self, data_snapshot, code_commit, params, metrics):
+        v = self._next; self._next += 1
+        self.versions[v] = {
+            "version": v, "stage": "staging",
+            "data_hash": _h(data_snapshot),  # lineage: which data produced this
+            "code_commit": code_commit,      # lineage: which code produced this
+            "params": params, "metrics": metrics,
+        }
+        return v
+
+    def promote(self, version):             # atomic stage transition
+        if self.production is not None:
+            self.versions[self.production]["stage"] = "archived"
+        self.versions[version]["stage"] = "production"
+        self.production = version            # one write flips the live model
+
+    def rollback(self, to_version):         # point production back at a known-good version
+        if self.production is not None:
+            self.versions[self.production]["stage"] = "archived"
+        self.versions[to_version]["stage"] = "production"
+        self.production = to_version
+
+    def serving_version(self):              # what every fleet node must agree to load
+        return self.production
+
+def fleet_resolve(reg, fleet_size):         # each node independently asks the registry
+    return [reg.serving_version() for _ in range(fleet_size)]
+
+reg = ModelRegistry("ranker")
+v1 = reg.register("corpus@2026-05-01", "git:a1b9f3", {"lr": 3e-4, "layers": 12}, {"auc": 0.901})
+v2 = reg.register("corpus@2026-06-10", "git:c7d201", {"lr": 3e-4, "layers": 12}, {"auc": 0.917})
+v3 = reg.register("corpus@2026-06-14", "git:e4f880", {"lr": 1e-4, "layers": 16}, {"auc": 0.908})
+print("registered versions :", sorted(reg.versions))
+
+reg.promote(v1)
+print("after promote v1     : production =", reg.serving_version(),
+      "| fleet loads", set(fleet_resolve(reg, 8)))
+reg.promote(v2)
+print("after promote v2     : production =", reg.serving_version(),
+      "| v1 stage =", reg.versions[v1]["stage"])
+
+# v3 trained but never approved; a canary on v2 regresses, so we roll back to v1.
+reg.rollback(v1)
+print("after rollback to v1 : production =", reg.serving_version(),
+      "| fleet loads", set(fleet_resolve(reg, 8)))
+print("lineage of v2        :", json.dumps({
+    "version": reg.versions[v2]["version"], "data_hash": reg.versions[v2]["data_hash"],
+    "code_commit": reg.versions[v2]["code_commit"], "metrics": reg.versions[v2]["metrics"]}))
+print("stages               :", {v: reg.versions[v]["stage"] for v in sorted(reg.versions)})
+</code></pre>
+<div class="code-caption"><strong>Code 26.3.1:</strong> A model registry in one class. Lineage is two hashes per version, the lifecycle is a stage string, and the entire notion of "the live model" is the single <code>self.production</code> pointer that <code>fleet_resolve</code> reads on behalf of every node.</div>
+<pre><code class="language-text">registered versions : [1, 2, 3]
+after promote v1     : production = 1 | fleet loads {1}
+after promote v2     : production = 2 | v1 stage = archived
+after rollback to v1 : production = 1 | fleet loads {1}
+lineage of v2        : {"version": 2, "data_hash": "d44dc25ac185", "code_commit": "git:c7d201", "metrics": {"auc": 0.917}}
+stages               : {1: 'production', 2: 'archived', 3: 'staging'}</code></pre>
+<div class="code-caption"><strong>Output 26.3.1:</strong> Promotion moves the pointer forward and archives the version it replaced; rollback moves it back to a prior known-good version. The fleet set is always a singleton (<code>{1}</code>), which is the visible proof that every node agreed on one model. Version 3 was trained but never promoted, so it sits in <code>staging</code> untouched.</div>
+<p>Three details in Output 26.3.1 carry the whole lesson. The fleet always resolves to a single value, never a split, because there is exactly one pointer. Promotion is reversible: the rollback to version 1 is just another pointer write, so recovering from a bad deploy is as cheap and atomic as the deploy was. And the lineage of version 2 survives every stage change untouched, so the answer to "what produced this model?" is stable even after the model is archived. A production registry adds durability, access control, and a real consensus store behind the pointer, but the shape of the thing is exactly Code 26.3.1.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: One Pointer the Whole Fleet Reads</div>
+<p>The registry is where this book's spine resurfaces in operations. The serving fleet of <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a> is many machines that must behave as one model, and the thing that makes them one model rather than many is a single agreed pointer, the same control-plane consensus that elected a leader in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.6.html">Chapter 2</a>. Scaling out the serving did not remove the need for a single source of truth; it concentrated that need into one tiny, heavily-read field. Whenever you see a fleet behaving coherently, look for the small piece of agreed state that makes the coherence possible.</p>
+</div>
+
+<h2>4. Prompts Are Code Too: The Prompt Registry <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The LLMOps era adds a second class of artifact that behaves exactly like a model and is too often treated like a sticky note: the prompt. A prompt or prompt template is a deployable artifact whose change alters system behavior just as surely as new weights do. Editing the system prompt of a customer-facing assistant is a deployment, with the same blast radius as shipping a new checkpoint, yet many teams still paste prompts inline in code or, worse, edit them live in a console with no version, no test, and no way back. A prompt registry fixes this by giving prompts the same treatment models get: every prompt template carries a version, a hash, a test result, and a stage, and "the production prompt" is a single pointer the fleet resolves, exactly as in Code 26.3.1.</p>
+<p>The payoff is symmetry. A prompt regression (a reworded instruction that quietly raises the refusal rate or breaks JSON formatting) becomes a one-line rollback to the previous prompt version instead of a frantic console edit under incident pressure. Pinning a model version and a prompt version together as a single deployed unit is what makes an LLM application reproducible: the same weights and the same prompt give you the same behavior, and changing either is a tracked, reversible event. The registry abstraction does not care whether the artifact is three gigabytes of weights or three hundred bytes of text; both need a version, lineage, a stage, and one production pointer.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Hotfix Heard Round the Fleet</div>
+<p>The classic prompt incident: someone "just tweaks" the system prompt at 2 a.m. to fix one weird answer, the new wording trips the model into ignoring its output format, and by morning every downstream parser in the company is choking on malformed responses with no record of what changed. A prompt registry turns that ghost story into a boring <code>rollback("prompt-v8")</code> and a diff you can read over coffee. Prompts are code; uncommitted code that runs in production is just a future incident with good intentions.</p>
+</div>
+
+<h2>5. Reaching for a Real Registry <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>You build Code 26.3.1 once to understand the moving parts, then you adopt a managed registry that provides the durability, access control, and consensus-backed pointer you do not want to implement yourself. The major options share the shape we built. MLflow Model Registry gives you named models, numbered versions, stage transitions, and a Python and REST API over a backing database and artifact store. Weights &amp; Biases offers artifact lineage and a registry with rich experiment links. Hugging Face Hub versions models (and increasingly prompts and datasets) with git-style history and model cards. The cloud platforms, Vertex AI Model Registry and SageMaker Model Registry, integrate the registry with their managed serving so the production pointer drives the deployed endpoint directly.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: MLflow, W&amp;B, and the Hugging Face Hub</div>
+<p>The roughly fifty lines of Code 26.3.1 become a handful of calls against a durable, multi-user service. The same register-promote-resolve flow in MLflow, with the backing database and artifact store handling persistence and the atomic pointer:</p>
+<pre><code class="language-python">import mlflow
+from mlflow.tracking import MlflowClient
+
+# Register an artifact already logged to the tracking server's artifact store (Ch 8).
+mlflow.register_model(model_uri="runs:/&lt;run_id&gt;/model", name="ranker")   # -> version N
+
+client = MlflowClient()
+client.transition_model_version_stage("ranker", version=2, stage="Production")  # promote
+client.transition_model_version_stage("ranker", version=1, stage="Archived")    # rollback target kept
+
+# Every serving node resolves the SAME production pointer, no split possible:
+prod = client.get_model_version_by_alias("ranker", "production")   # -> the one live version
+model = mlflow.pyfunc.load_model(f"models:/ranker@production")     # load by the pointer, not a path
+</code></pre>
+<div class="code-caption"><strong>Code 26.3.2:</strong> The register-promote-resolve cycle from Code 26.3.1 in MLflow. The library owns the database transaction behind the stage change, the artifact reference into object storage, and the access control, leaving you the same three verbs. Weights &amp; Biases (<code>wandb.Artifact</code> with aliases) and the Hugging Face Hub (<code>huggingface_hub</code> with revisions) expose the identical register-version-promote pattern.</div>
+<p>Use the from-scratch version to reason about correctness and the managed version in production. The line-count reduction is real, but the durability and the consensus-backed pointer are the parts you were never going to reimplement well.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Split-Brain Recommendation Fleet</div>
+<p><strong>Who:</strong> An ML platform engineer at a streaming service running a recommendation model across forty serving replicas.</p>
+<p><strong>Situation:</strong> A new model was rolled out by copying the checkpoint to each replica and restarting it, replica by replica, over twenty minutes.</p>
+<p><strong>Problem:</strong> During the rollout window, half the fleet served the new model and half served the old one, and an experiment running at the same time reported nonsensical, drifting metrics that nobody could reproduce.</p>
+<p><strong>Dilemma:</strong> Speed up the rollout so the inconsistent window shrinks (still leaving a window, and still split-brained for minutes), or stop deploying by file copy entirely and route every replica through one agreed production pointer.</p>
+<p><strong>Decision:</strong> They moved to a registry-backed deploy: replicas resolve the production version from MLflow at load time and on a refresh signal, so the live model is whatever the single pointer says, not whatever file happens to be on local disk.</p>
+<p><strong>How:</strong> Promotion became a single registry stage transition; replicas watched the pointer and hot-reloaded; rollback was the same transition pointed at the prior version, completing in seconds instead of a twenty-minute reverse copy.</p>
+<p><strong>Result:</strong> The split-brain window closed, the experiment metrics became reproducible, and the next bad model was rolled back fleet-wide in under a minute by flipping one pointer, exactly the behavior of the rollback in Output 26.3.1.</p>
+<p><strong>Lesson:</strong> Deploy by changing the agreed pointer, never by racing files onto machines. A registry makes "which model is live?" a single answer the whole fleet reads, which is the only way a multi-replica deploy stays consistent.</p>
+</div>
+
+<h2>6. Governance and the Research Frontier <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>A registry that records lineage is one step from a registry that enforces governance. Because every version already carries its data hash, code commit, metrics, and stage, the registry is the natural place to attach a model card (the documented intended use, evaluation results, and known limitations of a version) and to require an approval before a version may enter <code>production</code>. The stage transition becomes a policy gate: no card, no approval, no promotion. This closes the loop between the lineage of Section 2 and the operational control of Section 1, and it is increasingly a compliance requirement rather than a nicety.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Versioned Prompts and Governed Model Cards (2024 to 2026)</div>
+<p>Two threads are reshaping registries right now. The first is treating prompts as first-class registered artifacts: tools such as LangSmith, Langfuse, and PromptLayer (2024 to 2025) add prompt versioning, evaluation, and rollback, and MLflow's prompt registry brings prompt templates under the same stage-and-version machinery as models, making a prompt change a tracked deployment rather than a console edit. The second is governance as code: building on the model-cards line (Mitchell et al., 2019) and the model-card-toolkit lineage, registries now bind cards and approval policies to stage transitions, sharpened by the documentation and risk-management expectations of the EU AI Act (in force 2024, phased through 2026) and the NIST AI Risk Management Framework. The research and tooling question is how to make lineage and approval verifiable and tamper-evident, so a model card and its data-and-code provenance are auditable claims rather than self-reported text. We connect the retrieval and provenance side of this story to web-scale RAG in <a href="../module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a>.</p>
+</div>
+<p>The registry is now in place as the platform's shared source of truth: every model and prompt has a version, a lineage, a lifecycle, and one authoritative production pointer the fleet agrees on. What it does not yet have is an automated path from a passing test to a promoted version. That path, the pipeline that builds, validates, and ships a model change with the same rigor software gets, is continuous integration and delivery for distributed ML, and it is the subject of <a href="section-26.4.html">Section 26.4</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.3.1: What Must Lineage Capture? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Code 26.3.1 records two lineage hashes: the training-data snapshot and the code commit. Name at least three further inputs that can change a trained model's behavior even when those two hashes are identical (consider randomness, environment, and dependencies), and for each, state what you would hash or pin to capture it. Then argue which of your additions are essential for bit-for-bit reproducibility versus merely helpful for an audit, and why a registry might choose to record the audit-only items anyway.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.3.2: Add Approval Gates and a Prompt Registry <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 26.3.1 so that <code>promote</code> raises an error unless the version has an attached approval (add an <code>approve(version, approver)</code> method and a check). Then add a parallel <code>PromptRegistry</code> with the same register/promote/rollback/resolve interface for prompt templates, and a <code>DeployedUnit</code> that pins one model version and one prompt version together. Show a promotion of the unit and a rollback of only the prompt while the model stays fixed. Print the fleet-resolved (model, prompt) pair before and after to confirm it stays a singleton.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.3.3: The Cost of a Stale Pointer <span class="exercise-type analysis">Analysis</span></div>
+<p>Suppose a fleet of $K$ replicas caches the production pointer and refreshes it every $T$ seconds, so after a promotion a replica may serve the old model for up to $T$ seconds. If a fraction $f$ of replicas have refreshed at a given instant during the window, write the fraction of traffic served by the new model as a function of $f$, and explain why any $0 &lt; f &lt; 1$ is a split-brain state. Then reason about the trade-off: shrinking $T$ reduces the inconsistency window but increases read load on the registry. Relate this to the consensus and staleness discussion of <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.6.html">Chapter 2</a> and propose one mechanism (for example, a push notification or a version barrier) that closes the window without polling harder.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-26.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 26.2</span><span class="nav-title">Distributed Data and Training Pipelines</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 26</span><span class="nav-num">Contents</span><span class="nav-title">MLOps for Distributed AI</span></a>
+<a class="next" href="section-26.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 26.4</span><span class="nav-title">CI/CD for Distributed ML</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

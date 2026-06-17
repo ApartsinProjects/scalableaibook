@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 13.4: Distributed Graph Analytics. PageRank, connected components, shortest paths, and triangle counting expressed in the vertex-centric model and run at scale, and why an in-memory superstep engine beats iterative MapReduce." name="description"/>
+<title>Section 13.4: Distributed Graph Analytics | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Distributed Machine Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 13: Distributed Graph Machine Learning</a></div>
+<h1>Distributed Graph Analytics</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I told every vertex to whisper its rank to its neighbors. Thirty rounds later they all agreed, and not one of them ever saw the whole graph."</p>
+<cite>A Superstep That Finally Reached a Fixed Point</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The classic graph algorithms (PageRank, connected components, shortest paths, triangle counting) all turn out to be the same shape: a vertex looks only at messages from its neighbors, updates a single number, and sends new messages, repeating until nothing changes.</strong> That shape is exactly the vertex-centric, superstep model from <a href="section-13.3.html">Section 13.3</a>, which means every one of these algorithms distributes the same way: partition the vertices across machines, let each machine run the local update, and exchange messages along cut edges between supersteps. This section takes the four workhorse analytics, writes each as a vertex program, and shows why an in-memory superstep engine converges in seconds where the iterative-MapReduce version of <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/section-6.6.html">Section 6.6</a> spends most of its time reloading the graph from disk. The ranks, components, and counts these jobs produce are not the end goal; they become input features for the graph models of <a href="section-13.5.html">Section 13.5</a>.</p>
+</div>
+<p>By the end of <a href="section-13.3.html">Section 13.3</a> we had an engine: a set of vertices, each holding a small piece of state, each able to receive messages, run a local update, and send messages, all advancing in lockstep supersteps separated by a global barrier. That engine is deliberately spartan, and the payoff is that a great many graph computations fit inside it without modification. This section cashes in that generality. We take the four analytics that appear in almost every production graph pipeline, express each as a vertex program, and watch them converge. Along the way we account for two things that decide whether such a job is fast or slow at scale: how much the vertices have to say to each other each round (communication), and how many rounds it takes them to fall silent (convergence). Both, we will see, are governed by the partition quality established in <a href="section-13.2.html">Section 13.2</a>.</p>
+
+<h2>1. One Engine, Four Algorithms <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The vertex-centric contract is narrow on purpose. A vertex never queries the global graph, never reads another vertex's state directly, and never sees more than the messages addressed to it in the previous superstep. Everything it needs to act, it must receive. The surprising fact, and the reason Pregel-style systems caught on, is that the four most common graph analytics each compress into a handful of lines under this contract. Table 13.4.1 lays them side by side: what each vertex stores, what it sends, how it combines what arrives, and when the whole computation is allowed to stop.</p>
+<div class="table-caption"><strong>Table 13.4.1:</strong> Four classic analytics as vertex programs. Each row is the same superstep loop (receive, combine, update, send) with a different choice of state, message, and combiner. The narrowness of the contract is what makes them all distribute identically.</div>
+<table>
+<thead>
+<tr><th scope="col">Algorithm</th><th scope="col">Vertex state</th><th scope="col">Message sent</th><th scope="col">Combine on receive</th><th scope="col">Stops when</th></tr>
+</thead>
+<tbody>
+<tr><td>PageRank</td><td>current rank</td><td>rank / out-degree to each out-neighbor</td><td>sum incoming contributions</td><td>ranks change by less than a tolerance</td></tr>
+<tr><td>Connected components</td><td>smallest label seen</td><td>own label to all neighbors</td><td>take the minimum</td><td>no label changes in a superstep</td></tr>
+<tr><td>Single-source shortest paths</td><td>tentative distance</td><td>distance + edge weight to neighbors</td><td>take the minimum</td><td>no distance improves</td></tr>
+<tr><td>Triangle counting</td><td>neighbor set, then a count</td><td>neighbor list to higher-id neighbors</td><td>intersect lists, count matches</td><td>after a fixed two-superstep pass</td></tr>
+</tbody>
+</table>
+<p>Three of the four share an even tighter family resemblance: connected components and shortest paths are both "take the best value you have heard and pass it on", differing only in whether "best" means smallest label or smallest distance. This is the monotone-propagation pattern, and it has a useful property we return to in Section 5: because the combined value only ever moves in one direction (labels only shrink, distances only shorten), the computation cannot oscillate and is guaranteed to reach a fixed point. PageRank is the odd one out, because a rank is an average rather than a minimum, so it approaches its answer gradually rather than locking in pieces of it; we treat it first precisely because it is the most demanding.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Combiner Is the Algorithm</div>
+<p>In the vertex-centric model, the entire personality of a graph algorithm lives in one function: how a vertex combines the messages it receives. Sum gives you PageRank; minimum gives you connected components and shortest paths; set-intersection gives you triangle counting. Everything else (partitioning the vertices, shipping messages across cut edges, the global barrier between rounds) is shared infrastructure that the engine provides once and every algorithm reuses. To distribute a new graph computation, you do not design a new distributed system; you choose a combiner.</p>
+</div>
+
+<h2>2. Distributed PageRank, Superstep by Superstep <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>PageRank assigns each vertex a score equal to the probability that a random surfer, following out-edges at random and occasionally teleporting to a uniformly random vertex, is found at that vertex in the long run. Written as a fixed-point equation over the rank vector, with $N$ vertices, damping factor $d$, and $\text{out}(u)$ the out-degree of $u$,</p>
+$$\text{PR}(v) = \frac{1 - d}{N} + d \sum_{u \,\to\, v} \frac{\text{PR}(u)}{\text{out}(u)}.$$
+<p>The sum runs over the in-neighbors $u$ of $v$, and the term $\text{PR}(u)/\text{out}(u)$ is exactly the message $u$ sends along each of its out-edges: it splits its current rank evenly among its out-neighbors. This is the whole vertex program. In each superstep, every vertex (i) sums the contributions that arrived from its in-neighbors, (ii) applies the teleport-and-damping update above, and (iii) sends its new rank divided by its out-degree along each out-edge. The barrier between supersteps guarantees that a vertex reads only ranks from the previous round, so the computation is deterministic regardless of how vertices are spread across machines. Figure 13.4.1 shows one such superstep on a fragment of a graph.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A PageRank superstep: three source vertices each split their rank by out-degree and send equal-weight messages along their out-edges to a target vertex, which sums the incoming contributions and applies the damping update.">
+<defs>
+<marker id="arr134" markerWidth="9" markerHeight="9" refX="7.5" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.v134 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.vt134 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:2; }
+.t134 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.tt134 { font:600 14px sans-serif; fill:#b86b1f; text-anchor:middle; }
+.s134 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.m134 { fill:none; stroke:#b86b1f; stroke-width:1.8; marker-end:url(#arr134); }
+.lbl134 { font:11px sans-serif; fill:#8a5316; text-anchor:middle; }
+</style>
+<text class="t134" x="430" y="26">One PageRank superstep: messages flow along edges, then the target sums and updates</text>
+<circle class="v134" cx="110" cy="90" r="34"/>
+<text class="t134" x="110" y="86">u₁</text>
+<text class="s134" x="110" y="104">out=2</text>
+<circle class="v134" cx="110" cy="180" r="34"/>
+<text class="t134" x="110" y="176">u₂</text>
+<text class="s134" x="110" y="194">out=1</text>
+<circle class="v134" cx="110" cy="270" r="34"/>
+<text class="t134" x="110" y="266">u₃</text>
+<text class="s134" x="110" y="284">out=3</text>
+<circle class="vt134" cx="470" cy="180" r="44"/>
+<text class="tt134" x="470" y="176">v</text>
+<text class="s134" x="470" y="196">target</text>
+<path class="m134" d="M 146 96 C 280 120, 330 150, 420 168"/>
+<path class="m134" d="M 146 180 L 422 180"/>
+<path class="m134" d="M 146 264 C 280 240, 330 210, 420 192"/>
+<text class="lbl134" x="290" y="120">PR(u₁)/2</text>
+<text class="lbl134" x="290" y="168">PR(u₂)/1</text>
+<text class="lbl134" x="290" y="248">PR(u₃)/3</text>
+<rect class="vt134" x="600" y="120" width="230" height="120" rx="10"/>
+<text class="tt134" x="715" y="150">v gathers and updates</text>
+<text class="s134" x="715" y="176">incoming = sum of messages</text>
+<text class="s134" x="715" y="198">PR(v) ← (1−d)/N</text>
+<text class="s134" x="715" y="216">+ d · incoming</text>
+<text class="s134" x="715" y="234">then v sends PR(v)/out(v) onward</text>
+<path class="m134" d="M 514 180 L 596 180"/>
+</svg>
+<figcaption><strong>Figure 13.4.1:</strong> A single PageRank superstep at the target vertex $v$. Each in-neighbor $u_i$ sends its current rank split by its out-degree; $v$ sums the arriving contributions, applies the damping-and-teleport update, and in the same superstep emits $\text{PR}(v)/\text{out}(v)$ along its own out-edges. No vertex ever inspects the global graph; it acts only on the messages addressed to it.</figcaption>
+</figure>
+<p>Two edge cases need care and both are visible once you think in messages. A dangling vertex, one with no out-edges, has nobody to send its rank to, so its mass would silently leak out of the system and the ranks would no longer sum to one. The fix is to collect the total dangling mass each superstep and redistribute it uniformly, which keeps the rank vector a proper probability distribution. The second case is initialization: starting every vertex at $1/N$ is the natural choice, and because PageRank's update is a contraction for $d < 1$, the starting point affects only how many supersteps convergence takes, not the answer it converges to.</p>
+
+<h2>3. Why In-Memory Supersteps Beat Iterative MapReduce <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>PageRank is iterative by nature: the rank vector at superstep $t+1$ depends on the rank vector at superstep $t$, and you need dozens of rounds to converge. In <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/section-6.6.html">Section 6.6</a> we expressed exactly this computation as a chain of MapReduce jobs, one job per iteration. That version is correct, and for a single pass it is a fine illustration, but as an iterative algorithm it is wasteful in a way that is easy to overlook. Each MapReduce iteration reads the entire graph from distributed storage, shuffles the rank contributions across the network, writes the new rank vector back to storage, and only then can the next iteration start by reading that graph again. The graph structure, which never changes, is loaded from disk once per iteration. For thirty iterations on a graph too large to cache, that is thirty full reads of a structure that was identical every time.</p>
+<p>The vertex-centric, in-memory engine removes that waste by inverting what is persistent and what is transient. The graph is loaded once, partitioned across the workers, and kept resident in memory for the entire job; only the messages (the rank contributions) move between supersteps, and they move worker-to-worker without a detour through storage. The structural cost is paid a single time, and each superstep pays only for the messages it actually sends. Table 13.4.2 contrasts the two execution models on the parts that dominate the wall-clock for an iterative graph algorithm.</p>
+<div class="table-caption"><strong>Table 13.4.2:</strong> Iterative MapReduce versus an in-memory superstep engine for a graph algorithm that runs for $T$ supersteps. The decisive difference is that the unchanging graph structure is reloaded every iteration in one model and exactly once in the other.</div>
+<table>
+<thead>
+<tr><th scope="col">What it costs</th><th scope="col">Iterative MapReduce (Ch 6)</th><th scope="col">In-memory superstep engine</th></tr>
+</thead>
+<tbody>
+<tr><td>Graph structure reads from storage</td><td>once per superstep ($T$ times)</td><td>once for the whole job</td></tr>
+<tr><td>Where state lives between rounds</td><td>written to and re-read from disk</td><td>resident in worker memory</td></tr>
+<tr><td>What crosses the network each round</td><td>all rank contributions, via shuffle to storage</td><td>only messages on cut edges, worker to worker</td></tr>
+<tr><td>Per-round fixed overhead</td><td>job launch, scheduling, output commit</td><td>a single barrier synchronization</td></tr>
+</tbody>
+</table>
+<p>The lesson is not that MapReduce is the wrong tool in general; for a single-pass, embarrassingly parallel transformation it is excellent, as <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a> shows. The lesson is that iteration with unchanging structure is precisely the workload its design penalizes, and recognizing that pattern is what motivated the whole vertex-centric line of systems. The same instinct (keep the invariant part resident, move only the changing part) reappears when we keep model parameters resident on workers and move only gradients in <a href="../../part-3-distributed-ml/module-14-federated-decentralized-learning/index.html">Chapter 14</a> and beyond.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Move the Small Thing, Not the Big Thing</div>
+<p>The recurring move of this book is to pin the large, slowly-changing object in place and ship only the small, fast-changing one across the network. In data-parallel training we keep the data shard resident and all-reduce only the gradient (<a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a> gives the cost model that makes this pay). Here the large object is the graph structure and the small object is the message stream, and the superstep engine wins over iterative MapReduce for exactly the same reason: it stops re-shipping the part that never changed. Whenever a distributed design feels slow, ask which big thing is being moved that could instead be held still.</p>
+</div>
+
+<h2>4. Components, Shortest Paths, and Triangles <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The three remaining analytics reuse the same engine with a different combiner. Connected components labels each vertex with an integer such that two vertices share a label exactly when a path connects them. The vertex program is label propagation: every vertex starts with its own id as its label, and in each superstep adopts the minimum label among itself and its neighbors, then broadcasts that label onward. Because labels only ever decrease, the process is monotone and terminates; the number of supersteps it needs is bounded by the diameter of the largest component, since a small label has to travel hop by hop to reach the far side of its component.</p>
+<p>Single-source shortest paths is the same monotone propagation with arithmetic in place of comparison. The source starts at distance zero and every other vertex at infinity; each superstep, a vertex that has a tentative distance $\delta$ sends $\delta + w(e)$ along each out-edge $e$, and a receiver keeps the minimum of its current distance and the smallest arriving offer. This is Bellman-Ford recast as message passing, and like connected components it converges in a number of rounds bounded by the longest shortest-path in hops. Triangle counting is the one genuine departure: a vertex sends its neighbor list to its higher-id neighbors, and each receiver counts how many of its own neighbors also appear in a list it received, which is the number of triangles closed at that vertex. It needs only a couple of supersteps but its messages are neighbor lists rather than single numbers, so on a graph with high-degree vertices it is the communication-heaviest of the four, a point we quantify in Section 5.</p>
+<p>The code below runs distributed-style PageRank and connected components on a small two-cluster graph using a from-scratch superstep engine, printing the convergence behavior of each round. It is pure standard-library Python so the superstep logic is fully exposed; the same loop, with the vertex set partitioned across machines and messages shipped over the network, is what a production engine runs.</p>
+<pre><code class="language-python">out_edges = {
+    0: [1, 2], 1: [2], 2: [0, 3], 3: [2],      # component A: 0,1,2,3
+    4: [5], 5: [4, 6], 6: [4, 7], 7: [6],       # component B: 4,5,6,7
+}
+vertices = list(out_edges)
+N = len(vertices)
+out_deg = {v: len(out_edges[v]) for v in vertices}
+in_edges = {v: [] for v in vertices}            # who points at me (for the gather)
+for u in vertices:
+    for w in out_edges[u]:
+        in_edges[w].append(u)
+
+def pagerank(damping=0.85, max_supersteps=30, tol=1e-6):
+    rank = {v: 1.0 / N for v in vertices}       # every vertex starts at 1/N
+    for step in range(1, max_supersteps + 1):
+        dangling = sum(rank[v] for v in vertices if out_deg[v] == 0)   # leaked mass
+        new = {v: (1 - damping) / N
+                  + damping * (sum(rank[u] / out_deg[u] for u in in_edges[v])
+                               + dangling / N)
+               for v in vertices}
+        delta = sum(abs(new[v] - rank[v]) for v in vertices)          # L1 change
+        rank = new
+        if step <= 6 or delta < tol:
+            print(f"  superstep {step:2d}  L1-change={delta:.2e}  total={sum(rank.values()):.4f}")
+        if delta < tol:
+            print(f"  converged after {step} supersteps"); break
+    return rank
+
+def connected_components(max_supersteps=30):
+    neigh = {v: set(out_edges[v]) for v in vertices}                  # undirected view
+    for v in vertices:
+        for u in in_edges[v]:
+            neigh[v].add(u)
+    label = {v: v for v in vertices}            # own id as the starting label
+    for step in range(1, max_supersteps + 1):
+        new = {v: min([label[v]] + [label[u] for u in neigh[v]]) for v in vertices}
+        changed = sum(new[v] != label[v] for v in vertices)
+        label = new
+        print(f"  superstep {step:2d}  relabeled={changed}  distinct-labels={len(set(label.values()))}")
+        if changed == 0:
+            print(f"  converged after {step} supersteps"); break
+    return label
+
+print("PageRank:");             pagerank()
+print("Connected components:"); connected_components()
+</code></pre>
+<div class="code-caption"><strong>Code 13.4.1:</strong> A from-scratch superstep engine running PageRank (sum combiner) and connected components (minimum combiner) on a two-cluster graph. Only the combiner line differs between the two; the receive-update-send loop and the convergence test are shared, exactly as Table 13.4.1 promises.</div>
+<pre><code class="language-text">PageRank:
+  superstep  1  L1-change=4.25e-01  total=1.0000
+  superstep  2  L1-change=3.61e-01  total=1.0000
+  superstep  3  L1-change=2.69e-01  total=1.0000
+  superstep  4  L1-change=1.63e-01  total=1.0000
+  superstep  5  L1-change=9.01e-02  total=1.0000
+  superstep  6  L1-change=5.01e-02  total=1.0000
+  superstep 30  L1-change=7.66e-07  total=1.0000
+  converged after 30 supersteps
+Connected components:
+  superstep  1  relabeled=6  distinct-labels=4
+  superstep  2  relabeled=2  distinct-labels=2
+  superstep  3  relabeled=0  distinct-labels=2
+  converged after 3 supersteps
+</code></pre>
+<div class="code-caption"><strong>Output 13.4.1:</strong> PageRank's L1 change shrinks smoothly toward the tolerance and the ranks always sum to one, confirming the dangling-mass redistribution; connected components locks in the two clusters in three supersteps, bounded by the small diameter of each component. Both ran on one machine, but the per-vertex updates never consulted the global graph, so partitioning the vertices across workers would change only where each update executes, not its result.</div>
+<p>Notice the two convergence signatures, because they are characteristic. PageRank's L1 change decreases geometrically: each superstep multiplies the remaining error by roughly the damping factor, so the count of supersteps to a fixed tolerance grows only logarithmically as you tighten it. Connected components instead finishes in a small fixed number of rounds set by the graph's diameter, and would not run faster no matter how tight a tolerance you asked for, because once labels stop changing they stop for good. Knowing which signature an algorithm has tells you in advance whether throwing more supersteps at it helps.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Vertex That Never Got the Memo</div>
+<p>Connected components has a charming failure mode on a badly partitioned graph. If a single low-id vertex sits across a slow network link from the rest of its component, its winning label has to crawl one cut edge per superstep to reach the far side. The computation is correct, but it dawdles, waiting round after round for one message to make its way across the partition boundary. The vertices on the far side are, in effect, the last to hear who won the election. Good partitioning (Section 13.2) is what keeps that crawl short.</p>
+</div>
+
+<h2>5. Communication, Convergence, and the Price of a Bad Cut <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The cost of an iterative graph algorithm factors cleanly into two quantities, and both are now in view. The first is the number of supersteps to convergence, which is a property of the algorithm and the graph: logarithmic in the tolerance for PageRank, bounded by component diameter for label propagation and shortest paths, constant for triangle counting. The second is the communication per superstep, and this is where the partition from <a href="section-13.2.html">Section 13.2</a> sets the price. A message is cheap when it stays inside a worker and expensive when it crosses the network to another worker, and a message crosses the network exactly when its edge is cut by the partition. So the per-superstep network traffic is governed by the number of cut edges, which is the very quantity a graph partitioner tries to minimize.</p>
+<p>This is the through-line that ties the chapter together: partition quality, an abstract objective in <a href="section-13.2.html">Section 13.2</a>, becomes concrete wall-clock here. Two partitions of the same graph that differ in their edge cut produce identical answers but very different running times, because one ships far more messages across the barrier every single superstep, and an iterative job pays that difference $T$ times over. The combination is multiplicative: total network cost scales as (supersteps) times (cut edges touched per superstep). An algorithm with many supersteps, like PageRank, is the most sensitive to a poor cut, because it pays the inflated per-round communication on every one of its thirty-odd rounds. Triangle counting, with its two supersteps but list-valued messages, instead stresses the per-message size, so for it the partitioner should worry about isolating high-degree vertices rather than minimizing rounds.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Recommendation Team Whose PageRank Job Would Not Shrink</div>
+<p><strong>Who:</strong> A data engineer on the graph-features team at a large e-commerce company.</p>
+<p><strong>Situation:</strong> A nightly personalized-PageRank job over a billion-edge user-item graph fed ranking features the next morning, and it had crept past its window.</p>
+<p><strong>Problem:</strong> The job ran fifty supersteps to converge, and each superstep was dominated by network time, not by the per-vertex arithmetic.</p>
+<p><strong>Dilemma:</strong> Add more workers to spread the computation, which is the reflex for a slow distributed job, or accept that more workers might cut more edges and so ship more messages per superstep, making each of the fifty rounds slower.</p>
+<p><strong>Decision:</strong> They left the worker count alone and instead repartitioned the graph with a cut-minimizing partitioner, treating communication per superstep as the real bottleneck rather than raw parallelism.</p>
+<p><strong>How:</strong> They replaced the default hash partitioning with a multilevel edge-cut partitioner of the kind in <a href="section-13.2.html">Section 13.2</a>, co-locating each user's neighborhood on one worker so most rank messages stayed local.</p>
+<p><strong>Result:</strong> The superstep count was unchanged (the algorithm and graph were the same), but cross-worker messages fell sharply, and the wall-clock dropped enough to clear the window with room to spare.</p>
+<p><strong>Lesson:</strong> For an iterative graph job, the lever is usually communication per superstep, not the number of workers. A better cut multiplies its savings by every round the algorithm runs.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: GraphX, NetworkX, and cuGraph Ship These Analytics</div>
+<p>Code 13.4.1 spells out the superstep loop so the mechanics are visible, but you would not hand-write PageRank in production. Spark's GraphX exposes the Pregel API and a built-in <code>pageRank</code>, NetworkX gives you single-machine reference implementations for correctness checks, and NVIDIA's cuGraph runs the same analytics on the GPU at very high throughput. The roughly forty lines of engine in Code 13.4.1 collapse to a single call, and the library handles partitioning, message combiners, dangling-mass handling, and the convergence test for you:</p>
+<pre><code class="language-python"># Single-machine reference with NetworkX (great for validating a distributed run)
+import networkx as nx
+G = nx.DiGraph([(0,1),(0,2),(1,2),(2,0),(2,3),(3,2),(4,5),(5,4),(5,6),(6,4),(6,7),(7,6)])
+pr = nx.pagerank(G, alpha=0.85)               # the whole superstep loop, one call
+comps = list(nx.weakly_connected_components(G))   # connected components, one call
+
+# Distributed on a cluster with Spark GraphX (Scala/Python via GraphFrames)
+#   from graphframes import GraphFrame
+#   g.pageRank(resetProbability=0.15, tol=1e-6)   # runs the Pregel supersteps for you
+#   g.connectedComponents()                       # label propagation, partitioned
+
+# GPU-accelerated with RAPIDS cuGraph
+#   import cugraph
+#   cugraph.pagerank(cu_graph, alpha=0.85)        # same math, on the GPU
+</code></pre>
+<div class="code-caption"><strong>Code 13.4.2:</strong> The same two analytics as one library call each. NetworkX is the correctness oracle for a single machine, GraphX/GraphFrames runs the partitioned supersteps across a cluster, and cuGraph runs them on the GPU; all three internally do exactly what Code 13.4.1 spells out by hand.</div>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Graph Analytics as Features for Models (2024 to 2026)</div>
+<p>The ranks, components, and counts these jobs produce are increasingly consumed not by humans but by machine-learning models, and recent work sharpens that pipeline. Scalable approximate personalized PageRank, in the lineage of methods that push the local computation only where it matters, now underpins the propagation step in scalable graph neural networks such as the PPRGo and GBP families, letting a model precompute graph-structural features on billion-edge graphs without a full GNN forward pass. A parallel thread studies streaming and incremental analytics, where the graph changes continuously and PageRank or component labels must be maintained without recomputing from scratch, a setting that connects directly to the stream processing of <a href="../../part-2-distributed-data/module-09-stream-processing-online-ai/index.html">Chapter 9</a>. The framing to carry forward is that distributed analytics is no longer a terminal report; it is a feature-generation stage feeding the distributed graph neural networks of <a href="section-13.5.html">Section 13.5</a>, and the two are converging into a single pipeline.</p>
+</div>
+<p>We now have the full analytics toolkit running on the engine from <a href="section-13.3.html">Section 13.3</a>: PageRank by summing, connected components and shortest paths by taking minima, triangle counting by intersecting neighbor lists, each one a vertex program whose cost is supersteps times cut edges. These produce structural features that describe where a vertex sits in the graph. The natural next question is how to learn from those positions directly, training a model whose computation is itself shaped like the graph. That is the subject of the distributed graph neural networks in <a href="section-13.5.html">Section 13.5</a>, where the message a vertex sends is no longer a single rank but a learned feature vector.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.4.1: Pick the Combiner <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each of the following graph computations, state the vertex state, the message a vertex sends, and the combiner it uses on receipt, in the style of Table 13.4.1, and say whether the algorithm has PageRank's geometric-convergence signature or label propagation's diameter-bounded one: (a) compute, for every vertex, the maximum value held by any vertex in its connected component; (b) compute the number of hops from a single source to every reachable vertex (unweighted shortest path); (c) propagate a "infected" flag outward from an initial set of infected vertices until no new vertex becomes infected. Explain which of the three could be made to terminate one superstep sooner with a smarter stopping test.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.4.2: Add Shortest Paths to the Engine <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 13.4.1 with a <code>shortest_paths(source)</code> function on the same graph that runs single-source shortest paths as a superstep loop, taking all edges to have weight one. Initialize the source at distance zero and every other vertex at infinity, have each vertex send (its distance + 1) to its out-neighbors, and combine by taking the minimum. Print, per superstep, how many vertices improved their distance and how many still hold infinity, and confirm the job converges in a number of supersteps equal to the eccentricity of the source. Then break the graph into two components as in Code 13.4.1 and confirm the vertices in the other component remain at infinity, and explain what that means operationally.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.4.3: Cost of the Cut <span class="exercise-type analysis">Analysis</span></div>
+<p>Consider a graph with $E = 10^9$ edges run for $T = 40$ PageRank supersteps. Under partition X, $5\%$ of edges are cut; under partition Y, $30\%$ are cut. Each cut edge carries one 8-byte message per superstep and the cross-worker network moves data at 10 gigabytes per second. Estimate the total time spent on cross-worker communication under each partition, and the ratio between them. Now suppose partition Y uses twice as many workers as X; argue from your numbers whether the extra parallelism could ever pay back the extra communication for this iterative job, and contrast your answer with how it would change for triangle counting, which runs only two supersteps. Tie your reasoning back to the communication-cost model of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-13.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 13.3</span><span class="nav-title">The Pregel / Vertex-Centric Model</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 13</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Graph Machine Learning</span></a>
+<a class="next" href="section-13.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 13.5</span><span class="nav-title">Distributed Graph Neural Networks</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

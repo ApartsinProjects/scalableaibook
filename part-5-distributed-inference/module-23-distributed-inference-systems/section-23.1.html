@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 23.1: Why Model Serving Differs from Web Serving. GPU batching, huge per-replica cost, and KV-cache statefulness break the stateless-request, instant-autoscale assumptions of web serving and force the AI-specific fleet designs of this chapter." name="description"/>
+<title>Section 23.1: Why Model Serving Differs from Web Serving | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 23: Distributed Inference Systems</a></div>
+<h1>Why Model Serving Differs from Web Serving</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They handed me a load balancer that was perfect for web traffic. It spread my requests so evenly that not one of them ever met a friend, and my GPU sat there at four percent, lonely and underfed."</p>
+<cite>A Serving Replica That Just Wanted a Full Batch</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A model server looks like a web server (it takes requests over the network and returns responses), but three properties of the accelerator underneath it break the assumptions that make web serving simple: the GPU is fastest when it processes many requests <em>together</em>, each replica is enormous and slow to start, and a generation request is <em>stateful</em>, pinned to the replica that holds its key-value cache.</strong> A stateless web load balancer wants to spread requests instantly across replicas and spin up new replicas on demand. Do exactly that to a model fleet and you starve the GPU of batches, pay seconds-to-minutes of cold start on every scale event, and shatter the state that multi-step generation depends on. This chapter builds the fleet that respects those three properties. This first section names them precisely, shows in one runnable experiment why instant spreading is the wrong reflex, and previews the AI-specific machinery (batch-aware routing, GPU autoscaling, warm pools) that the rest of the chapter develops.</p>
+</div>
+<p>Chapter 22 took a single accelerator and made it as efficient as it could be: quantized weights, a paged key-value cache, fused attention kernels, the per-node craft of getting the most tokens per second out of one box. That work is the foundation, and this part assumes it. But one optimized box is still one box, with a finite memory ceiling, a finite throughput ceiling, and a finite probability of failing at the worst moment. The moment a deployed model must answer more requests than one accelerator can clear, or must stay up while individual machines crash, the problem becomes distributed: a <em>fleet</em> of replicas behind a router, the genuinely distributed serving problem this chapter is about. Chapter 22 built the node; this chapter builds the fleet around it.</p>
+<p>The tempting shortcut is to treat that fleet as a solved problem. We already know how to put many identical servers behind a load balancer and serve millions of stateless HTTP requests; surely a model is just another stateless service with a heavier <code>handle_request</code> function. That intuition is wrong in three specific, consequential ways, and naming them is the work of this section. Each one invalidates a design choice that web serving makes almost without thinking, and each one forces a replacement that the rest of the chapter develops in full.</p>
+
+<h2>1. The Three Properties That Break Web-Serving Assumptions <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Standard web serving rests on a small set of assumptions that hold so reliably for HTTP traffic that they fade into the background. Requests are independent and stateless, so any replica can serve any request. Replicas are cheap and start in milliseconds, so the autoscaler can add or remove them freely in response to load. Latency is dominated by the work of one request, so spreading requests as thinly as possible across replicas minimizes the time each one waits. A model fleet violates all three. Table 23.1.1 lays the contrast out directly; the three subsections that follow take each row in turn.</p>
+<div class="table-caption"><strong>Table 23.1.1:</strong> The three web-serving assumptions that model serving breaks, the property of the accelerator that breaks each one, and the section of this chapter that supplies the replacement design.</div>
+<table>
+<thead>
+<tr><th scope="col">Web-serving assumption</th><th scope="col">Why model serving breaks it</th><th scope="col">Replacement design (this chapter)</th></tr>
+</thead>
+<tbody>
+<tr><td>Spread each request instantly to minimize its wait</td><td>The GPU is fastest when requests are <em>batched</em> together, so the system wants to group, not spread</td><td>Batch-aware routing (<a href="section-23.2.html">23.2</a>), online vs batch (<a href="section-23.3.html">23.3</a>)</td></tr>
+<tr><td>Replicas are cheap and start in milliseconds</td><td>A replica holds a multi-GB model and takes seconds to minutes to load</td><td>GPU autoscaling on utilization (<a href="section-23.4.html">23.4</a>), warm pools and cold-start control (<a href="section-23.6.html">23.6</a>)</td></tr>
+<tr><td>Requests are stateless, so any replica serves any request</td><td>Generation keeps a per-request KV cache, pinning a multi-step request to one replica</td><td>Session-aware routing and failover (<a href="section-23.2.html">23.2</a>, <a href="section-23.7.html">23.7</a>)</td></tr>
+</tbody>
+</table>
+
+<h3>1.1 Property one: the GPU wants requests grouped, not spread</h3>
+<p>An accelerator runs a neural network as a sequence of large matrix operations. Those operations are bandwidth-bound and latency-bound at small sizes: launching a forward pass for a single request pays a large fixed cost (kernel launch, weight reads, pipeline fill) and then does very little useful work. Feed the same pass a batch of requests and the fixed cost is amortized across all of them, while the per-request marginal cost stays tiny. The result is that throughput climbs steeply with batch size before saturating, so the system maximizes throughput by <em>accumulating</em> requests and running them together, the exact opposite of the web instinct to dispatch each request the instant it arrives. This is the latency-throughput tension in its sharpest form: a small, deliberate wait to fill a batch buys a large gain in throughput. We met that tension as a general scaling phenomenon in <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.4.html">Section 3.4</a>; here it stops being a curve on a slide and becomes the central routing decision of the whole serving system.</p>
+<h3>1.2 Property two: replicas are huge and slow to start</h3>
+<p>A web replica is a few megabytes of code that forks in milliseconds, which is why autoscalers add and remove them freely. A model replica must load weights that are gigabytes to hundreds of gigabytes, pull them across the network or off disk, move them onto the accelerator, and warm up the kernels and the allocator before it can serve a single token. That startup is measured in seconds for a small model and minutes for a large one. You therefore cannot spin up a replica per request, and you cannot let an autoscaler react to a traffic spike by booting cold replicas that arrive after the spike is over. The cost and slowness of a replica forces autoscaling to be predictive and conservative, and forces a pool of pre-warmed replicas to absorb bursts, the subjects of <a href="section-23.4.html">Section 23.4</a> and <a href="section-23.6.html">Section 23.6</a>.</p>
+<h3>1.3 Property three: generation is stateful through the KV cache</h3>
+<p>A classification model returns one answer per request and keeps nothing between requests; it is genuinely stateless, and web-style routing handles it well. Autoregressive generation is different. To produce a sequence token by token, the model keeps a <em>key-value cache</em>, the stored attention keys and values for every token generated so far, on the accelerator, and each new token reads and extends it. That cache, whose per-node economics Chapter 22 dissected in <a href="../module-22-per-node-inference-efficiency/section-22.5.html">Section 22.5</a>, ties a multi-step generation request to the specific replica that holds it. A stateless load balancer that re-routes the next token of an in-flight generation to a different replica finds no cache there and either fails or silently recomputes the entire history. Statefulness means the router must keep a session on its replica, and means failover has to reckon with lost cache, which <a href="section-23.2.html">Section 23.2</a> and <a href="section-23.7.html">Section 23.7</a> address directly.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Model Serving Inverts the Web-Serving Reflex</div>
+<p>Web serving spreads requests instantly across stateless, cheap, interchangeable replicas. Model serving must do the reverse on all three counts: <em>group</em> requests so the GPU runs full batches, treat replicas as <em>expensive and slow-to-start</em> so scaling is predictive and warm-pooled, and respect <em>per-request state</em> so a session stays on the replica that holds its KV cache. Every later design in this chapter is a consequence of one of these three inversions. When a serving system surprises you, ask which of the three it is fighting.</p>
+</div>
+
+<h2>2. Watching the Wrong Reflex Fail: Spread vs Batch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The clearest way to feel the first property is to simulate two routers against the same stream of requests and a simple model of one accelerator. Our accelerator runs a <em>batch</em> of requests in a single forward pass whose time is a fixed overhead plus a small marginal cost per request: a pass over $b$ requests costs $\text{BASE} + \text{PER}\cdot b$ milliseconds but serves all $b$ at once. With $\text{BASE}=8$ ms and $\text{PER}=0.5$ ms, one request alone costs $8.5$ ms (a throughput ceiling near $118$ requests per second), while a full batch of $32$ costs $24$ ms yet clears $32$ requests, more than ten times the work for less than three times the time. The web-style router dispatches each request the instant it arrives, alone, so every pass is a batch of one. The batch-aware router holds arrivals for a short window (here $10$ ms, or until the batch is full at $32$) and then fires one pass for the whole group. The diagram in Figure 23.1.1 contrasts the two before we run them.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram contrasting web serving, which spreads four requests instantly to four idle replicas each running a batch of one, against model serving, which accumulates the four requests into one full batch on a single GPU and keeps a per-request key-value cache pinned to that replica.">
+<defs>
+<marker id="arr231" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.bx231 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.gp231 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.kv231 { fill:#eaf6ee; stroke:#2e7d4f; stroke-width:1.6; }
+.rq231 { fill:#e7edf6; stroke:#14385c; stroke-width:1.3; }
+.t231 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s231 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.ln231 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr231); }
+</style>
+<!-- Left: web serving -->
+<text class="t231" x="220" y="26">Web serving: spread instantly</text>
+<rect class="rq231" x="60" y="48" width="34" height="22" rx="4"/>
+<rect class="rq231" x="148" y="48" width="34" height="22" rx="4"/>
+<rect class="rq231" x="236" y="48" width="34" height="22" rx="4"/>
+<rect class="rq231" x="324" y="48" width="34" height="22" rx="4"/>
+<text class="s231" x="220" y="64" style="fill:#14385c;">4 independent requests</text>
+<line class="ln231" x1="77" y1="70" x2="77" y2="108"/>
+<line class="ln231" x1="165" y1="70" x2="165" y2="108"/>
+<line class="ln231" x1="253" y1="70" x2="253" y2="108"/>
+<line class="ln231" x1="341" y1="70" x2="341" y2="108"/>
+<rect class="bx231" x="52" y="112" width="50" height="46" rx="6"/>
+<rect class="bx231" x="140" y="112" width="50" height="46" rx="6"/>
+<rect class="bx231" x="228" y="112" width="50" height="46" rx="6"/>
+<rect class="bx231" x="316" y="112" width="50" height="46" rx="6"/>
+<text class="s231" x="77" y="140">R1</text>
+<text class="s231" x="165" y="140">R2</text>
+<text class="s231" x="253" y="140">R3</text>
+<text class="s231" x="341" y="140">R4</text>
+<text class="s231" x="220" y="184" style="fill:#b86b1f;font-weight:600;">each GPU runs a batch of 1</text>
+<text class="s231" x="220" y="204">large fixed cost paid four times,</text>
+<text class="s231" x="220" y="220">accelerators mostly idle</text>
+<!-- Divider -->
+<line x1="440" y1="40" x2="440" y2="340" stroke="#c5ccd6" stroke-width="1.2" stroke-dasharray="5 5"/>
+<!-- Right: model serving -->
+<text class="t231" x="660" y="26">Model serving: batch on the GPU</text>
+<rect class="rq231" x="500" y="48" width="34" height="22" rx="4"/>
+<rect class="rq231" x="588" y="48" width="34" height="22" rx="4"/>
+<rect class="rq231" x="676" y="48" width="34" height="22" rx="4"/>
+<rect class="rq231" x="764" y="48" width="34" height="22" rx="4"/>
+<text class="s231" x="660" y="64" style="fill:#14385c;">same 4 requests</text>
+<path class="ln231" d="M 517 70 L 600 100"/>
+<path class="ln231" d="M 605 70 L 640 100"/>
+<path class="ln231" d="M 693 70 L 680 100"/>
+<path class="ln231" d="M 781 70 L 720 100"/>
+<rect class="bx231" x="560" y="104" width="200" height="30" rx="6"/>
+<text class="s231" x="660" y="123" style="fill:#14385c;">router accumulates a window</text>
+<line class="ln231" x1="660" y1="134" x2="660" y2="156"/>
+<rect class="gp231" x="540" y="160" width="240" height="58" rx="8"/>
+<text class="t231" x="660" y="184" style="fill:#b86b1f;">one GPU, one forward pass</text>
+<text class="s231" x="660" y="204">full batch of 4: fixed cost paid once</text>
+<rect class="kv231" x="540" y="232" width="240" height="58" rx="8"/>
+<text class="t231" x="660" y="256" style="fill:#2e7d4f;">per-request KV cache (stateful)</text>
+<text class="s231" x="660" y="276">each generation pinned to this replica</text>
+<text class="s231" x="660" y="312">next token must come back to the same cache</text>
+</svg>
+<figcaption><strong>Figure 23.1.1:</strong> The inversion. On the left, web serving spreads four requests instantly across four replicas; each accelerator runs a batch of one, pays the fixed launch cost four times, and sits mostly idle. On the right, model serving accumulates the same four requests into one full batch on a single GPU (the fixed cost paid once) and keeps a per-request key-value cache that pins each ongoing generation to that replica. The left router maximizes spreading; the right router maximizes batching and respects state.</figcaption>
+</figure>
+<p>The code below implements both routers and the accelerator model, then runs them against two workloads drawn from the same generator: a short overload burst whose offered rate far exceeds one replica's instant-dispatch ceiling, and a light stream whose rate sits well below it. Reporting throughput together with the median (p50) and tail (p99) latency for each makes the tradeoff visible from both sides.</p>
+<pre><code class="language-python">import random
+
+# A GPU runs a BATCH in one forward pass: fixed overhead BASE plus a small
+# marginal cost PER per request. A pass over b requests costs BASE + PER*b ms
+# but serves all b at once, so 32-in-one-pass beats 32 single-request passes.
+BASE, PER, MAX_BATCH = 8.0, 0.5, 32
+def pass_time(b): return BASE + PER * b
+
+def web_style(arr):                      # dispatch each request instantly, alone
+    end, lat = 0.0, []
+    for t in arr:
+        start = max(t, end)              # queue behind the previous pass
+        end = start + pass_time(1)       # one request per forward pass
+        lat.append(end - t)
+    return end, lat
+
+WINDOW = 10.0                            # ms the router waits to fill a batch
+def batch_aware(arr):                    # accumulate a window, then one pass
+    end, lat, i = 0.0, [], 0
+    while i &lt; len(arr):
+        open_t, j = arr[i], i
+        while j &lt; len(arr) and arr[j] &lt;= open_t + WINDOW and (j - i) &lt; MAX_BATCH:
+            j += 1                        # admit arrivals within the window
+        batch = arr[i:j]
+        start = max(batch[-1], end)       # GPU free and window closed
+        end = start + pass_time(len(batch))
+        lat.extend(end - t for t in batch)
+        i = j
+    return end, lat
+
+def row(name, mk, lat):
+    lat = sorted(lat); n = len(lat)
+    print(f"  {name:&lt;12} throughput={1000.0*n/mk:8.1f} req/s   "
+          f"p50={lat[n//2]:8.2f} ms   p99={lat[int(0.99*n)]:8.2f} ms")
+
+def scenario(label, span_ms, n=1500, seed=0):
+    random.seed(seed)
+    arr = sorted(random.uniform(0, span_ms) for _ in range(n))
+    print(f"{label}  ({n} requests over {span_ms/1000:.0f} s, "
+          f"offered {1000.0*n/span_ms:.0f} req/s):")
+    mk_w, lat_w = web_style(arr); mk_b, lat_b = batch_aware(arr)
+    row("web-style", mk_w, lat_w); row("batch-aware", mk_b, lat_b)
+    print(f"  -&gt; batch-aware clears {(n/mk_b)/(n/mk_w):.1f}x the throughput\n")
+
+scenario("OVERLOAD",   span_ms=3000)     # burst above one replica's ceiling
+scenario("LIGHT LOAD", span_ms=20000)    # stream well below the ceiling</code></pre>
+<div class="code-caption"><strong>Code 23.1.1:</strong> Two routers, one accelerator model, two workloads. <code>web_style</code> dispatches each request the instant it arrives (a batch of one); <code>batch_aware</code> holds a short window and runs the accumulated group in a single pass. The same arrival generator feeds an overload burst and a light stream so the tradeoff is visible from both regimes.</div>
+<pre><code class="language-text">OVERLOAD  (1500 requests over 3 s, offered 500 req/s):
+  web-style    throughput=   117.6 req/s   p50= 4876.94 ms   p99= 9666.34 ms
+  batch-aware  throughput=   497.4 req/s   p50=   17.10 ms   p99=   27.64 ms
+  -> batch-aware clears 4.2x the throughput
+
+LIGHT LOAD  (1500 requests over 20 s, offered 75 req/s):
+  web-style    throughput=    74.9 req/s   p50=   12.18 ms   p99=   67.27 ms
+  batch-aware  throughput=    75.0 req/s   p50=    9.50 ms   p99=   19.12 ms
+  -> batch-aware clears 1.0x the throughput</code></pre>
+<div class="code-caption"><strong>Output 23.1.1:</strong> Under the overload burst the web-style router caps out at $118$ requests per second and its queue collapses (p50 near five seconds), while the batch-aware router clears $4.2\times$ the throughput with p50 latency of $17$ ms. Under light load both routers are limited by the arrival rate, so throughput is equal and the batching window costs nothing visible; batch-aware even trims the tail by clearing small clusters together.</div>
+<p>Read the two regimes together, because each tells half the truth. Under the overload burst the web-style reflex is catastrophic: capped at one request per pass, the single replica clears only $118$ requests per second against an offered $500$, so its queue grows without bound and median latency climbs to nearly five seconds. The batch-aware router, running the same hardware, accumulates full batches and clears more than four times the throughput at a median latency of seventeen milliseconds. Under light load, where the accelerator is rarely busy, the two routers are indistinguishable in throughput (both are limited by how fast requests arrive), and the ten-millisecond accumulation window adds no visible cost; the batch-aware policy even tightens the tail by sweeping up the occasional cluster of near-simultaneous arrivals. The lesson is not that batching is always faster but that it is the only policy that does not fall apart under load, and that the small wait it asks for is nearly free when load is light. That asymmetry is exactly why production model servers batch by default and why <a href="section-23.2.html">Section 23.2</a> makes batch-aware routing the core of the fleet rather than an optimization bolted on later.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Loneliest GPU in the Datacenter</div>
+<p>The most expensive way to run an accelerator is to feed it one request at a time. A web load balancer doing its textbook best, spreading traffic so evenly that no two requests ever share a forward pass, will hold a six-figure GPU at single-digit utilization and present a beautiful, flat, perfectly balanced dashboard while doing so. The first time an inference team sees that dashboard they congratulate the load balancer. The second time they realize the balancer was optimizing for the wrong thing entirely, and they go looking for the batch button.</p>
+</div>
+
+<h2>3. What This Chapter Builds on Top of the Optimized Node <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The three properties and the experiment above set the agenda for the rest of the chapter, each section repairing one of the broken assumptions for the distributed fleet. <a href="section-23.2.html">Section 23.2</a> turns the spread-versus-batch finding into real <em>batch-aware routing</em> across many replicas, with load balancing that accounts for batch occupancy and session affinity that keeps a stateful generation on its replica. <a href="section-23.3.html">Section 23.3</a> separates <em>online</em> serving (latency-critical, one request at a time) from <em>batch</em> serving (throughput-critical, run offline over a corpus), since the right batching window differs by orders of magnitude between them. <a href="section-23.4.html">Section 23.4</a> builds <em>autoscaling on GPU utilization and queue depth</em> rather than on request count, because a replica running full batches at high utilization should not be scaled the way a busy web server is. <a href="section-23.5.html">Section 23.5</a> packs <em>multiple models and tenants</em> onto shared accelerators so expensive hardware is not stranded behind one lightly used model. <a href="section-23.6.html">Section 23.6</a> attacks the cold-start tax head on with <em>warm pools and fast model loading</em>. <a href="section-23.7.html">Section 23.7</a> makes the fleet survive failures despite the lost-KV-cache problem, and <a href="section-23.8.html">Section 23.8</a> shows how production frameworks (Triton, Ray Serve, KServe) package all of this so you assemble a fleet instead of building one from scratch.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Scale-Up Was the Prerequisite; Scale-Out Is the Subject</div>
+<p>This part is where the book's distribution-first thesis meets inference. Chapter 22 was the labeled scale-up prerequisite: everything that makes one accelerator fast, quantization, paged KV cache, fused attention, all per-node craft. From here on the subject is scale-out. The KV-cache economics of <a href="../module-22-per-node-inference-efficiency/section-22.5.html">Section 22.5</a> do not disappear; they return multiplied across a fleet, where the cache now decides which replica a request must return to and what failover costs when that replica dies. Watch how each per-node quantity from Chapter 22 reappears in this chapter as a fleet-level constraint: batch size becomes a routing decision, model size becomes a cold-start budget, cache state becomes a session-affinity requirement. The single optimized node is the seed; the chapter grows the fleet around it.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Chatbot That Web-Scaled Itself Into the Ground</div>
+<p><strong>Who:</strong> A platform team launching a customer-support assistant backed by an open-weights language model.</p>
+<p><strong>Situation:</strong> They reused the company's mature web-serving stack, putting eight GPU replicas behind a standard round-robin load balancer with autoscaling on requests per second.</p>
+<p><strong>Problem:</strong> At launch the GPUs idled near eight percent utilization while p99 latency was terrible and the cost per conversation was four times the projection; under a traffic spike the autoscaler booted new replicas that took ninety seconds to load weights and arrived after the spike had passed.</p>
+<p><strong>Dilemma:</strong> Buy more GPUs to brute-force the latency (expensive, and it would not fix the idle utilization), or keep the hardware and replace the web-style serving assumptions with model-aware ones.</p>
+<p><strong>Decision:</strong> They kept the hardware. The diagnosis matched the three properties exactly: round-robin spreading starved the batches, request-count autoscaling fought multi-second cold starts, and re-routing mid-conversation kept losing the KV cache.</p>
+<p><strong>How:</strong> They moved to a serving framework with continuous batching, switched autoscaling to trigger on queue depth and GPU utilization, added a small warm pool of pre-loaded replicas to absorb bursts, and made the router session-affine so each conversation stayed on the replica holding its cache.</p>
+<p><strong>Result:</strong> GPU utilization rose from eight percent to over sixty, p99 latency fell by more than half, cost per conversation dropped near the original projection, and spikes were absorbed by the warm pool instead of by cold boots.</p>
+<p><strong>Lesson:</strong> A model fleet is not a web fleet with a heavier handler. Each of the three properties in Table 23.1.1, ignored, becomes a separate production fire; respected, each becomes a design the rest of this chapter hands you.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Serving Frameworks Implement the Batch-Aware Reflex for You</div>
+<p>Code 23.1.1 hand-rolled a fixed-window batcher to make the idea visible. Production serving stacks ship a far more capable version (dynamic batching that adapts the window to load, and, for generation, continuous batching that admits new requests into a running batch between token steps) behind a few lines of configuration. NVIDIA Triton Inference Server turns on dynamic batching with a snippet of model config; Ray Serve and KServe wrap the same idea at the fleet level with autoscaling and routing built in. A representative Triton model configuration:</p>
+<pre><code class="language-text"># config.pbtxt for one model served by Triton
+name: "support_llm"
+max_batch_size: 32
+dynamic_batching {
+  max_queue_delay_microseconds: 10000   # wait up to 10 ms to fill a batch
+  preferred_batch_size: [ 16, 32 ]      # aim for these efficient batch sizes
+}
+instance_group [ { count: 2, kind: KIND_GPU } ]   # 2 replicas on GPUs</code></pre>
+<div class="code-caption"><strong>Code 23.1.2:</strong> The accumulation window of Code 23.1.1 (its <code>WINDOW</code> and <code>MAX_BATCH</code>) expressed as a few lines of Triton configuration. The framework handles queue management, batch assembly, preferred-size padding, and GPU placement; you declare the policy instead of coding the scheduler. <a href="section-23.8.html">Section 23.8</a> compares Triton, Ray Serve, and KServe in depth.</div>
+</div>
+
+<h2>4. The Frontier: Batching Smarter and Disaggregating the Request <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The fixed-window batcher of Code 23.1.1 is the simplest member of a fast-moving family. Its crudest limitation is that, for generation, a single forward pass is not the whole request: a request runs for many token steps, and a static batch formed once at admission either makes early-finishing requests wait for slow ones or wastes slots as requests complete. The research and systems community has pushed well past it, and the moves below are the ones that <a href="section-23.2.html">Section 23.2</a> and Chapter 24 build on.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Continuous Batching and Prefill/Decode Disaggregation (2024 to 2026)</div>
+<p>Two ideas now dominate high-throughput model serving. <em>Continuous batching</em> (also called in-flight or iteration-level batching), introduced by the Orca system (Yu et al., OSDI 2022) and made mainstream by vLLM's PagedAttention (Kwon et al., SOSP 2023), admits and evicts requests <em>between</em> token steps rather than freezing a batch at admission, keeping the accelerator densely packed even as individual generations finish at different times; it is now the default in vLLM, TensorRT-LLM, and SGLang. <em>Prefill/decode disaggregation</em>, developed in DistServe (Zhong et al., OSDI 2024) and Splitwise (Patel et al., ISCA 2024) and shipped in production stacks through 2024 to 2026, separates the compute-bound prompt-processing phase from the memory-bandwidth-bound token-generation phase onto different replicas so each can batch on its own terms, since the two phases have opposite hardware appetites. Both ideas take the lesson of Output 23.1.1 (group work to feed the GPU) and apply it at finer grain than a fixed window allows. We develop continuous batching and disaggregation across a fleet in Chapter 24's distributed LLM serving; for now, read Code 23.1.1 as the first rung of a ladder these systems climb.</p>
+</div>
+<p>With the three properties named, the wrong reflex measured, and the chapter's agenda set, we are ready to build the fleet for real. The next section takes the spread-versus-batch finding and turns it into routing across many replicas: how to balance load when the unit of work is a batch rather than a request, and how to keep a stateful generation on the replica that holds its cache. That work begins in <a href="section-23.2.html">Section 23.2</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.1.1: Which Property Is Being Violated? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each symptom, name which of the three properties from Section 1 (batching, replica cost and startup, KV-cache statefulness) is being mishandled, and which section of this chapter supplies the fix: (a) GPUs sit at five percent utilization while latency is fine, on a model that returns one classification per request; (b) a traffic spike triggers new replicas that come online after the spike has ended; (c) a multi-turn chat occasionally produces garbled continuations whenever a particular replica is busy and the request is re-routed. Explain why applying the fix for the wrong property would not help.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.1.2: Find the Window That Hides <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 23.1.1 to sweep the accumulation <code>WINDOW</code> over the values $\{0, 2, 5, 10, 20, 50\}$ ms under a fixed moderate load (for example $1500$ requests over $6$ seconds, offered $250$ requests per second). Plot or tabulate throughput and p99 latency against the window. Identify the smallest window that already captures most of the throughput gain, and explain why pushing the window much larger buys little extra throughput while steadily raising latency. Relate the shape you find to the latency-throughput curve of <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.4.html">Section 3.4</a>.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.1.3: The Cold-Start Budget <span class="exercise-type analysis">Analysis</span></div>
+<p>A replica serves $120$ requests per second when warm and takes $90$ seconds to load its weights from cold. Traffic doubles instantaneously from $240$ to $480$ requests per second and stays there. Using only these numbers, estimate how long the fleet is under-provisioned if the autoscaler reacts to the spike by booting cold replicas, and how many requests queue up during that window. Then estimate the size of a warm pool (in pre-loaded idle replicas) needed to absorb the same doubling with no cold boots. Explain in one sentence why a web-serving autoscaler, which assumes millisecond startup, would size this pool at zero and be wrong. We make this analysis precise in <a href="section-23.6.html">Section 23.6</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html"><span class="nav-label">Chapter Overview</span><span class="nav-num">Chapter 23</span><span class="nav-title">Distributed Inference Systems</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 23</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Inference Systems</span></a>
+<a class="next" href="section-23.2.html"><span class="nav-label">Next</span><span class="nav-num">Section 23.2</span><span class="nav-title">Replicas, Load Balancing, and Batch-Aware Routing</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

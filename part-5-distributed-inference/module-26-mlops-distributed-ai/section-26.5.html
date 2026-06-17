@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 26.5: Distributed Experiment Tracking. Recording config, code, data, metrics, and artifacts per run when training spans many ranks and a sweep produces hundreds of concurrent runs, with a central tracking server, rank-0 vs all-rank views, leaderboards, and the link to the model registry." name="description"/>
+<title>Section 26.5: Distributed Experiment Tracking | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 26: MLOps for Distributed AI</a></div>
+<h1>Distributed Experiment Tracking</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Four hundred runs finished overnight. The one that won is the one nobody wrote down. I am the spreadsheet that was supposed to prevent this."</p>
+<cite>A Tracking Server With No Record of Its Best Run</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>An experiment you cannot reconstruct is an experiment you did not run.</strong> When a single training job spans hundreds of ranks and a hyperparameter search launches hundreds of jobs at once, the record of what was run, the configuration, the code version, the data version, the metrics over time, the environment, and the resulting artifacts, stops being a courtesy and becomes infrastructure. Experiment tracking is the shared service that ingests this record from every machine in the fleet, aggregates the per-rank chatter into one canonical history per run, lets you compare hundreds of runs on a leaderboard, and hands the winning run to the model registry for promotion. This section builds a tracker from first principles so that the distributed concerns, who logs, what gets aggregated, and how the server itself scales, are concrete rather than hidden behind a hosted dashboard.</p>
+</div>
+<p>The previous section wired up continuous delivery so that a vetted model can flow from commit to fleet automatically. That pipeline assumes you already know which model deserves promotion. Choosing it is the job of experiment tracking. Every serious training effort generates many candidate models: different learning rates, different data mixes, different architectures, each producing a curve of metrics over time. Without a disciplined record, the comparison degrades into screenshots and remembered numbers, and reproducibility, the property we made measurable back in <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.7.html">Section 5.7</a>, quietly evaporates. A tracker exists to make every run a first-class, queryable, comparable object.</p>
+<p>What turns this from a single-machine logging habit into a distributed-systems problem is scale on two axes at once. A single run is itself distributed across many ranks, so the tracker must decide whose numbers are canonical and how to fold in the rest. A single sweep is hundreds of such runs writing concurrently, so the tracking server is a shared service under real write load. We take these in turn, then build a tracker that handles both.</p>
+
+<h2>1. What a Run Record Must Capture <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A run is the atomic unit of experiment tracking, and a useful run record captures six things, each answering a question you will ask later when a result needs to be explained or reproduced. The configuration (the hyperparameters) answers "what knobs were set". The code version (a commit hash) answers "what program ran". The data version (a dataset hash or snapshot id) answers "what did it learn from". The metrics over time (loss, accuracy, throughput per step) answer "how did it go". The environment (library versions, hardware, the launch command) answers "where did it run". The artifacts (checkpoints, plots, the final model) answer "what came out". Drop any one of these and a run that looked decisive becomes a result you can admire but never trust or rebuild.</p>
+<p>The tie to reproducibility is direct. <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.7.html">Section 5.7</a> defined a reproducible result as one another team can regenerate from recorded inputs; the six fields above are exactly those inputs, captured automatically at run time rather than reconstructed from memory afterward. The discipline is to log them as the run happens, because the environment that produced a number is hardest to recover once the cluster has moved on to the next job.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Metric Without Its Context Is Noise</div>
+<p>A validation accuracy of 0.81 is meaningless until it is bound to the configuration, code, and data that produced it. Experiment tracking is not "saving the loss curve"; it is binding every metric to the full provenance of the run that emitted it, so that comparisons across runs are comparisons of like with like. The moment two runs differ in an unrecorded variable, the leaderboard ranks them on a difference you cannot see, and the wrong model gets promoted.</p>
+</div>
+
+<h2>2. The Distributed Angle: Who Logs, and What Gets Aggregated <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A data-parallel training run is not one process emitting metrics; it is $W$ ranks, each computing on its own shard, each capable of logging. If all $W$ ranks log the loss every step, the tracker receives $W$ copies of a quantity that is supposed to be one number, and the leaderboard fills with near-duplicates. The standard resolution is a division of labor. After the gradient all-reduce that synchronizes the model (the collective from <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>), every rank holds the same synchronized weights, so rank 0 logs the <em>canonical</em> metrics that describe the shared model, the validation accuracy, the synchronized loss, the global throughput. The remaining ranks stay silent on those, which keeps the canonical history clean and the write volume down by a factor of $W$.</p>
+<p>Per-rank logging does not disappear; it changes purpose. For debugging, you sometimes want every rank's local loss, because a single straggler shard with a corrupted batch or a slow link shows up as a divergence between rank 0's canonical number and the all-rank mean. A tracker that supports both views, rank-0 as the official record and all-rank as a diagnostic overlay, lets you answer both "how is the run doing" and "is any shard misbehaving" from the same store. The canonical metric for a step is the rank-0 value; the all-rank diagnostic is the mean over ranks,</p>
+$$m^{\text{canon}}_{t} = m^{(0)}_{t}, \qquad \bar{m}_{t} = \frac{1}{W}\sum_{r=0}^{W-1} m^{(r)}_{t},$$
+<p>and the gap $\lvert m^{\text{canon}}_{t} - \bar{m}_{t}\rvert$ is a cheap, continuously available skew signal across shards. We will reference this gap in the demo below.</p>
+
+<h2>3. The Tracking Server as a Shared Fleet Service <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The second axis of scale is the number of runs. A hyperparameter search, the subject of <a href="../../part-4-parallel-deep-learning/module-21-distributed-hpo-automl/index.html">Chapter 21</a>, does not run one job; it launches hundreds of concurrent trials, each a distributed run, each streaming metrics. The tracking server is the one component every trial writes to, which makes it a shared fleet service with its own scaling problem. If a sweep of 400 trials, each with 8 ranks logging at a few hertz, all point at one server, the ingest path must absorb thousands of small writes per second without becoming the bottleneck that stalls training.</p>
+<p>This is why production trackers separate the cheap, high-frequency write path from the expensive query path. Metrics are appended to a fast log-structured store (often batched and buffered on the client so the network sees one request per hundreds of points), while comparison queries and leaderboards run against an indexed view built asynchronously. The same architectural instinct from the rest of this book applies: the hot path stays simple and append-only, and the coordination-heavy work (ranking, joining across runs) is pushed off the critical path. Figure 26.5.1 shows the shape: many ranks across many runs funnel into one ingest service, which feeds both a comparison dashboard and the model registry from <a href="section-26.3.html">Section 26.3</a>.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 410" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram showing many ranks within several runs of a hyperparameter sweep all logging into one central tracking server, which feeds a comparison dashboard and links the winning run to the model registry.">
+<defs>
+<marker id="arr265" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b265 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w265 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g265 { fill:#eaf5ee; stroke:#1f7a44; stroke-width:1.6; }
+.t265 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s265 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l265 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr265); }
+.d265 { fill:none; stroke:#b86b1f; stroke-width:1.4; stroke-dasharray:4 3; }
+</style>
+<text class="t265" x="150" y="24">Sweep of many runs (Ch 21)</text>
+<rect class="w265" x="40" y="40" width="220" height="92" rx="9"/>
+<text class="t265" x="150" y="62">Run A (W ranks)</text>
+<rect class="b265" x="54" y="74" width="44" height="44" rx="5"/><text class="s265" x="76" y="100">r0</text>
+<rect class="b265" x="106" y="74" width="44" height="44" rx="5"/><text class="s265" x="128" y="100">r1</text>
+<rect class="b265" x="158" y="74" width="44" height="44" rx="5"/><text class="s265" x="180" y="100">r2</text>
+<rect class="b265" x="210" y="74" width="40" height="44" rx="5"/><text class="s265" x="230" y="100">rk</text>
+<rect class="w265" x="40" y="150" width="220" height="92" rx="9"/>
+<text class="t265" x="150" y="172">Run B (W ranks)</text>
+<rect class="b265" x="54" y="184" width="44" height="44" rx="5"/><text class="s265" x="76" y="210">r0</text>
+<rect class="b265" x="106" y="184" width="44" height="44" rx="5"/><text class="s265" x="128" y="210">r1</text>
+<rect class="b265" x="158" y="184" width="44" height="44" rx="5"/><text class="s265" x="180" y="210">r2</text>
+<rect class="b265" x="210" y="184" width="40" height="44" rx="5"/><text class="s265" x="230" y="210">rk</text>
+<text class="s265" x="150" y="278">... hundreds of concurrent runs ...</text>
+<rect class="b265" x="360" y="120" width="150" height="100" rx="10"/>
+<text class="t265" x="435" y="158">Tracking</text>
+<text class="t265" x="435" y="176">Server</text>
+<text class="s265" x="435" y="200">append-only ingest</text>
+<path class="l265" d="M 260 92 L 320 150 L 358 158"/>
+<path class="l265" d="M 260 196 L 320 188 L 358 182"/>
+<path class="l265" d="M 250 272 L 320 230 L 358 200"/>
+<text class="s265" x="305" y="120">rank-0 canonical</text>
+<text class="s265" x="305" y="252">+ per-rank debug</text>
+<rect class="b265" x="600" y="40" width="220" height="120" rx="10"/>
+<text class="t265" x="710" y="66">Comparison Dashboard</text>
+<text class="s265" x="710" y="90">metrics over time</text>
+<text class="s265" x="710" y="110">leaderboard / sweep view</text>
+<text class="s265" x="710" y="130">rank-0 vs all-rank skew</text>
+<path class="l265" d="M 510 150 L 600 110"/>
+<rect class="g265" x="600" y="220" width="220" height="96" rx="10"/>
+<text class="t265" x="710" y="250">Model Registry (26.3)</text>
+<text class="s265" x="710" y="272">winning run promoted</text>
+<text class="s265" x="710" y="290">to staging / production</text>
+<path class="d265" d="M 710 160 L 710 218" marker-end="url(#arr265)"/>
+<text class="s265" x="788" y="192">best run</text>
+<text class="s265" x="430" y="350">one shared service the whole fleet writes to; queries and ranking run off the hot path</text>
+</svg>
+<figcaption><strong>Figure 26.5.1:</strong> The shape of distributed experiment tracking. Many ranks inside many concurrent runs (a sweep from <a href="../../part-4-parallel-deep-learning/module-21-distributed-hpo-automl/index.html">Chapter 21</a>) log to one central server: rank 0 streams canonical metrics, other ranks stream per-rank diagnostics. The server feeds a comparison dashboard and, for the winning run, hands provenance to the model registry of <a href="section-26.3.html">Section 26.3</a> for promotion. The dashed arrow is the leaderboard-to-registry link this section ends on.</figcaption>
+</figure>
+
+<h2>4. A Tracker From First Principles <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The code below is a complete, if tiny, experiment tracker. It implements the central server as an append-only metric store, ingests metrics from multiple simulated ranks across the runs of a hyperparameter sweep, exposes both the rank-0 canonical view and the all-rank diagnostic view, and produces a leaderboard that ranks every run and names the one to promote. Nothing here needs a network or a database; the point is to make the aggregation logic, the part a hosted tracker hides, fully visible.</p>
+<pre><code class="language-python">import math, random
+from collections import defaultdict
+
+random.seed(7)
+
+# --- A central, in-memory tracking server the whole "fleet" writes to. ---
+class TrackingServer:
+    def __init__(self):
+        self.runs = {}                       # run_id -> config dict
+        self.metrics = defaultdict(list)     # (run_id, rank, key) -> [(step, value)]
+
+    def start_run(self, run_id, config):
+        self.runs[run_id] = dict(config)
+
+    def log(self, run_id, rank, step, key, value):   # the high-frequency hot path
+        self.metrics[(run_id, rank, key)].append((step, value))
+
+    # rank-0 holds the canonical metric; the all-rank view averages across ranks.
+    def series(self, run_id, key, ranks):
+        if ranks == "rank0":
+            return self.metrics.get((run_id, 0, key), [])
+        per_step = defaultdict(list)
+        for r in self._ranks_of(run_id):
+            for step, val in self.metrics.get((run_id, r, key), []):
+                per_step[step].append(val)
+        return [(s, sum(v) / len(v)) for s, v in sorted(per_step.items())]
+
+    def _ranks_of(self, run_id):
+        return sorted({r for (rid, r, k) in self.metrics if rid == run_id})
+
+    def final(self, run_id, key, ranks="rank0"):
+        s = self.series(run_id, key, ranks)
+        return s[-1][1] if s else float("nan")
+
+
+# --- Simulate a sweep: each run is a distributed job of W ranks. ---
+def simulate_run(server, run_id, lr, wd, world_size, steps=40):
+    server.start_run(run_id, {"lr": lr, "wd": wd, "world_size": world_size})
+    floor = 0.18 + 6.0 * (lr - 0.03) ** 2 + 1.5 * wd      # hyperparam-dependent loss floor
+    for step in range(steps):
+        base = floor + 0.9 * math.exp(-0.12 * step * (lr / 0.03))
+        for rank in range(world_size):
+            noisy = base + random.gauss(0, 0.02)          # per-rank shard noise
+            server.log(run_id, rank, step, "loss", noisy)
+        # After all-reduce every rank shares the weights, so rank-0 logs the canonical val_acc.
+        server.log(run_id, 0, step, "val_acc", 1.0 - base + random.gauss(0, 0.005))
+
+
+server = TrackingServer()
+sweep = [(lr, wd) for lr in (0.01, 0.03, 0.06) for wd in (0.0, 0.01)]
+WORLD = 4
+for i, (lr, wd) in enumerate(sweep):
+    simulate_run(server, f"run-{i:02d}", lr, wd, WORLD)
+
+print(f"ingested {len(server.runs)} concurrent runs x {WORLD} ranks each")
+print(f"total metric points: {sum(len(v) for v in server.metrics.values())}\n")
+
+# Rank-0 vs all-rank view for one run (detecting skew across shards).
+rid = "run-02"
+r0, allr = server.final(rid, "loss", "rank0"), server.final(rid, "loss", "allrank")
+print(f"{rid} final loss  rank-0 (canonical): {r0:.4f}")
+print(f"{rid} final loss  all-rank (mean)   : {allr:.4f}")
+print(f"{rid} rank skew                      : {abs(r0 - allr):.4f}\n")
+
+# Leaderboard across the sweep, ranked by rank-0 validation accuracy.
+board = sorted(
+    [(rid, c["lr"], c["wd"], server.final(rid, "val_acc"), server.final(rid, "loss"))
+     for rid, c in server.runs.items()],
+    key=lambda r: r[3], reverse=True)
+
+print("LEADERBOARD (by rank-0 val_acc)")
+print(f"{'run':<8}{'lr':>6}{'wd':>7}{'val_acc':>10}{'loss':>9}")
+for rid, lr, wd, acc, loss in board:
+    print(f"{rid:<8}{lr:>6}{wd:>7}{acc:>10.4f}{loss:>9.4f}")
+
+best = board[0]
+print(f"\nwinning run promoted to registry: {best[0]} "
+      f"(lr={best[1]}, wd={best[2]}, val_acc={best[3]:.4f})")
+</code></pre>
+<div class="code-caption"><strong>Code 26.5.1:</strong> A from-scratch experiment tracker. The <code>TrackingServer</code> is an append-only store written by every rank of every run; <code>series</code> returns either the rank-0 canonical history or the all-rank mean, and the leaderboard ranks the whole sweep and names the run to hand to the registry.</div>
+<pre><code class="language-text">ingested 6 concurrent runs x 4 ranks each
+total metric points: 1200
+
+run-02 final loss  rank-0 (canonical): 0.1860
+run-02 final loss  all-rank (mean)   : 0.1772
+run-02 rank skew                      : 0.0088
+
+LEADERBOARD (by rank-0 val_acc)
+run         lr     wd   val_acc     loss
+run-04    0.06    0.0    0.8144   0.1510
+run-02    0.03    0.0    0.8099   0.1860
+run-05    0.06   0.01    0.8036   0.2284
+run-03    0.03   0.01    0.7889   0.2133
+run-00    0.01    0.0    0.6211   0.3413
+run-01    0.01   0.01    0.6144   0.3591
+
+winning run promoted to registry: run-04 (lr=0.06, wd=0.0, val_acc=0.8144)
+</code></pre>
+<div class="code-caption"><strong>Output 26.5.1:</strong> Real output from Code 26.5.1. Six concurrent runs of four ranks each contribute 1200 metric points; run-02 shows a small rank-0 versus all-rank skew (0.0088, well within noise), and the leaderboard ranks the full sweep by canonical validation accuracy, naming run-04 as the run to promote.</div>
+<p>Three details in that output carry the section's argument. The 1200 points came from six runs writing concurrently to one server, which is the fleet-write pattern in miniature. The rank skew of 0.0088 on run-02 is the all-rank diagnostic doing its job: small here because the shards behave, but the same number would spike if one rank's shard were poisoned, surfacing a bug the rank-0 canonical curve alone would hide. And the leaderboard ranks every run on the same canonical metric, so the promotion decision, run-04 to the registry, is a comparison of like with like rather than of remembered screenshots.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Run That Won Was the Run Nobody Logged</div>
+<p>Every team that skips tracking eventually lives the same small tragedy: the best model of the quarter came from a one-off script someone ran on a Friday with hand-typed flags, and on Monday nobody can say what those flags were. The model sits in a folder named <code>final_v3_REAL_use_this</code>, unreproducible and unpromotable. Experiment tracking is the unglamorous habit that turns "it worked once" into "it works, here is exactly why".</p>
+</div>
+
+<h2>5. Comparing Runs, Leaderboards, and the Link to the Registry <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The leaderboard in Output 26.5.1 is where tracking pays off. With every run bound to its configuration and ranked on one canonical metric, the sweep becomes a queryable object: filter to runs with weight decay zero, sort by validation accuracy, read off that the higher learning rate wins on this problem. That is the comparison a hosted dashboard renders as a sortable table and a set of overlaid metric curves, and it is the same logic the demo computes by hand. The value is not the rendering; it is that the comparison is fair because the provenance is complete.</p>
+<p>The leaderboard's top entry is also the bridge to the rest of the chapter. The winning run carries exactly the provenance the model registry of <a href="section-26.3.html">Section 26.3</a> needs to register a new model version: the config, the code commit, the data version, and the artifact path. Promotion is then a hand-off of a tracked run, not a fresh upload of a mystery file, which is what makes the CI/CD flow of <a href="section-26.4.html">Section 26.4</a> trustworthy end to end. The tracked metrics do not stop mattering at promotion either; the validation curves recorded here become the baseline that production monitoring compares against, the connection <a href="section-26.6.html">Section 26.6</a> builds into fleet-wide observability.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Sweep That Lost Its Winner to a Silent Schema Drift</div>
+<p><strong>Who:</strong> An ML platform engineer running nightly hyperparameter sweeps for a recommendation team.</p>
+<p><strong>Situation:</strong> Each night a 256-trial sweep launched across a shared cluster, every trial a 8-rank data-parallel job streaming loss and validation metrics to a central tracker.</p>
+<p><strong>Problem:</strong> The morning leaderboard showed a clear winner, but when the team promoted it, the offline replay produced a noticeably worse model than the tracked number claimed.</p>
+<p><strong>Dilemma:</strong> Trust the leaderboard and ship, or block every promotion for manual replay, which would erase the throughput the sweep was built to provide.</p>
+<p><strong>Decision:</strong> They audited the tracker and found the cause: a feature-pipeline change had shifted the data version mid-sweep, so trials before and after were ranked against different data, yet only the configuration, not the data version, was being logged.</p>
+<p><strong>How:</strong> They made data-version capture mandatory in the run record, added a leaderboard guard that refused to compare runs across different data hashes, and surfaced the rank-0 versus all-rank skew so a poisoned shard could not masquerade as a better run.</p>
+<p><strong>Result:</strong> Leaderboards became comparisons of like with like again; the next sweep's promoted run matched its replay within noise, and the registry hand-off from <a href="section-26.3.html">Section 26.3</a> could be trusted without a manual gate.</p>
+<p><strong>Lesson:</strong> A leaderboard is only as honest as the least-recorded field in its run records. Capture all six fields, or rank on a difference you cannot see.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: MLflow Tracking and Weights &amp; Biases Do the Server for You</div>
+<p>Code 26.5.1 hand-rolled the server, the per-rank logging discipline, and the leaderboard. Production trackers give you all three as a few calls against a hosted or self-hosted service that scales the ingest path for you. With MLflow Tracking you wrap a run, log params and metrics, and the canonical rank-0 pattern is just "only log from rank 0":</p>
+<pre><code class="language-python">import mlflow                                  # pip install mlflow
+
+with mlflow.start_run(run_name="run-04"):
+    mlflow.log_params({"lr": 0.06, "wd": 0.0, "world_size": 8})
+    mlflow.set_tag("git_commit", code_version)  # provenance: code + data version
+    mlflow.set_tag("data_version", data_hash)
+    for step, (loss, val_acc) in enumerate(history):
+        if rank == 0:                            # rank-0 logs the canonical metrics
+            mlflow.log_metric("loss", loss, step=step)
+            mlflow.log_metric("val_acc", val_acc, step=step)
+    mlflow.log_artifact("checkpoint.pt")         # the artifact the registry will promote
+</code></pre>
+<div class="code-caption"><strong>Code 26.5.2:</strong> The same run record as Code 26.5.1, now through MLflow Tracking. The hand-built server, append store, and query layer collapse to <code>start_run</code> / <code>log_metric</code> / <code>log_artifact</code>; MLflow handles concurrent ingest from hundreds of trials, the comparison UI, and the direct hand-off to its Model Registry. Weights &amp; Biases (<code>wandb.init</code> / <code>wandb.log</code>) offers the same surface with a hosted dashboard and automatic sweep leaderboards; TensorBoard, Neptune, and Comet occupy the same niche.</div>
+</div>
+<p>One operational caveat survives every tool: logging is not free. At high frequency, a synchronous <code>log_metric</code> on the training hot path can stall the step, so trackers buffer points on the client and flush in batches, and you log scalars often but heavy artifacts rarely. The instinct is the same one from Section 3 of this section: keep the hot path append-only and cheap, push everything expensive off it.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Tracking at Foundation-Model Scale (2024 to 2026)</div>
+<p>As runs grew to thousands of ranks and months of wall-clock, tracking stopped being a dashboard and became a systems problem in its own right. Recent open work pushes experiment and metric tracking toward streaming, high-cardinality ingest: the 2024 era of large-model training reports (the OLMo and LLM360 fully-open training efforts) treats per-step telemetry, loss spikes, gradient norms, and hardware counters across the whole job as first-class artifacts released alongside checkpoints, so a run is reproducible at the level of its training dynamics, not just its final weights. A parallel line couples tracking to automated search: the sweep schedulers in Optuna and Ray Tune now stream trial metrics into the tracker and read them back to prune underperforming trials early (ASHA-style), closing the loop between the leaderboard and the launcher so that hundreds of concurrent runs are not just recorded but actively steered. The open question the field is circling is provenance at fleet scale: capturing data version, code version, and environment tightly enough that a result from a 1000-rank run is reproducible by a different team, the property <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.7.html">Section 5.7</a> demands, without the telemetry itself becoming the bottleneck.</p>
+</div>
+<p>We now have the record. Every run that crosses the fleet is captured with its full provenance, aggregated from many ranks into one canonical history, comparable against hundreds of peers on a leaderboard, and linked to the registry that promotes the winner. What that record cannot tell you is how the promoted model behaves once it is serving real traffic across the fleet, where the metrics that matter shift from training loss to latency, throughput, and error rates under load. Turning the tracked training baseline into live fleet-wide monitoring is the subject of <a href="section-26.6.html">Section 26.6</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.5.1: What Belongs in the Record? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each scenario, name which of the six run-record fields from Section 1 (config, code version, data version, metrics, environment, artifacts) was the one missing field that made the result irreproducible, and say which field a leaderboard would have to guard on to prevent the mistake: (a) two runs are ranked side by side but one used a different feature pipeline; (b) a winning run cannot be rebuilt because a library was silently upgraded between trials; (c) a promoted checkpoint scores far below its tracked accuracy on replay. Explain why logging only the configuration, the most common shortcut, is insufficient in all three.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.5.2: A Poisoned Shard <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 26.5.1 so that for one run, a single non-zero rank logs a loss that is consistently $0.3$ higher than the others (simulate a corrupted shard). Compute the rank-0 canonical final loss and the all-rank mean final loss, and show that the rank-0 curve alone hides the problem while the rank-0 versus all-rank skew $\lvert m^{\text{canon}} - \bar{m}\rvert$ surfaces it. Then add a method <code>skew(run_id, key)</code> to <code>TrackingServer</code> that returns this gap per step, and explain how a monitoring rule on that series would catch a misbehaving shard mid-run rather than after.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.5.3: The Cost of Logging Too Often <span class="exercise-type analysis">Analysis</span></div>
+<p>A sweep runs $R = 400$ concurrent trials, each a data-parallel job of $W = 8$ ranks, training for $S = 10^{5}$ steps. Suppose, naively, every rank logs the loss every step directly to one server. Estimate the total number of writes the server must absorb, and the writes per second if the sweep finishes in 6 hours. Now apply the two reductions from this section: only rank 0 logs canonical metrics, and the client buffers and flushes one request per 500 points. Recompute the server's request rate and state the total reduction factor. Argue from these numbers why the rank-0 convention and client-side batching are not optional niceties but the reason a single tracking server can serve a whole fleet.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-26.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 26.4</span><span class="nav-title">CI/CD for Distributed ML</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 26</span><span class="nav-num">Contents</span><span class="nav-title">MLOps for Distributed AI</span></a>
+<a class="next" href="section-26.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 26.6</span><span class="nav-title">Fleet-Wide Monitoring and Observability</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

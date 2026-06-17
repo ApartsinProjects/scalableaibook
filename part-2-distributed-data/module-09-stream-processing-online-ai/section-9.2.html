@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 9.2: Events, Streams, and Windows. The building blocks of stream processing for AI: immutable timestamped events, unbounded partitioned streams, tumbling, sliding, and session windows, and the partitioned checkpointed state that turns windowed aggregates into real-time features." name="description"/>
+<title>Section 9.2: Events, Streams, and Windows | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Distributed Data Processing for AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 9: Stream Processing and Online AI</a></div>
+<h1>Events, Streams, and Windows</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They told me the stream had no end. I asked for a window so I could at least count something before the next event arrived."</p>
+<cite>An Operator Waiting on a Watermark</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A stream is an unbounded, partitioned sequence of immutable timestamped events, and almost everything useful you compute over it is an aggregate over a finite window carved out of that infinite sequence.</strong> A batch job knows where its input ends, so it can read the whole thing and then answer. A streaming job never gets that luxury: the data keeps arriving, the job runs forever, and any total, average, or count must be scoped to a slice of time or it would never finish. This section names the three building blocks every streaming system is made of, the event, the stream, and the window, and shows how a windowed aggregate maintained as partitioned, checkpointed state becomes a real-time feature for an AI model. Get these three primitives right and the rest of the chapter, event time versus processing time, watermarks, distributed logs, is detail layered on top.</p>
+</div>
+<p>The previous section drew the line between batch and stream processing and argued that online AI lives on the stream side: features that must reflect what happened seconds ago, models that score events as they land, monitors that catch drift while it is still cheap to fix. This section supplies the vocabulary. Before you can reason about late data or exactly-once delivery, you need a precise account of what an event is, what a stream is, and how a window turns an infinite sequence into something you can actually sum. These are simple ideas with sharp edges, and the sharp edges are where the distributed-systems content of <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.3.html">Chapter 2</a> reappears.</p>
+<p>We will build each primitive in turn, then write the same windowed aggregations from scratch in pure Python so the mechanics are concrete, and finally connect the result back to the feature that an online model consumes. The diagram in Figure 9.2.1 is the picture to hold in your head throughout: one timeline of events, three different ways to slice it.</p>
+
+<h2>1. The Event: An Immutable Record With a Timestamp <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>An event is the atom of stream processing. It is a single immutable record that something happened at a particular moment: a user clicked, a sensor read 21.4 degrees, a payment cleared, a model emitted a prediction. Three properties make an event what it is. It carries a <em>timestamp</em>, the moment the thing happened, which is part of the data and not merely metadata about when we processed it. It carries a <em>payload</em>, the fields describing what happened. And it is <em>immutable</em>: once recorded, an event is never edited in place. If the world changes, you append a new event; you do not rewrite the old one.</p>
+<p>That immutability is not a stylistic preference, it is what makes streams safe to distribute and replay. Because an event never changes after it is written, a failed worker can re-read the same events and recompute the same result, and two workers reading the same event can never disagree about its contents. This is the same append-only discipline that makes a distributed log durable, which is why <a href="section-9.5.html">Section 9.5</a> can treat a Kafka-style log as the canonical transport for streams. For now, hold onto the mental model: an event is a tuple $(t, \text{key}, \text{payload})$ where $t$ is fixed forever.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Timestamp Is Data, Not Metadata</div>
+<p>The single most consequential decision in stream processing is to treat the time an event <em>occurred</em> as a first-class field of the event itself, distinct from the time your system happened to <em>see</em> it. A click that happened at 12:00:03 is a 12:00:03 event even if a flaky mobile network delivers it to your cluster at 12:00:47. Every window, every aggregate, and every feature in this chapter is computed against that embedded event time. The gap between when things happen and when we observe them is the entire subject of <a href="section-9.3.html">Section 9.3</a>, and it only becomes tractable because the timestamp travels inside the immutable event.</p>
+</div>
+
+<h2>2. The Stream: An Unbounded, Partitioned Sequence <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A stream is a sequence of events with no end. There is no last element to wait for, no total count to read off the front; the producer keeps appending, possibly forever. This unboundedness is the defining contrast with a batch dataset and the source of every difficulty in the chapter. You cannot sort an infinite sequence, you cannot hold all of it in memory, and you cannot wait for it to finish before you answer, because it never finishes.</p>
+<p>A stream is also <em>partitioned</em>, and for the same reason any web-scale dataset is partitioned: no single machine can ingest or hold the whole thing. The producer chooses a partition key, typically a field of the event such as the user id or device id, and routes each event to one of $P$ partitions, usually by hashing the key. Each partition is an ordered, append-only sub-sequence that lives on one machine and can be consumed by one worker. This is exactly the hash partitioning introduced in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.3.html">Chapter 2</a>, now applied to a sequence that grows without bound rather than a table that sits still. Choosing the key well is the same balancing act as before: hash on a field with many distinct values so load spreads evenly, and put events that must be aggregated together (all of one user's clicks) on the same partition so a single worker can see them all.</p>
+<p>The payoff of partitioning is the same as everywhere else in this book: $P$ partitions can be processed by $P$ workers in parallel, so stream throughput scales out horizontally. The cost is the same too. Order is guaranteed only <em>within</em> a partition, never across partitions, so two events on different partitions have no defined relative order even if their timestamps say otherwise. Any computation that needs a global view, a count across all users, must shuffle or reduce across partitions, the same boundary-crossing tax that <a href="../module-07-spark-dataframes/index.html">Chapter 7</a> charges for a Spark shuffle.</p>
+
+<h2>3. The Window: Slicing the Infinite Into the Finite <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>If a stream never ends, how do you ever compute a sum? You do not sum the stream; you sum a <em>window</em> of it. A window is a finite slice of the unbounded sequence, defined so that it eventually closes and an aggregate over it can be emitted. Windowing is the bridge from the infinite to the finite, and there are three shapes worth knowing. Figure 9.2.1 lays all three over a single event timeline so the differences are visible at a glance.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="An event timeline with dots marking events, beneath which three window strategies are drawn: tumbling windows as adjacent non-overlapping bars, sliding windows as overlapping bars stepping forward, and session windows as bars that group bursts of events separated by an idle gap.">
+<defs>
+<marker id="arr92" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.ax92 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr92); }
+.ev92 { fill:#b86b1f; stroke:#7d4711; stroke-width:1; }
+.tw92 { fill:#e6eef7; stroke:#14385c; stroke-width:1.4; }
+.sw92 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.4; }
+.se92 { fill:#e8f3ec; stroke:#2f7d4f; stroke-width:1.4; }
+.t92 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.lab92 { font:600 13px sans-serif; fill:#14385c; text-anchor:start; }
+.s92 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+</style>
+<!-- event timeline -->
+<line x1="150" y1="50" x2="830" y2="50" class="ax92"/>
+<text class="lab92" x="40" y="54">events</text>
+<text class="s92" x="833" y="54" text-anchor="start">time</text>
+<circle class="ev92" cx="190" cy="50" r="5"/>
+<circle class="ev92" cx="230" cy="50" r="5"/>
+<circle class="ev92" cx="265" cy="50" r="5"/>
+<circle class="ev92" cx="350" cy="50" r="5"/>
+<circle class="ev92" cx="390" cy="50" r="5"/>
+<circle class="ev92" cx="430" cy="50" r="5"/>
+<circle class="ev92" cx="610" cy="50" r="5"/>
+<circle class="ev92" cx="650" cy="50" r="5"/>
+<circle class="ev92" cx="690" cy="50" r="5"/>
+<!-- tumbling -->
+<text class="lab92" x="40" y="110">tumbling</text>
+<rect class="tw92" x="150" y="92" width="160" height="34" rx="4"/>
+<rect class="tw92" x="310" y="92" width="160" height="34" rx="4"/>
+<rect class="tw92" x="470" y="92" width="160" height="34" rx="4"/>
+<rect class="tw92" x="630" y="92" width="160" height="34" rx="4"/>
+<text class="s92" x="230" y="113">W1</text>
+<text class="s92" x="390" y="113">W2</text>
+<text class="s92" x="550" y="113">W3</text>
+<text class="s92" x="710" y="113">W4</text>
+<text class="s92" x="490" y="150" text-anchor="start">fixed width, no overlap: each event in exactly one window</text>
+<!-- sliding -->
+<text class="lab92" x="40" y="210">sliding</text>
+<rect class="sw92" x="150" y="186" width="160" height="26" rx="4"/>
+<rect class="sw92" x="230" y="216" width="160" height="26" rx="4"/>
+<rect class="sw92" x="310" y="246" width="160" height="26" rx="4"/>
+<rect class="sw92" x="390" y="276" width="160" height="26" rx="4"/>
+<text class="s92" x="230" y="203">S1</text>
+<text class="s92" x="310" y="233">S2</text>
+<text class="s92" x="390" y="263">S3</text>
+<text class="s92" x="470" y="293">S4</text>
+<text class="s92" x="575" y="245" text-anchor="start">width &gt; step: windows overlap, one event in several</text>
+<!-- session -->
+<text class="lab92" x="40" y="345">session</text>
+<rect class="se92" x="175" y="327" width="115" height="34" rx="4"/>
+<rect class="se92" x="335" y="327" width="120" height="34" rx="4"/>
+<rect class="se92" x="595" y="327" width="120" height="34" rx="4"/>
+<text class="s92" x="232" y="348">A</text>
+<text class="s92" x="395" y="348">B</text>
+<text class="s92" x="655" y="348">C</text>
+<line x1="290" y1="386" x2="335" y2="386" stroke="#2f7d4f" stroke-width="1.4" stroke-dasharray="3,3"/>
+<line x1="455" y1="386" x2="595" y2="386" stroke="#2f7d4f" stroke-width="1.4" stroke-dasharray="3,3"/>
+<text class="s92" x="430" y="402">gaps of inactivity close one session and open the next</text>
+</svg>
+<figcaption><strong>Figure 9.2.1:</strong> Three ways to window one event stream. <em>Tumbling</em> windows (top) tile the timeline into fixed, non-overlapping slices, so every event belongs to exactly one window. <em>Sliding</em> windows (middle) are wider than their step, so they overlap and a single event contributes to several windows. <em>Session</em> windows (bottom) have no fixed boundaries at all; they grow with activity and close after a gap of inactivity, grouping each burst of events into its own window.</figcaption>
+</figure>
+<p>A <strong>tumbling window</strong> partitions time into fixed-size, non-overlapping intervals, say every five seconds. Each event falls into exactly one window, determined by integer-dividing its timestamp by the window size. Tumbling windows answer questions of the form "how many events per five-second bucket?" and are the natural choice for periodic reporting where every event should be counted once and only once.</p>
+<p>A <strong>sliding window</strong> also has a fixed width but advances by a smaller <em>step</em>, so consecutive windows overlap and a single event can land in several of them. A window of width five seconds that slides every two seconds produces a new aggregate every two seconds, each summarizing the last five. Sliding windows answer "what is the rate over the trailing five seconds, refreshed every two?" and are the workhorse of real-time monitoring and the trailing-average features that AI models love.</p>
+<p>A <strong>session window</strong> has no fixed size at all. It groups events that arrive close together and closes when a configurable <em>gap</em> of inactivity passes with no new event for that key. Sessions naturally model bursty, user-driven activity: a single browsing session, a conversation, a sequence of API calls, each bounded not by the clock but by the user going quiet. Because a session's length depends on the data, session windows are the most expressive and the most stateful of the three.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Window That Never Closes</div>
+<p>A classic streaming bug is the session window with a gap that is longer than your patience. Set the inactivity gap to, say, thirty minutes, then onboard a chatty IoT sensor that pings every twenty-nine minutes forever. The session never sees a gap, never closes, and its state grows without bound until the operator runs out of memory and the job falls over at 3 a.m. The fix is a maximum session duration, a reminder that "unbounded" is a property of the stream you must never let leak into the state of a single window.</p>
+</div>
+
+<h2>4. Windowed Aggregation From Scratch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The cleanest way to see what a window <em>is</em> is to compute one. The code below takes a small synthetic stream of click events, each a tuple of (event time, user, value), and implements tumbling and sliding aggregation directly, with no framework. The tumbling function maps each event to one window by integer division; the sliding function generates overlapping windows of a fixed width at a fixed step and collects the events that fall inside each. It also maintains a per-key running sum, the simplest possible stateful operator, to foreshadow Section 5.</p>
+<pre><code class="language-python">from collections import defaultdict
+
+# A synthetic stream of click events: (event_time_seconds, user_id, value).
+# Events arrive in event-time order here for clarity; timestamps are immutable.
+events = [
+    (1, "u1", 4), (2, "u2", 9), (3, "u1", 1), (5, "u1", 7),
+    (6, "u2", 2), (8, "u1", 5), (9, "u2", 6), (11, "u1", 3),
+    (12, "u2", 8), (14, "u1", 2), (15, "u2", 1), (17, "u1", 9),
+]
+
+def tumbling(events, size):
+    """Fixed, non-overlapping windows of `size` seconds, keyed by window index."""
+    buckets = defaultdict(list)
+    for t, _user, v in events:
+        w = t // size                       # each event lands in exactly one window
+        buckets[w].append(v)
+    out = []
+    for w in sorted(buckets):
+        lo, hi = w * size, (w + 1) * size   # half-open interval [lo, hi)
+        vals = buckets[w]
+        out.append((lo, hi, len(vals), sum(vals)))
+    return out
+
+def sliding(events, size, step):
+    """Overlapping windows of width `size`, emitted every `step` seconds."""
+    t_max = max(t for t, _u, _v in events)
+    out = []
+    start = 0
+    while start &lt;= t_max:
+        lo, hi = start, start + size        # one event can fall in several windows
+        vals = [v for t, _u, v in events if lo &lt;= t &lt; hi]
+        if vals:
+            out.append((lo, hi, len(vals), sum(vals)))
+        start += step
+    return out
+
+print("TUMBLING windows (size=5s): [lo,hi)  count  sum")
+for lo, hi, c, s in tumbling(events, 5):
+    print(f"  [{lo:2d},{hi:2d})   count={c}  sum={s}")
+
+print("\nSLIDING windows (size=5s, step=2s): [lo,hi)  count  sum")
+for lo, hi, c, s in sliding(events, 5, 2):
+    print(f"  [{lo:2d},{hi:2d})   count={c}  sum={s}")
+
+# A per-key stateful aggregate: running sum per user, the seed of an online feature.
+state = defaultdict(int)
+print("\nPER-KEY running sum (partitioned state, updated per event):")
+for t, user, v in events:
+    state[user] += v
+    print(f"  t={t:2d}  {user}  event_value={v}  running_sum[{user}]={state[user]}")
+</code></pre>
+<div class="code-caption"><strong>Code 9.2.1:</strong> Tumbling and sliding window aggregation, plus a per-key running sum, over a synthetic event stream in pure Python. The tumbling map sends each event to one window; the sliding loop re-scans for events inside each overlapping window; the running sum is a stateful operator keyed by user.</div>
+<pre><code class="language-text">TUMBLING windows (size=5s): [lo,hi)  count  sum
+  [ 0, 5)   count=3  sum=14
+  [ 5,10)   count=4  sum=20
+  [10,15)   count=3  sum=13
+  [15,20)   count=2  sum=10
+
+SLIDING windows (size=5s, step=2s): [lo,hi)  count  sum
+  [ 0, 5)   count=3  sum=14
+  [ 2, 7)   count=4  sum=19
+  [ 4, 9)   count=3  sum=14
+  [ 6,11)   count=3  sum=13
+  [ 8,13)   count=4  sum=22
+  [10,15)   count=3  sum=13
+  [12,17)   count=3  sum=11
+  [14,19)   count=3  sum=12
+  [16,21)   count=1  sum=9
+
+PER-KEY running sum (partitioned state, updated per event):
+  t= 1  u1  event_value=4  running_sum[u1]=4
+  t= 2  u2  event_value=9  running_sum[u2]=9
+  t= 3  u1  event_value=1  running_sum[u1]=5
+  t= 5  u1  event_value=7  running_sum[u1]=12
+  t= 6  u2  event_value=2  running_sum[u2]=11
+  t= 8  u1  event_value=5  running_sum[u1]=17
+  t= 9  u2  event_value=6  running_sum[u2]=17
+  t=11  u1  event_value=3  running_sum[u1]=20
+  t=12  u2  event_value=8  running_sum[u2]=25
+  t=14  u1  event_value=2  running_sum[u1]=22
+  t=15  u2  event_value=1  running_sum[u2]=26
+  t=17  u1  event_value=9  running_sum[u1]=31
+</code></pre>
+<div class="code-caption"><strong>Output 9.2.1:</strong> The four disjoint tumbling windows partition the twelve events with no double counting (their counts sum to twelve); the sliding windows overlap, so the same event is counted in several of them and their counts sum to more than twelve. The per-key running sum shows state evolving one event at a time, separately for each user.</div>
+<p>Two things in Output 9.2.1 are worth pausing on. First, the tumbling counts add up to exactly twelve, the number of events, because every event is in one window; the sliding counts add up to far more, because overlap means an event near the middle of the timeline is summed into multiple windows. That double counting is the point of a sliding window, not a bug: it is what gives you a smoothly refreshed trailing aggregate. Second, the per-key running sum is computed independently for <code>u1</code> and <code>u2</code>, which is the seed of why streaming state must be partitioned by key, the subject of the next section.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One Line of Windowing in Spark Structured Streaming</div>
+<p>Code 9.2.1 spelled out window assignment by hand. A production streaming engine exposes the same operation declaratively, and it handles partitioning, state, late data, and incremental emission for you. The roughly forty lines of explicit bucketing collapse to a single grouped aggregation:</p>
+<pre><code class="language-python"># Spark Structured Streaming: a 5-second sliding window stepping every 2 seconds,
+# aggregated per user, over a stream read from Kafka.
+from pyspark.sql.functions import window, sum as ssum, col
+
+agg = (events_df
+    .groupBy(window(col("event_time"), "5 seconds", "2 seconds"), col("user_id"))
+    .agg(ssum("value").alias("sum_value")))   # engine maintains the per-key state
+</code></pre>
+<div class="code-caption"><strong>Code 9.2.2:</strong> The same sliding-window-per-user aggregate as Code 9.2.1, expressed as one <code>groupBy</code> in Spark Structured Streaming. The engine partitions by the grouping key, maintains windowed state, checkpoints it, and emits updates incrementally, the production machinery that <a href="section-9.6.html">Section 9.6</a> unpacks.</div>
+</div>
+
+<h2>5. Stateful Operators: Why State Is Partitioned and Checkpointed <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>An operator is <em>stateless</em> if its output for an event depends only on that event: a filter, a per-event scoring call, a field projection. A windowed aggregate is <em>stateful</em>: to emit the sum for a window it must remember every value seen in that window so far. That running memory is the operator's <em>state</em>, and managing it correctly across a distributed, failure-prone cluster is the hardest engineering problem in streaming. Two requirements follow directly, and both are familiar.</p>
+<p>The first is that <strong>state must be partitioned by key</strong>. The running sum for user <code>u1</code> must live on whatever worker processes <code>u1</code>'s events, and the sum for <code>u2</code> on whoever processes <code>u2</code>. If the stream is partitioned by the same key the aggregate groups on, this is automatic: every event for a key lands on one partition, so one worker owns that key's entire state and never has to ask another worker for it. This is the deep reason the partition key and the aggregation key should agree. When they do not, the engine must repartition (shuffle) the stream so that all events for a key meet on one worker, which is the streaming form of the shuffle from <a href="../module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a>. Partitioned state is what lets stateful streaming scale out at all: $P$ workers hold $P$ disjoint slices of the state and never contend.</p>
+<p>The second is that <strong>state must be checkpointed</strong>. A streaming job runs forever, so over a long enough horizon a worker <em>will</em> crash, and when it does, the in-memory running sums it held vanish. Recomputing them by replaying the entire stream from the beginning is impossible, because the stream has no beginning you can afford to re-read. The remedy is to periodically snapshot each operator's state to durable storage together with the stream position (offset) it reflects, so that after a failure a replacement worker reloads the last snapshot and replays only the events after that offset. This is exactly the checkpoint-and-recover model of <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.4.html">Chapter 2</a>, now applied continuously to a running aggregate rather than once to a batch job. The combination of an immutable, replayable stream and a periodically checkpointed state is what gives streaming engines their exactly-once guarantees, a thread we pick up in <a href="section-9.5.html">Section 9.5</a>.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Partition by the Key You Aggregate By</div>
+<p>The single most important design choice for a stateful streaming job is to partition the stream by the same key the windowed aggregate groups on. When they match, each key's events and each key's state co-locate on one worker, so the aggregate is computed with zero cross-worker communication and the state shards cleanly for fault-tolerant checkpointing. When they mismatch, every window forces a shuffle and the job inherits all the skew and network cost that shuffle implies. Align the two keys and stateful streaming scales out almost for free; misalign them and you pay the shuffle tax on every event.</p>
+</div>
+
+<h2>6. From Windowed Aggregate to Real-Time Feature <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Everything so far has been plumbing; here is the payoff for AI. A real-time feature is, almost always, a windowed aggregate over a stream of events keyed by some entity. "Number of transactions this card made in the last sixty seconds" is a sliding-window count keyed by card. "Average dwell time in the current browsing session" is a session-window mean keyed by user. "Clicks per article in the last five minutes" is a sliding-window count keyed by article. Each is a tiny number, refreshed continuously, that captures how an entity is behaving <em>right now</em>, and each is precisely the windowed-state computation of Sections 4 and 5.</p>
+<p>This matters because the freshness of these features is often what separates a model that works from one that does not. A fraud model scoring a card transaction needs the count of recent transactions <em>as of this transaction</em>, not as of last night's batch job; the fraud pattern it is built to catch unfolds in seconds. A streaming engine maintains that count as partitioned, checkpointed window state and serves it to the model at scoring time, turning the abstract machinery of events and windows into a feature vector. The same windowed state, evaluated continuously, is also what drift monitors watch, which is why <a href="section-9.9.html">Section 9.9</a> can detect concept drift from the very aggregates this section builds. We have now assembled the streaming feature pipeline in miniature: events flow in, partition by key, accumulate into windowed state, and emit a fresh feature on demand.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Fraud Feature That Was Always One Batch Behind</div>
+<p><strong>Who:</strong> A data engineer on the risk team at a digital payments company.</p>
+<p><strong>Situation:</strong> The fraud model used a feature, transactions-per-card-in-the-last-minute, computed by an hourly batch job that scanned the transaction warehouse.</p>
+<p><strong>Problem:</strong> Card-testing attacks fire dozens of small transactions in under a minute, so by the time the hourly job refreshed the feature, the attack was over and the money was gone.</p>
+<p><strong>Dilemma:</strong> Run the batch job far more often, which hammered the warehouse and still lagged by minutes, or rebuild the feature as a true streaming aggregate, which meant standing up a windowing job and managing its state.</p>
+<p><strong>Decision:</strong> They moved the feature to a sliding-window count, sixty-second width stepping every second, keyed by card id, partitioning the transaction stream by that same key so each card's state lived on one worker.</p>
+<p><strong>How:</strong> A Spark Structured Streaming job (the shape of Code 9.2.2) consumed the transaction log, maintained the per-card window count as checkpointed state, and published it to a low-latency feature store the model read at scoring time.</p>
+<p><strong>Result:</strong> The feature went from up to an hour stale to under two seconds, and the model began catching card-testing bursts mid-attack instead of in the next morning's report.</p>
+<p><strong>Lesson:</strong> A real-time feature is a windowed aggregate over a correctly partitioned stream. Align the window to the timescale of the behavior you want to catch, partition by the entity you key on, and the feature becomes as fresh as the events themselves.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Unifying Streaming Features and Training (2024 to 2026)</div>
+<p>The split between how a feature is computed for training (a batch scan over history) and how it is computed for serving (a streaming window over live events) is a notorious source of training-serving skew, and a vigorous engineering line is collapsing it. Open feature platforms such as Feast and Tecton, and the "feature/training-inference" architecture pattern popularized around 2024, push the same windowed-aggregate definition through both a batch backfill and a streaming engine so the two cannot drift apart. In parallel, streaming-native systems are pushing windowed state into vector and embedding features for retrieval, so that the recent-behavior aggregates of this section feed real-time personalization and retrieval-augmented systems directly. The research questions are sharpening: how to guarantee that a window defined once yields bit-identical features online and offline, and how to checkpoint and reshard windowed state elastically as load shifts, the elastic-state problem that connects this chapter to <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.4.html">Chapter 2</a>'s fault-tolerance machinery. Expect the boundary between a feature store and a streaming engine to keep eroding.</p>
+</div>
+<p>We now have the three primitives, event, stream, window, and the partitioned, checkpointed state that turns a window into a live feature. Every one of them leaned on a question we have so far waved away: which clock defines the window boundaries, the time an event happened or the time we processed it? That distinction, and the trouble it causes when events arrive out of order, is the subject of <a href="section-9.3.html">Section 9.3</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.2.1: Three Windows, One Stream <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each task, state which window type (tumbling, sliding, or session) fits best and justify the choice in one sentence: (a) bill each tenant for API calls in clean, non-overlapping one-hour blocks; (b) raise an alert whenever error rate over the trailing five minutes, refreshed every ten seconds, exceeds a threshold; (c) compute the total time a user spent in a single uninterrupted shopping visit. Then explain why using a tumbling window for task (b) would miss a burst of errors that straddles two adjacent windows.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.2.2: Session Windows From Scratch <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 9.2.1 with a <code>sessionize(events, gap)</code> function that groups each user's events into session windows: sort one user's events by time, start a new session whenever the time since the previous event exceeds <code>gap</code>, and emit each session's start, end, event count, and value sum. Run it per user on the synthetic stream with a gap of 3 seconds and print the sessions. Confirm that a single very active user produces one long session while sparse activity produces several short ones, and explain why a session's state cannot be released until the gap has elapsed with no new event.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.2.3: The Cost of Misaligned Keys <span class="exercise-type analysis">Analysis</span></div>
+<p>Suppose a stream of 100,000 events per second is partitioned by <code>region</code> (5 distinct values) but a windowed aggregate groups by <code>user_id</code> (millions of distinct values). Argue from the partitioning rules of Section 2 and 5 why every window now forces a shuffle, estimate qualitatively how the cross-worker traffic compares to the partition-by-<code>user_id</code> case, and describe the load-skew problem the 5-way region partition creates. Then state the single change that removes both the shuffle and the skew, and connect your answer to the hash-partitioning discussion in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.3.html">Chapter 2</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-9.1.html"><span class="nav-label">Previous</span><span class="nav-num">Section 9.1</span><span class="nav-title">Batch Processing vs Stream Processing</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 9</span><span class="nav-num">Contents</span><span class="nav-title">Stream Processing and Online AI</span></a>
+<a class="next" href="section-9.3.html"><span class="nav-label">Next</span><span class="nav-num">Section 9.3</span><span class="nav-title">Event Time and Processing Time</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

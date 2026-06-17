@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 25.4: Approximate Nearest Neighbor Search. The three index families inside a vector database (IVF, HNSW, product quantization), the recall-latency-memory trade-off surface their knobs move, and why those per-shard numbers set up the sharding of the next section." name="description"/>
+<title>Section 25.4: Approximate Nearest Neighbor Search | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 25: Distributed Retrieval and Vector Search</a></div>
+<h1>Approximate Nearest Neighbor Search</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I never find the single closest vector. I find ten that are close enough, in a millisecond, and let the reader decide which truth it wanted. So far the reader has always been satisfied."</p>
+<cite>An Index That Negotiates With Exactness</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A vector database does not search by comparing the query against every stored vector; it builds an index that lets it look at a small fraction of them and still return almost the right answer. Three index families dominate, and each one trades the same three quantities against each other: recall, latency, and memory.</strong> Inverted-file (IVF) indexes cluster the vectors and probe only the nearest cells. Hierarchical navigable small-world (HNSW) graphs walk a layered graph from a coarse entry point down to close neighbors. Product quantization (PQ) compresses each vector into a few bytes so a billion of them fit in memory. The knob you turn on each family (nprobe, efSearch, the PQ code size) slides the system along the recall-latency-memory surface, and where you choose to sit on that surface fixes the per-shard memory footprint and per-query latency that the next section then shards and replicates across machines. Get the single-shard index right and distribution is a matter of fan-out; get it wrong and no amount of fan-out will save the latency budget.</p>
+</div>
+<p><a href="../../part-3-distributed-ml/module-12-distributed-classical-ml/section-12.7.html">Section 12.7</a> introduced approximate nearest neighbor search as the operation that makes embedding retrieval tractable, and showed why exhaustive comparison against a billion vectors is hopeless under a latency budget. This section opens the index itself. We look inside the three structures that vector databases actually use, name the single knob each one exposes, and watch that knob trade recall for speed or memory in real measured numbers. The point is not just to catalog the families; it is to see that every vector database is a choice of one point on a three-way trade-off surface, and that the coordinates of that point, the per-shard memory and the per-query latency, are exactly the inputs that <a href="section-25.5.html">Section 25.5</a> needs before it can decide how to shard and replicate the index across a fleet.</p>
+<p>We work throughout with a database of $N$ vectors in $d$ dimensions and a query that asks for the $k$ nearest. Exhaustive search computes $N$ distances per query, which is $O(Nd)$ work; for $N$ in the billions and a few-millisecond budget, that is far too much. Every index in this section is a way to touch many fewer than $N$ vectors while still finding most of the true top $k$.</p>
+
+<h2>1. The Quantity We Are Trading: Recall <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Before comparing index families we need a single number that says how good an approximate answer is. The standard measure is recall at $k$. Let $A_q$ be the set of $k$ vectors the index returns for query $q$, and let $G_q$ be the true $k$ nearest neighbors found by exhaustive search. Averaged over a query set $\mathcal{Q}$,</p>
+$$\text{recall@}k = \frac{1}{|\mathcal{Q}|} \sum_{q \in \mathcal{Q}} \frac{|A_q \cap G_q|}{k}.$$
+<p>A recall of $1.0$ means the index returned exactly the true neighbors; a recall of $0.9$ means it found nine of every ten true neighbors on average and substituted slightly-worse vectors for the rest. For most retrieval-augmented generation and recommendation workloads, recall in the $0.9$ to $0.99$ range is indistinguishable from exact in downstream quality, which is precisely why approximation is worth the speedup. The whole game is to reach that recall band while touching as few vectors and bytes as possible.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Every Index Is One Point on a Three-Way Surface</div>
+<p>Recall, latency, and memory are not independent dials you can max out together; they form a trade-off surface, and an index family with its parameter fixed is a single point on it. IVF's nprobe buys recall with latency at fixed memory. PQ's code size buys memory back at the cost of recall. HNSW's efSearch buys recall with latency, but the graph itself costs memory up front. There is no free corner where recall is perfect, latency is zero, and memory is tiny. Choosing an index is choosing where on this surface your workload can afford to sit, and that choice is what the next section then multiplies across shards.</p>
+</div>
+
+<h2>2. The Three Index Families <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Figure 25.4.1 shows the three structures side by side, because seeing their shapes makes their trade-offs intuitive before any code runs. IVF carves the space into cells and visits a few; HNSW threads a graph you traverse from coarse to fine; PQ replaces each full vector with a short code that approximates it. Each panel highlights the one knob that moves the family along the trade-off surface.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three panels: IVF showing space partitioned into Voronoi cells with three cells probed near a query; HNSW showing a three-layer graph traversed from a sparse top layer to a dense bottom layer; PQ showing a full 64-dimension vector compressed into four small codebook indices.">
+<defs>
+<marker id="arr254" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.t254 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s254 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.cell254 { fill:#f4f7fb; stroke:#9bb0c6; stroke-width:1; }
+.probe254 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.node254 { fill:#14385c; }
+.edge254 { stroke:#9bb0c6; stroke-width:1; fill:none; }
+.path254 { stroke:#b86b1f; stroke-width:2; fill:none; marker-end:url(#arr254); }
+.q254 { fill:#b8324f; }
+.code254 { fill:#e8eef5; stroke:#14385c; stroke-width:1.2; }
+</style>
+<!-- Panel A: IVF -->
+<text class="t254" x="150" y="22">IVF: probe nearest cells</text>
+<rect class="cell254" x="40" y="38" width="73" height="70"/>
+<rect class="cell254" x="113" y="38" width="73" height="70"/>
+<rect class="cell254" x="186" y="38" width="74" height="70"/>
+<rect class="cell254" x="40" y="108" width="73" height="70"/>
+<rect class="probe254" x="113" y="108" width="73" height="70"/>
+<rect class="probe254" x="186" y="108" width="74" height="70"/>
+<rect class="cell254" x="40" y="178" width="73" height="60"/>
+<rect class="probe254" x="113" y="178" width="73" height="60"/>
+<rect class="cell254" x="186" y="178" width="74" height="60"/>
+<circle class="q254" cx="160" cy="160" r="5"/>
+<text class="s254" x="150" y="262">query lands in one cell;</text>
+<text class="s254" x="150" y="278">nprobe = 3 shaded cells searched</text>
+<text class="s254" x="150" y="298" style="font-weight:600;fill:#b86b1f">knob: nprobe</text>
+<!-- Panel B: HNSW -->
+<text class="t254" x="440" y="22">HNSW: descend graph layers</text>
+<circle class="node254" cx="360" cy="60" r="4"/>
+<circle class="node254" cx="520" cy="60" r="4"/>
+<line class="edge254" x1="360" y1="60" x2="520" y2="60"/>
+<text class="s254" x="320" y="64">L2</text>
+<circle class="node254" cx="360" cy="120" r="4"/>
+<circle class="node254" cx="430" cy="135" r="4"/>
+<circle class="node254" cx="510" cy="120" r="4"/>
+<line class="edge254" x1="360" y1="120" x2="430" y2="135"/>
+<line class="edge254" x1="430" y1="135" x2="510" y2="120"/>
+<text class="s254" x="320" y="124">L1</text>
+<circle class="node254" cx="350" cy="200" r="4"/>
+<circle class="node254" cx="400" cy="185" r="4"/>
+<circle class="node254" cx="445" cy="210" r="4"/>
+<circle class="node254" cx="490" cy="190" r="4"/>
+<circle class="node254" cx="525" cy="215" r="4"/>
+<line class="edge254" x1="350" y1="200" x2="400" y2="185"/>
+<line class="edge254" x1="400" y1="185" x2="445" y2="210"/>
+<line class="edge254" x1="445" y1="210" x2="490" y2="190"/>
+<line class="edge254" x1="490" y1="190" x2="525" y2="215"/>
+<line class="edge254" x1="400" y1="185" x2="490" y2="190"/>
+<text class="s254" x="320" y="204">L0</text>
+<path class="path254" d="M 520 64 L 432 130"/>
+<path class="path254" d="M 430 139 L 446 205"/>
+<circle class="q254" cx="470" cy="215" r="5"/>
+<text class="s254" x="440" y="262">enter at top, hop greedily down to L0</text>
+<text class="s254" x="440" y="278">efSearch = size of the candidate list kept</text>
+<text class="s254" x="440" y="298" style="font-weight:600;fill:#b86b1f">knob: efSearch</text>
+<!-- Panel C: PQ -->
+<text class="t254" x="730" y="22">PQ: compress to short codes</text>
+<rect class="code254" x="610" y="46" width="240" height="26"/>
+<text class="s254" x="730" y="63">full vector: 64 floats = 256 bytes</text>
+<line class="edge254" x1="730" y1="74" x2="730" y2="96" stroke="#14385c" marker-end="url(#arr254)"/>
+<rect class="code254" x="615" y="100" width="50" height="26"/>
+<rect class="code254" x="675" y="100" width="50" height="26"/>
+<rect class="code254" x="735" y="100" width="50" height="26"/>
+<rect class="code254" x="795" y="100" width="50" height="26"/>
+<text class="s254" x="640" y="117">id 53</text>
+<text class="s254" x="700" y="117">id 8</text>
+<text class="s254" x="760" y="117">id 211</text>
+<text class="s254" x="820" y="117">id 97</text>
+<text class="s254" x="730" y="148">4 subspaces, 1 byte each = 4 bytes</text>
+<text class="s254" x="730" y="166">64x smaller; each id points into a codebook</text>
+<rect class="code254" x="660" y="186" width="140" height="40"/>
+<text class="s254" x="730" y="203">codebook k: 256 centroids</text>
+<text class="s254" x="730" y="219">for subspace k</text>
+<text class="s254" x="730" y="262">distance read from precomputed tables;</text>
+<text class="s254" x="730" y="278">smaller code = less memory, lower recall</text>
+<text class="s254" x="730" y="298" style="font-weight:600;fill:#b86b1f">knob: code size m</text>
+</svg>
+<figcaption><strong>Figure 25.4.1:</strong> The three index families. <em>Left (IVF):</em> the vectors are clustered into cells; a query searches only the nprobe cells nearest its own cell (shaded), so most of the database is never touched. <em>Center (HNSW):</em> a layered proximity graph is entered at a sparse top layer and traversed greedily downward, with efSearch controlling how wide a candidate frontier is kept. <em>Right (PQ):</em> a full vector is split into subspaces, each replaced by the index of its nearest codebook centroid, shrinking 256 bytes to 4. The highlighted knob in each panel is what moves the family along the recall-latency-memory surface.</figcaption>
+</figure>
+
+<h3>IVF: cluster, then probe only the near cells</h3>
+<p>An inverted-file index first runs k-means over the database to produce $\text{nlist}$ centroids, then assigns every vector to its nearest centroid, building one posting list (the "cell") per centroid. At query time it computes the distance from the query to all $\text{nlist}$ centroids, picks the $\text{nprobe}$ nearest, and exhaustively searches only the vectors in those cells. If a database of $N$ vectors splits evenly into $\text{nlist}$ cells, one probe touches roughly $N/\text{nlist}$ vectors, so probing nprobe of them costs about $\text{nlist} + \text{nprobe} \cdot N/\text{nlist}$ distance computations instead of $N$. The single knob is nprobe: at $\text{nprobe} = 1$ the search is fast but misses true neighbors that fell just across a cell boundary; as nprobe rises, recall climbs toward $1.0$ and latency rises with it. Memory is essentially the raw vectors plus a tiny centroid table, so IVF alone does not save memory; it saves time.</p>
+
+<h3>HNSW: walk a layered proximity graph</h3>
+<p>A hierarchical navigable small-world graph stores each vector as a node connected to its near neighbors, with a small random subset of nodes promoted into sparse upper layers that act as express lanes. A search enters at the single top-layer node, greedily hops to whichever neighbor is closest to the query, drops a layer when it can get no closer, and repeats until it reaches the dense bottom layer, where it expands a candidate frontier of size efSearch and returns the best $k$. Because each hop only examines a node's handful of edges, a query touches a logarithmic-ish number of nodes rather than $N$, which makes HNSW the fastest family at high recall. The price is paid twice in memory: the graph stores the full vectors plus tens of edges per node, and building or inserting is costly because every new node must find and link its neighbors. efSearch is the query-time knob; raising it widens the frontier, lifting recall at the cost of latency, with no change to the memory already spent on the graph.</p>
+
+<h3>Product quantization: compress vectors into bytes</h3>
+<p>Product quantization attacks the memory axis directly. It splits each $d$-dimensional vector into $m$ contiguous subvectors and, for each subspace, learns a codebook of (typically) 256 centroids by k-means. A vector is then stored not as $d$ floats but as $m$ one-byte codes, each naming the nearest centroid in its subspace. A $d = 64$ float32 vector that occupied 256 bytes becomes $m$ bytes; at $m = 8$ that is a 32-fold shrink. Search uses an asymmetric distance: the query stays full precision, and for each subspace the index precomputes a small table of distances from the query subvector to all 256 centroids, so a database vector's approximate distance is just $m$ table lookups summed. The knob is $m$, the code size: more subspaces means more bytes per vector but a finer approximation and higher recall. PQ is rarely used alone for search quality; its power is memory, which is why it is almost always combined with IVF.</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Index That Forgets on Purpose</div>
+<p>Product quantization is a database that deliberately throws away most of what it was told. A 256-byte vector goes in; 8 bytes come out, and the other 248 are gone forever. The trick is that the 8 bytes remember the <em>shape</em> of the vector well enough to rank neighbors correctly most of the time. It is the rare engineering win where forgetting 97 percent of your data makes the system better, because the 3 percent you keep is the 3 percent that fit in RAM.</p>
+</div>
+
+<h2>3. IVF-PQ and the Combined Index <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The two non-graph families compose into the workhorse index of large vector databases: IVF-PQ. IVF supplies the coarse partition that limits how many vectors are scanned, and PQ compresses the vectors inside each cell so the whole index fits in memory. The refinement that makes IVF-PQ accurate is residual encoding: rather than quantizing each raw vector, the index subtracts the cell centroid first and product-quantizes the <em>residual</em>, the part of the vector the coarse centroid did not capture. Residuals are smaller and more uniform than raw vectors, so the same code size buys higher recall. A query then probes nprobe cells and ranks their compressed members by table-lookup distance, combining IVF's time saving with PQ's memory saving in one structure. This is the index that lets a billion vectors live on a single machine's RAM and still answer in milliseconds, and it is the per-shard building block the next section replicates.</p>
+
+<h2>4. Measuring the Trade-Off Surface From Scratch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Words about the trade-off surface are less convincing than measured numbers. The code below implements IVF (k-means clustering plus cell probing) and PQ (per-subspace codebooks with asymmetric table-lookup distance) in pure NumPy on a synthetic clustered dataset, then sweeps the two knobs. The IVF sweep over nprobe traces the recall-versus-latency curve; the PQ sweep over the code size $m$ traces the recall-versus-memory curve. Both are compared against exhaustive search, which defines recall $1.0$ and the latency baseline.</p>
+<pre><code class="language-python">import numpy as np
+import time
+
+rng = np.random.default_rng(0)
+N, d, Q = 40_000, 64, 200       # database vectors, dimension, queries
+nlist = 128                     # IVF coarse clusters
+topk = 10                       # neighbors to return
+
+# Synthetic clustered data so the index structure is realistic.
+centers = rng.standard_normal((20, d)) * 3.0
+assign = rng.integers(0, 20, N)
+X = centers[assign] + rng.standard_normal((N, d))
+Xq = centers[rng.integers(0, 20, Q)] + rng.standard_normal((Q, d))
+
+def sqdist(A, B):
+    # ||a-b||^2 = ||a||^2 + ||b||^2 - 2 a.b, vectorized and memory-light.
+    return (A * A).sum(1)[:, None] + (B * B).sum(1)[None, :] - 2.0 * A @ B.T
+
+# ---- Exhaustive ground truth ----
+t0 = time.perf_counter()
+D = sqdist(Xq, X)
+truth = np.argpartition(D, topk, axis=1)[:, :topk]
+t_exh = (time.perf_counter() - t0) / Q * 1e3   # ms per query
+
+def recall(approx, truth):
+    hit = sum(len(set(a.tolist()) &amp; set(t.tolist())) for a, t in zip(approx, truth))
+    return hit / (topk * len(truth))
+
+def kmeans(data, k, iters=10):                 # Lloyd's algorithm
+    c = data[rng.choice(len(data), k, replace=False)].copy()
+    for _ in range(iters):
+        lab = np.argmin(sqdist(data, c), axis=1)
+        for j in range(k):
+            m = lab == j
+            if m.any():
+                c[j] = data[m].mean(0)
+    return c, lab
+
+# ---- IVF: coarse quantizer, probe nprobe nearest cells ----
+cent, labels = kmeans(X, nlist, iters=8)
+cells = [np.where(labels == j)[0] for j in range(nlist)]
+
+def ivf_search(q, nprobe):
+    cd = ((cent - q) ** 2).sum(1)
+    probe = np.argpartition(cd, nprobe)[:nprobe]        # nearest cells
+    cand = np.concatenate([cells[j] for j in probe])    # their members
+    if len(cand) &lt; topk:
+        return cand
+    dd = ((X[cand] - q) ** 2).sum(1)
+    return cand[np.argpartition(dd, topk)[:topk]]
+
+print("=== IVF: sweep nprobe (recall vs latency) ===")
+print(f"{'nprobe':&gt;7}{'recall':&gt;9}{'ms/query':&gt;11}")
+for nprobe in [1, 4, 8, 16, 32]:
+    t0 = time.perf_counter()
+    approx = [ivf_search(q, nprobe) for q in Xq]
+    ms = (time.perf_counter() - t0) / Q * 1e3
+    print(f"{nprobe:&gt;7}{recall(approx, truth):&gt;9.3f}{ms:&gt;11.3f}")
+print(f"{'exhaust':&gt;7}{1.000:&gt;9.3f}{t_exh:&gt;11.3f}")
+
+# ---- Product Quantization: m subspaces, 256-entry codebook each ----
+def train_pq(data, m, ksub=256):
+    dsub = d // m
+    books = np.empty((m, ksub, dsub))
+    for i in range(m):
+        sub = data[:, i * dsub:(i + 1) * dsub]
+        books[i], _ = kmeans(sub, ksub, iters=6)
+    return books, dsub
+
+def encode_pq(data, books, dsub, m):
+    codes = np.empty((len(data), m), dtype=np.uint8)    # 1 byte per subspace
+    for i in range(m):
+        sub = data[:, i * dsub:(i + 1) * dsub]
+        codes[:, i] = np.argmin(sqdist(sub, books[i]), axis=1)
+    return codes
+
+def pq_search(q, books, codes, dsub, m):
+    tabs = np.empty((m, books.shape[1]))                # query-to-centroid tables
+    for i in range(m):
+        qsub = q[i * dsub:(i + 1) * dsub]
+        tabs[i] = ((books[i] - qsub) ** 2).sum(1)
+    approx_d = tabs[np.arange(m)[:, None], codes.T].sum(0)   # m lookups summed
+    return np.argpartition(approx_d, topk)[:topk]
+
+print("\n=== PQ: sweep code size m (recall vs memory) ===")
+print(f"{'m':&gt;4}{'bytes/vec':&gt;11}{'recall':&gt;9}{'compress':&gt;10}")
+raw_bytes = d * 4
+for m in [4, 8, 16, 32]:
+    books, dsub = train_pq(X, m)
+    codes = encode_pq(X, books, dsub, m)
+    approx = [pq_search(q, books, codes, dsub, m) for q in Xq]
+    print(f"{m:&gt;4}{m:&gt;11}{recall(approx, truth):&gt;9.3f}{raw_bytes / m:&gt;9.0f}x")
+print(f"raw float32 vector: {raw_bytes} bytes/vec")
+</code></pre>
+<div class="code-caption"><strong>Code 25.4.1:</strong> IVF and PQ implemented from first principles in NumPy. The IVF block clusters the database and probes nprobe cells per query; the PQ block compresses each vector into <code>m</code> one-byte codes and ranks by summed table-lookup distance. The two sweeps trace the two trade-off curves that Figure 25.4.2 plots.</div>
+<pre><code class="language-text">=== IVF: sweep nprobe (recall vs latency) ===
+ nprobe   recall   ms/query
+      1    0.321      0.221
+      4    0.801      1.075
+      8    0.973      2.073
+     16    1.000      3.940
+     32    1.000      7.230
+exhaust    1.000      3.147
+
+=== PQ: sweep code size m (recall vs memory) ===
+   m  bytes/vec   recall  compress
+   4          4    0.054       64x
+   8          8    0.116       32x
+  16         16    0.251       16x
+  32         32    0.686        8x
+raw float32 vector: 256 bytes/vec
+</code></pre>
+<div class="code-caption"><strong>Output 25.4.1:</strong> The two trade-off curves in real numbers. IVF reaches 0.973 recall at nprobe 8 while touching a fraction of the data and running faster than the exhaustive baseline (2.07 ms versus 3.15 ms); probing more cells only buys the last few percent of recall at rising latency. PQ shows the opposite axis: shrinking each vector from 256 bytes to 4 (a 64-fold memory win) drops recall sharply, and recovering recall costs bytes back. Standalone PQ on raw vectors recalls poorly here, which is exactly why production indexes pair it with IVF and encode residuals.</div>
+<p>Two lessons fall out of Output 25.4.1, and both feed the next section. First, IVF's nprobe is a near-monotone recall-latency dial: there is a sweet spot (nprobe 8 here) where recall is already near $1.0$ and latency is below the exhaustive baseline, and pushing past it wastes time for almost no recall. Second, PQ's code size is a recall-memory dial pointing the other way: the 64-fold memory saving at $m = 4$ is real and is what makes billion-scale indexes fit in RAM, but raw PQ alone is too lossy for final ranking, which is the empirical argument for IVF-PQ with residual encoding. The numbers you would carry forward, "this shard needs $B$ bytes per vector and answers in $T$ milliseconds," are precisely the per-shard cost and latency that <a href="section-25.5.html">Section 25.5</a> sums and replicates.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two line charts. Left: IVF recall rising from 0.32 to 1.0 as latency rises from 0.2 to 7.2 milliseconds per query. Right: PQ recall rising from 0.05 to 0.69 as bytes per vector rise from 4 to 32, far below the 256-byte raw baseline.">
+<style>
+.ax254 { stroke:#5a626c; stroke-width:1.2; }
+.gl254 { stroke:#e2e7ee; stroke-width:1; }
+.tk254 { font:10px sans-serif; fill:#5a626c; text-anchor:middle; }
+.tkl254 { font:10px sans-serif; fill:#5a626c; text-anchor:end; }
+.ti254 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.lab254 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.curve254 { fill:none; stroke:#b86b1f; stroke-width:2; }
+.dot254 { fill:#14385c; }
+.base254 { stroke:#b8324f; stroke-width:1.5; stroke-dasharray:5 4; }
+</style>
+<!-- Left chart: IVF recall vs latency -->
+<text class="ti254" x="220" y="22">IVF: recall vs latency (nprobe sweep)</text>
+<line class="ax254" x1="80" y1="50" x2="80" y2="230"/>
+<line class="ax254" x1="80" y1="230" x2="400" y2="230"/>
+<line class="gl254" x1="80" y1="50" x2="400" y2="50"/>
+<line class="gl254" x1="80" y1="140" x2="400" y2="140"/>
+<text class="tkl254" x="72" y="54">1.0</text>
+<text class="tkl254" x="72" y="144">0.5</text>
+<text class="tkl254" x="72" y="234">0.0</text>
+<text class="lab254" x="240" y="258">latency (ms/query)</text>
+<text class="tk254" x="80" y="246">0</text>
+<text class="tk254" x="400" y="246">7.5</text>
+<!-- x: 80 + (ms/7.5)*320 ; y: 230 - recall*180 -->
+<polyline class="curve254" points="89,172 126,86 168,55 248,50 388,50"/>
+<circle class="dot254" cx="89" cy="172" r="3"/>
+<circle class="dot254" cx="126" cy="86" r="3"/>
+<circle class="dot254" cx="168" cy="55" r="3"/>
+<circle class="dot254" cx="248" cy="50" r="3"/>
+<circle class="dot254" cx="388" cy="50" r="3"/>
+<text class="tk254" x="89" y="188">np=1</text>
+<text class="tk254" x="168" y="48">np=8</text>
+<line class="base254" x1="214" y1="50" x2="214" y2="230"/>
+<text class="tk254" x="214" y="244" style="fill:#b8324f">exhaustive 3.15ms</text>
+<!-- Right chart: PQ recall vs memory -->
+<text class="ti254" x="650" y="22">PQ: recall vs memory (code-size sweep)</text>
+<line class="ax254" x1="500" y1="50" x2="500" y2="230"/>
+<line class="ax254" x1="500" y1="230" x2="830" y2="230"/>
+<line class="gl254" x1="500" y1="50" x2="830" y2="50"/>
+<line class="gl254" x1="500" y1="140" x2="830" y2="140"/>
+<text class="tkl254" x="492" y="54">1.0</text>
+<text class="tkl254" x="492" y="144">0.5</text>
+<text class="tkl254" x="492" y="234">0.0</text>
+<text class="lab254" x="665" y="258">bytes per vector</text>
+<text class="tk254" x="500" y="246">0</text>
+<text class="tk254" x="830" y="246">256</text>
+<!-- x: 500 + (bytes/256)*330 ; y: 230 - recall*180 -->
+<polyline class="curve254" points="505,220 510,209 521,185 541,107"/>
+<circle class="dot254" cx="505" cy="220" r="3"/>
+<circle class="dot254" cx="510" cy="209" r="3"/>
+<circle class="dot254" cx="521" cy="185" r="3"/>
+<circle class="dot254" cx="541" cy="107" r="3"/>
+<text class="tk254" x="505" y="236">m=4</text>
+<text class="tk254" x="552" y="103">m=32</text>
+<line class="base254" x1="830" y1="50" x2="830" y2="230"/>
+<text class="tk254" x="800" y="244" style="fill:#b8324f">raw 256B</text>
+</svg>
+<figcaption><strong>Figure 25.4.2:</strong> The two trade-off curves plotted from the Output 25.4.1 numbers. <em>Left:</em> IVF recall climbs steeply with latency as nprobe rises, flattening near $1.0$ once it crosses the exhaustive-latency line (dashed), so the useful operating points sit at small nprobe. <em>Right:</em> PQ recall rises with bytes per vector, but every point sits far left of the 256-byte raw baseline (dashed), which is the memory it saves; standalone PQ recall is low, motivating the IVF-PQ residual combination of Section 3.</figcaption>
+</figure>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: FAISS Builds an IVF-PQ Index in Six Lines</div>
+<p>Code 25.4.1 spends roughly a hundred lines re-deriving k-means clustering, cell probing, and codebook encoding so the mechanics are visible. In production you never write that; FAISS (the standard similarity-search library) builds, trains, and queries an IVF-PQ index, and exposes nprobe as a single attribute. The same two knobs you swept by hand are one assignment and one constructor argument:</p>
+<pre><code class="language-python">import faiss, numpy as np
+d, nlist, m, nbits = 64, 128, 8, 8     # dim, cells, PQ subspaces, bits/code
+
+quantizer = faiss.IndexFlatL2(d)                       # coarse quantizer
+index = faiss.IndexIVFPQ(quantizer, d, nlist, m, nbits)  # IVF + PQ residuals
+index.train(database)                                  # learns centroids + codebooks
+index.add(database)                                    # encodes and stores codes
+
+index.nprobe = 8                                       # the recall-latency knob
+D, I = index.search(queries, k=10)                     # batched ANN search
+</code></pre>
+<div class="code-caption"><strong>Code 25.4.2:</strong> The from-scratch index of Code 25.4.1 as a FAISS <code>IndexIVFPQ</code>. About a hundred lines of clustering and quantization collapse to six, and FAISS handles residual encoding, SIMD-optimized table lookups, and optional GPU execution internally. For graph search the analogous one-liner is <code>hnswlib.Index(space='cosine', dim=d)</code> with an <code>ef</code> attribute in place of nprobe.</div>
+</div>
+
+<h2>5. Distance Metrics: What "Nearest" Means <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Every index above ranks candidates by a distance, but "distance" is a choice, and the choice must match how the embedding model was trained. Three metrics cover almost all retrieval. Squared Euclidean (L2) distance, $\lVert a - b \rVert^2$, is what Code 25.4.1 used and is natural when magnitude carries meaning. Inner product, $a \cdot b$, ranks by alignment and magnitude together and is the right metric for models trained with a dot-product objective, including many recommendation and dense-retrieval embeddings; note that "nearest" under inner product means <em>largest</em> dot product, so the index maximizes rather than minimizes. Cosine similarity, $\frac{a \cdot b}{\lVert a \rVert \lVert b \rVert}$, is inner product after normalizing both vectors to unit length, and is the default for text embeddings where only direction, not magnitude, should matter. The practical rule is to normalize once at index-build time if the model expects cosine, after which cosine and inner product coincide and the same fast inner-product machinery serves both.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Choosing the Index Point for a RAG Service</div>
+<p><strong>Who:</strong> A platform engineer standing up the retrieval tier for a retrieval-augmented generation product.</p>
+<p><strong>Situation:</strong> 200 million text-embedding vectors at $d = 768$, a 25 ms retrieval budget inside a larger LLM request, and a fixed fleet of memory-bounded machines.</p>
+<p><strong>Problem:</strong> Stored as raw float32, the vectors need about 600 GB, which does not fit the planned per-machine RAM, and exhaustive search blows the latency budget by orders of magnitude.</p>
+<p><strong>Dilemma:</strong> Pure HNSW would hit the recall and latency targets but stores full vectors plus a heavy graph, exceeding the memory budget; pure IVF on raw vectors fits the latency target but still does not shrink the 600 GB; standalone PQ shrinks memory but, as Output 25.4.1 shows, recalls too poorly for final answers.</p>
+<p><strong>Decision:</strong> They chose IVF-PQ with residual encoding, normalized for cosine, sized so the compressed index fit comfortably in RAM, and tuned nprobe up from a low default until recall@10 crossed 0.95 on a held-out query set.</p>
+<p><strong>How:</strong> Built a FAISS <code>IndexIVFPQ</code> as in Code 25.4.2 with $m$ chosen to hit roughly 32 bytes per vector (a 24-fold shrink to about 25 GB), then swept nprobe offline to find the smallest value meeting the recall target, fixing latency well inside 25 ms.</p>
+<p><strong>Result:</strong> The index fit one machine's RAM with headroom, met both the recall and latency targets, and produced concrete per-shard numbers, bytes per vector and milliseconds per query, that the team handed to the sharding design.</p>
+<p><strong>Lesson:</strong> The index family and its knobs are chosen by which axis binds first. Memory bound it here, so PQ had to be in the mix, and IVF-PQ was the only point on the surface that satisfied all three constraints at once.</p>
+</div>
+
+<h2>6. When the Index Exceeds RAM: Disk-Based ANN <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>IVF-PQ shrinks vectors enough that hundreds of millions fit in one machine's memory, but at billion to ten-billion scale even compressed codes plus a high-recall graph can exceed RAM. Disk-based ANN keeps the bulk of the index on SSD and only a compressed summary in memory. DiskANN is the canonical design: it stores a single flat proximity graph and the full-precision vectors on SSD, keeps PQ-compressed codes of every vector in RAM for fast approximate ranking during traversal, and issues a small number of carefully batched SSD reads to fetch and re-rank the most promising candidates at full precision. The in-memory PQ codes steer the search so that only a handful of disk pages are read per query, which keeps latency in the single-digit-millisecond range despite the index living on disk. The trade-off surface gains a fourth coordinate here, SSD reads per query, but the framing is unchanged: you are still spending one resource (disk I/O) to buy back another (RAM), and the per-shard cost you report to the next section now includes a disk-bandwidth term.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: GPU-Native and Learned ANN (2024 to 2026)</div>
+<p>Three threads are reshaping the trade-off surface. GPU-native ANN has matured: NVIDIA's cuVS (the successor to RAFT, 2024) ships GPU IVF, IVF-PQ, and the CAGRA graph index, with CAGRA reporting order-of-magnitude throughput gains over CPU HNSW at matched recall and a graph layout designed for massively parallel traversal, and FAISS now offers cuVS-backed GPU indexes directly. Disk-based methods have advanced past the original DiskANN with filtered and streaming variants (FreshDiskANN and the filtered-DiskANN line) that support real-time inserts and attribute-constrained search without rebuilding, the operations a live vector database actually needs. A third thread learns the index structure itself: learned partitions and routing functions that replace hand-tuned k-means cells with trained models (in the lineage of learned indexes and query-aware routing such as the SOAR and ScaNN-family refinements) push recall-per-byte further than fixed quantization. The common direction is that the knobs of Section 2, nprobe, efSearch, code size, are increasingly chosen or replaced by learned components and executed on hardware that traverses graphs and scans codes in parallel. We meet GPU-accelerated retrieval again as part of web-scale RAG in <a href="../../part-8-case-studies/module-36-case-web-scale-text-rag/index.html">Chapter 36</a>.</p>
+</div>
+
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Index Sets the Per-Shard Numbers That Get Scaled Out</div>
+<p>This section is single-machine on purpose: it chooses an index family and a point on the recall-latency-memory surface for one shard. That choice is the unit the rest of the chapter distributes. The bytes-per-vector you fixed with PQ determines how many vectors a shard can hold, and therefore how many shards a billion-vector corpus needs; the milliseconds-per-query you fixed with nprobe or efSearch determines the per-shard latency that fan-out then has to fit inside the request budget. <a href="section-25.5.html">Section 25.5</a> takes these numbers and shards the index across machines (so each shard holds a slice of the corpus) and replicates it (so each slice survives a node failure and serves more queries per second), turning the single-shard index of this section into a distributed retrieval service. The embedding tables of <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a> were sharded by the same logic; an ANN index is a read-optimized sibling of that sharded table.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.4.1: Reading the Trade-Off Surface <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using only the numbers in Output 25.4.1, answer each part and justify it from the trade-off surface. (a) A service has a strict 2.5 ms per-query budget and needs recall@10 of at least 0.95; which IVF nprobe setting do you pick, and how much latency headroom is left? (b) A second service is memory-bound and can spend at most 16 bytes per vector; what recall does standalone PQ give it, and why is that an argument for IVF-PQ rather than raw PQ? (c) Explain in one sentence why raising nprobe past 16 in this run is pure waste.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.4.2: Add Residual Encoding to the PQ <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 25.4.1 into a minimal IVF-PQ. After clustering with the existing IVF code, for each vector subtract its cell centroid to form a residual, and train and encode the PQ on residuals instead of raw vectors; at search time, probe nprobe cells and rank their members by PQ distance computed on residuals (remember to use each cell's own centroid). Sweep $m \in \{4, 8, 16\}$ at a fixed nprobe of 8 and report recall@10 and bytes per vector. Confirm that residual encoding raises recall at every code size compared with the standalone PQ column of Output 25.4.1, and explain in two sentences why residuals are easier to quantize than raw vectors.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.4.3: Sizing a Billion-Vector Shard <span class="exercise-type analysis">Analysis</span></div>
+<p>You must index $10^9$ vectors of dimension $d = 768$ stored as float32, on machines with 64 GB of usable RAM each. (a) Compute the raw memory for the full corpus and the number of machines needed if you store raw vectors. (b) Recompute both for an IVF-PQ index at 32 bytes per vector (ignore the small centroid and codebook overhead). (c) State how the per-shard query latency you measured for one shard relates to the end-to-end latency once the corpus is split across the shards from part (b) and queried in parallel, and identify which term, per-shard search or cross-shard fan-out, <a href="section-25.5.html">Section 25.5</a> must control. Express your memory answers with the recall@$k$ definition's notation in mind, treating each shard as holding $N/S$ vectors for $S$ shards.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-25.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 25.3</span><span class="nav-title">Vector Databases</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 25</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Retrieval and Vector Search</span></a>
+<a class="next" href="section-25.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 25.5</span><span class="nav-title">Index Sharding and Replication</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 6.3: Key-Value Computation: Word Count and Inverted Indexing. The two canonical MapReduce computations, why they are the same emit-and-collect pattern, and how they build search indexes and corpus statistics for AI." name="description"/>
+<title>Section 6.3: Key-Value Computation: Word Count and Inverted Indexing | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Distributed Data Processing for AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 6: The MapReduce Model and Distributed Algorithms</a></div>
+<h1>Key-Value Computation: Word Count and Inverted Indexing</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They asked me to count words. I emitted a billion little ones each saying 'I am here', went to sleep, and woke up holding the dictionary of an entire civilization."</p>
+<cite>A Mapper That Underestimated Its Corpus</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Almost every large-scale data computation for AI is one shape: each record emits a few key-value pairs, the system gathers all pairs that share a key onto one machine, and a reducer collapses each key's pile into an answer.</strong> Word count and the inverted index are the two computations that make this shape concrete, and they are not toy examples kept around for nostalgia. The inverted index is the data structure underneath every search engine and every retrieval system, and the corpus statistics that fall out of word count (term and document frequencies) are the raw material for cleaning training data and for the TF-IDF features that classical text models still run on. This section shows that both computations are the same map (emit a posting) plus the same reduce (collect by key), so that once you can write one, you can write the family.</p>
+</div>
+<p>The previous section took apart the MapReduce execution model into its three phases, map, shuffle, and reduce, and showed how the shuffle is the load-bearing step that moves data between machines. This section puts that machinery to work on the two computations that defined MapReduce in the first place. Word count is the canonical "hello world" of distributed data processing, and the inverted index is the canonical real workload that word count is secretly a special case of. Treating them together makes a point that the rest of the chapter depends on: the algorithm you write is almost entirely in the choice of what key to emit, and the framework supplies the rest.</p>
+<p>We care about these two computations for a reason specific to this book. Building an AI system at scale almost always begins with a corpus that has to be understood before it can be trained on. You need to know how often each term appears, how many documents contain it, which documents mention which entities, and which records are near-duplicates of which others. Every one of those questions is a key-value computation over the corpus, and the inverted index is the structure that turns "which documents contain this term?" from a full scan into a lookup. That is exactly the question a retrieval system answers at query time, which is why the index you build here returns in <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a> as the backbone of distributed retrieval.</p>
+
+<h2>1. Word Count Is an Emit-and-Collect <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Counting how often each word appears in a corpus sounds trivial until the corpus does not fit on one machine. The single-machine version is a loop that increments a dictionary entry per word; the distributed version cannot keep one shared dictionary, because the corpus is spread across many nodes and no single node can hold the running totals for a web-scale vocabulary while the data streams past. MapReduce solves this by refusing to share any state during the scan. Each mapper reads its own shard of documents and, for every word it sees, emits a single key-value pair: the word as the key, and the number one as the value. A mapper never looks up a total; it only ever says "here is one more occurrence of this word."</p>
+<p>The shuffle then does the only globally coordinated work. It routes every emitted pair to a reducer chosen by the key, so that all the ones for the word <code>cat</code> arrive together at one reducer, no matter which document or which machine produced them. The reducer receives a key and the full list of values for that key, and it sums them. Formally, if document $d$ contributes a count $c_{t,d}$ of term $t$, the reducer for term $t$ computes the corpus term frequency</p>
+$$\mathrm{tf}(t) = \sum_{d \in \text{corpus}} c_{t,d},$$
+<p>and the sum decomposes across documents exactly the way the gradient sum decomposed across shards in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>. The mappers compute the per-document terms in parallel, blind to one another; the reducer performs the regrouping. Nothing about the answer depends on how the documents were partitioned across mappers, which is precisely what makes the computation safe to distribute.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Algorithm Is the Key You Emit</div>
+<p>In a key-value computation you do not write the parallelism, the partitioning, or the data movement; the framework supplies all three. What you write is two short functions and, above all, one decision: what key does the map step emit? Emit the word and you get word count. Emit the word paired with the document it came from and you get an inverted index. Emit a normalized fingerprint and you get deduplication. The shuffle groups by whatever key you chose, so the key <em>is</em> the algorithm. Most of the computations in this chapter differ only in that one line.</p>
+</div>
+
+<h2>2. The Inverted Index Is the Same Pattern, One Key Wider <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>An inverted index maps each term to the list of documents that contain it, the inverse of the obvious "forward" layout that maps each document to the words it contains. That inversion is what makes search fast: to answer "which documents mention <code>retrieval</code>?" you read one short posting list instead of scanning every document in the corpus. The list of document identifiers attached to a term is called its <em>postings list</em>, and building it is the workhorse of every text-retrieval system ever shipped.</p>
+<p>The build is word count with a richer payload. The map step still emits one pair per term occurrence, but now the value carries the document identity rather than a bare one. The reducer still collects everything for a key, but instead of summing it collapses the collected document identifiers into a sorted, de-duplicated set, the postings list. Counting the length of that set gives the <em>document frequency</em> $\mathrm{df}(t)$, the number of distinct documents containing the term, which is a different and more useful statistic than the raw term frequency: a word can appear a thousand times but in only one document. Figure 6.3.1 traces a handful of documents through the map, shuffle, and reduce phases to show the postings lists assembling.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three documents on the left each pass through a map step that emits term-document postings; a shuffle groups postings by term; reducers on the right collapse each group into a sorted postings list with a document-frequency count.">
+<defs>
+<marker id="arr63" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b63 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w63 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g63 { fill:#eef6ee; stroke:#2f7d32; stroke-width:1.6; }
+.t63 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.m63 { font:600 12px sans-serif; fill:#b86b1f; text-anchor:middle; }
+.s63 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.c63 { font:11px monospace; fill:#2f7d32; text-anchor:middle; }
+.l63 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr63); }
+</style>
+<text class="t63" x="80" y="22">Documents</text>
+<rect class="b63" x="25" y="36" width="110" height="40" rx="7"/>
+<text class="s63" x="80" y="54">d1: the cat</text>
+<text class="s63" x="80" y="70">sat on mat</text>
+<rect class="b63" x="25" y="92" width="110" height="40" rx="7"/>
+<text class="s63" x="80" y="110">d2: the dog</text>
+<text class="s63" x="80" y="126">sat on log</text>
+<rect class="b63" x="25" y="148" width="110" height="40" rx="7"/>
+<text class="s63" x="80" y="166">d3: the cat</text>
+<text class="s63" x="80" y="182">chased dog</text>
+<text class="m63" x="300" y="22">Map: emit (term, doc)</text>
+<rect class="w63" x="210" y="36" width="180" height="56" rx="7"/>
+<text class="c63" x="300" y="58">(the,d1) (cat,d1)</text>
+<text class="c63" x="300" y="74">(sat,d1) (on,d1) (mat,d1)</text>
+<rect class="w63" x="210" y="106" width="180" height="56" rx="7"/>
+<text class="c63" x="300" y="128">(the,d2) (dog,d2)</text>
+<text class="c63" x="300" y="144">(sat,d2) (on,d2) (log,d2)</text>
+<rect class="w63" x="210" y="176" width="180" height="56" rx="7"/>
+<text class="c63" x="300" y="198">(the,d3) (cat,d3)</text>
+<text class="c63" x="300" y="214">(chased,d3) (dog,d3)</text>
+<line x1="138" y1="56" x2="207" y2="60" class="l63"/>
+<line x1="138" y1="112" x2="207" y2="128" class="l63"/>
+<line x1="138" y1="168" x2="207" y2="200" class="l63"/>
+<rect class="b63" x="440" y="120" width="92" height="60" rx="9"/>
+<text class="t63" x="486" y="146">Shuffle</text>
+<text class="s63" x="486" y="164">group by term</text>
+<line x1="392" y1="64" x2="438" y2="130" class="l63"/>
+<line x1="392" y1="134" x2="438" y2="148" class="l63"/>
+<line x1="392" y1="204" x2="438" y2="168" class="l63"/>
+<text class="t63" x="710" y="22">Reduce: postings list + df</text>
+<rect class="g63" x="580" y="40" width="260" height="34" rx="7"/>
+<text class="c63" x="710" y="62">the -> [d1,d2,d3]   df=3</text>
+<rect class="g63" x="580" y="84" width="260" height="34" rx="7"/>
+<text class="c63" x="710" y="106">cat -> [d1,d3]   df=2</text>
+<rect class="g63" x="580" y="128" width="260" height="34" rx="7"/>
+<text class="c63" x="710" y="150">dog -> [d2,d3]   df=2</text>
+<rect class="g63" x="580" y="172" width="260" height="34" rx="7"/>
+<text class="c63" x="710" y="194">sat -> [d1,d2]   df=2</text>
+<rect class="g63" x="580" y="216" width="260" height="34" rx="7"/>
+<text class="c63" x="710" y="238">on -> [d1,d2]   df=2</text>
+<line x1="532" y1="140" x2="577" y2="57" class="l63"/>
+<line x1="532" y1="148" x2="577" y2="101" class="l63"/>
+<line x1="532" y1="152" x2="577" y2="145" class="l63"/>
+<line x1="532" y1="156" x2="577" y2="189" class="l63"/>
+<line x1="532" y1="160" x2="577" y2="233" class="l63"/>
+<text class="s63" x="440" y="300">map runs in parallel per shard &#183; shuffle is the only cross-machine step &#183; each reducer owns a disjoint set of terms</text>
+</svg>
+<figcaption><strong>Figure 6.3.1:</strong> Building an inverted index as map, shuffle, reduce. Each document is mapped to a stream of <code>(term, doc)</code> postings (orange), the shuffle groups every posting by term, and each reducer (green) collapses one term's group into a sorted postings list and a document-frequency count. Word count is the identical diagram with the value <code>doc</code> replaced by the constant <code>1</code> and the reducer summing instead of collecting.</figcaption>
+</figure>
+<p>Reading Figure 6.3.1 left to right makes the shared skeleton visible. The map column is per-document and embarrassingly parallel; the shuffle is the single cross-machine step that gathers a term's postings from wherever they were produced; the reduce column turns each gathered group into one output row. Swap the emitted value from a document identifier to the constant one, and swap the reducer from "collect into a set" to "sum," and the very same picture computes word count. The two computations are one template with two fillings.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Why "Inverted"?</div>
+<p>The name sounds like the index is broken. It is not; it is inverted relative to the document itself. A book's body reads document-to-words (page 12 contains "gradient"); the index at the back reads word-to-pages ("gradient" appears on pages 12, 88, 201). The back-of-book index is a hand-built inverted index, and a search engine is the same idea with a few billion more pages and no one willing to compile it by hand.</p>
+</div>
+
+<h2>3. Building the Index by Hand <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The code below builds a small inverted index and computes document frequencies from a four-document corpus, written as an explicit map, shuffle, and reduce so the framework's role is visible. The map function yields one <code>(term, doc_id)</code> posting per token, a plain Python <code>defaultdict</code> stands in for the shuffle that groups postings by key, and the reduce step collapses each group into a sorted document set and a document-frequency count. It then uses the index to answer a two-term query by intersecting postings lists, and feeds the document frequencies into the inverse-document-frequency term of TF-IDF.</p>
+<pre><code class="language-python">from collections import defaultdict
+import math
+
+# A tiny corpus: each document is (doc_id, text).
+corpus = [
+    ("d1", "the cat sat on the mat"),
+    ("d2", "the dog sat on the log"),
+    ("d3", "the cat chased the dog"),
+    ("d4", "a quick brown dog"),
+]
+
+def tokenize(text):
+    return text.lower().split()
+
+# MAP: every document emits one posting (term, doc_id) per token occurrence.
+def map_doc(doc_id, text):
+    for term in tokenize(text):
+        yield (term, doc_id)
+
+# SHUFFLE: group every emitted posting by its key (the term).
+grouped = defaultdict(list)
+for doc_id, text in corpus:
+    for term, did in map_doc(doc_id, text):
+        grouped[term].append(did)
+
+# REDUCE: collapse each term's postings into a sorted, de-duplicated
+# document set plus a document frequency (how many documents contain the term).
+inverted_index, doc_freq = {}, {}
+for term, postings in grouped.items():
+    docs = sorted(set(postings))
+    inverted_index[term] = docs
+    doc_freq[term] = len(docs)
+
+print("INVERTED INDEX  (term -> documents)")
+for term in sorted(inverted_index):
+    print(f"  {term:&lt;7} df={doc_freq[term]}  -> {inverted_index[term]}")
+
+# A query is now a set intersection over posting lists, not a corpus scan.
+hits_cat = set(inverted_index.get("cat", []))
+hits_dog = set(inverted_index.get("dog", []))
+print("\nQUERY 'cat' AND 'dog' -> documents:", sorted(hits_cat & hits_dog))
+
+# The same df values feed the IDF term of TF-IDF.
+N = len(corpus)
+print("\nIDF = log(N / df), N =", N)
+for term in ["the", "cat", "quick"]:
+    print(f"  {term:&lt;7} df={doc_freq[term]}  idf={math.log(N / doc_freq[term]):.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 6.3.1:</strong> An inverted index built as explicit map, shuffle, and reduce over a four-document corpus, then used for a boolean query and for the IDF statistic. The <code>map_doc</code> generator is the only line that decides the algorithm; emitting <code>(term, 1)</code> and summing in the reducer would make this word count instead.</div>
+<pre><code class="language-text">INVERTED INDEX  (term -> documents)
+  a       df=1  -> ['d4']
+  brown   df=1  -> ['d4']
+  cat     df=2  -> ['d1', 'd3']
+  chased  df=1  -> ['d3']
+  dog     df=3  -> ['d2', 'd3', 'd4']
+  log     df=1  -> ['d2']
+  mat     df=1  -> ['d1']
+  on      df=2  -> ['d1', 'd2']
+  quick   df=1  -> ['d4']
+  sat     df=2  -> ['d1', 'd2']
+  the     df=3  -> ['d1', 'd2', 'd3']
+
+QUERY 'cat' AND 'dog' -> documents: ['d3']
+
+IDF = log(N / df), N = 4
+  the     df=3  idf=0.288
+  cat     df=2  idf=0.693
+  quick   df=1  idf=1.386
+</code></pre>
+<div class="code-caption"><strong>Output 6.3.1:</strong> The postings lists and document frequencies for the corpus. The query <code>cat AND dog</code> resolves to a single set intersection returning <code>d3</code>, and the IDF column shows the index's payoff for AI: the ubiquitous term <code>the</code> earns a near-zero weight while the rare term <code>quick</code> earns a high one.</div>
+<p>The last block of Output 6.3.1 is where the corpus statistics become an AI feature. Term frequency-inverse document frequency weights a term in a document as $\mathrm{tfidf}(t, d) = \mathrm{tf}(t, d) \cdot \log\!\big(N / \mathrm{df}(t)\big)$, where $N$ is the number of documents and $\mathrm{df}(t)$ the document frequency the reducer just produced. The logarithm makes a term that appears in nearly every document (like <code>the</code>, with $\mathrm{df}=3$ out of $N=4$) almost worthless as a discriminator and a rare term (like <code>quick</code>) highly informative. The entire numerator of that weight, the global $\mathrm{df}(t)$ over a corpus too large for one machine, is exactly what the reduce step computes. Feature engineering itself now lives with the storage and loading machinery of <a href="../module-08-distributed-storage-data-loading/index.html">Chapter 8</a>; the point here is that the feature's raw ingredient is a distributed key-value reduction.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Shuffle Is the Combine Step, Again</div>
+<p>The "group all values for a key onto one machine" step you just simulated with a <code>defaultdict</code> is the MapReduce shuffle, and it is the same combining motion as the all-reduce of <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>: partial results computed independently per shard, then merged by key. The shuffle moves variable-length postings keyed by term; the all-reduce moves fixed-length gradient vectors keyed by parameter position. <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> shows that they are members of one family of collective operations, and the cost of this cross-machine grouping, not the map or reduce arithmetic, is what governs whether either computation scales.</p>
+</div>
+
+<h2>4. Why This One Pattern Generalizes <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The reason word count and the inverted index are taught first is not that text is special; it is that the emit-and-collect shape is general. Any computation that can be phrased as "for each record, produce some (key, payload) pairs, then for each key combine its payloads" fits the template, and a surprising fraction of corpus-scale AI preprocessing can be phrased that way. Counting label frequencies in a training set is word count with labels as keys. Grouping records by a join key, the subject of <a href="section-6.4.html">Section 6.4</a>, is the inverted index with the join key in place of the term. Finding near-duplicate documents, which keeps web-scale training corpora from being polluted with repeats, emits a content fingerprint as the key so that duplicates collide at the same reducer, a technique we reach in the locality-sensitive hashing section later in this chapter.</p>
+<p>The constraint that makes the pattern both general and scalable is associativity. Because the reducer combines a key's payloads in whatever order they arrive, and because a partial combine of a subset gives the same result as combining everything at once, the framework is free to start reducing on each mapper before the shuffle (a <em>combiner</em>) and to re-run any failed task without corrupting the answer. That associativity is what links this section to fault tolerance: a reducer that dies mid-merge can be restarted from the same inputs and produce the same postings list, which is why MapReduce can run a word count across thousands of unreliable machines and still get the right dictionary. We make that re-execution guarantee precise in the fault-tolerance section that closes the chapter.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Deduplication Pass Before a Trillion-Token Run</div>
+<p><strong>Who:</strong> A data engineer on a team assembling a pretraining corpus for a foundation model.</p>
+<p><strong>Situation:</strong> A raw web crawl of several hundred terabytes was destined for a language-model training run, with budget for a single pass over the data.</p>
+<p><strong>Problem:</strong> The crawl was riddled with near-duplicate pages (mirrors, boilerplate, syndicated articles), and training on duplicates wastes compute and memorizes junk, but no single machine could hold a hash set over hundreds of terabytes.</p>
+<p><strong>Dilemma:</strong> Build a bespoke distributed hashing service, weeks of systems work, or express the deduplication as a key-value job on the cluster they already ran their inverted indexes on.</p>
+<p><strong>Decision:</strong> They wrote it as a MapReduce job, because grouping documents by a content fingerprint is structurally identical to the inverted index in Code 6.3.1, only the emitted key changed.</p>
+<p><strong>How:</strong> The map step emitted <code>(fingerprint, doc_id)</code> for each document; the shuffle gathered colliding fingerprints together; the reducer kept one representative document per fingerprint group and dropped the rest, writing out document frequencies of each fingerprint as a duplication report.</p>
+<p><strong>Result:</strong> The pass removed roughly a fifth of the corpus by volume in a single shuffle, ran on the existing cluster with no new infrastructure, and produced a per-fingerprint count that flagged the worst boilerplate for the next crawl.</p>
+<p><strong>Lesson:</strong> When a corpus-scale data problem can be phrased as "group by some key, then combine," it is the inverted index wearing a different key, and it inherits that pattern's parallelism and fault tolerance for free.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One Pass in Spark Replaces the Hand-Rolled Shuffle</div>
+<p>Code 6.3.1 spelled out the shuffle with a <code>defaultdict</code> so the grouping was visible. On a real cluster you never write that loop; a data engine performs the shuffle, the parallel scheduling, and the fault-tolerant re-execution for you. In PySpark, the entire inverted-index build is a flat-map to postings followed by a group-by-key, and it runs unchanged on one core or a thousand:</p>
+<pre><code class="language-python"># Spark distributes the shuffle, scheduling, and re-execution across the cluster.
+docs = sc.parallelize([("d1", "the cat sat on the mat"),
+                       ("d2", "the dog sat on the log")])
+
+postings = docs.flatMap(lambda d: [(t, d[0]) for t in d[1].lower().split()])
+index = (postings
+         .groupByKey()                       # the shuffle: group postings by term
+         .mapValues(lambda ds: sorted(set(ds)))   # reduce: de-duplicated postings list
+         .collectAsMap())
+</code></pre>
+<div class="code-caption"><strong>Code 6.3.2:</strong> The inverted index of Code 6.3.1 in three lines of PySpark. The explicit <code>defaultdict</code> shuffle and the per-key reduce loop collapse into <code>groupByKey().mapValues(...)</code>, and Spark supplies the cross-machine data movement and fault tolerance that <a href="../module-07-spark-dataframes/index.html">Chapter 7</a> unpacks in full.</div>
+</div>
+
+<h2>5. From Postings Lists to Retrieval at Scale <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The index in Output 6.3.1 fits in a dictionary, but a real one does not. A web-scale inverted index has billions of terms and posting lists millions of documents long, so the index itself must be partitioned across machines, and the partitioning choice shapes how queries run. Partitioning by term (each machine owns a disjoint set of terms and their full posting lists) makes a single-term query touch one machine but forces multi-term queries to ship long lists between machines. Partitioning by document (each machine holds the full index for its slice of the corpus) makes every query fan out to all machines but keeps each posting list local. This is the same sharding-by-key versus sharding-by-row tension that recurs for embedding tables in <a href="../../part-3-distributed-ml/module-12-distributed-classical-ml/index.html">Chapter 12</a> and for model parameters in <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>; the index is just the first place it bites.</p>
+<p>Modern retrieval for AI extends the inverted index rather than replacing it. A boolean or TF-IDF inverted index matches exact terms, so a query for "automobile" misses a document that only says "car." Dense retrieval answers that by indexing learned vector embeddings and searching by nearest neighbor, and production systems run a hybrid: the term-based inverted index from this section for exact and rare matches, alongside a vector index for semantic matches, with the two score lists fused. Both are still emit-and-collect builds, one keyed by term and one keyed by a quantized vector cell, and both shard the same two ways. <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a> builds out the distributed vector side; the postings list you assembled here is the half that has been carrying search for fifty years and is not going anywhere.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Learned and Hybrid Sparse Indexes (2024 to 2026)</div>
+<p>The inverted index is in the middle of a quiet revival driven by retrieval-augmented generation. Learned sparse-retrieval models in the SPLADE lineage predict term weights and document expansions with a transformer, then write the result into a classic inverted index, so the postings list is built by a neural network but queried with the same fast intersection as Code 6.3.1. Production search now standardly fuses these sparse signals with dense vectors using reciprocal rank fusion, and 2024 to 2026 work on the BGE-M3 family trains a single model to emit dense, sparse, and multi-vector representations together for one-pass hybrid indexing. The engineering message for distributed systems is that the term-keyed inverted index is not being retired for AI retrieval; it is being fed by better mappers, and it still has to be sharded and shuffled exactly as this section describes. We evaluate these hybrid retrievers in <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a> and put one to work in the web-scale RAG case study of <a href="../../part-8-case-studies/module-36-case-web-scale-text-rag/index.html">Chapter 36</a>.</p>
+</div>
+<p>With word count and the inverted index in hand, you have the two computations that the rest of this chapter generalizes. The next section keeps the same key-value skeleton but asks the reducer to do more than collect: it adds aggregation with combiners, filtering during the map, and the secondary sort that lets a reducer see its values in a chosen order. That progression starts in <a href="section-6.4.html">Section 6.4</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.3.1: One Template, Two Computations <span class="exercise-type conceptual">Conceptual</span></div>
+<p>State precisely the two changes to Code 6.3.1 that turn the inverted-index build into a word-count job: what the map step emits as the value, and what the reduce step does with the collected values. Then explain why, despite producing different outputs, both computations require the identical shuffle, and what that shared shuffle implies about which of the three phases dominates the running time as the corpus grows. Identify one further computation from Section 4 (label counting, joining, or deduplication) and give the single key it must emit.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.3.2: Positional Postings and Phrase Queries <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 6.3.1 so that each posting carries not just the document identifier but also the position of the term within the document, emitting <code>(term, (doc_id, position))</code>. Have the reducer build a positional postings list per term. Then write a function that answers the phrase query <code>"sat on"</code> by intersecting the postings of <code>sat</code> and <code>on</code> and keeping only documents where <code>on</code> appears exactly one position after <code>sat</code>. Run it on the corpus and report which documents match. Explain how much larger the positional index is than the plain one and why phrase search needs it.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.3.3: Term Partitioning Versus Document Partitioning <span class="exercise-type analysis">Analysis</span></div>
+<p>Consider a two-term conjunctive query <code>A AND B</code> on an index sharded across $M$ machines. Under term partitioning, the posting lists for $A$ and $B$ live on (at most) two machines; under document partitioning, every one of the $M$ machines holds a slice of both lists. For each scheme, estimate the number of machines contacted and the volume of posting data that must move between machines to compute the intersection, in terms of the posting-list lengths $|A|$ and $|B|$ and the shard count $M$. State which scheme you would choose for a latency-sensitive search service and which for a throughput-oriented batch analytics job, and connect your reasoning to the partitioning trade-off named in Section 5.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-6.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 6.2</span><span class="nav-title">The Map, Shuffle, and Reduce Pattern</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 6</span><span class="nav-num">Contents</span><span class="nav-title">The MapReduce Model and Distributed Algorithms</span></a>
+<a class="next" href="section-6.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 6.4</span><span class="nav-title">Aggregation, Filtering, and Secondary Sorting</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

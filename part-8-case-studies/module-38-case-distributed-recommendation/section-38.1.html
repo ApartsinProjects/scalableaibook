@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 38.1: Problem Definition. Framing a web-scale recommender over billions of items and hundreds of millions of users, fixing its latency and throughput SLO, and decomposing the multi-stage pipeline onto the six axes of distribution." name="description"/>
+<title>Section 38.1: Problem Definition | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Case Studies and Capstone Projects</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 38: Distributed Recommendation at Scale</a></div>
+<h1>Problem Definition</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"You scrolled, and I had thirty milliseconds. In that blink I asked a hundred machines what you might like, watched a billion items shrink to twenty, and handed you a row of suggestions as if I had been thinking about you all along."</p>
+<cite>A Recommendation, Assembled in Eighty Milliseconds From a Hundred Machines</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A web-scale recommender is the one system in this book where the model itself, not just the data or the request volume, is the thing that does not fit on a machine.</strong> Its embedding tables hold a learned vector for every item in a catalog of billions and every user in a population of hundreds of millions, and those tables run to terabytes that no single accelerator can store. On top of that immovable model sits a serving path that must turn a billion candidate items into a ranked handful within tens of milliseconds, hundreds of thousands of times per second. This chapter takes one such recommender apart end to end. This opening section states the problem precisely, fixes the scale numbers that make a single machine impossible, decomposes the multi-stage pipeline into the components the rest of the chapter builds, and maps each component onto the six axes of distribution from <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Chapter 1</a>. Everything that follows is engineering against the requirements written down here.</p>
+</div>
+<p>A recommender system answers a question that has no query text: given who you are and what you are looking at right now, which few items, out of a catalog of billions, should fill this row of the screen. On a laptop, over a few thousand products and a few hundred users, this is a weekend project: learn a small matrix factorization, score every item for every user, and sort. The interesting version, and the one this chapter studies, is the version that powers a large marketplace, video platform, or social feed. When the catalog is measured in billions of items, the audience in hundreds of millions of users, and the response budget in tens of milliseconds, every component that was trivial on the laptop becomes a distributed system in its own right. The purpose of this case study is to show how the machinery built in Parts III through VII assembles into one coherent product, and where the seams between those parts actually fall.</p>
+<p>We will treat the system as a concrete target rather than an abstraction. Throughout the chapter, the running specification is a recommendation service with a catalog on the order of two billion items, an active user population in the hundreds of millions, a serving path that must return a ranked slate within a latency a person never notices, a peak throughput measured in hundreds of thousands of requests per second, and a freshness requirement that lets a click recorded seconds ago shape the next recommendation. Those five pressures, catalog and user scale, latency, throughput, freshness of signals, and cost, are the requirements; the rest of the chapter is the design that satisfies them.</p>
+
+<h2>1. The Requirements: Five Numbers That Rule Out One Machine <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A problem definition is only useful if it commits to numbers, because the numbers decide which ceilings bind and therefore which axes of distribution we must reach for. We fix five requirements and carry them through the entire chapter. The first is scale: the system learns and serves embeddings for a catalog of $N_{\text{items}} \approx 2 \times 10^{9}$ items and $N_{\text{users}} \approx 4 \times 10^{8}$ users, plus categorical features (the advertiser, the query, the device, the context) whose vocabularies add billions more rows. The second is latency: the end-to-end serving budget, from request to ranked slate, sits on the order of tens of milliseconds, because a recommendation that arrives after the page has rendered is a recommendation nobody saw. The third is throughput: the service must sustain hundreds of thousands of requests per second at peak, every one of which fans out across the retrieval and ranking fleet. The fourth is freshness: a user who just clicked, skipped, or purchased should see that signal reflected within seconds, so the system is never a nightly batch but a continuously updated flow. The fifth is cost: the design must hit the first four at a price an operator would pay, which immediately disqualifies any approach that scores the whole catalog per request or holds a private copy of the embedding tables on every server.</p>
+<p>These five requirements interact, and the interaction is the whole subject. Freshness fights cost, because applying every click to the embedding tables in real time burns memory bandwidth and network traffic. Latency fights catalog size, because a larger catalog means more candidates to consider per request. Throughput fights latency, because every concurrent request competes for the same retrieval and ranking hardware. A single machine fails all five at once and for independent reasons: it cannot store the embedding tables, cannot scan billions of candidates inside the budget, cannot apply the update stream, and cannot serve the request volume. The next section makes that failure quantitative.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Model, Not the Data, Is What Overflows Here</div>
+<p>In the RAG case study of <a href="../module-36-case-web-scale-text-rag/section-36.1.html">Chapter 36</a> the corpus was the giant; the generator fit on a few accelerators. A recommender inverts this. Its deep network is small, often a few hundred megabytes of dense weights, but its embedding tables, one learned vector per id across catalog, users, and every categorical feature, are terabytes. The binding ceiling is parameter memory, which is why this case study leans hardest on the distribute-the-model axis and on the sharded parameter servers of <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a>. Read a recommender's requirements and the first ceiling you hit is almost always the size of the embedding table, not the size of the dataset.</p>
+</div>
+
+<h2>2. Why a Single Machine Is Not Even Close <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The argument for distribution here is not rhetorical; it falls out of arithmetic on the five requirements. Take the embedding tables first. Every id the model knows about, an item, a user, an advertiser, a query token, gets a learned vector of dimension $d$ stored at $b$ bytes per dimension. The number of rows across all tables and the table size in bytes are</p>
+$$R = N_{\text{items}} + N_{\text{users}} + N_{\text{feat}}, \qquad S_{\text{emb}} = R \cdot d \cdot b,$$
+<p>where $N_{\text{feat}}$ collects the categorical-feature vocabularies. With billions of rows, a dimension $d = 256$, and $b = 4$ bytes per dimension in single precision, $S_{\text{emb}}$ runs to several terabytes, one to two orders of magnitude past the memory of any single node. The number of parameter-server shards the table must be split into is the table size divided by the memory each node can devote to it,</p>
+$$K_{\text{shard}} = \left\lceil \frac{S_{\text{emb}}}{M_{\text{node}}} \right\rceil,$$
+<p>which for a node offering tens of gigabytes of fast memory to embeddings lands in the dozens to low hundreds. The serving path is no kinder. It cannot score all $N_{\text{items}}$ candidates per request, so it runs a funnel that shrinks the catalog through successive stages, retrieval then ranking then final selection, with a multiplicative reduction</p>
+$$\rho = \prod_{j} \frac{n_{j}}{n_{j+1}},$$
+<p>that takes billions of items down to the few tens actually shown. Even the surviving candidates obey a concurrency wall. The query path follows Little's law: the number of requests in flight at any instant is the arrival rate times how long each one stays in the system,</p>
+$$C = \lambda \cdot L,$$
+<p>so a throughput $\lambda$ of hundreds of thousands of requests per second at a latency $L$ of tens of milliseconds keeps thousands of requests being served concurrently, which no single server's compute or memory can hold. Figure 38.1.1 shows the multi-stage pipeline and the axis each stage loads; Code 38.1.1 puts real numbers behind every one of these formulas.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 880 500" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Multi-stage distributed recommender drawn as a retrieval funnel and serving dataflow. Sharded embedding tables holding terabytes of learned vectors feed both an offline training loop and the online serving path. At request time a user and context are looked up in the embedding tables, candidate generation retrieves about ten thousand items from a billion-item catalog via approximate nearest neighbor, ranking scores the survivors down to a few hundred, and final selection returns a slate of about twenty. A streaming feature pipeline feeds fresh signals back into the feature store and embeddings, and an online evaluation loop measures the served slates.">
+<defs>
+<marker id="arr381" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr381b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.box381 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.qbox381 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.fbox381 { fill:#eef6ef; stroke:#2f7d4f; stroke-width:1.6; }
+.t381 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s381 { font:10.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.a381 { font:italic 10px sans-serif; fill:#8a5a12; text-anchor:middle; }
+.l381 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr381); }
+.le381 { fill:none; stroke:#b86b1f; stroke-width:1.5; stroke-dasharray:5 4; marker-end:url(#arr381b); }
+.hdr381 { font:700 12px sans-serif; fill:#14385c; text-anchor:start; }
+</style>
+<text class="hdr381" x="30" y="26">Sharded model (terabytes, never on one node)</text>
+<rect class="box381" x="300" y="40" width="280" height="56" rx="8"/>
+<text class="t381" x="440" y="62">Sharded Embedding Tables</text>
+<text class="s381" x="440" y="80">~6.6 TB, ~100 parameter-server shards</text>
+<text class="a381" x="440" y="116">distribute the model</text>
+
+<text class="hdr381" x="30" y="170">Online serving path (per request, tens of ms SLO)</text>
+<rect class="qbox381" x="20" y="186" width="120" height="60" rx="8"/>
+<text class="t381" x="80" y="210">User + Context</text>
+<text class="s381" x="80" y="228">embed lookup</text>
+<rect class="qbox381" x="180" y="186" width="150" height="60" rx="8"/>
+<text class="t381" x="255" y="210">Candidate Gen</text>
+<text class="s381" x="255" y="228">ANN retrieve ~10^4</text>
+<text class="a381" x="255" y="266">coordinate the cluster</text>
+<rect class="qbox381" x="370" y="186" width="140" height="60" rx="8"/>
+<text class="t381" x="440" y="210">Ranking</text>
+<text class="s381" x="440" y="228">score down to ~500</text>
+<text class="a381" x="440" y="266">distribute inference</text>
+<rect class="qbox381" x="550" y="186" width="140" height="60" rx="8"/>
+<text class="t381" x="620" y="210">Final Select</text>
+<text class="s381" x="620" y="228">slate of ~20</text>
+<rect class="qbox381" x="730" y="186" width="120" height="60" rx="8"/>
+<text class="t381" x="790" y="210">Slate</text>
+<text class="s381" x="790" y="228">served</text>
+<line class="l381" x1="140" y1="216" x2="176" y2="216"/>
+<line class="l381" x1="330" y1="216" x2="366" y2="216"/>
+<line class="l381" x1="510" y1="216" x2="546" y2="216"/>
+<line class="l381" x1="690" y1="216" x2="726" y2="216"/>
+<path class="l381" d="M 360 96 L 360 150 L 255 150 L 255 184"/>
+<path class="l381" d="M 480 96 L 480 150 L 440 150 L 440 184"/>
+<text class="s381" x="600" y="143">tables serve lookups + scoring</text>
+
+<text class="hdr381" x="30" y="338">Streaming features and freshness (continuous)</text>
+<rect class="fbox381" x="20" y="354" width="170" height="58" rx="8"/>
+<text class="t381" x="105" y="378" fill="#2f7d4f">Click / View Stream</text>
+<text class="s381" x="105" y="396">events, seconds old</text>
+<rect class="fbox381" x="230" y="354" width="170" height="58" rx="8"/>
+<text class="t381" x="315" y="378" fill="#2f7d4f">Feature Store</text>
+<text class="s381" x="315" y="396">online + offline</text>
+<text class="a381" x="315" y="432">distribute data</text>
+<line class="l381" x1="190" y1="383" x2="226" y2="383"/>
+<path class="le381" d="M 400 383 L 600 383 L 600 250"/>
+<text class="a381" x="500" y="375">fresh features into ranking</text>
+<path class="le381" d="M 315 352 L 315 110 L 296 110 L 296 96"/>
+<text class="s381" x="200" y="330">updates embeddings</text>
+
+<text class="hdr381" x="30" y="468">Online evaluation (closes the loop)</text>
+<rect class="box381" x="450" y="478" width="400" height="20" rx="6"/>
+<text class="t381" x="650" y="492" font-size="11">Online eval: A/B tests, interleaving, counterfactual estimates</text>
+<path class="le381" d="M 790 246 L 790 478"/>
+</svg>
+<figcaption><strong>Figure 38.1.1:</strong> The multi-stage distributed recommender as a dataflow. The sharded embedding tables (top) hold terabytes of learned vectors that never fit on one node and serve both training and the online path. The serving path (middle) embeds the user and context, retrieves about ten thousand candidates from a billion-item catalog by approximate nearest neighbor, ranks the survivors down to a few hundred, and selects a final slate of roughly twenty, all within the latency budget. The streaming layer (lower band) turns clicks and views seconds old into fresh features and embedding updates, and the online evaluation loop (bottom) measures the served slates. Each stage is labeled with its approximate scale (from Code 38.1.1) and the axis of distribution it loads most heavily.</figcaption>
+</figure>
+
+<p>The diagram fixes the vocabulary for the chapter. The terabyte-scale embedding tables at the top are the model that cannot live on one machine and that every other stage reads from. The middle row is the per-request serving funnel that runs under the latency SLO. The lower band is the streaming feature and freshness layer that keeps the model current; the bottom strip is the online evaluation that keeps the whole thing honest. The numbers on each box come from the same back-of-envelope model, which we now run with real arithmetic so that no estimate in this chapter is a guess.</p>
+
+<pre><code class="language-python">import math
+
+# --- Catalog and user scale (the five requirements) ---
+N_items   = 2_000_000_000    # catalog size (billions of items)
+N_users   = 400_000_000      # active users (hundreds of millions)
+N_feat    = 4_000_000_000    # extra categorical-feature ids (ad, query, context)
+dim       = 256              # embedding dimension d
+bytes_id  = 4                # fp32 per dimension, b
+qps       = 300_000          # peak queries per second, lambda
+latency   = 0.030            # end-to-end SLO budget, seconds (tens of ms)
+mem_node  = 64               # GB of fast memory a node devotes to embeddings
+
+# --- Embedding table size: rows R = items + users + features ---
+R       = N_items + N_users + N_feat
+S_emb   = R * dim * bytes_id                    # table size in bytes
+emb_tb  = S_emb / 1e12
+shards  = math.ceil(S_emb / (mem_node * 1e9))   # K_shard parameter-server shards
+
+# --- Candidate funnel: catalog -> retrieved -> ranked -> shown ---
+funnel  = [N_items, 10_000, 500, 20]
+rho     = [funnel[j] / funnel[j + 1] for j in range(len(funnel) - 1)]
+
+# --- Concurrency from Little's law: C = lambda * L ---
+C = qps * latency
+
+# --- Cost per 1000 requests at an assumed serving-fleet rate ---
+fleet_nodes   = 1200
+node_per_hour = 3.50                              # USD per node-hour
+cost_per_1k   = (fleet_nodes * node_per_hour) / (qps * 3600) * 1000
+
+print(f"embedding rows R (all tables): {R:,}")
+print(f"embedding table S_emb        : {emb_tb:,.1f} TB")
+print(f"parameter-server shards      : {shards:,}")
+print(f"candidate funnel             : {' -> '.join(f'{x:,}' for x in funnel)}")
+print(f"per-stage reduction factors  : {' , '.join(f'{r:,.0f}x' for r in rho)}")
+print(f"queries in flight C=QPS*L    : {C:,.0f}")
+print(f"cost per 1000 requests       : ${cost_per_1k:.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 38.1.1:</strong> The five-requirement back-of-envelope model for the running specification. Each printed quantity corresponds to one formula in this section: the row count $R$, the table size $S_{\text{emb}}$, the shard count $K_{\text{shard}}$, the funnel sizes and their reduction factors $\rho$, the Little's-law concurrency $C$, and a cost-per-thousand-requests estimate.</div>
+<pre><code class="language-text">embedding rows R (all tables): 6,400,000,000
+embedding table S_emb        : 6.6 TB
+parameter-server shards      : 103
+candidate funnel             : 2,000,000,000 -> 10,000 -> 500 -> 20
+per-stage reduction factors  : 200,000x , 20x , 25x
+queries in flight C=QPS*L    : 9,000
+cost per 1000 requests       : $0.004
+</code></pre>
+<div class="code-caption"><strong>Output 38.1.1:</strong> Real output. The embedding tables alone are $6.6$ terabytes and demand on the order of one hundred shards; the serving funnel must shrink the catalog by a factor of two hundred thousand at retrieval before ranking even begins; and the query path keeps roughly nine thousand requests in flight at once. Every number here is a wall the single machine hits, and each maps to a different axis of distribution.</div>
+<p>The output settles the question. The embedding tables are $6.6$ terabytes, which alone exceeds the memory of any single accelerator by one to two orders of magnitude and forces the table across roughly one hundred shards before training or serving can begin. The serving funnel must reduce two billion candidates to twenty, a total compression of a hundred million to one, with the first and largest cut, a factor of two hundred thousand, taken at retrieval rather than by brute-force scoring. The query path keeps thousands of requests in flight simultaneously. None of these is a marginal overshoot that a faster chip would absorb; each is one to several orders of magnitude beyond a single node, and each lands on a different stage of the pipeline. That separation is exactly what makes the six-axis decomposition the right tool.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Model Itself Is Too Big for One Machine</div>
+<p>Chapter 1 named three pressures that force distribution: data, model, and throughput. Most case studies in this part lean on data and throughput. The recommender is the book's cleanest instance of the second pressure, the one where the <em>model</em> overflows. Its $6.6$-terabyte embedding table cannot be replicated onto a serving node the way a few-hundred-megabyte network can; it must be sharded across machines that the serving path queries over the network, exactly the sharded-parameter pattern introduced in <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a> and generalized to model shards in <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>. When you reach the capstone in <a href="../module-41-capstone-project-design/index.html">Chapter 41</a> and must defend a distribution axis, this is the worked example for "the parameters do not fit": scale-out is not an optimization on the recommender, it is the only form in which the recommender can exist.</p>
+</div>
+
+<h2>3. Decomposing the Pipeline Onto the Six Axes <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The six axes of distribution from <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>, distribute data, distribute training, distribute the model, distribute inference, coordinate the cluster, and distribute intelligence, give us a map onto which every stage of Figure 38.1.1 places cleanly. Mapping the stages is the planning act of the whole chapter: it tells us which earlier part of the book owns each stage and which later section of this chapter develops it. Table 38.1.1 is that map, and it doubles as the chapter's table of contents.</p>
+<div class="table-caption"><strong>Table 38.1.1:</strong> Each pipeline stage assigned to the axis of distribution it loads most heavily, the earlier chapter that owns the underlying machinery, and the later section of this chapter that builds it.</div>
+<table>
+<thead>
+<tr><th scope="col">Pipeline stage</th><th scope="col">Primary axis</th><th scope="col">Owning earlier chapter</th><th scope="col">Built in this chapter</th></tr>
+</thead>
+<tbody>
+<tr><td>Learn the embeddings</td><td>Distribute the model</td><td><a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Ch 11</a> (parameter servers, sharded embeddings)</td><td><a href="section-38.2.html">Section 38.2</a></td></tr>
+<tr><td>Candidate generation / retrieval</td><td>Coordinate the cluster</td><td><a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Ch 25</a> (ANN, vector search)</td><td><a href="section-38.3.html">Section 38.3</a></td></tr>
+<tr><td>Ranking</td><td>Distribute inference</td><td><a href="../../part-5-distributed-inference/module-23-distributed-inference-systems/index.html">Ch 23</a>, <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Ch 24</a></td><td><a href="section-38.4.html">Section 38.4</a></td></tr>
+<tr><td>Feature store</td><td>Distribute data</td><td><a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/index.html">Ch 8</a> (storage and loading)</td><td><a href="section-38.5.html">Section 38.5</a></td></tr>
+<tr><td>Real-time personalization</td><td>Distribute data</td><td><a href="../../part-2-distributed-data/module-09-stream-processing-online-ai/index.html">Ch 9</a> (stream processing)</td><td><a href="section-38.6.html">Section 38.6</a></td></tr>
+<tr><td>Online evaluation</td><td>Distribute intelligence</td><td><a href="../../part-1-foundations/module-05-evaluating-distributed-ai/index.html">Ch 5</a> (evaluation)</td><td><a href="section-38.7.html">Section 38.7</a></td></tr>
+<tr><td>End-to-end architecture</td><td>Coordinate the cluster</td><td><a href="../../part-5-distributed-inference/module-23-distributed-inference-systems/index.html">Ch 23</a></td><td><a href="section-38.8.html">Section 38.8</a></td></tr>
+<tr><td>Capstone build</td><td>All axes</td><td><a href="../module-41-capstone-project-design/index.html">Ch 41</a></td><td><a href="section-38.9.html">Section 38.9</a></td></tr>
+</tbody>
+</table>
+<p>Reading the table top to bottom traces the dataflow of Figure 38.1.1, and reading the third column traces the path back through the book. Learning the embeddings is the act of distributing a model too large for one node: the tables are sharded across parameter servers that workers push gradients to and pull current vectors from, the push-pull pattern of <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a>, here scaled to billions of rows. Candidate generation is approximate nearest-neighbor retrieval over a sharded vector index, the scatter-gather across shards that <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a> owns, and its tight latency makes it primarily a cluster-coordination problem. Ranking is distributed inference: a deep scoring model replicated across the fleet and run on the few hundred candidates the funnel let through, drawing on the inference-systems and serving economics of <a href="../../part-5-distributed-inference/module-23-distributed-inference-systems/index.html">Chapter 23</a> and <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>. The feature store is distributed data, the storage and loading machinery of <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/index.html">Chapter 8</a> specialized to serve features at both training and request time. Real-time personalization is stream processing, the online-AI material of <a href="../../part-2-distributed-data/module-09-stream-processing-online-ai/index.html">Chapter 9</a> that turns a click seconds old into a fresh feature. Evaluation closes the loop with the methodology of <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/index.html">Chapter 5</a>. No stage is new machinery; the contribution of this chapter is the assembly and the seams.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Recommender That Outgrew Its Server's Memory</div>
+<p><strong>Who:</strong> A machine learning engineer at a growing video platform owning the home-feed model.</p>
+<p><strong>Situation:</strong> The recommender ran as a single service: one process loaded the whole embedding table into a high-memory server, scored a few million candidate videos per request, and returned a ranked feed.</p>
+<p><strong>Problem:</strong> The catalog crossed a hundred million items, the embedding table outgrew the largest single server's memory, and per-request scoring of the full catalog pushed tail latency past the budget.</p>
+<p><strong>Dilemma:</strong> Rent an ever-larger memory-heavy machine to hold the table and keep brute-force scoring, a scale-up move that postponed the wall by one order of magnitude and left throughput capped at one box, or re-architect into sharded embeddings with a retrieve-then-rank funnel, the structure of Figure 38.1.1.</p>
+<p><strong>Decision:</strong> They re-architected, sharding the embedding table across parameter servers, replacing full-catalog scoring with approximate-nearest-neighbor retrieval, and replicating a smaller ranking model behind the retrieval stage.</p>
+<p><strong>How:</strong> They ran the back-of-envelope model of Code 38.1.1 on their own catalog size and QPS first, which told them the table needed dozens of shards and the funnel had to cut the catalog by five orders of magnitude before ranking, and they sized the cluster from those numbers rather than from guesses.</p>
+<p><strong>Result:</strong> The feed met its latency SLO at the larger catalog, and because the embedding table was sharded and the funnel replaced the full scan, growing the catalog further meant adding shards and retrieval replicas without touching the ranking code.</p>
+<p><strong>Lesson:</strong> When the embedding table, not the request volume, is the first ceiling, no single machine is the answer. Sharding the model and replacing the full scan with a funnel is the move, and the arithmetic of Section 2 tells you how far to take each.</p>
+</div>
+
+<h2>4. The Training Path Versus the Serving Path <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>One structural decision organizes the rest of the chapter, and it is visible in Figure 38.1.1 as the difference between the streaming layer that updates the tables and the serving funnel that reads them. The training path and the serving path have opposite cost profiles and must be engineered against opposite metrics. The training path is throughput-bound and latency-tolerant: it streams interaction events into the sharded embedding tables and the ranking model, it is measured in events processed per second and in how quickly a signal propagates, and a gradient applied a few seconds late costs almost nothing. The serving path is latency-bound and throughput-replicated: each request must finish inside the tens-of-milliseconds budget, it is measured in tail latency and in how many concurrent requests the fleet sustains, and being even a hundred milliseconds slow costs an impression. Conflating these two paths is a common design error, because the techniques that make training cheap, large asynchronous batches and relaxed deadlines, are exactly the techniques that ruin the serving path.</p>
+<p>The two paths meet at two shared artifacts: the embedding tables and the feature store. The training path writes them; the serving path reads them. Freshness is precisely the rate at which updates flow from the streaming layer into the tables and features that the serving path is already querying, which is why neither can be a static snapshot but must be live, incrementally updated structures, a point <a href="section-38.5.html">Section 38.5</a> and <a href="section-38.6.html">Section 38.6</a> take up in detail. The concurrency the serving path must hold, the $C = \lambda L$ from Output 38.1.1, is the budget that <a href="section-38.4.html">Section 38.4</a> spends on replicated ranking. Keeping the two paths logically separate while letting them share exactly those two artifacts is the architectural spine of the chapter, and <a href="section-38.8.html">Section 38.8</a> draws the full picture.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Laptop Recommender That Hides Every Distributed Problem</div>
+<p>It is worth seeing the system this chapter does not study, because it shows exactly which problems scale removes the luxury of ignoring. A few lines of a modern library give a working recommender on a small catalog:</p>
+<pre><code class="language-python"># pip install implicit scipy
+import implicit
+from scipy.sparse import csr_matrix
+
+# user x item interaction matrix, small enough to live in RAM
+interactions = csr_matrix(load_clicks())          # one machine, one process
+model = implicit.als.AlternatingLeastSquares(factors=128)
+model.fit(interactions)                            # learns ALL embeddings in memory
+recs = model.recommend(user_id, interactions[user_id], N=20)  # scores every item
+</code></pre>
+<div class="code-caption"><strong>Code 38.1.2:</strong> A complete single-machine recommender in a handful of lines. It silently assumes the entire embedding table fits in RAM, training touches every interaction at once, and scoring can scan the whole catalog per request. Each of those assumptions is one of the requirements from Section 1, and each fails at web scale; the rest of this chapter is what these lines become when the table is terabytes, the events never stop arriving, and the catalog cannot be scanned per request.</div>
+</div>
+
+<h2>5. What This Chapter Builds, Section by Section <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>With the requirements fixed, the scale proven, and the axes mapped, the path through the chapter is set. <a href="section-38.2.html">Section 38.2</a> learns the sharded embeddings, the terabyte-scale model that the parameter servers of <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a> hold across machines. <a href="section-38.3.html">Section 38.3</a> builds candidate generation, the approximate-nearest-neighbor retrieval that takes the $200{,}000\times$ first cut of the funnel from Output 38.1.1. <a href="section-38.4.html">Section 38.4</a> ranks the survivors with a replicated deep scorer, spending the concurrency budget $C$ on distributed inference. <a href="section-38.5.html">Section 38.5</a> builds the feature store that both paths read and write. <a href="section-38.6.html">Section 38.6</a> adds real-time personalization, turning the click stream into fresh signals within seconds. <a href="section-38.7.html">Section 38.7</a> closes the loop with online evaluation, A/B testing, interleaving, and counterfactual estimates that judge served slates. <a href="section-38.8.html">Section 38.8</a> assembles the end-to-end architecture, and <a href="section-38.9.html">Section 38.9</a> turns it into a buildable project. Each section opens with the slice of Figure 38.1.1 it owns and the requirement from Section 1 it must satisfy.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Where Web-Scale Recommendation Is Moving (2024 to 2026)</div>
+<p>The boundary of this problem is shifting on every axis at once. On the model side, generative and sequence-based recommenders such as Meta's HSTU and the wider "generative recommenders" line (Zhai et al., 2024) recast ranking as next-token prediction over interaction histories, trading hand-built features for scale and pushing embedding tables larger still, which only sharpens the distribute-the-model pressure of Section 2. Semantic-id and learned-tokenizer approaches in the TIGER lineage replace billion-row id tables with compact generative codes, attacking the $S_{\text{emb}}$ ceiling directly. On the retrieval side, learned and disk-resident approximate-nearest-neighbor indices in the DiskANN and SPANN lineage pack billions of vectors per node and shrink the shard count $K_{\text{shard}}$ that Section 2 computed. On the serving side, the funnel itself is under revision as single-stage retrieve-and-rank models blur the boundary between candidate generation and ranking. The constant across all of it is the five-requirement tension of Section 1: every advance is judged by whether it improves one of scale, latency, throughput, freshness, or cost without surrendering the other four.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: A Hundred Million to One, Twenty Times a Second in Your Pocket</div>
+<p>Output 38.1.1 says the funnel compresses two billion candidates to twenty, a hundred-million-to-one reduction, and does it inside a budget of tens of milliseconds. Per item shown, the system has considered roughly a hundred million it chose not to show, and it repeats that feat hundreds of thousands of times a second. The screen you scroll betrays none of it: a calm little row of suggestions, behind which a hundred machines just held a very fast, very large election and agreed on twenty winners before your thumb finished moving.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 38.1.1: Read the Requirements, Name the Ceilings <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each of the five requirements in Section 1 (catalog and user scale, latency, throughput, freshness, cost), name the single pipeline stage in Figure 38.1.1 that it pressures hardest, the axis of distribution from Table 38.1.1 that stage sits on, and one concrete failure that occurs if that stage is left on a single machine. Then identify which two of the five requirements are in the most direct tension with each other and explain why satisfying one cheaply makes the other harder. Contrast your answer with the RAG case study of <a href="../module-36-case-web-scale-text-rag/section-36.1.html">Chapter 36</a>: which requirement binds first there, and why does the recommender's first ceiling differ?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 38.1.2: Resize the System <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 38.1.1 to model a catalog five times larger ($N_{\text{items}} = 10^{10}$) and an embedding dimension of $512$ instead of $256$. Report the new table size $S_{\text{emb}}$ and shard count $K_{\text{shard}}$, then compute how many shards are saved by storing the table in $b = 1$ byte (int8) instead of $4$ bytes. Next, add a freshness model: assume the click stream arrives at $500{,}000$ events per second and each event updates a handful of embedding rows; estimate the write throughput in gigabytes per second that the sharded tables must absorb, and discuss whether that load is spread evenly across the $K_{\text{shard}}$ shards or concentrated on the most popular items.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 38.1.3: The Concurrency Budget Across the Funnel <span class="exercise-type analysis">Analysis</span></div>
+<p>Using Little's law $C = \lambda L$ from Section 2, suppose the serving path must sustain $\lambda = 250{,}000$ requests per second at a target $p50$ latency of $0.025$ seconds, of which retrieval consumes $0.010$ seconds and ranking consumes the rest. Estimate the number of concurrent requests in each of the two stages separately, and argue from those two numbers which stage dominates the fleet sizing. Then discuss how the answer changes if a long tail makes the $p99$ latency four times the $p50$, and connect your reasoning to the replicated-inference treatment forthcoming in <a href="section-38.4.html">Section 38.4</a> and the serving economics of <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html"><span class="nav-label">Chapter Overview</span><span class="nav-num">Chapter 38</span><span class="nav-title">Distributed Recommendation at Scale</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 38</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Recommendation at Scale</span></a>
+<a class="next" href="section-38.2.html"><span class="nav-label">Next</span><span class="nav-num">Section 38.2</span><span class="nav-title">Distributed User and Item Embeddings</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

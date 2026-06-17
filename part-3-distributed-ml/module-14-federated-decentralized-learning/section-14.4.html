@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 14.4: Non-IID Data. Why each federated client owns its own slice of the distribution, how that heterogeneity drives client drift, why many local epochs amplify it, and what FedProx, SCAFFOLD, server momentum, and distillation do about it." name="description"/>
+<title>Section 14.4: Non-IID Data | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Distributed Machine Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 14: Federated and Decentralized Learning</a></div>
+<h1>Non-IID Data</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"In the datacenter they shuffled my data until every shard looked the same. Out here, my whole world is one person's camera roll, and I am very confident about cats."</p>
+<cite>A Client Model Overfit to Its Owner</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The defining hardship of federated learning is that nobody gets to shuffle the data.</strong> In datacenter training we deliberately randomize examples so every worker's shard is a faithful miniature of the whole distribution, which is exactly what made the data-parallel gradient identity of <a href="../../part-1-foundations/module-01-scale-out-ai/index.html">Chapter 1</a> exact. Federated clients break that assumption by construction: a phone holds one person's photos, a hospital holds one region's patient mix, and no client may ship its raw data anywhere to be reshuffled. Each client therefore optimizes toward its own local minimum, and when those locally drifted models are averaged, the average can be worse than any honest gradient step on the pooled data would have been. This section names the kinds of heterogeneity, shows why running many local epochs makes the problem worse, and surveys the mitigations (fewer local steps, proximal and control-variate corrections, server momentum, and limited data sharing or distillation) that make federated optimization converge despite the skew.</p>
+</div>
+<p>In <a href="section-14.3.html">Section 14.3</a> we built FedAvg: each round, the server broadcasts the current model, a set of clients each run several local SGD epochs on their own data, and the server averages the returned models weighted by how many examples each client holds. We mentioned that FedProx and SCAFFOLD exist as variants without yet saying what disease they cure. This section is that diagnosis. The single assumption that FedAvg silently inherited from datacenter data parallelism, that each participant's data is an independent and identically distributed (IID) sample from one global distribution, is precisely the assumption that real federated populations violate. Once we drop it, the comforting "an average decomposes, so distribution is exact" argument loses its footing, and the gap it opens is the subject of the rest of the chapter.</p>
+
+<h2>1. Why Shuffling Was Doing All the Work <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Recall what shuffling buys you in ordinary distributed training. You take a dataset, permute it uniformly at random, and hand contiguous blocks to each worker. Because the permutation is uniform, every worker's block is a representative sample: its label histogram, its feature statistics, and its difficulty profile all match the global ones up to sampling noise. The local gradient each worker computes is therefore an unbiased estimate of the global gradient, and averaging those estimates reduces variance without introducing bias. That is the entire statistical foundation of synchronous data parallelism, and it is why a hundred workers can act as one.</p>
+<p>Federated learning removes the permutation step and cannot put it back. The data was generated where it lives and must stay there, for reasons of privacy, regulation, bandwidth, or simple physics: you are not going to upload every phone's camera roll to a central shuffler. So the partition into clients is not a random cut through one distribution; it is a partition by source, and sources differ. Formally, write client $k$'s local distribution as $\mathcal{D}_k$ and the global mixture as $\mathcal{D} = \sum_k \frac{n_k}{n}\,\mathcal{D}_k$, where $n_k$ is client $k$'s sample count. In the IID datacenter world every $\mathcal{D}_k \approx \mathcal{D}$. In the federated world the $\mathcal{D}_k$ are different distributions, and the size of that difference is what we now have to reason about.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Local Optimum Is Not the Global Optimum</div>
+<p>Under IID shards, every client's loss surface is a noisy copy of the same surface, so each client's local minimum sits near the global minimum and averaging local models lands near it too. Under non-IID data, client $k$ minimizes its own objective $F_k(w)=\mathbb{E}_{(x,y)\sim\mathcal{D}_k}[\ell(w;x,y)]$, whose minimizer $w_k^\star$ can be far from the global minimizer $w^\star$ of $F(w)=\sum_k \frac{n_k}{n}F_k(w)$. Many local steps pull each client toward its own $w_k^\star$; averaging those pulls does not generally point at $w^\star$. The bias is not noise that more clients average away; it is structural, and it survives no matter how many clients you add.</p>
+</div>
+
+<h2>2. The Four Faces of Heterogeneity <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>"Non-IID" is an umbrella over several distinct ways client distributions can differ, and they call for different remedies, so it pays to keep them separate. Table 14.4.1 names the four that dominate practice. Factor the joint distribution as $\mathcal{D}_k(x,y) = \mathcal{D}_k(y)\,\mathcal{D}_k(x\mid y)$ on each client, and most heterogeneity types are a statement about which factor varies.</p>
+<div class="table-caption"><strong>Table 14.4.1:</strong> The four common forms of client heterogeneity in federated learning, the factor of the joint distribution each one perturbs, and a canonical example.</div>
+<table>
+<thead>
+<tr><th scope="col">Type</th><th scope="col">What differs across clients</th><th scope="col">Canonical example</th></tr>
+</thead>
+<tbody>
+<tr><td>Label-distribution skew</td><td>The class prior $\mathcal{D}_k(y)$</td><td>One phone photographs mostly its owner's dog; a clinic sees mostly one disease stage</td></tr>
+<tr><td>Feature skew</td><td>The conditional $\mathcal{D}_k(x\mid y)$</td><td>The same digit written by different people; the same diagnosis on different scanners</td></tr>
+<tr><td>Quantity skew</td><td>The sample count $n_k$</td><td>A power user with 10,000 photos beside a new user with 12</td></tr>
+<tr><td>Concept drift</td><td>The mapping $y\mid x$, across clients or over time</td><td>The same word means different things to different communities; preferences shift</td></tr>
+</tbody>
+</table>
+<p>Label-distribution skew is the form most studies stress-test, because it is both common and severe: the standard benchmark sorts a dataset by label and hands each client only one or two classes, a synthetic worst case that nonetheless mirrors reality where a user generates a narrow slice of the label space. Feature skew is subtler and often invisible to the label histogram: every hospital may see the full range of diagnoses, yet each one's images carry a scanner-specific signature that a model can latch onto. Quantity skew interacts with the weighting in FedAvg, since a few enormous clients can dominate the average. Concept drift is the hardest, because it means there is no single $w^\star$ that is simultaneously right for everyone, which is the motivation for the personalized methods of <a href="section-14.7.html">Section 14.7</a>. This last form connects directly to the distribution-shift and concept-drift machinery we built for streaming systems in <a href="../../part-2-distributed-data/module-09-stream-processing-online-ai/section-9.9.html">Chapter 9</a>; federated non-IID data is distribution shift across space rather than across time.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Benchmark That Gave Every Client One Class</div>
+<p>The pathological partition that the literature loves, sort by label and deal each client a single class, produces clients that are individually certain and collectively useless. A client holding only cats trains a model that screams "cat" at everything; a client holding only dogs does the mirror image. Average the two and you get a model unsure whether anything is an animal at all. It is the machine-learning version of a committee where every member is a single-issue zealot, and the minutes read accordingly.</p>
+</div>
+
+<h2>3. Client Drift, and Why Many Local Epochs Amplify It <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The mechanism that turns heterogeneity into a convergence problem is client drift: during a round, each client moves its copy of the model away from the shared starting point and toward its own local optimum, so by aggregation time the client models have spread apart. A useful scalar measure of how badly a round drifted is the average distance of the client models from their aggregate,</p>
+$$\text{drift} = \frac{1}{K}\sum_{k=1}^{K}\bigl\lVert w_k - \bar{w}\bigr\rVert, \qquad \bar{w}=\sum_{k=1}^{K}\frac{n_k}{n}\,w_k,$$
+<p>where $w_k$ is client $k$'s model after its local steps and $\bar{w}$ is the FedAvg aggregate. Two knobs inflate this quantity. The first is heterogeneity itself: the more the local gradients $\nabla F_k$ disagree at the shared starting point, the faster the clients diverge. The second, and the one practitioners control directly, is the number of local epochs $E$ introduced in <a href="section-14.3.html">Section 14.3</a>. Each extra local epoch lets a client travel further down its own loss surface before the server gets a chance to average, so larger $E$ means each $w_k$ sits closer to its private $w_k^\star$ and further from its neighbors. FedAvg uses large $E$ precisely to save communication, which is the tension <a href="section-14.5.html">Section 14.5</a> takes up: the same local computation that cuts your network bill is what lets clients drift.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three clients with different label histograms each run local training that pulls a shared global model toward a different local optimum; the three drifted models are then averaged into an aggregate that sits between them, away from any single local optimum.">
+<defs>
+<marker id="arr144" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+<marker id="arr144b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b144 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w144 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.t144 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s144 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.d144 { fill:none; stroke:#b86b1f; stroke-width:1.8; marker-end:url(#arr144); }
+.g144 { fill:none; stroke:#14385c; stroke-width:1.8; stroke-dasharray:5 4; marker-end:url(#arr144b); }
+.bar1 { fill:#b86b1f; } .bar0 { fill:#d8c6ae; }
+</style>
+<text class="t144" x="430" y="24">Each client's skewed labels pull the shared model a different way</text>
+<!-- global start -->
+<circle cx="430" cy="180" r="9" fill="#14385c"/>
+<text class="t144" x="430" y="160">global model w</text>
+<!-- client A top-left -->
+<rect class="w144" x="40" y="60" width="150" height="74" rx="8"/>
+<text class="t144" x="115" y="80">Client A</text>
+<rect class="bar1" x="60" y="92" width="14" height="30"/><rect class="bar0" x="80" y="112" width="14" height="10"/><rect class="bar0" x="100" y="116" width="14" height="6"/><rect class="bar0" x="120" y="114" width="14" height="8"/>
+<text class="s144" x="150" y="120">mostly class 0</text>
+<circle cx="150" cy="150" r="7" class="w144"/>
+<text class="s144" x="150" y="168">w*&#8202;(A)</text>
+<!-- client B top-right -->
+<rect class="w144" x="670" y="60" width="150" height="74" rx="8"/>
+<text class="t144" x="745" y="80">Client B</text>
+<rect class="bar0" x="690" y="114" width="14" height="8"/><rect class="bar1" x="710" y="92" width="14" height="30"/><rect class="bar0" x="730" y="116" width="14" height="6"/><rect class="bar0" x="750" y="112" width="14" height="10"/>
+<text class="s144" x="710" y="120">mostly class 1</text>
+<circle cx="710" cy="150" r="7" class="w144"/>
+<text class="s144" x="710" y="168">w*&#8202;(B)</text>
+<!-- client C bottom -->
+<rect class="w144" x="355" y="290" width="150" height="58" rx="8"/>
+<text class="t144" x="430" y="310">Client C</text>
+<text class="s144" x="430" y="330">mostly class 2</text>
+<circle cx="430" cy="278" r="7" class="w144"/>
+<text class="s144" x="470" y="282">w*&#8202;(C)</text>
+<!-- drift arrows from global to each local optimum -->
+<path class="d144" d="M 421 174 L 165 154"/>
+<path class="d144" d="M 439 174 L 695 154"/>
+<path class="d144" d="M 430 189 L 430 268"/>
+<!-- aggregate -->
+<circle cx="430" cy="180" r="22" fill="none" stroke="#14385c" stroke-width="1.4" stroke-dasharray="3 3"/>
+<text class="s144" x="430" y="212">average w&#772; lands between the pulls,</text>
+<text class="s144" x="430" y="228">at none of the local optima</text>
+</svg>
+<figcaption><strong>Figure 14.4.1:</strong> Client drift under label skew. Three clients with different class histograms each pull the shared model $w$ toward their own local optimum $w_k^\star$ (orange arrows); the server averages the drifted models into $\bar{w}$ (dashed circle), which sits in the middle and matches no client. The longer each client trains locally (larger $E$), the further the orange arrows reach and the worse the average becomes. The drift scalar of Section 3 measures the average length of those arrows.</figcaption>
+</figure>
+<p>The runnable demo below makes both effects measurable on a tiny softmax classifier. It builds one synthetic dataset, partitions it two ways (an IID shuffle and a label-sorted non-IID split where each client sees essentially one class), and runs FedAvg at $E=1$ and $E=10$ local epochs. For each setting it reports the average per-round drift defined above and the final test accuracy, so you can watch heterogeneity and local epochs inflate drift while accuracy slips.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+C, D, N = 6, 30, 12000           # classes, features, total examples
+NC = 30                          # number of clients
+ROUNDS = 30
+
+means = rng.standard_normal((C, D)) * 0.45
+y = rng.integers(0, C, size=N)
+X = means[y] + rng.standard_normal((N, D))
+
+def softmax(Z):
+    Z = Z - Z.max(axis=1, keepdims=True)
+    E = np.exp(Z); return E / E.sum(axis=1, keepdims=True)
+
+def grad(W, Xb, yb):
+    P = softmax(Xb @ W)
+    Y = np.zeros_like(P); Y[np.arange(len(yb)), yb] = 1.0
+    return Xb.T @ (P - Y) / len(yb)
+
+def accuracy(W):
+    return float((softmax(X @ W).argmax(1) == y).mean())
+
+def iid_partition():
+    return np.array_split(rng.permutation(N), NC)
+
+def noniid_partition():
+    # Sort by label, then chop into shards: each client sees one class
+    # (extreme label-distribution skew, the standard worst case).
+    return np.array_split(np.argsort(y, kind="stable"), NC)
+
+def fedavg(parts, E, lr=1.5, batch=32):
+    W = np.zeros((D, C))
+    sizes = np.array([len(p) for p in parts], dtype=float)
+    drift_acc = 0.0
+    for _ in range(ROUNDS):
+        locals_ = []
+        for p in parts:
+            Wl = W.copy()
+            for _ in range(E):                       # E local epochs
+                pp = rng.permutation(p)
+                for b in range(0, len(pp), batch):
+                    bi = pp[b:b + batch]
+                    Wl -= lr * grad(Wl, X[bi], y[bi])
+            locals_.append(Wl)
+        stack = np.stack(locals_)
+        Wbar = np.average(stack, axis=0, weights=sizes)   # FedAvg aggregation
+        # Client drift: mean distance of each local model from the average.
+        drift_acc += float(np.mean([np.linalg.norm(Wl - Wbar) for Wl in stack]))
+        W = Wbar
+    return drift_acc / ROUNDS, accuracy(W)
+
+iid, non = iid_partition(), noniid_partition()
+print(f"{'setting':&lt;30}{'mean client drift':&gt;18}{'test accuracy':&gt;16}")
+print("-" * 64)
+for name, parts, E in [
+    ("IID,     E=1",  iid, 1),
+    ("IID,     E=10", iid, 10),
+    ("non-IID, E=1",  non, 1),
+    ("non-IID, E=10", non, 10),
+]:
+    drift, acc = fedavg(parts, E)
+    print(f"{name:&lt;30}{drift:&gt;18.3f}{acc:&gt;16.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 14.4.1:</strong> FedAvg on IID versus label-sorted non-IID clients, instrumented to report the per-round client-drift scalar of Section 3 alongside final accuracy. The only differences between runs are the partition (shuffle versus label-sort) and the number of local epochs $E$.</div>
+<pre><code class="language-text">setting                        mean client drift   test accuracy
+----------------------------------------------------------------
+IID,     E=1                               2.107           0.825
+IID,     E=10                              4.932           0.824
+non-IID, E=1                               2.632           0.818
+non-IID, E=10                              4.971           0.805
+</code></pre>
+<div class="code-caption"><strong>Output 14.4.1:</strong> Three readings stand out. Holding $E$ fixed, the non-IID split drifts more than the IID split (2.632 against 2.107 at $E=1$). Holding the split fixed, raising $E$ from 1 to 10 more than doubles the drift. And the worst accuracy, 0.805, is the non-IID run with many local epochs, while cutting that run back to $E=1$ recovers it to 0.818, the cheapest non-IID mitigation there is.</div>
+<p>The numbers tell the whole story of this section in one table. Non-IID data raises drift on its own, more local epochs raise it further, and the accuracy cost lands hardest exactly where both compound: many local epochs on skewed clients. The convex softmax model here is forgiving, so the accuracy gap is modest; in the non-convex deep networks of <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a> the same drift can stall or destabilize training outright. The drift scalar is the early-warning signal that the final-accuracy number hides until it is too late.</p>
+
+<h2>4. Mitigations: From Free to Expensive <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>There is a ladder of responses to client drift, ordered roughly by cost. The cheapest, demonstrated in Output 14.4.1, is to reduce the number of local steps: fewer local epochs means less room to drift, at the price of more communication rounds. The next rung adds a correction term to the local objective. FedProx, introduced in <a href="section-14.3.html">Section 14.3</a>, augments each client's loss with a proximal penalty $\frac{\mu}{2}\lVert w - w^{\text{global}}\rVert^2$ that pulls local updates back toward the round's starting point, directly shrinking the drift scalar at the cost of a hyperparameter $\mu$ to tune. SCAFFOLD goes further with control variates: the server and each client maintain correction vectors that estimate the difference between the client's local gradient direction and the global one, and subtract it during local steps, cancelling the drift bias rather than merely penalizing it. A third rung lives on the server: applying momentum or an adaptive optimizer (FedAdam and relatives) to the sequence of aggregates smooths over the per-round noise that heterogeneity injects.</p>
+<p>The most expensive rung relaxes the no-data-movement constraint, where policy allows. Sharing a small globally representative public dataset, or a server-held proxy set, lets clients or the server correct the skew directly; knowledge-distillation variants transmit soft predictions on shared unlabeled data instead of weights, which both sidesteps drift in weight space and shrinks the messages. These methods trade some of the privacy and bandwidth advantages that motivated federation in the first place, so they are a last resort reserved for the cross-silo settings of <a href="section-14.2.html">Section 14.2</a> where a small shared corpus is legally and practically available. Table 14.4.2 lays the ladder out.</p>
+<div class="table-caption"><strong>Table 14.4.2:</strong> Mitigations for non-IID client drift, from cheapest to most invasive, with the mechanism each uses and the price it pays.</div>
+<table>
+<thead>
+<tr><th scope="col">Mitigation</th><th scope="col">Mechanism</th><th scope="col">Cost</th></tr>
+</thead>
+<tbody>
+<tr><td>Fewer local epochs</td><td>Less local travel before averaging</td><td>More communication rounds</td></tr>
+<tr><td>FedProx</td><td>Proximal penalty toward the global model</td><td>One hyperparameter $\mu$</td></tr>
+<tr><td>SCAFFOLD</td><td>Control variates cancel the drift bias</td><td>Extra state and one more vector per message</td></tr>
+<tr><td>Server momentum / FedAdam</td><td>Adaptive optimizer on the aggregates</td><td>Server-side state; momentum tuning</td></tr>
+<tr><td>Data sharing / distillation</td><td>A shared public set corrects the skew</td><td>Relaxes the no-data-movement guarantee</td></tr>
+</tbody>
+</table>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Flower Swaps FedAvg for a Drift-Robust Strategy in One Line</div>
+<p>In Code 14.4.1 the aggregation rule and any drift correction are hand-written inside the training loop. Production federated frameworks make the aggregation strategy a pluggable object, so moving from plain FedAvg to a drift-robust method is a one-line change with no edit to the client code. In Flower, the strategy is passed to the server:</p>
+<pre><code class="language-python">import flwr as fl
+
+# Plain FedAvg drifts under non-IID clients ...
+strategy = fl.server.strategy.FedAvg(fraction_fit=0.2)
+
+# ... swap in FedProx (proximal mu) or FedAdam (server momentum) instead.
+strategy = fl.server.strategy.FedProx(fraction_fit=0.2, proximal_mu=0.5)
+strategy = fl.server.strategy.FedAdam(fraction_fit=0.2)   # adaptive server optimizer
+
+fl.server.start_server(config=fl.server.ServerConfig(num_rounds=30),
+                       strategy=strategy)
+</code></pre>
+<div class="code-caption"><strong>Code 14.4.2:</strong> The same federated run as Code 14.4.1, with the aggregation strategy chosen by name. The dozen lines of hand-rolled averaging and any proximal or momentum logic collapse to one constructor call; Flower handles client sampling, the proximal term on each client, and the server-side optimizer state internally.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Keyboard Model That Learned Only Slang</div>
+<p><strong>Who:</strong> A machine learning engineer on a mobile keyboard team training a federated next-word predictor across millions of phones.</p>
+<p><strong>Situation:</strong> To save battery and radio, each phone ran twenty local epochs per round before uploading, a large $E$ chosen purely to cut communication.</p>
+<p><strong>Problem:</strong> The global model's quality plateaued early and its suggestions skewed toward whichever cohort of phones happened to be sampled, with formal-writing users getting slang and slang users getting formal completions.</p>
+<p><strong>Dilemma:</strong> Cut local epochs to reduce drift and pay for far more communication rounds and battery, or keep the cheap communication schedule and add an algorithmic correction whose hyperparameters nobody on the team had tuned before.</p>
+<p><strong>Decision:</strong> They did both in stages: first halved the local epochs as a free fix, measured the drift scalar drop, then layered FedProx on top to claw back the rounds they had added.</p>
+<p><strong>How:</strong> They logged the per-round client-drift measure from Section 3 as a first-class training metric, swept the proximal $\mu$ on a held-out cohort, and adopted server-side momentum once drift was under control.</p>
+<p><strong>Result:</strong> The plateau lifted, cohort-dependent swings shrank, and total communication landed below the original twenty-epoch schedule once FedProx let them safely raise local epochs partway back.</p>
+<p><strong>Lesson:</strong> Treat client drift as a metric you watch, not a footnote. The cheapest mitigation (fewer local steps) and the algorithmic ones (FedProx, server momentum) compose, and you only know how to trade them off once drift is on the dashboard.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Taming Heterogeneity (2024 to 2026)</div>
+<p>Non-IID data remains the most active sub-field of federated learning. Recent work pushes past the FedProx and SCAFFOLD lineage in several directions. Server-side adaptive optimizers in the FedAdam and FedYogi family (Reddi et al.) are now standard baselines, and 2024 to 2026 work studies how they interact with client sampling under severe skew. Federated foundation-model fine-tuning has become a focus: parameter-efficient methods (federated LoRA and adapter tuning) cut the bytes per round so far that clients can afford fewer local epochs, attacking drift and communication together, while studies of client heterogeneity in federated instruction tuning show that skew in which clients hold which tasks reshapes the merged model. A parallel thread brings personalization (clustered and meta-learned federated models, the subject of <a href="section-14.7.html">Section 14.7</a>) to bear on concept drift, accepting that one global model cannot fit genuinely conflicting client objectives. The honest current consensus is that no single mitigation dominates across heterogeneity types, which is why production stacks combine fewer local steps, a drift correction, and server momentum rather than betting on one.</p>
+</div>
+
+<h2>5. Where Non-IID Data Reappears <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The heterogeneity introduced here is not confined to this chapter; it is the constraint that shapes every later federated setting in the book. When federated learning moves to the network edge in <a href="../../part-7-infrastructure/module-34-edge-fog-on-device/index.html">Chapter 34</a>, device populations are even more skewed and intermittently available, so the drift problem is compounded by clients that appear and vanish mid-round. When we reach the federated medical case study of <a href="../../part-8-case-studies/module-37-case-federated-medical-ai/index.html">Chapter 37</a>, feature skew across hospital scanners and label skew across regional disease prevalence are the central engineering reality, not a textbook caricature. And the same averaging-of-divergent-updates tension recurs whenever local computation is traded against communication, including the local-SGD methods we will compare in <a href="../module-10-distributed-optimization/index.html">Chapter 10</a>; non-IID federated optimization is local SGD with the additional cruelty that you cannot fix the data.</p>
+<p>With heterogeneity diagnosed and its mitigations laid out, the natural next question is the one we kept deferring: how few bytes can a federated round actually cost, and how does that budget interact with the local-epoch knob that drives drift? That is the communication-constraint story, and it begins in <a href="section-14.5.html">Section 14.5</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.4.1: Name the Skew <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each federated scenario, identify which of the four heterogeneity types in Table 14.4.1 dominates, and state which mitigation from Table 14.4.2 you would reach for first and why: (a) a wildlife-camera network where each camera sees mostly the species native to its location; (b) a federation of hospitals that all diagnose the same conditions but image them on different MRI machines; (c) a keyboard federation where a handful of power users generate a thousand times more text than the median user; (d) a sentiment model where the word "sick" means approval in one user community and illness in another. Explain why a single global model is hardest to justify in case (d).</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.4.2: Add a Proximal Term <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 14.4.1 with a FedProx proximal penalty: inside the local update, replace the gradient with $\nabla \ell + \mu\,(W_{\text{local}} - W_{\text{global}})$ for a configurable $\mu$, then re-run the non-IID, $E=10$ setting while sweeping $\mu \in \{0, 0.1, 0.5, 1.0\}$. Plot or tabulate the per-round drift scalar and the final accuracy against $\mu$. Identify the value of $\mu$ that minimizes drift, confirm that very large $\mu$ over-damps the update and hurts accuracy by freezing the model near its starting point, and explain the trade-off in terms of the drift definition in Section 3.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.4.3: Bound the Drift <span class="exercise-type analysis">Analysis</span></div>
+<p>Suppose every client runs $E$ full-batch local gradient steps of size $\eta$ starting from a shared model $w$, and assume each client's gradient at $w$ differs from the global gradient by at most $\zeta$ in norm (a standard bounded-heterogeneity assumption). Argue that after one local epoch the client models can differ from each other by a quantity that grows with $\eta$, $E$, and $\zeta$, and shrinks to zero when $\zeta = 0$ (the IID case). Use this to explain analytically why Output 14.4.1 shows drift rising with both the non-IID partition and with $E$, and why halving $E$ is a first-line mitigation. You do not need a tight constant; a scaling argument in $\eta$, $E$, and $\zeta$ suffices.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-14.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 14.3</span><span class="nav-title">FedAvg and Its Variants</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 14</span><span class="nav-num">Contents</span><span class="nav-title">Federated and Decentralized Learning</span></a>
+<a class="next" href="section-14.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 14.5</span><span class="nav-title">Communication Constraints</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

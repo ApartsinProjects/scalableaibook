@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 22.5: KV Cache and Paged Attention. The data structure that makes autoregressive LLM inference fast, the memory it consumes, and how PagedAttention manages it like virtual memory so one GPU can serve many more concurrent sequences." name="description"/>
+<title>Section 22.5: KV Cache and Paged Attention | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 22: Per-Node Inference Efficiency: A Prerequisite</a></div>
+<h1>KV Cache and Paged Attention</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I remember every token you ever said to me. That is precisely the problem, and also why I have run out of room for anyone else."</p>
+<cite>A KV Cache That Cannot Forget</cite>
+</blockquote>
+<figure class="mental-model">
+<img src="images/mm-paged-kv-cache.png" alt="Mental model: Paged KV Cache" loading="lazy">
+<figcaption><strong>Mental model.</strong> Attention memory is managed like virtual memory: the cache is split into fixed pages and each sequence occupies a scattered set of pages linked by pointers, eliminating fragmentation and lifting serving throughput.</figcaption>
+</figure>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The KV cache is the single most important data structure in LLM serving: it turns generation from quadratic recompute into one cheap step per token, and in doing so becomes the memory that actually limits how many users one GPU can serve.</strong> Every token a model generates must attend to every token before it, so a server that did not remember anything would redo all of that attention work at every step. Caching the past keys and values fixes the compute, but the cache grows with every token and with every concurrent user, until it dwarfs the model weights and decides, more than any other factor, how many sequences fit on a node. This section explains the cache, the memory problem it creates, and PagedAttention, the per-node memory manager that treats the cache like virtual memory so one GPU can hold many more sequences at once. This is scale-up, not scale-out, but it is the substrate that the distributed LLM serving of <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a> multiplies across a fleet.</p>
+</div>
+<p>In the previous section we shrank the model itself through distillation; now we turn to the memory that the model consumes <em>while it runs</em>. Autoregressive generation produces one token at a time, and each new token is computed by attending to the entire sequence so far. Written naively, generating the token at position $t$ recomputes the keys and values of all $t$ earlier tokens, so producing a sequence of length $T$ costs work that grows with $T^2$. The keys and values of past tokens do not change once computed, so a serving system caches them and reuses them. That cache, the KV cache, is what makes a chatbot answer at a steady pace instead of slowing to a crawl as the conversation lengthens. It is also, on a loaded server, the resource that runs out first.</p>
+<p>This is firmly a per-node, scale-up topic, exactly the unit economics that <a href="section-22.1.html">Section 22.1</a> argued you must master before sizing any fleet. We study the cache on one GPU because every distributed serving decision later, how many replicas, how large a batch, how to route a multi-turn conversation, is downstream of how many concurrent sequences a single node can actually hold in KV memory.</p>
+
+<h2>1. Why the KV Cache Exists <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A decoder-only transformer generates text one token at a time. To produce the next token it runs self-attention, in which the query vector of the current position is compared against the key vectors of all previous positions, and the result is a weighted sum of their value vectors. The keys and values of positions $1$ through $t-1$ depend only on those tokens and the (frozen) weights; they do not change when token $t$ arrives. Recomputing them at every step is pure waste.</p>
+<p>The KV cache removes that waste by storing, for every layer and every attention head, the key and value vectors of every token seen so far. When the next token arrives, the model computes only its own query, key, and value, appends the new key and value to the cache, and attends against the whole cache. The cost of one generation step drops from $O(t)$ recompute to $O(1)$ work plus one cheap attention pass over the cached entries. The two regimes of inference fall straight out of this structure: a <em>prefill</em> phase that ingests the prompt and fills the cache in one parallel pass, then a <em>decode</em> phase that extends the cache one token at a time. The figure below traces the cache filling during decode.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A row of token cells filling left to right across three generation steps; each new token appends one key-value entry to the cache and attends over all entries to its left.">
+<defs>
+<marker id="arr225" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.cached225 { fill:#eef4fb; stroke:#14385c; stroke-width:1.4; }
+.new225 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.t225 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s225 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.a225 { fill:none; stroke:#b86b1f; stroke-width:1.4; marker-end:url(#arr225); }
+</style>
+<text class="t225" x="430" y="22">The KV cache grows by one entry per generated token</text>
+<!-- Step 1 -->
+<text class="s225" x="60" y="58" text-anchor="start">Step t:</text>
+<rect class="cached225" x="60" y="66" width="40" height="34" rx="5"/>
+<rect class="cached225" x="102" y="66" width="40" height="34" rx="5"/>
+<rect class="cached225" x="144" y="66" width="40" height="34" rx="5"/>
+<rect class="new225" x="186" y="66" width="40" height="34" rx="5"/>
+<text class="s225" x="143" y="120">prompt KV (prefill)</text>
+<text class="s225" x="206" y="120">new</text>
+<!-- Step 2 -->
+<text class="s225" x="320" y="58" text-anchor="start">Step t+1:</text>
+<rect class="cached225" x="320" y="66" width="40" height="34" rx="5"/>
+<rect class="cached225" x="362" y="66" width="40" height="34" rx="5"/>
+<rect class="cached225" x="404" y="66" width="40" height="34" rx="5"/>
+<rect class="cached225" x="446" y="66" width="40" height="34" rx="5"/>
+<rect class="new225" x="488" y="66" width="40" height="34" rx="5"/>
+<path class="a225" d="M 508 64 C 508 38 360 38 360 62"/>
+<text class="s225" x="430" y="120">query attends over all cached keys/values</text>
+<!-- Step 3 -->
+<text class="s225" x="600" y="58" text-anchor="start">Step t+2:</text>
+<rect class="cached225" x="600" y="66" width="34" height="34" rx="5"/>
+<rect class="cached225" x="636" y="66" width="34" height="34" rx="5"/>
+<rect class="cached225" x="672" y="66" width="34" height="34" rx="5"/>
+<rect class="cached225" x="708" y="66" width="34" height="34" rx="5"/>
+<rect class="cached225" x="744" y="66" width="34" height="34" rx="5"/>
+<rect class="new225" x="780" y="66" width="34" height="34" rx="5"/>
+<text class="s225" x="690" y="120">one entry appended each step</text>
+<text class="s225" x="430" y="168">without the cache: step t+2 would recompute all 6 entries from scratch (cost grows with length)</text>
+<text class="s225" x="430" y="190">with the cache: step t+2 reuses 5 entries and computes only 1 (cost is flat per step)</text>
+<text class="s225" x="430" y="226" style="font-style:italic">total cache size scales with sequence length times batch size, the binding constraint on a loaded GPU</text>
+</svg>
+<figcaption><strong>Figure 22.5.1:</strong> The KV cache during decode. At each step the model computes the key and value for only the newest token (orange), appends them to the cache (blue), and attends the new query over the whole cache. The cache lengthens by one entry per step; the total memory it occupies is what Section 2 quantifies and what limits concurrency.</figcaption>
+</figure>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Cache Trades Memory for Compute, and Memory Is the Scarcer Resource</div>
+<p>The KV cache converts a recompute cost that grows with sequence length into a memory cost that grows with sequence length. On modern accelerators that is usually the right trade, because decode is memory-bandwidth bound and arithmetic is cheap relative to moving data. But it relocates the bottleneck rather than removing it: the question at serving time stops being "can the GPU compute fast enough?" and becomes "does the GPU have room to remember all these conversations at once?" Everything in the rest of this section is about answering the second question well.</p>
+</div>
+
+<h2>2. The Memory the Cache Costs <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The KV cache has a size you can write down exactly. For a single sequence, the cache stores one key vector and one value vector per token, per layer, per attention head, with each number taking a fixed count of bytes. Multiply by the number of concurrent sequences in the batch and you have the total. With $L$ layers, $H$ key/value heads, head dimension $d_h$, sequence length $S$, batch size $B$, and $p$ bytes per element, the cache occupies</p>
+$$M_{\text{KV}} = 2 \cdot B \cdot S \cdot L \cdot H \cdot d_h \cdot p \;\text{ bytes},$$
+<p>where the leading $2$ counts keys and values separately. Put real numbers in. A 13-billion-parameter model with $L = 40$ layers, $H = 40$ heads, $d_h = 128$, in 2-byte half precision, caches $2 \cdot 40 \cdot 40 \cdot 128 \cdot 2 \approx 0.82$ megabytes per token. A single sequence at $S = 2048$ tokens therefore carries about $1.7$ gigabytes of KV cache, and a batch of 32 such sequences needs roughly $54$ gigabytes, well beyond the model's own $26$ gigabytes of half-precision weights. The cache does not merely rival the weights; for long contexts and healthy batch sizes it is the dominant consumer of GPU memory, and therefore the true ceiling on how many users a node can serve.</p>
+<p>Two properties of this formula drive every design choice that follows. First, $M_{\text{KV}}$ is linear in both $S$ and $B$, so doubling the context length or the batch doubles the cache; long-context serving and high-concurrency serving pull on the same scarce resource. Second, the cache is the part of the memory budget that is genuinely dynamic, growing and shrinking as sequences arrive, generate, and finish, whereas the weights are fixed. A memory manager that handles this churn badly will leave the GPU half-empty while turning users away, which is exactly the failure the next section diagnoses.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Model Packed Light, the Conversation Did Not</div>
+<p>It is a little absurd that a 13-billion-parameter model, the product of months of training and millions of dollars, can be out-massed in GPU memory by the transcript of a few dozen chats it is currently having. The weights are the cathedral; the KV cache is the crowd that showed up, and the crowd needs somewhere to stand.</p>
+</div>
+
+<h2>3. The Fragmentation Problem in Naive Allocation <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Knowing the cache is large is not the same as managing it well. The natural first implementation stores each sequence's cache in one contiguous slab of memory, the way a tensor normally lives. But a sequence's final length is not known when it is admitted: a user might type two words or two thousand. To hold a contiguous slab safely, the server must reserve the maximum supported length up front, so a 20-token chat reserves room for 2048 tokens and leaves the rest idle. This over-reservation is <em>internal fragmentation</em>, memory committed to a sequence that the sequence never uses.</p>
+<p>Contiguity creates a second waste. As sequences of different lengths finish and free their slabs, the gaps they leave are scattered and oddly sized. A new sequence that needs a slab larger than any single gap cannot be admitted even when the total free memory is more than enough, because no single hole is big enough. This is <em>external fragmentation</em>, the classic failure mode of contiguous allocators, and it means a GPU can report plenty of free KV memory while refusing new work. Between over-reservation and scattered holes, naive contiguous KV management routinely wastes most of the memory it is given, which translates directly into serving far fewer concurrent users than the hardware could support.</p>
+<p>The fix is the same one operating systems found decades ago for exactly this problem: stop demanding that a logically contiguous object be physically contiguous. The code below makes the waste concrete by running both strategies over the same realistic mix of variable-length sequences on one GPU's KV budget.</p>
+<pre><code class="language-python">import random
+
+# A KV-cache memory manager bake-off on one GPU. We compare a naive contiguous
+# allocator that must reserve a fixed maximum length per sequence (the source of
+# over-reservation + fragmentation waste) against a paged block allocator that
+# hands out fixed-size blocks on demand (the PagedAttention idea).
+
+random.seed(7)
+
+# --- Per-node budget and model facts (Llama-2-13B-class, fp16 KV) -------------
+GPU_KV_SLOTS = 200_000        # token-slots of KV memory left after weights (one GPU)
+MAX_LEN      = 2048           # the context length the server advertises / must support
+BLOCK        = 16             # tokens per page (vLLM default)
+
+# A realistic serving mix: most prompts are short, a few are long. Each sequence's
+# *actual* final length is unknown when it is admitted, so a contiguous allocator
+# has to reserve MAX_LEN up front to be safe.
+def sample_lengths(n):
+    out = []
+    for _ in range(n):
+        r = random.random()
+        if r < 0.80:   out.append(random.randint(8, 256))     # short chats
+        elif r < 0.97: out.append(random.randint(256, 1024))  # medium
+        else:          out.append(random.randint(1024, MAX_LEN))  # long context
+    return out
+
+seqs = sample_lengths(2000)
+
+# --- Contiguous allocator: reserve MAX_LEN per admitted sequence --------------
+cont_used = 0          # token-slots actually filled by live tokens
+cont_resv = 0          # token-slots reserved (and thus unavailable to others)
+cont_admitted = 0
+for L in seqs:
+    if cont_resv + MAX_LEN > GPU_KV_SLOTS:
+        break                          # no room to safely admit another sequence
+    cont_resv += MAX_LEN               # must reserve the worst case
+    cont_used += L                     # but only L slots ever hold real KV
+    cont_admitted += 1
+
+# --- Paged allocator: hand out BLOCK-sized pages on demand --------------------
+def blocks_for(L):
+    return (L + BLOCK - 1) // BLOCK     # ceil-div: pages this sequence needs
+
+page_used = 0          # token-slots holding real KV
+page_resv = 0          # token-slots backed by allocated pages
+page_admitted = 0
+for L in seqs:
+    need = blocks_for(L) * BLOCK
+    if page_resv + need > GPU_KV_SLOTS:
+        break
+    page_resv += need
+    page_used += L
+    page_admitted += 1
+
+def util(used, resv):
+    return 100.0 * used / resv if resv else 0.0
+
+print(f"GPU KV budget         : {GPU_KV_SLOTS:,} token-slots")
+print(f"advertised max length : {MAX_LEN}   page size: {BLOCK} tokens")
+print()
+print("contiguous (reserve max-length per sequence)")
+print(f"  sequences admitted  : {cont_admitted}")
+print(f"  slots reserved      : {cont_resv:,}")
+print(f"  slots holding KV    : {cont_used:,}")
+print(f"  memory utilization  : {util(cont_used, cont_resv):.1f}%")
+print()
+print("paged (blocks on demand, PagedAttention)")
+print(f"  sequences admitted  : {page_admitted}")
+print(f"  slots reserved      : {page_resv:,}")
+print(f"  slots holding KV    : {page_used:,}")
+print(f"  memory utilization  : {util(page_used, page_resv):.1f}%")
+print()
+print(f"concurrency gain      : {page_admitted / cont_admitted:.1f}x more sequences per GPU")
+print(f"waste under contiguous: {cont_resv - cont_used:,} slots reserved but never used")
+print(f"waste under paged     : {page_resv - page_used:,} slots (only last-block padding)")
+</code></pre>
+<div class="code-caption"><strong>Code 22.5.1:</strong> A pure-Python KV allocator bake-off. The contiguous strategy reserves the advertised maximum length for every admitted sequence; the paged strategy backs each sequence with just enough fixed-size blocks. Both run against the same per-node token-slot budget and the same stream of variable-length sequences.</div>
+<pre><code class="language-text">GPU KV budget         : 200,000 token-slots
+advertised max length : 2048   page size: 16 tokens
+
+contiguous (reserve max-length per sequence)
+  sequences admitted  : 97
+  slots reserved      : 198,656
+  slots holding KV    : 21,781
+  memory utilization  : 11.0%
+
+paged (blocks on demand, PagedAttention)
+  sequences admitted  : 778
+  slots reserved      : 199,600
+  slots holding KV    : 194,032
+  memory utilization  : 97.2%
+
+concurrency gain      : 8.0x more sequences per GPU
+waste under contiguous: 176,875 slots reserved but never used
+waste under paged     : 5,568 slots (only last-block padding)</code></pre>
+<div class="code-caption"><strong>Output 22.5.1:</strong> Same GPU, same workload, two allocators. Contiguous reservation fills only 11.0% of the KV memory it holds and admits 97 sequences; paged allocation reaches 97.2% utilization and admits 778, an 8.0x gain in concurrency per node. The contiguous allocator strands 176,875 token-slots it reserved but never filled; the paged allocator wastes only last-block padding.</div>
+<p>The numbers are stark because the workload is realistic: most chats are short, a few are long, and a contiguous allocator must plan for the longest. Reserving the worst case for every sequence is what drags utilization down to a ninth of the memory, and it is precisely the waste the paged scheme removes by allocating only what each sequence currently needs.</p>
+
+<h2>4. PagedAttention: the Cache as Virtual Memory <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>PagedAttention, introduced with the vLLM serving engine, applies the operating-system idea of paging to the KV cache. The physical KV memory is carved into many small fixed-size <em>blocks</em> (pages), each holding the keys and values for a handful of tokens, sixteen by default. A sequence's cache is no longer a contiguous slab; it is a list of blocks, and a per-sequence <em>block table</em> maps the sequence's logical token positions to whichever physical blocks currently hold them, exactly as a page table maps virtual addresses to physical frames. The attention kernel is rewritten to gather keys and values through this block table, so the blocks can sit anywhere in memory and need not be adjacent.</p>
+<p>This single change dissolves both kinds of fragmentation. There is no external fragmentation because every free block is interchangeable: any block fits any sequence's next need, so the GPU can never be in the situation of having free memory it cannot use. There is almost no internal fragmentation because a sequence allocates a new block only when its current block fills, so the only waste is the partial fill of the last block, at most fifteen unused slots per sequence rather than the hundreds or thousands that contiguous reservation stranded. The right side of the figure below contrasts the two layouts.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left: a contiguous layout where each sequence reserves a full max-length slab, most of it empty. Right: a paged layout where sequences are scattered across small fixed-size blocks via a block table, with almost no empty space.">
+<style>
+.frame225 { fill:none; stroke:#9aa3ad; stroke-width:1.3; }
+.fill225 { fill:#cfe0f1; stroke:#14385c; stroke-width:1; }
+.empty225 { fill:#f6f7f9; stroke:#c4ccd4; stroke-width:1; }
+.blkA225 { fill:#cfe0f1; stroke:#14385c; stroke-width:1; }
+.blkB225 { fill:#fde3c6; stroke:#b86b1f; stroke-width:1; }
+.blkC225 { fill:#d8efda; stroke:#3a7d44; stroke-width:1; }
+.blkF225 { fill:#f6f7f9; stroke:#c4ccd4; stroke-width:1; }
+.h225 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s225b { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.lab225 { font:11px sans-serif; fill:#5a626c; text-anchor:start; }
+</style>
+<text class="h225" x="210" y="24">Contiguous: reserve max length per sequence</text>
+<!-- three contiguous slabs, mostly empty -->
+<g>
+<rect class="frame225" x="60" y="44" width="300" height="34"/>
+<rect class="fill225" x="60" y="44" width="46" height="34"/>
+<rect class="empty225" x="106" y="44" width="254" height="34"/>
+<text class="lab225" x="60" y="98">seq A: 23 tokens used, 2048 reserved</text>
+</g>
+<g>
+<rect class="frame225" x="60" y="120" width="300" height="34"/>
+<rect class="fill225" x="60" y="120" width="120" height="34"/>
+<rect class="empty225" x="180" y="120" width="180" height="34"/>
+<text class="lab225" x="60" y="174">seq B: 760 tokens used, 2048 reserved</text>
+</g>
+<g>
+<rect class="frame225" x="60" y="196" width="300" height="34"/>
+<rect class="fill225" x="60" y="196" width="30" height="34"/>
+<rect class="empty225" x="90" y="196" width="270" height="34"/>
+<text class="lab225" x="60" y="250">seq C: 11 tokens used, 2048 reserved</text>
+</g>
+<text class="s225b" x="210" y="288">blue = real KV, grey = reserved but empty (internal fragmentation)</text>
+<!-- divider -->
+<line x1="430" y1="40" x2="430" y2="296" stroke="#c4ccd4" stroke-width="1.2"/>
+<!-- paged side -->
+<text class="h225" x="650" y="24">Paged: fixed blocks via a block table</text>
+<text class="lab225" x="470" y="52">block table (logical to physical)</text>
+<text class="lab225" x="470" y="70" style="fill:#14385c">A: [0,4,7]  B: [1,2,3,6]  C: [5]</text>
+<!-- physical block pool 4x3 grid -->
+<g>
+<rect class="blkA225" x="490" y="92" width="58" height="30"/><text class="s225b" x="519" y="112">A0</text>
+<rect class="blkB225" x="556" y="92" width="58" height="30"/><text class="s225b" x="585" y="112">B0</text>
+<rect class="blkB225" x="622" y="92" width="58" height="30"/><text class="s225b" x="651" y="112">B1</text>
+<rect class="blkB225" x="688" y="92" width="58" height="30"/><text class="s225b" x="717" y="112">B2</text>
+<rect class="blkA225" x="490" y="128" width="58" height="30"/><text class="s225b" x="519" y="148">A1</text>
+<rect class="blkC225" x="556" y="128" width="58" height="30"/><text class="s225b" x="585" y="148">C0</text>
+<rect class="blkB225" x="622" y="128" width="58" height="30"/><text class="s225b" x="651" y="148">B3</text>
+<rect class="blkA225" x="688" y="128" width="58" height="30"/><text class="s225b" x="717" y="148">A2</text>
+<rect class="blkF225" x="490" y="164" width="58" height="30"/><text class="s225b" x="519" y="184">free</text>
+<rect class="blkF225" x="556" y="164" width="58" height="30"/><text class="s225b" x="585" y="184">free</text>
+<rect class="blkF225" x="622" y="164" width="58" height="30"/><text class="s225b" x="651" y="184">free</text>
+<rect class="blkF225" x="688" y="164" width="58" height="30"/><text class="s225b" x="717" y="184">free</text>
+</g>
+<text class="s225b" x="650" y="222">each sequence holds only the blocks it needs;</text>
+<text class="s225b" x="650" y="240">free blocks are interchangeable (no external fragmentation)</text>
+<text class="s225b" x="650" y="270">A, B, C are scattered yet logically contiguous</text>
+<text class="s225b" x="650" y="288">via the block table, just like OS virtual memory</text>
+</svg>
+<figcaption><strong>Figure 22.5.2:</strong> Contiguous versus paged KV layout. On the left, each sequence reserves a full max-length slab and leaves most of it grey (internal fragmentation). On the right, sequences A, B, and C are scattered across small fixed-size blocks; a per-sequence block table makes the scattered blocks behave as one logical cache, and any free block can serve any sequence, so external fragmentation cannot occur. This is the layout that produced the 97.2% utilization in Output 22.5.1.</figcaption>
+</figure>
+<p>The indirection buys more than density. Because two sequences can point their block tables at the <em>same</em> physical block, identical content can be shared rather than duplicated. When many requests share a long system prompt, or when a single prompt forks into several sampled continuations, the shared prefix is stored once and the divergent suffixes get their own blocks, a copy-on-write arrangement borrowed straight from virtual memory. This prefix sharing is the per-node mechanism behind the prefix-caching features that <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a> routes around at fleet scale, and the partitioning-and-mapping idea echoes the sharding theme that runs from <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a> onward.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: vLLM Gives You PagedAttention in Three Lines</div>
+<p>Code 22.5.1 modeled the allocator to expose the waste; it did not implement a block table, a paged attention kernel, copy-on-write prefix sharing, or the scheduler that admits and preempts sequences as blocks free up. vLLM implements all of it, and the paged cache is on by default. The entire mechanism you would otherwise hand-write reduces to constructing an engine and calling generate:</p>
+<pre><code class="language-python"># pip install vllm
+from vllm import LLM, SamplingParams
+
+llm = LLM(model="meta-llama/Llama-2-13b-hf")          # paged KV cache, on by default
+params = SamplingParams(temperature=0.7, max_tokens=256)
+
+# Many prompts that share a long system prefix: vLLM stores the prefix blocks once
+# and gives each continuation its own blocks (copy-on-write), all under the hood.
+outputs = llm.generate(["[SYS] You are a helpful assistant. [USER] " + q
+                        for q in user_questions], params)
+</code></pre>
+<div class="code-caption"><strong>Code 22.5.2:</strong> The same paged cache as Code 22.5.1, now production-grade. vLLM handles the block table, the gather-based attention kernel, copy-on-write prefix sharing, and the block-aware scheduler internally; the roughly forty lines of allocator logic above collapse to an engine constructor and one <code>generate</code> call.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Chat Service That Tripled Its Users Without New Hardware</div>
+<p><strong>Who:</strong> An inference platform engineer running a customer-support LLM on a fixed pool of GPUs.</p>
+<p><strong>Situation:</strong> The service answered chats well but kept rejecting new conversations at peak, even though GPU memory monitors showed gigabytes free.</p>
+<p><strong>Problem:</strong> The serving stack reserved the full 2048-token context for every conversation on admission, so a few dozen mostly-short chats exhausted the KV budget while leaving most of it empty.</p>
+<p><strong>Dilemma:</strong> Buy more GPUs to raise the concurrency ceiling, a direct but expensive scale-out, or change how the existing GPUs manage KV memory, cheaper but a swap of the serving engine.</p>
+<p><strong>Decision:</strong> They migrated to a paged-KV engine, because the monitors made clear the bottleneck was allocation policy, not raw memory, exactly the diagnosis in Output 22.5.1.</p>
+<p><strong>How:</strong> They replaced the home-grown server with vLLM, kept the same model and GPUs, and let the paged cache and block-aware scheduler manage admission.</p>
+<p><strong>Result:</strong> Concurrent conversations per GPU rose several-fold and peak rejections disappeared, at no hardware cost, because utilization climbed from a small fraction toward near-full.</p>
+<p><strong>Lesson:</strong> Before adding nodes to raise serving capacity, check whether the per-node KV manager is wasting the memory you already have; paging often recovers a multiple of capacity for free.</p>
+</div>
+
+<h2>5. Shrinking the Cache: Quantization and Grouped Attention <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Paging packs the cache densely, but it does not change how many bytes each token costs. Two complementary techniques attack that size directly, and they multiply with paging rather than competing with it. The first is KV-cache quantization: store the cached keys and values in fewer bits, typically 8-bit or 4-bit integers instead of 16-bit floats, halving or quartering $M_{\text{KV}}$ at a small, often negligible, quality cost. Because the cache is read every decode step and decode is bandwidth bound, narrower KV entries also move faster, so quantization tends to speed up generation as well as enlarge effective capacity.</p>
+<p>The second technique changes the model architecture so the cache is smaller by construction. In the formula $M_{\text{KV}} = 2 B S L H d_h p$, the factor $H$ is the number of key/value heads. Standard multi-head attention gives every query head its own key/value head; <em>multi-query attention</em> collapses all of them to a single shared key/value head, and <em>grouped-query attention</em> compromises by sharing one key/value head across a small group of query heads. Cutting $H$ from, say, 40 down to 8 shrinks the cache roughly fivefold with little loss in quality, which is why most recent open models ship with grouped-query attention as standard. Paging, quantization, and grouped-query attention stack: paging removes the waste, quantization narrows each entry, and grouped-query attention reduces the number of entries, together turning the KV ceiling from a hard wall into a tunable budget.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Squeezing the KV Cache (2024 to 2026)</div>
+<p>The KV cache is one of the most active targets in efficient LLM serving. PagedAttention and vLLM (Kwon et al., 2023) set the baseline of treating the cache as virtual memory, and the line has since pushed in three directions. Compression methods discard or merge low-importance entries: H2O and SnapKV evict tokens the model rarely attends to, while quantization work such as KIVI drives KV down to 2 bits per element with reported minimal degradation. Architectural reductions go further than grouped-query attention; DeepSeek's multi-head latent attention (2024) compresses keys and values into a small shared latent, shrinking the cache by an order of magnitude. And cross-request reuse has matured into prefix caching and disaggregated prefill/decode designs, where SGLang's RadixAttention (2024) indexes shared prefixes in a radix tree so cache blocks are reused across many requests. The through-line is that per-node KV economics, the subject of this section, are now a first-class research problem because they set the unit cost that <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a> multiplies across an entire serving fleet.</p>
+</div>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: A Per-Node Number That Sets the Fleet's Bill</div>
+<p>This is a scale-up section in a scale-out book, and it earns its place by fixing a number the rest of Part V depends on: how many concurrent sequences one GPU can hold. PagedAttention is a single-node memory manager, but the 8.0x concurrency gain in Output 22.5.1 propagates straight into the fleet. <a href="../module-23-distributed-inference-systems/index.html">Chapter 23</a> turns per-node concurrency into replica counts and autoscaling thresholds, and <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a> shows distributed LLM serving routing multi-turn conversations to keep their KV blocks resident. Every distributed serving decision is downstream of the per-node KV economics established here; get the unit wrong and the whole fleet is mis-sized.</p>
+</div>
+
+<h2>6. Why This Is the Pivotal Single-Node Serving Mechanism <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Among the per-node techniques in this chapter, KV-cache management has the largest leverage on serving capacity, and the reason is structural. Quantizing weights or pruning the model shrinks a fixed cost paid once; managing the KV cache governs a dynamic cost paid for every concurrent user, and concurrency is exactly what a serving system sells. Output 22.5.1 showed a single change of allocation policy multiplying the number of sequences a GPU serves by eight, with no change to the model, the hardware, or the quality of any answer. Few other interventions in this book move the capacity needle that far for that little.</p>
+<p>That leverage is why paged KV management became the default in essentially every serious LLM serving stack within two years of its introduction, and why this section sits at the center of the per-node prerequisite. The cache is the substrate on which all the distributed serving of <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a> is built: a fleet's throughput, its cost per token, and its ability to honor long contexts all reduce, at the bottom, to how many tokens of KV one node can hold and how little of that memory it wastes. The next section turns from the memory the attention computation <em>stores</em> to the way that computation <em>runs</em>, with FlashAttention reshaping the attention kernel itself so the per-node compute keeps pace with the per-node memory we have just learned to manage.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.5.1: Size the Cache, Find the Ceiling <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using $M_{\text{KV}} = 2 B S L H d_h p$, take a model with $L = 32$ layers, $H = 32$ key/value heads, $d_h = 128$, in 2-byte precision, served on a GPU with 16 gigabytes of memory left for KV after the weights. (a) Compute the KV bytes per token and the bytes for one 4096-token sequence. (b) What is the largest batch of 4096-token sequences the GPU can hold? (c) Now switch the model to grouped-query attention with $H = 8$ and recompute the batch. State in one sentence why this architectural change, rather than buying memory, is the cheaper path to higher concurrency.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.5.2: Add Prefix Sharing to the Allocator <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 22.5.1 so a fraction of the sequences (say 60%) share a common 512-token system prompt. In the paged allocator, charge the shared prefix's blocks only <em>once</em> across all sequences that use it (copy-on-write), while each sequence still pays for its own suffix blocks; the contiguous allocator must store the prefix separately for every sequence. Re-run and report the new utilization and admitted-sequence counts for both allocators. Explain how prefix sharing changes the gap between the two strategies and why this matters for a service with a long fixed system prompt.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.5.3: Block Size Versus Waste <span class="exercise-type analysis">Analysis</span></div>
+<p>The paged allocator's only waste is the partial fill of each sequence's last block. (a) Derive the expected wasted slots per sequence as a function of block size $b$, assuming a sequence's final length is uniformly distributed modulo $b$. (b) Re-run Code 22.5.1 sweeping $b \in \{1, 8, 16, 64, 256\}$ and plot utilization against $b$. (c) A larger block also means fewer block-table entries and a cheaper attention gather, but more last-block waste. Argue from your sweep where the sensible operating range lies, and connect the trade-off to the alpha-beta cost reasoning of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-22.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 22.4</span><span class="nav-title">Knowledge Distillation</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 22</span><span class="nav-num">Contents</span><span class="nav-title">Per-Node Inference Efficiency: A Prerequisite</span></a>
+<a class="next" href="section-22.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 22.6</span><span class="nav-title">FlashAttention and Efficient Attention</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

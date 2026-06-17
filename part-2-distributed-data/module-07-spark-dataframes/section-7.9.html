@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 7.9: Spark Performance Tuning. A practical playbook that reads the Spark UI, right-sizes partitions, kills the shuffle, broadcasts small joins, caches reuse, and enables Adaptive Query Execution, closing Chapter 7." name="description"/>
+<title>Section 7.9: Spark Performance Tuning | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Distributed Data Processing for AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 7: Spark and Distributed DataFrames</a></div>
+<h1>Spark Performance Tuning</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They asked why the job took six hours. I had eight cores and four partitions; four of us worked and four of us watched. Nobody asked the four of us who watched."</p>
+<cite>An Executor Slot That Was Never Scheduled</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Tuning a Spark job is not a bag of tricks; it is a single discipline: measure where the time goes in the Spark UI, find the stage that dominates, and apply the one lever that attacks that stage's cost.</strong> Almost every slow Spark job is slow for one of a small number of reasons: too few partitions leaving cores idle, too many partitions drowning in overhead, a shuffle that moves more data than it needs to, a skewed key that pins one task while the rest finish, a small table read once per row instead of broadcast once, or a dataset recomputed from scratch every time it is touched. This closing section of Chapter 7 turns the chapter's individual ideas (the DAG, RDD lineage, DataFrames and Catalyst, partitioning and caching, joins and skew) into an ordered playbook you can run against any job, and ties each lever back to the section that explains why it works.</p>
+</div>
+<p>Everything earlier in this chapter built one machine: a lazy DAG of partitioned transformations that Catalyst plans and the cluster executes stage by stage. This section is about making that machine fast. The good news is that performance tuning in Spark is unusually diagnosable, because the engine reports exactly what it did. The Spark UI shows every stage, every task, how many bytes each task read and wrote across the shuffle, and how long each task ran. A slow job is rarely a mystery; it is a number on a page that is larger than it should be. The skill is reading that page, naming the bottleneck, and reaching for the matching lever rather than guessing.</p>
+<p>We proceed in the order a real investigation takes. First, diagnose with the UI. Then walk the levers from the cheapest and highest-impact (partition sizing, killing the shuffle, broadcasting, caching, Adaptive Query Execution) down to the memory and serialization knobs you turn only when the structural fixes are exhausted. Throughout, the rule is the same one this book repeats for every distributed system: the expensive thing is moving data between machines, so the best optimization is the data movement you avoid.</p>
+
+<h2>1. Diagnose First: Read the Spark UI <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>You cannot tune what you have not measured, and Spark measures everything. The Spark UI (served on port 4040 while a job runs, and persisted to the history server afterward) breaks the job into <em>jobs</em>, then <em>stages</em>, then <em>tasks</em>. A stage is the unit bounded by shuffles, exactly the stage boundaries that lazy evaluation and the DAG produced in <a href="section-7.4.html">Section 7.4</a>. The single most useful screen is the stage detail, which shows, per task, the run time and the shuffle read and write bytes. Three patterns on that screen account for most slow jobs, and Figure 7.9.1 shows what each looks like as a timeline of tasks across the cluster's cores.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three stacked Spark UI stage timelines. The top shows balanced tasks filling all cores. The middle shows only half the cores used because there are too few partitions. The bottom shows one very long straggler task caused by data skew while the others finish early.">
+<defs>
+<marker id="arr79" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.lab79 { font:600 13px sans-serif; fill:#14385c; }
+.sub79 { font:11px sans-serif; fill:#5a626c; }
+.ax79 { font:10.5px sans-serif; fill:#8a929c; }
+.good79 { fill:#cfe8d6; stroke:#2f7d4f; stroke-width:1; }
+.idle79 { fill:#eef1f5; stroke:#c2cad4; stroke-width:1; stroke-dasharray:3 3; }
+.skew79 { fill:#f6cfcf; stroke:#b83a3a; stroke-width:1; }
+.gl79 { stroke:#b0b8c2; stroke-width:1; }
+</style>
+<!-- Panel 1: balanced -->
+<text class="lab79" x="20" y="28">Healthy: tasks balanced, every core busy</text>
+<line class="gl79" x1="120" y1="44" x2="120" y2="120"/>
+<text class="ax79" x="60" y="60">core 1</text><rect class="good79" x="124" y="50" width="300" height="14" rx="2"/>
+<text class="ax79" x="60" y="76">core 2</text><rect class="good79" x="124" y="68" width="312" height="14" rx="2"/>
+<text class="ax79" x="60" y="92">core 3</text><rect class="good79" x="124" y="86" width="296" height="14" rx="2"/>
+<text class="ax79" x="60" y="108">core 4</text><rect class="good79" x="124" y="104" width="308" height="14" rx="2"/>
+<text class="sub79" x="470" y="88">stage finishes when the last core finishes: short and even</text>
+<!-- Panel 2: too few partitions -->
+<text class="lab79" x="20" y="168">Too few partitions: half the cluster sits idle</text>
+<line class="gl79" x1="120" y1="184" x2="120" y2="260"/>
+<text class="ax79" x="60" y="200">core 1</text><rect class="good79" x="124" y="190" width="560" height="14" rx="2"/>
+<text class="ax79" x="60" y="216">core 2</text><rect class="good79" x="124" y="208" width="560" height="14" rx="2"/>
+<text class="ax79" x="60" y="232">core 3</text><rect class="idle79" x="124" y="226" width="560" height="14" rx="2"/>
+<text class="ax79" x="60" y="248">core 4</text><rect class="idle79" x="124" y="244" width="560" height="14" rx="2"/>
+<text class="sub79" x="700" y="218">2 tasks,</text><text class="sub79" x="700" y="232">4 cores:</text><text class="sub79" x="700" y="246">2 watch</text>
+<!-- Panel 3: skew -->
+<text class="lab79" x="20" y="304">Data skew: one straggler task pins the whole stage</text>
+<line class="gl79" x1="120" y1="320" x2="120" y2="396"/>
+<text class="ax79" x="60" y="336">core 1</text><rect class="good79" x="124" y="326" width="150" height="14" rx="2"/>
+<text class="ax79" x="60" y="352">core 2</text><rect class="good79" x="124" y="344" width="140" height="14" rx="2"/>
+<text class="ax79" x="60" y="368">core 3</text><rect class="good79" x="124" y="362" width="160" height="14" rx="2"/>
+<text class="ax79" x="60" y="384">core 4</text><rect class="skew79" x="124" y="380" width="600" height="14" rx="2"/>
+<line class="gl79" x1="284" y1="320" x2="284" y2="396" stroke-dasharray="3 3"/>
+<text class="sub79" x="300" y="372">three cores done here ...</text>
+<text class="sub79" x="540" y="372">... stage waits for the hot key</text>
+</svg>
+<figcaption><strong>Figure 7.9.1:</strong> Three Spark UI stage timelines, each bar a task running on one core. Top: a healthy stage where tasks are even and every core is busy, so the stage is short. Middle: too few partitions, so only two of four cores run tasks and the other two (dashed) sit idle, the failure mode our runnable demo quantifies. Bottom: data skew, where one hot key produces a straggler task (red) that runs long after the other three cores finish, pinning the stage's wall-clock to the slowest task. The diagnosis in each case is a glance at task-time spread, not a guess.</figcaption>
+</figure>
+<p>The middle and bottom panels of Figure 7.9.1 are the two failures you will meet most. Idle cores mean too few partitions: there are fewer tasks than slots, so some slots never get work, the exact situation our demo in Section 4 measures. A single long bar while the rest finish early means skew: one key carries far more rows than the others, a problem we diagnosed and fixed in <a href="section-7.7.html">Section 7.7</a>. The metric to watch is the spread between the median task time and the maximum task time; when the max is many times the median, you have a straggler, and no amount of extra hardware will help until you rebalance the work.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Stage's Wall-Clock Is the Slowest Task, Not the Average</div>
+<p>A Spark stage does not finish when the average task finishes; it finishes when the <em>last</em> task finishes, because the next stage cannot start until every partition of this one is done. This single fact explains why both idle cores and skew are so costly: an idle core contributes nothing to progress, and a straggler task makes every other core wait at the stage barrier. Tuning is therefore almost always about shrinking the maximum task time, by spreading work evenly across enough partitions and breaking up the keys that are too big. Optimize the tail, not the mean.</p>
+</div>
+
+<h2>2. The Levers, In Order of Impact <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Once the UI has named the bottleneck, you reach for a lever. They are not equal: the structural levers (partition count, shuffle avoidance, broadcast, cache) routinely change runtime by multiples, while the memory and serialization knobs trim percentages. Table 7.9.1 is the playbook itself. Each row names a symptom you can see in the UI, the lever that attacks it, the Spark configuration or API involved, and the chapter section that explains the underlying mechanism. Work the table top to bottom; the cheapest and highest-impact fixes come first.</p>
+<div class="table-caption"><strong>Table 7.9.1:</strong> The Spark tuning playbook. Diagnose the symptom in the UI, apply the lever, and consult the linked section for why it works. Structural levers (top) dominate; memory and serialization knobs (bottom) are last resorts after the structure is right.</div>
+<table>
+<thead>
+<tr><th scope="col">Symptom in the UI</th><th scope="col">Lever</th><th scope="col">Config / API</th><th scope="col">Why it works</th></tr>
+</thead>
+<tbody>
+<tr><td>Idle cores; fewer tasks than slots</td><td>Raise partition count</td><td><code>spark.sql.shuffle.partitions</code>, <code>repartition</code></td><td><a href="section-7.6.html">7.6</a> partitioning</td></tr>
+<tr><td>Thousands of tiny tasks; scheduler overhead</td><td>Lower partition count</td><td><code>coalesce</code>, AQE coalescing</td><td><a href="section-7.6.html">7.6</a> partitioning</td></tr>
+<tr><td>Huge shuffle read/write bytes</td><td>Aggregate before shuffling</td><td><code>reduceByKey</code> over <code>groupByKey</code></td><td><a href="section-7.5.html">7.5</a> transformations</td></tr>
+<tr><td>Large shuffle on a join with one small side</td><td>Broadcast the small side</td><td><code>broadcast()</code>, auto-broadcast threshold</td><td><a href="section-7.7.html">7.7</a> joins</td></tr>
+<tr><td>One straggler task; skewed key</td><td>Split the hot key (salt / AQE skew join)</td><td><code>spark.sql.adaptive.skewJoin.enabled</code></td><td><a href="section-7.7.html">7.7</a> skew</td></tr>
+<tr><td>Same dataset recomputed every action</td><td>Cache the reused dataset</td><td><code>cache()</code>, <code>persist()</code></td><td><a href="section-7.6.html">7.6</a> caching</td></tr>
+<tr><td>Plan chosen before data sizes are known</td><td>Enable Adaptive Query Execution</td><td><code>spark.sql.adaptive.enabled</code></td><td><a href="section-7.3.html">7.3</a> Catalyst</td></tr>
+<tr><td>OutOfMemory; heavy disk spill</td><td>Raise executor memory / partition finer</td><td><code>spark.executor.memory</code>, spill</td><td>Section 5 below</td></tr>
+<tr><td>Driver OOM on collect</td><td>Never collect large data to the driver</td><td><code>write</code>, <code>limit</code>, aggregate first</td><td>Section 3 below</td></tr>
+</tbody>
+</table>
+<p>The two partition rows at the top of Table 7.9.1 pull in opposite directions, and finding the balance between them is the most common tuning decision in Spark, so we give it a runnable demonstration in Section 4. The shuffle, broadcast, and skew rows all attack data movement, the dominant cost in any distributed job; we treat them next. The caching and AQE rows recover work the chapter already taught. The last two rows are the memory and driver safety levers of Section 5.</p>
+
+<h3>Minimize the shuffle, the most expensive thing Spark does</h3>
+<p>A shuffle is an all-to-all exchange: every task may send rows to every other task, across the network, written to and read from disk on the way. It is the Spark relative of the MapReduce shuffle from <a href="../module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a>, and the same arc returns yet again as the gradient all-reduce of <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>. Because it touches the network and the disk, the shuffle dominates the cost of most non-trivial jobs, and the highest-leverage thing you can do is move less data through it. The classic example is the choice between <code>groupByKey</code> and <code>reduceByKey</code> from <a href="section-7.5.html">Section 7.5</a>: <code>groupByKey</code> ships every value across the network and then reduces, while <code>reduceByKey</code> reduces locally on each partition first and ships only the partial results.</p>
+<pre><code class="language-python"># Counting events per user. Both produce the same answer; one moves far less data.
+
+# BAD: groupByKey ships every single event across the network, then counts.
+counts = events.groupByKey().mapValues(len)            # shuffle = all the values
+
+# GOOD: reduceByKey adds up counts WITHIN each partition first (a map-side
+# combine), so the shuffle carries one partial count per (user, partition).
+counts = events.map(lambda e: (e.user, 1)).reduceByKey(lambda a, b: a + b)
+
+# DataFrame API: a groupBy + agg compiles to the same map-side partial aggregation,
+# and Catalyst (Section 7.3) inserts the local combine for you.
+counts = df.groupBy("user").count()                    # preferred in practice
+</code></pre>
+<div class="code-caption"><strong>Code 7.9.1:</strong> The single highest-impact shuffle optimization. <code>reduceByKey</code> performs a map-side combine before the exchange, so the bytes crossing the network shrink from one-per-row to one-per-key-per-partition. On the DataFrame API, Catalyst inserts this partial aggregation automatically, one more reason to prefer DataFrames over raw RDDs.</div>
+<p>The same principle drives broadcast joins. When one side of a join is small enough to fit in each executor's memory, Spark can send a full copy to every executor and join locally, with no shuffle of the large side at all. This is the broadcast-hash join of <a href="section-7.7.html">Section 7.7</a>, and it converts a network-bound shuffle join into a local hash lookup. You can request it explicitly, and Spark also applies it automatically when a side is below <code>spark.sql.autoBroadcastJoinThreshold</code> (10 MB by default).</p>
+<pre><code class="language-python">from pyspark.sql.functions import broadcast
+
+# 'dim' is a small lookup table (a few MB); 'facts' is billions of rows.
+# Broadcasting 'dim' avoids shuffling 'facts' entirely: each executor joins
+# its local facts partitions against an in-memory copy of dim.
+result = facts.join(broadcast(dim), on="key", how="inner")
+
+# Equivalent automatic behavior, controlled by a size threshold:
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", 32 * 1024 * 1024)  # 32 MB
+</code></pre>
+<div class="code-caption"><strong>Code 7.9.2:</strong> A broadcast join. Sending a few megabytes to every executor once is far cheaper than shuffling billions of rows of the large table across the network, which is why a broadcast join is usually the first thing to try when one join side is small.</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Nightly Job That Got Slower Every Week</div>
+<p><strong>Who:</strong> A data engineer at a streaming-media company owning the nightly user-feature pipeline.</p>
+<p><strong>Situation:</strong> A Spark job enriched a billion-row watch-events table by joining it against a country-and-plan lookup table, then aggregated features per user for the next day's recommendation training.</p>
+<p><strong>Problem:</strong> The job had crept from forty minutes to over three hours as the events table grew, and was now missing the training window.</p>
+<p><strong>Dilemma:</strong> Request a bigger cluster, the easy ask that doubled the monthly bill, or open the Spark UI and find out where the three hours actually went before spending anything.</p>
+<p><strong>Decision:</strong> They read the UI first, and the dominant stage was a sort-merge join shuffling the full billion-row events table by key, even though the lookup table was only six megabytes.</p>
+<p><strong>How:</strong> They wrapped the lookup side in <code>broadcast()</code> exactly as in Code 7.9.2, turned on Adaptive Query Execution, and set <code>spark.sql.shuffle.partitions</code> to a few times the core count from the curve in Output 7.9.5.</p>
+<p><strong>Result:</strong> The events table was no longer shuffled at all; the join became a local hash lookup, and the job fell from three hours back to thirty-five minutes on the same cluster, at no extra cost.</p>
+<p><strong>Lesson:</strong> The bigger cluster would have hidden the real problem and kept billing for it. Reading the UI named the shuffle, and one broadcast removed it.</p>
+</div>
+
+<h3>Cache reuse, enable Adaptive Query Execution, and let Catalyst plan</h3>
+<p>Spark's laziness, the property that makes the DAG possible in <a href="section-7.4.html">Section 7.4</a>, has a sharp edge: a dataset with no cache is recomputed in full every time an action touches it, all the way back along its RDD lineage from <a href="section-7.2.html">Section 7.2</a>. If you train three models on the same prepared feature table, or run several aggregations over one cleaned dataset, an uncached dataset pays the entire preparation cost three times. The fix is one call, <code>cache()</code> or <code>persist()</code> from <a href="section-7.6.html">Section 7.6</a>, placed on the dataset that is read more than once. Cache deliberately: caching a dataset used only once wastes memory that another stage needs.</p>
+<p>Adaptive Query Execution (AQE), on by default since Spark 3.2, is the highest-value single switch in the whole playbook because it fixes several rows of Table 7.9.1 at once, using real runtime statistics that the static Catalyst planner of <a href="section-7.3.html">Section 7.3</a> could only estimate. After each shuffle, AQE sees the actual partition sizes and can coalesce hundreds of tiny post-shuffle partitions into a sensible number, switch a planned shuffle join to a broadcast join when a side turned out small, and split a skewed partition into several so one hot key no longer pins a straggler task.</p>
+<pre><code class="language-python"># Adaptive Query Execution: let the engine re-plan using real shuffle statistics.
+spark.conf.set("spark.sql.adaptive.enabled", True)                 # master switch
+spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", True)  # auto right-size
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", True)        # split hot keys
+
+# A sane static starting point for the post-shuffle partition count when you
+# tune by hand: aim for a few times the total executor cores (see the demo).
+spark.conf.set("spark.sql.shuffle.partitions", 256)   # default is 200
+</code></pre>
+<div class="code-caption"><strong>Code 7.9.3:</strong> The configuration that earns its keep. AQE re-plans with runtime statistics and resolves partition sizing, broadcast promotion, and skewed joins automatically; the static <code>shuffle.partitions</code> value still sets the starting point, which the next demo helps you choose.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: AQE Replaces a Tuning Spreadsheet With One Switch</div>
+<p>Before AQE, getting these levers right meant manual work: profile a representative run, compute a good <code>spark.sql.shuffle.partitions</code> from the shuffle volume, hand-mark small join sides with <code>broadcast()</code>, and salt skewed keys yourself, then redo it whenever the data sizes shifted. That is dozens of lines of tuning code and a recurring babysitting chore. <code>spark.sql.adaptive.enabled = true</code> folds partition coalescing, broadcast promotion, and skew-join splitting into the engine, driven by statistics it measures after each shuffle. You still set a sensible starting <code>shuffle.partitions</code> and still broadcast obvious cases by hand, but the framework now handles the cases that used to require a tuning spreadsheet, and it re-tunes itself when the data changes.</p>
+</div>
+
+<h2>3. Keep Big Data Off the Driver <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>One tuning rule is really a correctness rule, because violating it does not merely slow the job, it crashes it. The driver is a single machine, the one process that holds the DAG and coordinates the executors. Any operation that pulls the distributed result back to the driver (<code>collect()</code>, <code>toPandas()</code>, a large <code>take()</code>) tries to fit data that lived across the whole cluster into one machine's memory, and on real data it triggers an OutOfMemory error on the driver. The fix is to keep large results distributed: write them to storage with <code>write</code>, or reduce them to something small first.</p>
+<pre><code class="language-python"># DANGER: pulls every row of a billion-row DataFrame into the driver's RAM.
+rows = big_df.collect()          # driver OutOfMemory on real data
+pdf  = big_df.toPandas()         # same trap, same crash
+
+# SAFE: keep the result distributed, or shrink it before collecting.
+big_df.write.parquet("s3://bucket/output/")          # stays across the cluster
+summary = big_df.groupBy("label").count().collect()  # tiny: one row per label
+sample  = big_df.limit(1000).toPandas()              # bounded, fits in the driver
+</code></pre>
+<div class="code-caption"><strong>Code 7.9.4:</strong> The driver-collection trap and its three escapes. Write large results to storage, aggregate to a small summary before collecting, or bound the pull with <code>limit</code>; never materialize cluster-scale data in the single driver process.</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The <code>collect()</code> That Took Down the Cluster</div>
+<p>A reliable rite of passage for new Spark users is the celebratory <code>df.collect()</code> at the end of a pipeline that worked beautifully on a ten-row sample. On the full dataset, the driver inhales four hundred gigabytes it does not have, the job dies, and the logs say <code>java.lang.OutOfMemoryError</code> with a cheerful stack trace. The cluster is fine; the executors were barely warmed up. It was always the driver. The cure is muscle memory: if the result is big, it gets <code>write</code>, never <code>collect</code>.</p>
+</div>
+
+<h2>4. Demonstration: Finding the Partition Sweet Spot <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The first and most common tuning decision, how many partitions, has a sweet spot that the two top rows of Table 7.9.1 only describe in words. We can see it as a curve. The model below is pure Python, no Spark required: a fixed cluster of eight worker slots runs a job of fixed total work, split into $P$ partitions. Each partition (task) carries a share of the work plus a fixed per-task overhead (launch, serialization, shuffle bookkeeping), and the tasks are deliberately uneven, because real data never splits perfectly. A greedy scheduler hands each task to the slot that is free earliest, and the stage finishes when the last slot finishes, the wall-clock rule from the Key Insight above. Sweeping $P$ traces the trade-off.</p>
+<pre><code class="language-python">import random
+
+WORKERS = 8           # executor slots (cores) in the cluster
+TOTAL_WORK = 1000.0   # total useful compute, arbitrary time units
+OVERHEAD = 0.25       # fixed cost per task (launch, serialize, shuffle bookkeeping)
+SKEW = 0.6            # tasks are uneven: real data partitions never split evenly
+
+def makespan(num_partitions):
+    """Greedy list-scheduling on UNEVEN tasks. Each task costs a (skewed) share
+    of the work plus a fixed OVERHEAD; assign every task to the worker that
+    finishes earliest. Return when the LAST worker finishes (the stage wall-clock).
+    More tasks balance the skew better but add overhead."""
+    rng = random.Random(0)
+    raw = [1.0 + SKEW * rng.random() for _ in range(num_partitions)]
+    scale = TOTAL_WORK / sum(raw)                # rescale so tasks sum to TOTAL_WORK
+    finish = [0.0] * WORKERS
+    for r in raw:
+        cost = r * scale + OVERHEAD
+        i = min(range(WORKERS), key=lambda w: finish[w])  # earliest-free worker
+        finish[i] += cost
+    return max(finish)
+
+ideal = TOTAL_WORK / WORKERS                     # perfect split, zero overhead
+print(f"workers={WORKERS}  total_work={TOTAL_WORK:.0f}  overhead/task={OVERHEAD}")
+print(f"ideal makespan (perfect split, no overhead) = {ideal:.1f}\n")
+print(f"{'partitions':>10} {'makespan':>9} {'efficiency':>11}  note")
+for p in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]:
+    span, eff = makespan(p), ideal / makespan(p)
+    note = "workers idle (too few tasks)" if p < WORKERS else \
+           ("overhead piling up" if p > 4 * WORKERS else "")
+    print(f"{p:>10} {span:>9.1f} {eff:>10.1%}  {note}")
+</code></pre>
+<div class="code-caption"><strong>Code 7.9.5:</strong> A pure-Python model of the partition-count trade-off on a fixed cluster, with no Spark dependency. Too few partitions leave slots idle; too many drown the useful work in per-task overhead; uneven tasks make a few partitions worse than the arithmetic suggests. Running it traces the efficiency curve.</div>
+<pre><code class="language-text">workers=8  total_work=1000  overhead/task=0.25
+ideal makespan (perfect split, no overhead) = 125.0
+
+partitions  makespan  efficiency  note
+         1    1000.3      12.5%  workers idle (too few tasks)
+         2     509.0      24.6%  workers idle (too few tasks)
+         4     280.9      44.5%  workers idle (too few tasks)
+         8     142.8      87.6%
+        16     137.7      90.8%
+        32     135.6      92.2%
+        64     133.2      93.8%  overhead piling up
+       128     132.9      94.0%  overhead piling up
+       256     134.7      92.8%  overhead piling up
+       512     142.0      88.0%  overhead piling up
+      1024     157.7      79.2%  overhead piling up
+
+best single point : 128 partitions, efficiency 94.0%
+good plateau (>=90%): partitions 16..256 (2x..32x the 8 cores)
+takeaway: aim a few-times the core count; the curve is flat there, and falls off hard at both ends.</code></pre>
+<div class="code-caption"><strong>Output 7.9.5:</strong> The efficiency curve has the shape every Spark tuner learns to expect. At one to four partitions, most of the eight cores sit idle and efficiency is dismal (12 to 45 percent). It climbs to a broad plateau above 90 percent from 16 to 256 partitions (two to thirty-two times the core count), then falls off as per-task overhead piles up past 512. The lesson matches Spark's own guidance: aim for a small multiple of the total cores, where the curve is flat, and avoid both ends.</div>
+<p>The plateau in Output 7.9.5 is the whole point. There is no single magic number, but there is a wide safe zone at a few times the core count, with cliffs on both sides: idle cores on the left (the middle panel of Figure 7.9.1) and overhead on the right. This is exactly why <code>spark.sql.shuffle.partitions</code> defaults to 200 and why AQE's partition coalescing is so valuable: the goal is to land anywhere on the plateau, and the engine, watching real shuffle sizes, lands there more reliably than a fixed guess.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Learned and Automatic Spark Tuning (2024 to 2026)</div>
+<p>Hand-tuning the dozens of knobs in Table 7.9.1 across changing workloads is exactly the kind of repetitive optimization that machine learning now attacks. Adaptive Query Execution was the first step, replacing static plans with runtime-statistic re-planning, and it is now the assumed baseline. Beyond it, a research and product line aims at fully automatic configuration: cost-based and learned auto-tuners that profile a workload and search the configuration space, and cloud offerings such as Databricks' Predictive Optimization and serverless auto-scaling that size clusters and set shuffle parameters without a human in the loop. The 2024 to 2026 direction couples these with learned cardinality and cost estimators so the planner's guesses about partition sizes and join strategies improve from history rather than from static heuristics. The through-line is the same one this section teaches by hand: measure the real data, then choose the lever, with the engine increasingly doing both. The vector-search and serving chapters (<a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a>) show the same shift from hand-tuned to learned configuration in a different distributed system.</p>
+</div>
+
+<h2>5. Memory and Serialization: The Last Knobs <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>When the structural levers are exhausted (partitions sized, shuffle minimized, small sides broadcast, reuse cached, AQE on) and the job is still slow or unstable, the remaining knobs are memory and serialization. They matter, but they are last because no amount of memory tuning rescues a job that shuffles ten times more data than it needs to. Spark divides each executor's heap between execution memory (for shuffles, joins, and aggregations) and storage memory (for cached data), and the two borrow from each other under a unified manager. When a shuffle or aggregation needs more execution memory than is available, Spark spills the overflow to local disk: correct, but slow, and visible in the UI as spill bytes. Heavy spill is the signal to either give executors more memory or, often better, use more partitions so each task's working set is smaller.</p>
+<pre><code class="language-python"># Memory and serialization knobs, turned only after the structural fixes are in.
+spark.conf.set("spark.executor.memory", "8g")        # heap per executor
+spark.conf.set("spark.executor.memoryOverhead", "2g")  # off-heap (shuffle, Python)
+spark.conf.set("spark.memory.fraction", "0.6")       # execution+storage share of heap
+
+# Kryo serializes shuffle and cached data far more compactly than Java default,
+# which shrinks both network bytes and the memory a cached dataset occupies.
+spark.conf.set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+</code></pre>
+<div class="code-caption"><strong>Code 7.9.6:</strong> The memory and serialization configuration of last resort. Kryo serialization shrinks shuffle and cache bytes; raising executor memory or partitioning finer relieves disk spill. Reach for these only after the structural levers of Table 7.9.1 are set, because they trim percentages where structure changes multiples.</div>
+<p>Serialization deserves the same framing. Every byte that crosses the shuffle, and every cached object, is serialized first, so a more compact serializer (Kryo, rather than the Java default) directly reduces both network traffic and cache memory. It is a genuine win, but a bounded one: it makes the data movement cheaper per byte, whereas the structural levers reduce the number of bytes moved at all. That ordering, structure before knobs, is the discipline this whole section has been arguing for.</p>
+
+<div class="callout key-takeaway">
+<div class="callout-title">Key Takeaway: Chapter 7 in One Breath</div>
+<p>Spark is an in-memory, lazily evaluated DAG engine. It records every transformation as <strong>RDD lineage</strong> (<a href="section-7.2.html">7.2</a>), which both defers work into a <strong>DAG</strong> the cluster runs stage by stage (<a href="section-7.4.html">7.4</a>) and lets it recompute any lost partition for fault tolerance. The <strong>DataFrame API and the Catalyst optimizer</strong> (<a href="section-7.3.html">7.3</a>) let you write declarative queries that compile to efficient plans, inserting map-side combines and choosing join strategies for you. Performance lives in the data layout: <strong>partitioning and caching</strong> (<a href="section-7.6.html">7.6</a>) decide how work is split across cores and what is recomputed, while <strong>joins, shuffles, and skew</strong> (<a href="section-7.7.html">7.7</a>) decide how much data crosses the network. <strong>PySpark</strong> (<a href="section-7.8.html">7.8</a>) makes all of this the workhorse for distributed feature engineering and data preparation feeding AI training. This final section ties it together as a playbook: read the Spark UI, find the dominant stage, then size partitions to the core count, kill the shuffle, broadcast small sides, cache reuse, and let Adaptive Query Execution re-plan, reaching for memory and serialization knobs only last. The shuffle you just tamed here is the same primitive that returns as the gradient all-reduce when we start training models across machines in <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.9.1: Read the Timeline <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each Spark UI observation, name the lever from Table 7.9.1 you would apply first and the section that explains why: (a) a stage has 8,000 tasks, each running for 40 milliseconds, on a 64-core cluster; (b) one task in a join stage reads 50 GB of shuffle data while the median task reads 200 MB; (c) the same prepared DataFrame is used by four separate aggregations and each one takes the full preparation time; (d) a stage on a 200-core cluster shows only 12 tasks. For each, explain in one sentence what would happen if you instead reached for a bigger cluster without applying the lever.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.9.2: Map the Efficiency Cliff <span class="exercise-type coding">Coding</span></div>
+<p>Take the model in Code 7.9.5 and sweep <code>OVERHEAD</code> over the values 0.05, 0.25, and 1.0 while keeping everything else fixed. For each, find the partition count that minimizes the makespan and the width of the 90-percent-efficiency plateau. Explain how a higher per-task overhead (a cluster with slow task launch or expensive serialization) moves the sweet spot and narrows the safe zone, and connect this to why coalescing tiny partitions, the second row of Table 7.9.1, matters more on some clusters than others.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.9.3: Cost the Shuffle You Avoided <span class="exercise-type analysis">Analysis</span></div>
+<p>A join has a large side of $2 \times 10^9$ rows at 200 bytes each and a small side of $5 \times 10^5$ rows at 200 bytes each. Estimate the bytes a shuffle-hash join must move (both sides shuffled by key) versus a broadcast join (the small side sent to each of 50 executors, the large side not moved at all). At a network rate of 10 GB/s, estimate the data-movement time for each strategy and the speedup from broadcasting. State the assumption that has to hold for the broadcast join to be legal, and tie your answer back to the broadcast threshold in Code 7.9.2.</p>
+</div>
+
+<div class="callout project-ideas">
+<div class="callout-title">Project Ideas: Chapter 7</div>
+<p>Carry Chapter 7 from reading into building with one of these. Each is sized to run on a laptop in Spark local mode or a small cluster, and each exercises the full diagnose-then-tune loop.</p>
+<p><strong>1. Tune a skewed join end to end.</strong> Generate a two-table dataset where one join key holds 80 percent of the rows (a power-law key distribution). Run the join naively, capture the straggler in the Spark UI (the bottom panel of Figure 7.9.1), then fix it three ways: enable AQE skew-join handling, salt the hot key by hand, and broadcast the small side if it qualifies. Report the stage wall-clock and the maximum task time for each, and write up which lever helped most and why, grounding each choice in <a href="section-7.7.html">Section 7.7</a>.</p>
+<p><strong>2. Build a Spark feature pipeline that feeds a training job.</strong> Take a tabular dataset (for example, a public clickstream or transactions log), and write a PySpark pipeline that cleans, joins dimension tables, and computes aggregate features per entity, caching the reused intermediate. Write the result to Parquet, then load it into a single-machine training job (scikit-learn or PyTorch). Measure how partition count and caching change the preparation wall-clock, and confirm the handoff to training matches the PySpark-for-AI pattern of <a href="section-7.8.html">Section 7.8</a>. This pipeline is the direct on-ramp to the storage and data-loading concerns of <a href="../module-08-distributed-storage-data-loading/index.html">Chapter 8</a>.</p>
+<p><strong>3. Reproduce the partition-sweet-spot curve in real Spark.</strong> Take Code 7.9.5's idealized curve and reproduce it on an actual cluster: run a fixed shuffle-heavy job (a large <code>groupBy</code>) while sweeping <code>spark.sql.shuffle.partitions</code> across the same range, with AQE off, and record the stage wall-clock from the Spark UI at each setting. Plot measured wall-clock against partition count, compare the shape to Output 7.9.5, then turn AQE on and show where its coalescing lands on your curve.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-7.8.html"><span class="nav-label">Previous</span><span class="nav-num">Section 7.8</span><span class="nav-title">PySpark for AI Workloads</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 7</span><span class="nav-num">Contents</span><span class="nav-title">Spark and Distributed DataFrames</span></a>
+<a class="next" href="../module-08-distributed-storage-data-loading/index.html"><span class="nav-label">Next</span><span class="nav-num">Chapter 8</span><span class="nav-title">Distributed Storage and Data Loading</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

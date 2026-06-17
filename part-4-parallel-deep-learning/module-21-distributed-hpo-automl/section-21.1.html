@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 21.1: Why Search Is Embarrassingly Parallel, and Why That Is Not Enough. Hyperparameter trials are independent, so they parallelize for free, but naive parallel search burns GPU-hours on configurations that were never going to win. The real problems are allocation and scheduling, not communication." name="description"/>
+<title>Section 21.1: Why Search Is Embarrassingly Parallel, and Why That Is Not Enough | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: Distributed Hyperparameter Search and AutoML</a></div>
+<h1>Why Search Is Embarrassingly Parallel, and Why That Is Not Enough</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They gave me a thousand machines and told me to find the best learning rate. I found it on machine three, in the first ten minutes. The other nine hundred and ninety-seven trained losers to convergence, beautifully, in parallel."</p>
+<cite>A Scheduler That Allocated First and Thought Later</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Hyperparameter search is the easiest kind of parallelism to start and the easiest kind to waste.</strong> Every trial, one model trained under one configuration, is independent of every other, so trials need no communication and scatter across a cluster trivially. That is the good news, and it is why search looks like a solved problem. The bad news is that most configurations are bad, and a naive parallel sweep spends its entire budget training those bad configurations all the way to convergence before discarding them. The expensive question in distributed search is therefore not "how do machines talk to each other?" (they barely do) but "which configurations deserve compute, and how much?" This chapter is about allocation and scheduling, not communication, and this section frames the four ideas that organize the rest of it: smarter sampling, adaptive early stopping, distributed scheduling, and cost-awareness.</p>
+</div>
+<p>Almost every chapter so far has fought communication. Data-parallel training in <a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a> lives and dies by the cost of the gradient all-reduce; sharded and expert parallelism in Chapters 16 and 17 are elaborate dances to keep the interconnect from becoming the bottleneck. Hyperparameter search is the rare distributed AI workload where communication is almost absent. You pick a set of configurations, train one model per configuration, compare their validation scores, and keep the winner. The trials never exchange a gradient, never share a parameter, never wait on a barrier. In the taxonomy of parallel computing this is the embarrassingly parallel ideal: $K$ machines deliver close to a $K$-fold speedup because there is nothing to coordinate. If that were the whole story, this chapter would be one page long.</p>
+<p>It is not the whole story, because parallel efficiency is not the same as compute efficiency. A sweep can keep a thousand GPUs perfectly busy and still be enormously wasteful, because most of those GPUs are training configurations that a competent practitioner could see were doomed after the first few minutes. The scarce resource in search is not the network and it is not coordination; it is GPU-hours, and the central skill of this chapter is spending them on configurations that might win instead of configurations that already lost. That reframing, from a communication problem to an allocation problem, is what the rest of this section makes precise.</p>
+
+<h2>1. Trials Are Independent, So Search Parallelizes for Free <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Start with the part that genuinely is easy. A hyperparameter configuration is a point in a search space: a learning rate, a batch size, a weight-decay coefficient, a number of layers, a dropout rate, and so on. A trial is the act of training a model under one such configuration and recording how good it turns out to be, usually a validation loss or accuracy. Given a list of configurations $c_1, c_2, \dots, c_M$, the score of trial $i$ depends only on $c_i$ and the data; it does not depend on what any other trial is doing. There is no shared state, so there is nothing to synchronize.</p>
+<p>This independence is exactly what makes search the cleanest form of distribution in the book. Hand configuration $c_i$ to whichever worker is free, let it train in isolation, collect the score when it finishes, and move on. No all-reduce, no parameter server, no consensus round. Workers can sit in different racks, different data centers, even different clouds, and the result is identical, because there is no information to lose in transit. Contrast this with the communication-bound training of <a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a>, where placing two workers on opposite sides of a slow link can erase the benefit of adding them. In search, slow links between trials cost nothing, because there are no messages between trials.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Search Is Parallel by Construction, but Compute Is Spent by Policy</div>
+<p>Because trials never communicate, a search of $M$ configurations on $K$ workers finishes in roughly $\lceil M/K \rceil$ trial-times: parallel efficiency is essentially free and scales until you run out of either machines or configurations. But that says nothing about whether the GPU-hours were spent well. Two searches with the same parallel efficiency can differ by an order of magnitude in compute efficiency, depending entirely on which configurations they chose to run and how much compute they granted each one. The hard part of distributed search lives in those two policy decisions, not in the parallelism.</p>
+</div>
+<p>So the parallel structure is a gift, and we accept it. Figure 21.1.1 shows why the gift comes with a catch. The trials fan out with no edges between them, which is the embarrassingly parallel picture we just described. But the shading tells the real story: the great majority of the trials are bad configurations, and a naive sweep pays to train each of them all the way to the right edge of the diagram, to full convergence, before reading off a score that a glance at the early curve would have predicted.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A controller fans out many independent trials to separate workers with no connections between them; most trials are shaded as bad configurations yet are drawn running all the way to a full-convergence finish line, illustrating wasted compute, while one good trial is highlighted.">
+<defs>
+<marker id="arr211" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.ctl211 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.bad211 { fill:#f3e9e9; stroke:#9a5b5b; stroke-width:1.4; }
+.good211 { fill:#e7f3ea; stroke:#2f7d4f; stroke-width:1.8; }
+.t211 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.tb211 { font:600 13px sans-serif; fill:#7a4444; text-anchor:middle; }
+.tg211 { font:600 13px sans-serif; fill:#256b41; text-anchor:middle; }
+.s211 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l211 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr211); }
+.fin211 { stroke:#9a5b5b; stroke-width:1.4; stroke-dasharray:5 4; }
+</style>
+<rect class="ctl211" x="40" y="150" width="120" height="60" rx="10"/>
+<text class="t211" x="100" y="176">Controller</text>
+<text class="s211" x="100" y="194">samples configs</text>
+<path class="l211" d="M 162 165 L 250 70"/>
+<path class="l211" d="M 162 175 L 250 135"/>
+<path class="l211" d="M 162 185 L 250 200"/>
+<path class="l211" d="M 162 195 L 250 265"/>
+<path class="l211" d="M 162 200 L 250 330"/>
+<rect class="bad211" x="255" y="48" width="150" height="44" rx="7"/>
+<text class="tb211" x="330" y="68">Trial 1 (bad)</text>
+<text class="s211" x="330" y="84">worker A</text>
+<rect class="bad211" x="255" y="113" width="150" height="44" rx="7"/>
+<text class="tb211" x="330" y="133">Trial 2 (bad)</text>
+<text class="s211" x="330" y="149">worker B</text>
+<rect class="good211" x="255" y="178" width="150" height="44" rx="7"/>
+<text class="tg211" x="330" y="198">Trial 3 (good)</text>
+<text class="s211" x="330" y="214">worker C</text>
+<rect class="bad211" x="255" y="243" width="150" height="44" rx="7"/>
+<text class="tb211" x="330" y="263">Trial 4 (bad)</text>
+<text class="s211" x="330" y="279">worker D</text>
+<rect class="bad211" x="255" y="308" width="150" height="44" rx="7"/>
+<text class="tb211" x="330" y="328">Trial 5 (bad)</text>
+<text class="s211" x="330" y="344">worker E</text>
+<line class="fin211" x1="720" y1="40" x2="720" y2="360"/>
+<text class="s211" x="720" y="28">full convergence</text>
+<line x1="405" y1="70" x2="715" y2="70" stroke="#9a5b5b" stroke-width="6" opacity="0.5"/>
+<line x1="405" y1="135" x2="715" y2="135" stroke="#9a5b5b" stroke-width="6" opacity="0.5"/>
+<line x1="405" y1="200" x2="715" y2="200" stroke="#2f7d4f" stroke-width="6" opacity="0.65"/>
+<line x1="405" y1="265" x2="715" y2="265" stroke="#9a5b5b" stroke-width="6" opacity="0.5"/>
+<line x1="405" y1="330" x2="715" y2="330" stroke="#9a5b5b" stroke-width="6" opacity="0.5"/>
+<text class="tb211" x="600" y="356">four of five GPU-hour budgets train losers to the finish line</text>
+<text class="s211" x="790" y="200">keep</text>
+</svg>
+<figcaption><strong>Figure 21.1.1:</strong> The embarrassingly parallel structure of search, and its hidden waste. A controller samples configurations and scatters one trial to each worker; there are no arrows between workers because trials never communicate. The horizontal bars are each trial's training run, drawn all the way to the dashed full-convergence finish line. Most configurations (shaded red) are bad, yet a naive sweep pays the full GPU-hour cost of training each one to completion before discarding it. Only the highlighted good trial (green) was worth finishing. The remedy is not faster communication; it is to stop the red bars early.</figcaption>
+</figure>
+
+<h2>2. Why the Naive Sweep Wastes Most of Its Budget <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Two empirical facts about hyperparameter landscapes make naive search wasteful, and both are worth stating plainly because the rest of the chapter is built on them. The first is that good configurations are rare. In most realistic search spaces, the fraction of configurations that come anywhere near the best achievable score is small; the space is mostly mediocre, with a thin shell of strong settings. A uniform random draw of, say, two hundred configurations might contain only a handful worth deploying. The second fact is that bad configurations usually reveal themselves early. A learning rate that is too high diverges in the first epoch; a model that is too small plateaus above the good configurations within a few epochs. The final ranking of the strong configurations may need full training to resolve, but separating obvious losers from plausible contenders rarely does.</p>
+<p>Put those two facts together and the naive sweep looks indefensible. It draws configurations, most of which are bad, and trains every one of them to convergence, including the ones whose first epoch already screamed that they were hopeless. If a full training run costs $T$ epochs and a competent early-stopping rule could have killed a doomed trial after $T/10$ epochs, then every doomed trial in the sweep wasted nine tenths of its compute proving something that was already visible. With a budget fixed in GPU-hours, that wasted compute is not free; it is compute you could have spent examining more configurations or training the promising ones longer. The naive sweep does not lose on parallel efficiency; it loses on the only thing that matters once the parallelism is free, which is where the GPU-hours go.</p>
+<p>The fix is to make compute allocation adaptive. Instead of committing a full training budget to a configuration before you know anything about it, give every configuration a small slice of compute, look at the early learning curve, and then redirect the budget away from the trials that are already losing and toward the trials that still might win. This is the idea of <em>early stopping</em>, and in its scheduled, budget-aware form it is <em>multi-fidelity</em> optimization: evaluate many configurations cheaply at low fidelity (few epochs, a subsample of data, a smaller image), promote only the survivors to higher fidelity, and repeat. The next demonstration shows how large the payoff is, holding the total compute budget exactly fixed.</p>
+
+<h2>3. The Same Budget, Spent Two Ways <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>To make the argument concrete and reproducible, we strip search down to its essentials in pure Python. Each configuration has a hidden quality that determines the loss it eventually converges to, and we model a realistic learning curve in which a configuration's eventual advantage is already partly visible after a few epochs, the property that makes early stopping work. We then spend one fixed budget, measured in epoch-units, two ways. Strategy A is the naive sweep: random search that runs each trial to full convergence, so the budget buys only a handful of complete trials. Strategy B spends the identical budget on many more trials started cheaply, repeatedly halving the survivors and granting the keepers more epochs, the successive-halving schedule that <a href="section-21.4.html">Section 21.4</a> develops into Hyperband.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+
+# Each config has a hidden "quality" q in [0,1]; lower final loss is better.
+# A trial trained for t epochs reaches loss roughly  floor(q) + decay(t),
+# so a good config (small floor) eventually wins, but its advantage is ALREADY
+# visible after a few epochs. We model that learning curve explicitly.
+MAX_EPOCHS = 27           # epochs to "fully" train one config to completion
+N_CONFIGS = 200           # size of the search space we draw from
+
+def floor_loss(q):        # asymptotic loss this config converges to
+    return 0.20 + 0.80 * q
+
+def learning_curve(q, epoch):
+    # monotone-decreasing toward floor_loss(q), plus small per-epoch noise
+    base = floor_loss(q) + (1.0 - floor_loss(q)) * np.exp(-0.18 * epoch)
+    return base + 0.01 * rng.standard_normal()
+
+# A shared population of candidate configs (their hidden q values).
+configs_q = rng.uniform(0.0, 1.0, size=N_CONFIGS)
+
+# Total compute budget, measured in epoch-units (one epoch on one trial = 1 unit).
+BUDGET = 540
+
+# --- Strategy A: random search, every trial run to completion -----------------
+n_full = BUDGET // MAX_EPOCHS                 # how many full trials the budget buys
+idx_A = rng.choice(N_CONFIGS, size=n_full, replace=False)
+final_A = [learning_curve(configs_q[i], MAX_EPOCHS) for i in idx_A]
+best_A = min(final_A)
+spent_A = n_full * MAX_EPOCHS
+
+# --- Strategy B: same budget, more trials + early stopping (successive halving)
+# Start MANY trials cheaply, keep halving the survivors and giving them more epochs.
+RUNG_EPOCHS = [1, 3, 9, 27]                   # epochs granted at each rung
+START = 180                                   # initial number of trials
+idx_B = rng.choice(N_CONFIGS, size=START, replace=False)
+alive = list(idx_B)
+spent_B = 0
+for r, ep_target in enumerate(RUNG_EPOCHS):
+    ep_prev = RUNG_EPOCHS[r - 1] if r &gt; 0 else 0
+    delta = ep_target - ep_prev               # extra epochs added at this rung
+    spent_B += len(alive) * delta             # charge only the incremental epochs
+    if spent_B &gt; BUDGET:                       # stop if we would overrun the budget
+        spent_B -= len(alive) * delta
+        break
+    scored = [(learning_curve(configs_q[i], ep_target), i) for i in alive]
+    scored.sort()                             # ascending loss: best first
+    keep = max(1, len(scored) // 3)           # keep top third, drop the rest
+    alive = [i for _, i in scored[:keep]]
+
+# fully evaluate the single survivor to report a comparable final loss
+best_B = min(learning_curve(configs_q[i], MAX_EPOCHS) for i in alive)
+
+print(f"budget (epoch-units)        : {BUDGET}")
+print(f"A  full-train trials        : {n_full}  (spent {spent_A})")
+print(f"A  best final loss          : {best_A:.4f}")
+print(f"B  trials started           : {START}  (spent {spent_B})")
+print(f"B  best final loss          : {best_B:.4f}")
+print(f"loss reduction from B       : {100*(best_A-best_B)/best_A:.1f}%")
+print(f"trials examined  A vs B     : {n_full} vs {START}")
+</code></pre>
+<div class="code-caption"><strong>Code 21.1.1:</strong> Two ways to spend one fixed search budget. Strategy A runs a few configurations to full convergence; Strategy B starts many configurations cheaply and uses successive halving to redirect compute toward survivors. The budget accounting (<code>spent_A</code>, <code>spent_B</code>) is explicit so the comparison is honest: both strategies consume essentially the same epoch-units.</div>
+<pre><code class="language-text">budget (epoch-units)        : 540
+A  full-train trials        : 20  (spent 540)
+A  best final loss          : 0.3625
+B  trials started           : 180  (spent 528)
+B  best final loss          : 0.2089
+loss reduction from B       : 42.4%
+trials examined  A vs B     : 20 vs 180
+</code></pre>
+<div class="code-caption"><strong>Output 21.1.1:</strong> For the same 540 epoch-units of compute, the naive full-train sweep examined 20 configurations and its best reached a loss of 0.36, while early stopping examined 180 configurations and reached 0.21, a 42% lower loss. The win comes entirely from where the GPU-hours went, not from any extra compute or any communication.</div>
+<p>The numbers in Output 21.1.1 are the whole argument in miniature. Both strategies burned the same budget, roughly 540 epoch-units, and neither sent a single message between trials, so their parallel efficiency is identical. Yet early stopping looked at nine times as many configurations (180 against 20) and found one with a 42% lower loss. It achieved this not by training harder but by refusing to train losers: configurations that looked weak after one epoch were cut before they could consume a second, and the survivors inherited the budget the losers gave up. This is the entire chapter compressed into one experiment. Smart search is not faster parallelism; it is smarter allocation of a fixed pool of compute, and that is a scheduling problem.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Bottleneck Moves from the Network to the Scheduler</div>
+<p>Every parallel-training chapter so far located the scaling bottleneck in communication: the all-reduce of <a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a>, the reduce-scatter of sharded training, the all-to-all of expert parallelism. Distributed hyperparameter search is the first workload in the book where communication is a non-issue and the bottleneck moves entirely to <em>allocation and scheduling</em>: which configurations to run, how much compute each gets, and how to pack many heterogeneous, early-killable trials onto a shared cluster. That makes this chapter a hinge. It hands the scheduling problem it uncovers to the cluster-scheduling machinery of <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/index.html">Chapter 33</a>, and it inherits the cost-versus-accuracy framing of <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.9.html">Section 3.9</a>, where compute spent is treated as a budget to be optimized rather than a quantity to be maximized.</p>
+</div>
+
+<h2>4. Allocation, Scheduling, and Cost: The Three Real Problems <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>If communication is not the hard part of distributed search, what is? Three problems, and naming them now gives the map for the chapter. The first is <em>sampling</em>: deciding which configurations to try at all. Random and grid search treat every configuration as equally worth running, which wastes draws on regions the data already declared hopeless; model-based methods such as Bayesian optimization spend draws where the evidence says the best configurations are likely to be. The second is <em>allocation</em>: deciding how much compute each chosen configuration deserves. Early stopping and multi-fidelity methods, as Output 21.1.1 showed, can dominate uniform allocation by a wide margin, because they let the early learning curve decide who keeps running. The third is <em>scheduling</em>: packing many heterogeneous trials, some just starting cheaply, some promoted to long runs, some about to be killed, onto a shared cluster whose GPUs are finite and contended.</p>
+<p>That third problem is where distributed search rejoins the rest of the book. A real search controller does not own its cluster; it competes for GPUs with training jobs and serving jobs, trials start and stop at unpredictable times, and a trial killed by early stopping frees a GPU that should be handed to a waiting trial within seconds, not minutes. Those are exactly the concerns of the cluster scheduler in <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/index.html">Chapter 33</a>, which is why a serious autoML system is as much a scheduling system as a statistics system. And because every trial costs real money, the controller must also be cost-aware: a configuration that needs a week on a node of 8 GPUs to gain a fraction of a percent may not be worth running at all, a trade-off we make quantitative in the framework of <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.9.html">Section 3.9</a> and revisit in this chapter's own <a href="section-21.8.html">Section 21.8</a> on cost-aware experimentation.</p>
+<p>Those three problems, sampling, allocation, and scheduling, plus the cost-awareness that ties them together, organize the chapter into four movements. Table 21.1.1 lays out the route from here to the end of the chapter, so that each later section reads as the answer to one question this section raised.</p>
+<div class="table-caption"><strong>Table 21.1.1:</strong> How the rest of Chapter 21 answers the three real problems of distributed search. Each movement deepens one of the policy decisions that parallel efficiency leaves untouched.</div>
+<table>
+<thead>
+<tr><th scope="col">Movement</th><th scope="col">The question it answers</th><th scope="col">Sections</th></tr>
+</thead>
+<tbody>
+<tr><td>Smarter sampling</td><td>Which configurations should we even try?</td><td><a href="section-21.2.html">21.2</a>, <a href="section-21.3.html">21.3</a></td></tr>
+<tr><td>Adaptive early stopping</td><td>How much compute does each trial deserve?</td><td><a href="section-21.4.html">21.4</a>, <a href="section-21.5.html">21.5</a></td></tr>
+<tr><td>Distributed scheduling</td><td>How do we pack heterogeneous trials on a shared cluster?</td><td><a href="section-21.6.html">21.6</a>, <a href="section-21.7.html">21.7</a></td></tr>
+<tr><td>Cost-awareness</td><td>Is the next configuration worth its GPU-hours at all?</td><td><a href="section-21.8.html">21.8</a></td></tr>
+</tbody>
+</table>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Ray Tune and Optuna Turn Code 21.1.1 into a Few Lines</div>
+<p>The successive-halving loop in Code 21.1.1 is about thirty lines of bookkeeping: tracking which trials are alive, charging incremental epochs, sorting, and culling. Production frameworks make the whole policy a configuration object. In Ray Tune, you declare a search space, an early-stopping scheduler, and a sampler, and the framework distributes the trials across the cluster, reports their intermediate scores, and kills the losers for you. Optuna does the same with its pruners. The example below expresses the entire Strategy B of Output 21.1.1, scaled across a real cluster, in roughly a dozen lines:</p>
+<pre><code class="language-python">from ray import tune
+from ray.tune.schedulers import ASHAScheduler   # async successive halving
+
+def train(config):                               # one trial; one worker runs this
+    for epoch in range(config["max_epochs"]):
+        loss = step(config["lr"], config["wd"], epoch)
+        tune.report(loss=loss)                   # intermediate score; lets Tune prune
+
+tuner = tune.Tuner(
+    train,
+    param_space={"lr": tune.loguniform(1e-5, 1e-1),
+                 "wd": tune.loguniform(1e-6, 1e-2),
+                 "max_epochs": 27},
+    tune_config=tune.TuneConfig(
+        num_samples=180,                         # examine 180 configs, like Strategy B
+        scheduler=ASHAScheduler(metric="loss", mode="min")),  # early stopping for free
+)
+results = tuner.fit()                            # Tune places, runs, and prunes trials
+print(results.get_best_result(metric="loss", mode="min").config)
+</code></pre>
+<div class="code-caption"><strong>Code 21.1.2:</strong> The same many-trials-plus-early-stopping strategy as Output 21.1.1, now as a Ray Tune job. The thirty-line halving loop collapses to one <code>ASHAScheduler</code>, and Ray handles trial placement, cluster-wide scheduling, intermediate reporting, and culling, the very concerns Sections <a href="section-21.6.html">21.6</a> and <a href="section-21.7.html">21.7</a> unpack.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Sweep That Filled the Cluster and Found Nothing Faster</div>
+<p><strong>Who:</strong> An ML platform engineer running hyperparameter sweeps for a computer-vision team.</p>
+<p><strong>Situation:</strong> The team launched a 256-trial grid sweep across 64 GPUs, each trial training a detector to full convergence over roughly a day.</p>
+<p><strong>Problem:</strong> The cluster sat at 100% utilization for four days and the dashboards looked perfect, yet the best configuration found was barely better than the team's existing baseline.</p>
+<p><strong>Dilemma:</strong> Buy more GPUs to run a bigger grid faster, the instinct when a cluster is already saturated, or change how the existing GPUs were spending their time, which meant admitting the sweep itself was the problem, not its size.</p>
+<p><strong>Decision:</strong> They kept the 64 GPUs and replaced grid-plus-full-training with random sampling under an asynchronous successive-halving scheduler, killing weak trials after a small fraction of an epoch budget.</p>
+<p><strong>How:</strong> A dozen-line change to a Ray Tune <code>Tuner</code> with an <code>ASHAScheduler</code>, like Code 21.1.2, plus a <code>tune.report</code> call inside the existing training loop to surface intermediate validation scores.</p>
+<p><strong>Result:</strong> The new run examined roughly eight times as many configurations within the same GPU-day budget and found a configuration about three points of mAP better, because the cluster stopped spending whole days training detectors that were visibly weak by the first checkpoint.</p>
+<p><strong>Lesson:</strong> A saturated cluster is not a productive one. Utilization measures parallel efficiency; what the sweep was missing was compute efficiency, and that is bought by allocation policy, not more hardware.</p>
+</div>
+
+<h2>5. The Frontier: Tuning That Transfers and Tuning That Tunes Itself <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The most active recent direction in this area attacks the budget problem from a different angle: rather than searching more cleverly, make the search shorter or unnecessary. The cleanest example is hyperparameter transfer through maximal-update parametrization, the muP work of Yang and colleagues, extended in the muTransfer line (Yang et al., 2021 onward). The idea is to parametrize a network so that the best hyperparameters are stable as the model grows, which lets you tune a small, cheap proxy model and transfer the winning configuration directly to a model orders of magnitude larger, skipping the catastrophically expensive search that tuning a frontier model directly would require. For the largest training runs, this turns hyperparameter search from a distributed-compute problem into a one-time small-scale calibration.</p>
+<p>A second strand pushes autoML toward genuine self-tuning. Modern frameworks combine model-based sampling (the tree-structured Parzen estimators and Gaussian-process methods behind Optuna and similar tools) with multi-fidelity allocation in a single loop, and recent systems use the search history itself, sometimes summarized by a language model, to warm-start the sampler and recommend promising regions before any trial runs. The through-line of all of this work, from 2024 into 2026, is the same reframing this section opened with: the binding constraint in distributed search is compute spent, not machines coordinated, so the research that matters is research that spends fewer GPU-hours per unit of model quality, whether by transferring known-good settings, by allocating adaptively, or by learning across searches what good settings tend to look like.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Hyperparameter Transfer and Self-Tuning AutoML (2024 to 2026)</div>
+<p>Three lines define the current frontier. First, <strong>hyperparameter transfer via muP / muTransfer</strong> (Yang et al.) parametrizes networks so that optimal learning rates and related settings are invariant to width, letting practitioners tune a tiny proxy and transfer to a frontier-scale model, a technique now standard in several large open training efforts. Second, <strong>integrated model-based plus multi-fidelity search</strong>, the combination of Bayesian sampling with Hyperband-style allocation (the BOHB lineage), continues to be hardened in Ray Tune and Optuna for cluster-scale use. Third, an emerging <strong>LLM-assisted autoML</strong> line uses language models to warm-start samplers from prior search histories and natural-language priors over the space. All three share one premise: at frontier scale the cost of search dominates, so the win is in fewer trials and cheaper trials, not faster parallelism. We build toward the sampling half of this story in <a href="section-21.2.html">Section 21.2</a> and the allocation half in <a href="section-21.4.html">Section 21.4</a>.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Grad-Student Descent</div>
+<p>Before any of these methods existed, the dominant hyperparameter optimization algorithm in research labs had a name: grad-student descent. A graduate student stares at a loss curve, mutters "the learning rate is too high," changes it, and reruns. It is multi-fidelity (you kill bad runs by hitting Ctrl-C), it is model-based (the model is the student's intuition), and it does not parallelize, because there is only one student. Everything in this chapter can be read as an attempt to replace that student with a scheduler that never sleeps and never gets attached to a configuration it spent all night on.</p>
+</div>
+<p>We now have the frame for the entire chapter. Search is embarrassingly parallel, so parallel efficiency comes free, but compute efficiency does not, and the difference between a wasteful sweep and a smart one is entirely a matter of which configurations get compute and how much. The next section opens the first movement, smarter sampling, by comparing the three foundational strategies, grid, random, and Bayesian optimization, and showing why random search beats grid search badly enough that grid search should rarely be your first choice. That comparison begins in <a href="section-21.2.html">Section 21.2</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.1.1: Where Did the GPU-Hours Go? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A team reports that their 512-trial sweep kept 128 GPUs at 99% utilization for three days and call it a success because no hardware sat idle. Explain why high utilization is the wrong success metric for a hyperparameter search, and describe two searches that have identical utilization but differ by an order of magnitude in the quality of the configuration they return for the same GPU-hours. Which of the three problems from Section 4 (sampling, allocation, scheduling) does utilization completely fail to capture?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.1.2: Make Early Stopping Backfire <span class="exercise-type coding">Coding</span></div>
+<p>Modify the <code>learning_curve</code> in Code 21.1.1 so that a configuration's early loss is <em>uninformative</em> about its final loss (for example, make the early epochs dominated by noise that washes out only late in training, so the best final configurations look mediocre at epoch one). Re-run both strategies. Show that early stopping's advantage shrinks or reverses, and explain in terms of the two empirical facts from Section 2 exactly which assumption early stopping depends on. What does this imply about when multi-fidelity search is safe to use?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.1.3: The Break-Even Point for Smarter Search <span class="exercise-type analysis">Analysis</span></div>
+<p>Suppose a full trial costs $T$ epochs, the fraction of configurations worth deploying is $p$, and a perfect early-stopping rule can identify and kill a doomed trial after $\alpha T$ epochs for some $\alpha \in (0,1)$. With a fixed budget of $B$ epoch-units, write an expression for the expected number of strong configurations examined under naive full-training search versus under ideal early stopping. For what values of $p$ and $\alpha$ does early stopping examine at least ten times as many strong configurations? Connect your answer to why the gap in Output 21.1.1 was so large, and use it to predict how the gap would change if good configurations became more common.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html"><span class="nav-label">Chapter Overview</span><span class="nav-num">Chapter 21</span><span class="nav-title">Distributed Hyperparameter Search and AutoML</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 21</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Hyperparameter Search and AutoML</span></a>
+<a class="next" href="section-21.2.html"><span class="nav-label">Next</span><span class="nav-num">Section 21.2</span><span class="nav-title">Grid, Random, and Bayesian Optimization</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

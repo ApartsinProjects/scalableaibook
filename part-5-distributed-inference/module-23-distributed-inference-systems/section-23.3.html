@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 23.3: Online vs Batch Inference Across a Fleet. The same model, two opposite tunings: low-latency small-batch online serving versus high-throughput large-batch offline scoring, and the hybrid patterns that share one fleet between them." name="description"/>
+<title>Section 23.3: Online vs Batch Inference Across a Fleet | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 23: Distributed Inference Systems</a></div>
+<h1>Online vs Batch Inference Across a Fleet</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"In the morning I answer one customer in nine milliseconds and feel important. At night I answer nine hundred million of them in my sleep and nobody thanks me. Same weights, opposite life."</p>
+<cite>A Model Serving Two Shifts</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The same trained model serves two completely different workloads, and the fleet must be tuned in opposite directions for each.</strong> Online serving answers a stream of live requests under a strict latency budget, so the fleet keeps batches tiny and headroom plentiful, optimizing for tail latency and elasticity. Offline batch inference scores a fixed, enormous dataset where no one is waiting, so the fleet packs items into the largest batches the hardware will hold, runs at maximum utilization, and rents the cheapest preemptible capacity it can find. Identical weights, identical math, yet the throughput and the cost per item differ by more than two orders of magnitude purely because of how the work is grouped. This section shows why the two regimes pull apart, how a single fleet can run both at once through priority queues and idle-capacity reuse, and how large-scale batch inference becomes a distributed data job that maps a model over sharded inputs.</p>
+</div>
+<p>Chapter 22 established the per-node serving economics: how a single accelerator batches requests, pages a KV cache, and turns floating-point throughput into answered queries. We carry those numbers up to the fleet now, and the first thing the fleet forces us to confront is that "serving the model" is not one task but two. A request that a user is waiting for and a corpus that a nightly job is grinding through place opposite demands on the same hardware. The processing-mode distinction we drew in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.5.html">Section 1.5</a>, between work that must answer as it arrives and work that can be accumulated and swept in bulk, returns here as the central design axis of an inference fleet. Get the regime wrong and you either blow the latency budget or burn money scoring a backlog one item at a time.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram contrasting the online path, where individual live requests flow through tiny batches to low-latency replicas, against the offline path, where a sharded dataset is mapped over large batches on preemptible workers at maximum utilization.">
+<defs>
+<marker id="arr233" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b233 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w233 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g233 { fill:#eef7f0; stroke:#2f7d4f; stroke-width:1.6; }
+.t233 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.u233 { font:600 13px sans-serif; fill:#7a4310; text-anchor:middle; }
+.s233 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l233 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr233); }
+.d233 { font:700 13px sans-serif; fill:#14385c; text-anchor:middle; }
+</style>
+<text class="d233" x="220" y="24">Online: low latency, small batch</text>
+<line x1="20" y1="34" x2="420" y2="34" stroke="#c7d2de" stroke-width="1"/>
+<circle cx="60" cy="70" r="9" class="b233"/>
+<circle cx="60" cy="100" r="9" class="b233"/>
+<circle cx="60" cy="130" r="9" class="b233"/>
+<text class="s233" x="60" y="160">live requests</text>
+<rect class="b233" x="150" y="70" width="120" height="62" rx="8"/>
+<text class="t233" x="210" y="96">tiny batch</text>
+<text class="s233" x="210" y="116">(1 to 8 items)</text>
+<rect class="b233" x="320" y="58" width="92" height="40" rx="8"/>
+<text class="t233" x="366" y="83">replica A</text>
+<rect class="b233" x="320" y="106" width="92" height="40" rx="8"/>
+<text class="t233" x="366" y="131">replica B</text>
+<path class="l233" d="M 72 100 L 146 100"/>
+<path class="l233" d="M 270 92 L 316 80"/>
+<path class="l233" d="M 270 110 L 316 124"/>
+<text class="s233" x="366" y="172">answer in milliseconds, SLO bound</text>
+<text class="s233" x="210" y="200">headroom kept free for traffic spikes</text>
+<line x1="455" y1="40" x2="455" y2="320" stroke="#c7d2de" stroke-width="1.4" stroke-dasharray="5 4"/>
+<text class="u233" x="675" y="24">Offline: high throughput, large batch</text>
+<line x1="490" y1="34" x2="860" y2="34" stroke="#e3cdb0" stroke-width="1"/>
+<rect class="g233" x="500" y="62" width="120" height="78" rx="8"/>
+<text class="t233" x="560" y="92">sharded</text>
+<text class="t233" x="560" y="110">dataset</text>
+<text class="s233" x="560" y="130">(shards 1..M)</text>
+<rect class="w233" x="690" y="56" width="150" height="34" rx="7"/>
+<text class="u233" x="765" y="78">worker: batch 512+</text>
+<rect class="w233" x="690" y="98" width="150" height="34" rx="7"/>
+<text class="u233" x="765" y="120">worker: batch 512+</text>
+<rect class="w233" x="690" y="140" width="150" height="34" rx="7"/>
+<text class="u233" x="765" y="162">worker: batch 512+</text>
+<path class="l233" d="M 622 92 L 686 73"/>
+<path class="l233" d="M 622 105 L 686 115"/>
+<path class="l233" d="M 622 118 L 686 157"/>
+<text class="s233" x="765" y="200">100% utilization on preemptible / spot GPUs</text>
+<text class="s233" x="675" y="228">latency irrelevant; cost per item is the target</text>
+<rect class="b233" x="150" y="250" width="600" height="86" rx="10"/>
+<text class="d233" x="450" y="282">One model, opposite tunings</text>
+<text class="s233" x="450" y="306">small batch buys latency and elasticity; large batch buys throughput and cheap cost-per-item</text>
+<text class="s233" x="450" y="324">a shared fleet runs both, with priorities deciding who waits</text>
+</svg>
+<figcaption><strong>Figure 23.3.1:</strong> The two serving regimes on one fleet. On the left, live requests flow through tiny batches to latency-bound replicas that keep spare headroom for spikes. On the right, a sharded dataset is mapped over large batches on preemptible workers running flat out, where only cost per item matters. The lower band states the trade the rest of the section quantifies: the same weights, tuned in opposite directions.</figcaption>
+</figure>
+
+<h2>1. Two Regimes, One Set of Weights <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Online (real-time) serving handles requests that arrive continuously and unpredictably, each attached to a caller who is waiting for the answer. A search ranker, a chat assistant, a fraud check at the point of sale: the defining constraint is a latency service-level objective (SLO), usually stated as a tail percentile such as "99 percent of requests answered within 200 milliseconds." Because a human or a downstream service is blocked on the result, the fleet cannot wait to accumulate a big batch; it must run whatever has arrived, now. Small batches mean each accelerator is rarely full, so online serving deliberately trades hardware efficiency for responsiveness, and it keeps spare replicas idle so that a sudden burst of traffic does not push the tail latency past the SLO.</p>
+<p>Offline (batch) inference is the opposite situation. You hold a fixed, often enormous dataset and you must run the model over every item: embed an entire document corpus for a retrieval index, label a backlog of millions of images, score a held-out set for an evaluation, or precompute recommendations for every user overnight. Nobody is waiting on any individual result; the only things that matter are total throughput and total cost. So the fleet does everything online serving refuses to do. It forms the largest batches the device memory allows, runs every accelerator at full utilization, and, because the job can be paused and resumed, runs on the cheapest preemptible or spot capacity available, the same economics we exploited for elastic training in <a href="../../part-4-parallel-deep-learning/module-18-elastic-fault-tolerant-training/section-18.6.html">Section 18.6</a>.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Same Model, Opposite System Tuning</div>
+<p>Online and offline inference run identical weights through identical math, yet their optimal system configurations are mirror images. Online optimizes the tail of the latency distribution and pays for elasticity with idle headroom and tiny batches. Offline optimizes throughput and cost by filling every batch and saturating every device on the cheapest interruptible hardware. The knob that separates them, batch size, also sets which resource you are spending: small batches spend money to buy latency, large batches spend latency to buy throughput. A fleet that confuses the two either misses its SLO or scores a corpus at a hundred times the necessary cost.</p>
+</div>
+
+<h2>2. The Cost of a Grouping Decision <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The two regimes diverge because every forward call carries a fixed overhead that is paid once per call regardless of how many items ride inside it: request handling, kernel launch, host-to-device dispatch, and framework bookkeeping. Let $o$ be that fixed per-call overhead in seconds, let $c$ be the marginal compute time each item adds, and let $b$ be the batch size. The wall-clock time for one forward call is $o + b\,c$, so the time attributed to each item is</p>
+$$t_{\text{item}}(b) = \frac{o + b\,c}{b} = \frac{o}{b} + c.$$
+<p>At batch size one, every item pays the full overhead $o$; as $b$ grows, the $o/b$ term collapses toward zero and the per-item time approaches the irreducible compute floor $c$. Multiply by the rented price of the hardware and you get the quantity that decides an offline budget, the cost per million items,</p>
+$$\text{cost}_{1\text{M}}(b) = 10^{6} \cdot t_{\text{item}}(b) \cdot \frac{p}{3600},$$
+<p>where $p$ is the dollars-per-hour price of the instance. Two levers move this number: the batch size $b$ (which shrinks $t_{\text{item}}$ through amortization) and the price $p$ (which the offline job lowers by accepting preemptible capacity). Online serving cannot pull either lever, because a large $b$ means waiting for a batch to fill and a preemptible instance means a request can vanish mid-flight. The code below makes both terms concrete on one model.</p>
+<p>The script runs the same small multilayer perceptron in both regimes. Online uses batch size one and reports the per-request latency; offline uses a large batch and reports the amortized per-item time, then prices each on its own hardware tier. The fixed per-call overhead $o$ and the per-item compute $c$ are made explicit constants and the wall-clock of a call is modeled as $o + c\,b$, so the amortization is visible and the printed numbers are exact rather than at the mercy of one machine's clock; the real matmul still runs to show the answer is identical in both regimes.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+D, H, C = 256, 512, 16           # input dim, hidden, classes: a small MLP "model"
+W1 = (rng.standard_normal((D, H)) / np.sqrt(D)).astype(np.float32)
+W2 = (rng.standard_normal((H, C)) / np.sqrt(H)).astype(np.float32)
+
+# A forward call costs a FIXED per-call overhead O_MS (request handling, kernel
+# launch, host/device dispatch, framework bookkeeping) plus a small marginal
+# compute C_MS per item. We model the cost analytically so the result is exact
+# and reproducible, and still run the real matmul to show the answer is identical.
+O_MS, C_MS = 6.0, 0.18           # fixed per-call overhead (o) and per-item compute (c)
+
+def score(batch):                                # the real forward pass (the answer)
+    h = np.maximum(batch @ W1, 0.0)              # ReLU hidden layer
+    return h @ W2                                # logits
+def call_ms(b): return O_MS + C_MS * b           # modeled wall-clock of one call: o + c*b
+
+DOLLARS_PER_HOUR_ONLINE = 3.00   # on-demand, reserved for low tail latency
+DOLLARS_PER_HOUR_BATCH  = 0.90   # preemptible / spot, ~70% cheaper
+LATENCY_SLO_MS          = 50.0   # online tail-latency budget per request
+
+def measure(batch_size):
+    data = rng.standard_normal((batch_size, D)).astype(np.float32)
+    score(data)                                  # run it; the logits are the answer
+    per_batch_ms = call_ms(batch_size)           # modeled time of the forward call
+    return per_batch_ms / batch_size / 1000.0, per_batch_ms   # per-item s, per-batch ms
+
+def cost_per_million(per_item_s, price_per_hr):
+    return 1e6 * per_item_s * (price_per_hr / 3600.0)
+
+online_pi, online_ms = measure(batch_size=1)     # one request at a time
+batch_pi,  batch_ms  = measure(batch_size=512)   # large offline batch
+
+online_iph = 3600.0 / online_pi;  batch_iph = 3600.0 / batch_pi
+online_cpm = cost_per_million(online_pi, DOLLARS_PER_HOUR_ONLINE)
+batch_cpm  = cost_per_million(batch_pi,  DOLLARS_PER_HOUR_BATCH)
+
+print("Same model (256->512->16 MLP), one accelerator, two serving regimes\n")
+hdr = f"{'regime':&lt;9}{'batch':&gt;7}{'per-item ms':&gt;13}{'items/hour':&gt;15}{'$/1M items':&gt;13}{'batch ms':&gt;11}"
+print(hdr); print("-" * len(hdr))
+for name, bs, pi, iph, cpm, bms in [
+    ("online",  1,   online_pi, online_iph, online_cpm, online_ms),
+    ("offline", 512, batch_pi,  batch_iph,  batch_cpm,  batch_ms),
+]:
+    print(f"{name:&lt;9}{bs:&gt;7}{pi*1e3:&gt;13.4f}{iph:&gt;15,.0f}{cpm:&gt;13.4f}{bms:&gt;11.2f}")
+
+print(f"\nonline per-request latency  : {online_ms:6.2f} ms  (SLO {LATENCY_SLO_MS:.0f} ms -> within budget)")
+print(f"throughput gain offline     : {batch_iph/online_iph:6.1f}x more items/hour")
+print(f"cost gain offline           : {online_cpm/batch_cpm:6.1f}x cheaper per million items")
+</code></pre>
+<div class="code-caption"><strong>Code 23.3.1:</strong> One model, two regimes. The <code>online</code> row uses batch size one and reports its per-request latency against the SLO; the <code>offline</code> row uses a large batch on cheaper preemptible pricing and reports the amortized cost per million items. Only the grouping and the price differ.</div>
+<pre><code class="language-text">Same model (256->512->16 MLP), one accelerator, two serving regimes
+
+regime     batch  per-item ms     items/hour   $/1M items   batch ms
+--------------------------------------------------------------------
+online         1       6.1800        582,524       5.1500       6.18
+offline      512       0.1917     18,777,506       0.0479      98.16
+
+online per-request latency  :   6.18 ms  (SLO 50 ms -> within budget)
+throughput gain offline     :   32.2x more items/hour
+cost gain offline           :  107.4x cheaper per million items</code></pre>
+<div class="code-caption"><strong>Output 23.3.1:</strong> The offline regime answers roughly 32 times more items per hour and costs about 107 times less per million items, while the online regime stays comfortably inside its 50 millisecond latency budget. The throughput gain comes from amortizing the fixed overhead across a large batch; the extra cost gain on top of it comes from the cheaper preemptible price.</div>
+<p>The numbers make the trade concrete. The online regime pays the full $6.18$ millisecond overhead on every single request, which is fine because a person is waiting and the budget is generous, but it means each item costs about five dollars per million. The offline regime spreads that same overhead across $512$ items, drops the per-item time by more than thirty times, and then takes a further discount by running on spot hardware, landing near five cents per million. Nothing about the model changed; only the decision of how to group the work and where to run it. This is the same exactness-versus-cost story from <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>, seen from the serving side: the answer each item receives is identical in both regimes, but the system cost of producing it is not.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Embedding Backlog That Cost a Hundred Times Too Much</div>
+<p><strong>Who:</strong> A platform engineer at a document-management company building a semantic search feature.</p>
+<p><strong>Situation:</strong> A backlog of 400 million stored documents had to be embedded once to populate a vector index before search could launch.</p>
+<p><strong>Problem:</strong> The team reused the production online embedding endpoint, sending documents one at a time through the same low-latency service that served live queries.</p>
+<p><strong>Dilemma:</strong> Keep the simple path and let the one-at-a-time job run for weeks on expensive reserved GPUs, or build a separate offline pipeline that batches aggressively on cheap preemptible capacity but cannot reuse the existing endpoint.</p>
+<p><strong>Decision:</strong> They built the offline pipeline, because the backlog was a fixed dataset with no latency requirement, exactly the case where batch economics dominate.</p>
+<p><strong>How:</strong> They sharded the document table, ran a batch-inference job that formed batches of several hundred documents per forward call, and placed the workers on spot instances that checkpointed progress per shard so a preemption only lost the current shard.</p>
+<p><strong>Result:</strong> The job finished in under two days instead of an estimated five weeks, at a small fraction of the original projected cost, while the online endpoint kept serving live queries undisturbed, mirroring the gap in Output 23.3.1.</p>
+<p><strong>Lesson:</strong> A one-time scoring job over a fixed corpus is an offline workload, never an online one. Pushing it through a latency-optimized endpoint pays the per-request overhead and the on-demand price on every item, the two costs batch inference exists to avoid.</p>
+</div>
+
+<h2>3. Batch Inference as a Distributed Data Job <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Once the dataset is large enough that one machine cannot sweep it in reasonable time, offline inference stops being a serving problem and becomes a distributed data-processing problem. The pattern is the map step you already know: partition the input into shards, run the same model over each shard in parallel on many workers, and write the per-item outputs back to storage. The model is the map function, the corpus is the partitioned input, and there is no reduce step unless you are aggregating, which makes batch inference one of the cleanest embarrassingly parallel jobs in the book. The input side is itself a distributed-data concern: the sharded reading, the columnar formats, and the shuffle-free partitioning come straight from the DataFrame machinery of <a href="../../part-2-distributed-data/module-07-spark-dataframes/index.html">Chapter 7</a>, now feeding a model instead of an aggregation.</p>
+<p>Framing batch inference this way buys two things. First, fault tolerance is free: because each shard is independent and outputs are written per shard, a preempted worker only forces the re-execution of its current shard, the same re-execution model that made MapReduce robust in <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a>, which is precisely what makes running on cheap interruptible capacity safe. Second, throughput scales by adding workers, with no communication between them, so the job has none of the all-reduce tax that limits distributed training. The bottleneck is rarely the model; it is feeding data to the accelerators fast enough, which is why a batch-inference job is tuned by overlapping data loading with compute and by sizing the batch to keep every device saturated.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Ray Data Maps a Model Over Sharded Inputs</div>
+<p>The from-scratch view treats batch inference as a hand-written shard loop with manual batching, checkpointing, and worker placement. A modern batch-inference framework collapses that to a streaming map over a dataset, with the sharding, batch formation, accelerator placement, and preemption recovery handled internally. Ray Data expresses the entire job as one <code>map_batches</code> call:</p>
+<pre><code class="language-python">import ray, numpy as np
+
+class Embedder:                          # the model is loaded once per worker
+    def __init__(self):
+        self.model = load_model()        # heavy weights, paid once, not per batch
+    def __call__(self, batch: dict) -&gt; dict:
+        batch["embedding"] = self.model(batch["text"])   # run on a whole batch
+        return batch
+
+ds = ray.data.read_parquet("s3://corpus/")               # sharded, streamed input
+out = ds.map_batches(                                    # the model IS the map fn
+    Embedder,
+    batch_size=512,                                      # large offline batch
+    concurrency=64,                                      # 64 parallel GPU workers
+    num_gpus=1,
+)
+out.write_parquet("s3://embeddings/")                    # per-shard outputs
+</code></pre>
+<div class="code-caption"><strong>Code 23.3.2:</strong> The shard loop of Section 3 as one Ray Data pipeline. Roughly a hundred lines of manual sharding, batching, GPU placement, and preemption handling collapse to a single <code>map_batches</code>; the framework streams shards through 64 workers, forms large batches, and re-runs only the shards an interruption lost. Spark offers the same shape through <code>mapInPandas</code> or a pandas UDF.</div>
+</div>
+
+<h2>4. Sharing One Fleet: Priorities and Idle Capacity <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Running separate fleets for online and offline work is simple but wasteful, because the online fleet is provisioned for peak traffic and sits half-idle the rest of the day. The hybrid patterns reclaim that waste by letting both workloads share the same accelerators, with a scheduler deciding who runs when. The first pattern is a priority queue: latency-critical online requests are admitted ahead of best-effort batch work on the same devices, so the batch job soaks up whatever capacity the online traffic is not using and yields it instantly when a live request arrives. The batch work runs as a low-priority background tenant, preemptible by the foreground service, which is exactly the disposition that lets it tolerate interruption.</p>
+<p>The second pattern is temporal: online traffic follows a daily cycle, so the idle troughs, nights and weekends for a consumer service, are exactly when a large offline backlog can run on the otherwise-empty online fleet at no extra hardware cost. This turns the online fleet's elasticity headroom, the spare replicas it keeps for spikes, into useful offline throughput whenever the spikes are not happening. Both patterns depend on the scheduler being able to preempt and resume the batch job cleanly, which is why the distributed-data framing of Section 3 matters: a job built from independent, checkpointed shards can be paused and moved without losing work. The cluster-scheduling machinery that arbitrates these priorities, gang scheduling and preemption, is the subject of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>'s performance models and is developed fully when we reach cluster infrastructure later in the book.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Night Shift Nobody Schedules</div>
+<p>A consumer chat service at 3 a.m. is a stadium with the lights on and three people in the seats. The cheapest "new" GPUs a company can find are often the ones it already rents and leaves warming the data center overnight. Backfilling that idle online fleet with a batch job is less an optimization than a refusal to pay twice for silence.</p>
+</div>
+<p>There is a failure mode worth naming. If the batch tenant is not truly preemptible, or if its batches are so large that a single forward call holds the device for hundreds of milliseconds, then an online request arriving mid-batch waits behind it and the tail latency spikes. The remedy is to cap the batch tenant's maximum batch size on a shared device so that no single call blocks the accelerator longer than the online SLO can absorb. Sharing a fleet is therefore not free; it trades a little batch efficiency for the right to reuse idle capacity, and the cap is the price of admission. Multi-tenant GPU serving, where several models and tenants share devices under isolation guarantees, is the dedicated subject of <a href="../../part-2-distributed-data/module-09-stream-processing-online-ai/index.html">Chapter 9</a>'s online-processing patterns and the next section's autoscaling controls.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Cheap Offline LLM Inference at Scale (2024 to 2026)</div>
+<p>The online-versus-batch split has become a first-class product feature for large language models. Since 2024 the major providers ship asynchronous batch APIs (OpenAI's Batch API, Anthropic's Message Batches, Google's Vertex batch prediction) that accept a file of requests, run them offline within a 24-hour window, and charge roughly half the synchronous price, the productized form of the cost gap in Output 23.3.1. On the open-inference side, engines such as vLLM and SGLang expose offline batch entry points that pair continuous batching with prefix and KV-cache reuse so that a corpus of prompts sharing a long system preamble is scored far below its naive cost, and frameworks like Ray Data integrate vLLM directly as a batch-inference operator over sharded datasets. A parallel research thread targets throughput-optimal offline serving specifically, scheduling thousands of concurrent sequences to keep every accelerator saturated when no latency constraint applies, the regime where the only objective is items per dollar. The shared lesson is that batch inference is no longer an afterthought of an online stack; it is a separately engineered system with its own APIs, schedulers, and price.</p>
+</div>
+<p>We now have both regimes, the equation that separates them, the distributed-data framing that scales the offline one, and the hybrid patterns that let a single fleet serve both. The remaining question is how the fleet decides, moment to moment, how many replicas to keep running as live traffic rises and falls and as a batch queue drains. That control problem, driving replica count from GPU utilization and queue depth, is where <a href="section-23.4.html">Section 23.4</a> takes us next.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.3.1: Classify the Workload <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each task, decide whether it is fundamentally online or offline, and name the one property that decides it: (a) a chat assistant answering a user typing in a browser; (b) precomputing tomorrow's recommended items for all 50 million users overnight; (c) a content-moderation model that must flag a livestream within two seconds; (d) re-embedding an entire 200 million document corpus after upgrading the embedding model. For each offline case, state which cheaper hardware tier from Section 1 you would run it on and why a preemption would not corrupt the result.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.3.2: Find the Break-Even Batch Size <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 23.3.1 to sweep the batch size $b$ over the values 1, 2, 4, 8, 16, 32, 64, 128, 256, 512 and plot or print the per-item time $t_{\text{item}}(b)$ and the cost per million items for each. Using the model $t_{\text{item}}(b) = o/b + c$ from Section 2, fit $o$ and $c$ from two of your measurements and predict the per-item time at $b = 1024$; compare the prediction to a measured run. Then identify the batch size beyond which doubling $b$ cuts the per-item cost by less than 5 percent, and explain why an online fleet bound by a 50 millisecond SLO would still refuse to use it.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.3.3: Size the Shared-Fleet Cap <span class="exercise-type analysis">Analysis</span></div>
+<p>A shared fleet serves online requests under a 100 millisecond tail-latency SLO and backfills a low-priority batch job on the same GPUs. The batch job's forward call takes $0.2$ milliseconds per item plus a fixed $6$ millisecond overhead. If an online request can arrive at any instant and must wait for the current batch call to finish before it runs, derive the largest batch size the batch tenant may use so that this head-of-line wait never consumes more than 40 percent of the online SLO. State how the answer changes if the device supports preemption at the granularity of a single forward call, and connect your reasoning to the preemptible-shard design of Section 3.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-23.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 23.2</span><span class="nav-title">Replicas, Load Balancing, and Batch-Aware Routing</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 23</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Inference Systems</span></a>
+<a class="next" href="section-23.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 23.4</span><span class="nav-title">Autoscaling on GPU Utilization and Queue Depth</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

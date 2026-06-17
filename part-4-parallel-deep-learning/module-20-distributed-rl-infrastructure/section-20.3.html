@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 20.3: Distributed Experience Collection. Scaling the rollout side of reinforcement learning with vectorized environments, distributed CPU actors, and the environment-steps-per-second throughput math that keeps a GPU learner fed." name="description"/>
+<title>Section 20.3: Distributed Experience Collection | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 20: Distributed Reinforcement Learning Infrastructure</a></div>
+<h1>Distributed Experience Collection</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I stepped a thousand worlds at once so the learner would never go hungry. It still complained that the batch was late."</p>
+<cite>A Vectorized Actor Between Resets</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A reinforcement learning system is starved or fed by one number: how many environment steps per second its actors can produce.</strong> Unlike supervised training, where the data already exists on disk, an RL agent must generate its own data by acting in environments, and that generation is the bottleneck for most modern systems. The previous section split the work into actors that collect experience and learners that update the policy. This section scales the actor side: it batches many environments into one process (vectorization), spreads thousands of environment instances across many cheap CPU machines, and works out the throughput arithmetic that tells you how many actors a single GPU learner needs. The recurring tension is a hardware mismatch: environment simulation usually wants CPUs while the policy's forward pass wants a GPU, and every rollout architecture is a different answer to where that split should fall.</p>
+</div>
+<p>In <a href="section-20.2.html">Section 20.2</a> we drew the actor-learner architecture: actors run the current policy inside environments and emit transitions, a learner consumes those transitions and updates the policy, and the updated weights flow back to the actors. That diagram hides the question that decides whether the whole system is fast or slow. A learner on a modern accelerator can apply gradient updates extremely quickly; if it sits idle waiting for transitions to arrive, the accelerator you paid for is wasted. The job of distributed experience collection is to produce transitions fast enough, and cheaply enough, that the learner never waits. Everything in this section is in service of that single goal.</p>
+<p>We measure the rollout side in <strong>environment steps per second</strong>, the rate at which actors advance their environments and record transitions. This is the currency of RL infrastructure the way examples-per-second is the currency of supervised training. A step is one call to the environment's transition function: feed it an action, get back the next observation, a reward, and a done flag. Producing a step requires two things in sequence, an action from the policy and a transition from the environment, and the rest of this section is about making both of those happen at scale.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of distributed experience collection: on the left, many CPU actor machines each running a vectorized batch of environments; their transitions flow over the network into a central GPU learner on the right, which sends updated policy weights back to the actors.">
+<defs>
+<marker id="arr203" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr203b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.b203 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w203 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g203 { fill:#eaf5ee; stroke:#1f7a4d; stroke-width:1.6; }
+.t203 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.tg203 { font:600 13px sans-serif; fill:#1f7a4d; text-anchor:middle; }
+.s203 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l203 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr203); }
+.lw203 { fill:none; stroke:#b86b1f; stroke-width:1.8; marker-end:url(#arr203b); stroke-dasharray:5 4; }
+</style>
+<text class="t203" x="170" y="24">CPU actor machines (cheap, many)</text>
+<rect class="w203" x="40" y="44" width="260" height="74" rx="9"/>
+<text class="t203" x="170" y="66">Actor 1: vectorized envs</text>
+<rect class="b203" x="56" y="80" width="36" height="26" rx="4"/>
+<rect class="b203" x="98" y="80" width="36" height="26" rx="4"/>
+<rect class="b203" x="140" y="80" width="36" height="26" rx="4"/>
+<rect class="b203" x="182" y="80" width="36" height="26" rx="4"/>
+<rect class="b203" x="224" y="80" width="58" height="26" rx="4"/>
+<text class="s203" x="253" y="98">env B</text>
+<rect class="w203" x="40" y="134" width="260" height="50" rx="9"/>
+<text class="t203" x="170" y="156">Actor 2: vectorized envs</text>
+<text class="s203" x="170" y="173">small policy runs on CPU</text>
+<rect class="w203" x="40" y="200" width="260" height="50" rx="9"/>
+<text class="t203" x="170" y="222">Actor M: vectorized envs</text>
+<text class="s203" x="170" y="239">B environments per process</text>
+<text class="s203" x="170" y="278">each actor: ~10^3 to 10^4 env-steps/s</text>
+<text class="s203" x="170" y="296">CPU-bound simulation + small forward pass</text>
+<path class="l203" d="M 300 100 L 470 100 L 470 168"/>
+<path class="l203" d="M 300 159 L 430 159 L 430 168"/>
+<path class="l203" d="M 300 225 L 410 225 L 410 240"/>
+<text class="s203" x="392" y="120">transitions</text>
+<text class="s203" x="392" y="134">(serialized, over network)</text>
+<rect class="g203" x="560" y="150" width="270" height="92" rx="10"/>
+<text class="tg203" x="695" y="180">GPU learner (few, expensive)</text>
+<text class="s203" x="695" y="202">batches transitions, updates policy</text>
+<text class="s203" x="695" y="220">must never sit idle waiting</text>
+<path class="lw203" d="M 560 215 L 360 215 L 360 252 L 170 252"/>
+<text class="s203" x="450" y="338" fill="#b86b1f">updated policy weights broadcast back to all actors</text>
+<line x1="430" y1="320" x2="430" y2="305" stroke="#b86b1f" stroke-width="1.6" stroke-dasharray="5 4"/>
+</svg>
+<figcaption><strong>Figure 20.3.1:</strong> Distributed experience collection. Many cheap CPU actor machines (orange) each step a vectorized batch of $B$ environments and run a small policy locally; their transitions are serialized and shipped over the network into a few expensive GPU learners (green), which broadcast updated weights back (dashed). The CPU/GPU split is the central design choice: simulation is CPU-bound, while the learner's gradient step wants a GPU. The throughput target is to make the actors' combined environment-steps-per-second exceed what the learner can consume.</figcaption>
+</figure>
+
+<h2>1. Vectorized Environments: Batch the Rollout in One Process <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The first lever costs no extra machines at all. A naive rollout loop advances one environment at a time: call the policy for one observation, get one action, step one environment, repeat. In an interpreted language this is dominated by per-call overhead, the Python interpreter dispatches the same handful of operations millions of times, and each call processes a single tiny observation. A <strong>vectorized environment</strong> instead holds $B$ independent environment instances and advances all of them together, so one Python-level call processes a batch of $B$ observations and emits $B$ transitions. The policy's forward pass also becomes a single batched matrix multiply over $B$ observations instead of $B$ separate ones, which is exactly the shape that both CPUs and GPUs execute most efficiently.</p>
+<p>The throughput gain is large and comes for free in machine count. If the per-step Python and dispatch overhead is the dominant cost, batching $B$ environments amortizes that fixed cost across $B$ transitions, so a single process can reach an order of magnitude more environment steps per second. The demonstration below measures this directly: it times a scalar single-environment loop against a vectorized loop over a batch, both doing the same per-step arithmetic, and reports the speedup.</p>
+<pre><code class="language-python">import time, math
+import numpy as np
+
+STATE_DIM = 64
+
+def env_step_scalar(state):                 # one transition, pure-Python loop
+    s = 0.0
+    for i in range(STATE_DIM):
+        s += math.sin(state * 0.001 + i) * 1.000001
+    return s
+
+def run_single_env(num_steps):              # advance ONE env, num_steps times
+    state, t0 = 1.0, time.perf_counter()
+    for _ in range(num_steps):
+        state = env_step_scalar(state)
+    return num_steps / (time.perf_counter() - t0)        # env-steps per second
+
+def run_vectorized_env(num_steps, batch):   # advance B envs together each step
+    state = np.ones(batch); idx = np.arange(STATE_DIM, dtype=np.float64)
+    t0 = time.perf_counter()
+    for _ in range(num_steps):
+        state = np.sin(state[:, None] * 0.001 + idx).sum(axis=1) * 1.000001
+    return (num_steps * batch) / (time.perf_counter() - t0)
+
+STEPS, BATCH = 20_000, 256
+single = run_single_env(STEPS)
+vec    = run_vectorized_env(STEPS, BATCH)
+print(f"single-env throughput   : {single:,.0f} env-steps/s")
+print(f"vectorized (B={BATCH}) throughput : {vec:,.0f} env-steps/s")
+print(f"speedup from batching   : {vec / single:,.1f}x")
+
+# How many CPU actors keep one GPU learner fed? Model a realistic per-actor rate.
+learner_demand = 512 / (8.0 / 1000.0)       # 512 transitions every 8 ms learner step
+realistic_actor_sps = 1_000.0               # one actor running a real game/sim
+print()
+print(f"learner demand          : {learner_demand:,.0f} transitions/s")
+print(f"per-actor supply (real) : {realistic_actor_sps:,.0f} env-steps/s")
+print(f"actors to feed 1 learner: {math.ceil(learner_demand / realistic_actor_sps)}")
+</code></pre>
+<div class="code-caption"><strong>Code 20.3.1:</strong> Single-environment versus vectorized stepping, plus an actor-count model. The scalar loop and the batched loop perform the same per-step arithmetic; the only difference is that the vectorized version advances $B = 256$ environments per Python iteration, amortizing interpreter overhead across the batch.</div>
+<pre><code class="language-text">single-env throughput   : 130,049 env-steps/s
+vectorized (B=256) throughput : 1,728,380 env-steps/s
+speedup from batching   : 13.3x
+
+learner demand          : 64,000 transitions/s
+per-actor supply (real) : 1,000 env-steps/s
+actors to feed 1 learner: 64
+</code></pre>
+<div class="code-caption"><strong>Output 20.3.1:</strong> Batching 256 environments into one process raised throughput by 13.3 times with no extra machines. The actor-count model then shows that a learner demanding 64,000 transitions per second, fed by realistic 1,000-step-per-second actors, requires 64 actors running in parallel to stay busy.</div>
+<p>The 13.3 times speedup is the headline, and notice that the toy benchmark's vectorized rate is far higher than any real simulator would reach, because the per-step work here is trivial. That is why the actor-count model uses a deliberately realistic 1,000 steps per second for a single CPU actor running an actual game or physics engine. With that grounded number, one learner needs dozens of actors, which is precisely why the rollout side must be distributed across machines and not merely vectorized within one.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Rollout Currency Is Environment Steps Per Second</div>
+<p>An RL system's speed is governed by the slower of two rates: how fast actors produce transitions and how fast the learner consumes them. Vectorization raises the actor rate for free by amortizing interpreter overhead across a batch of environments; distribution raises it further by adding actor machines. The learner's accelerator is only worth its cost if the combined actor rate keeps it busy, so the first quantity to measure in any RL infrastructure is environment-steps-per-second, not floating-point operations or wall-clock per gradient step.</p>
+</div>
+
+<h2>2. The Throughput Math: How Many Actors Feed One Learner <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The actor-count calculation in Code 20.3.1 deserves to be written out, because it is the back-of-the-envelope that sizes every rollout fleet. Let a single actor produce $r_a$ environment steps per second. With $M$ actors running in parallel, the system's transition supply rate is</p>
+$$S = M \cdot r_a \quad \text{(transitions per second produced)}.$$
+<p>The learner consumes transitions in batches. If it processes $b$ transitions per gradient step and each step takes $t_\ell$ seconds, its demand rate is</p>
+$$D = \frac{b}{t_\ell} \quad \text{(transitions per second consumed)}.$$
+<p>To keep the learner busy without starving it, supply must at least meet demand, $S \ge D$, which rearranges into the number of actors you must provision:</p>
+$$M \ge \frac{D}{r_a} = \frac{b}{t_\ell \, r_a}.$$
+<p>With the numbers from Output 20.3.1, $b = 512$, $t_\ell = 8$ milliseconds, and $r_a = 1000$, this gives $M \ge 64$. The formula also tells you what each design lever does. A faster simulator (larger $r_a$) lowers the actor count linearly. A bigger learner batch (larger $b$) raises it. A slower learner step (larger $t_\ell$, perhaps because the policy grew) lowers the demand rate and so lowers the actor count, which is the counterintuitive observation that a heavier learner is easier to keep fed. Whenever supply exceeds demand, the surplus transitions pile up in a buffer, which is exactly the structure <a href="section-20.4.html">Section 20.4</a> builds out as the distributed replay buffer.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Idle Learner That Cost a Fortune</div>
+<p><strong>Who:</strong> An RL engineer training a control policy for a warehouse-robotics simulator on a single GPU learner plus a pool of CPU actors.</p>
+<p><strong>Situation:</strong> Training a policy that needed roughly two billion environment steps to converge, on a cloud cluster billed by the hour.</p>
+<p><strong>Problem:</strong> GPU utilization on the learner hovered around 15 percent; the expensive accelerator spent most of its time waiting for transitions to arrive.</p>
+<p><strong>Dilemma:</strong> Buy a second, faster learner GPU to "speed things up," or leave the learner alone and instead grow the cheap actor pool that was actually the bottleneck.</p>
+<p><strong>Decision:</strong> They measured first. One actor produced about 900 environment steps per second; the learner demanded near 60,000 transitions per second, so by $M \ge D / r_a$ they were running far too few actors.</p>
+<p><strong>How:</strong> They vectorized each actor to a batch of 64 environments and scaled the actor pool from 8 to 80 CPU instances, leaving the single learner untouched.</p>
+<p><strong>Result:</strong> Learner GPU utilization rose above 85 percent, wall-clock to convergence fell by roughly four times, and total cost dropped because the added capacity was cheap CPUs rather than a second GPU.</p>
+<p><strong>Lesson:</strong> Size the actor fleet from the throughput inequality, not from intuition. The accelerator is rarely the rollout bottleneck; the supply of environment steps almost always is.</p>
+</div>
+
+<h2>3. The CPU-GPU Split: Where Does Policy Inference Run? <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Producing one environment step requires two pieces of work with different hardware appetites. The environment's transition function, a physics integrator, a game engine, a market simulator, is almost always CPU-bound and does not vectorize onto a GPU cleanly. The policy's forward pass, by contrast, is a neural-network inference that runs fastest on a GPU, especially when batched. These two preferences pull in opposite directions, and the architecture you choose is essentially a decision about where to place the policy inference relative to the environment simulation.</p>
+<p>One option runs a small policy directly on the actor's CPU. The actor steps its vectorized environments and computes actions locally with no network round trip, which is simple and has low latency, but it wastes a GPU's inference speed and forces the policy to stay small enough to run acceptably on a CPU. This is the design implied by the cheap-CPU-actor fleet in Figure 20.3.1. The opposite option, central batched inference, gathers observations from many actors onto a dedicated inference GPU, runs one large batched forward pass, and returns actions; this keeps the policy on the hardware it prefers and lets a big model serve many actors, at the cost of a network hop on every step. That second design is the heart of the SEED RL architecture, which <a href="section-20.6.html">Section 20.6</a> develops in full alongside Ape-X and R2D2.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Actor That Refused to Phone Home</div>
+<p>Engineers sometimes discover that shrinking the policy until it runs on the actor's CPU beats a fancy central-inference setup, not because CPU inference is fast, but because the network round trip on every single environment step was quietly dominating everything. The cheapest packet is the one you never send. Always measure the round trip before you architect around avoiding it.</p>
+</div>
+<p>There is no universally correct placement; the right answer depends on policy size, environment cost, and network latency. A heavy vision policy serving a slow, expensive simulator favors central batched inference, because the forward pass dominates and a GPU is worth the network hop. A tiny policy on a fast, cheap environment favors local CPU inference, because the round trip would cost more than the inference it saves. The throughput inequality from Section 2 still governs either way: whichever placement yields the higher sustained environment-steps-per-second per dollar is the one to pick.</p>
+
+<h2>4. Heterogeneous Resources and GPU-Accelerated Simulators <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The classic rollout fleet is deliberately heterogeneous: many cheap CPU actors and a few expensive GPU learners, sized so the cluster spends its money where it produces value. This is a cost-aware placement problem, and it is exactly the kind of mixed-resource scheduling that <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/index.html">Chapter 33</a> treats in general: the cluster scheduler must pack CPU actor jobs and GPU learner jobs onto the right node types and keep them co-located enough that the transition stream does not cross a slow network link. Getting this placement wrong, scheduling actors far from the learner, or starving the learner of CPU nodes, undoes the throughput math no matter how cleverly the code is vectorized.</p>
+<p>A more recent shift rewrites the split entirely. <strong>GPU-accelerated simulators</strong> such as Isaac Gym and Brax run thousands of environment instances directly on the GPU, as a single massive batched simulation, so the environment step and the policy forward pass live on the same device and the CPU-to-GPU transfer of observations disappears. When the simulator itself is on the GPU, the rollout no longer waits on slow CPU physics or on the network, and a single GPU can produce environment steps at rates that previously required a large CPU cluster. The bottleneck moves: it is no longer the supply of transitions but the learner's ability to consume them and the memory needed to hold thousands of parallel environment states. We return to this frontier below.</p>
+<p>Whichever simulator hardware you use, the transitions still have to travel from where they are produced to where they are consumed, and that travel is not free. Each transition carries an observation, an action, a reward, and bookkeeping; serializing those structures and shipping them over the network costs CPU time on both ends and bandwidth in between. This is the same communication tax that <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> quantifies for collective operations, applied here to the experience stream. When observations are large (raw frames, point clouds), the serialization and network cost can rival the simulation cost, and practical systems compress observations, send only deltas, or move the policy to the data rather than the data to the policy.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Gymnasium Vector Envs and EnvPool</div>
+<p>You do not write the vectorized stepping loop of Code 20.3.1 by hand in practice. Gymnasium ships a vector-environment API that batches many environment instances behind one <code>step</code> call, and EnvPool implements the same idea in C++ with a thread pool, reaching far higher environment-steps-per-second than a pure-Python loop:</p>
+<pre><code class="language-python"># pip install gymnasium envpool
+import gymnasium as gym
+import numpy as np
+
+# Gymnasium: B independent envs stepped together, one batched call.
+envs = gym.make_vec("CartPole-v1", num_envs=256, vectorization_mode="sync")
+obs, _ = envs.reset(seed=0)
+actions = np.zeros(256, dtype=np.int64)            # your policy would produce these
+obs, rewards, terminated, truncated, info = envs.step(actions)   # 256 transitions
+print(obs.shape, rewards.shape)                    # (256, 4) (256,)
+
+# EnvPool: the same batched stepping, implemented in C++ for much higher throughput.
+# import envpool
+# pool = envpool.make("CartPole-v1", env_type="gymnasium", num_envs=256)
+</code></pre>
+<div class="code-caption"><strong>Code 20.3.2:</strong> The roughly twenty hand-written lines of vectorized stepping in Code 20.3.1 collapse to a single <code>gym.make_vec</code> call. Gymnasium and EnvPool handle the batched reset, the per-environment auto-reset on episode end, and the conversion of $B$ environments into one batched observation tensor; EnvPool additionally moves the stepping loop out of Python into a C++ thread pool.</div>
+</div>
+
+<h2>5. When Collection Stops Being the Bottleneck <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>For most of RL's history the rollout was the bottleneck, which is why this section exists. The arithmetic of Section 2 assumed actor supply was the scarce quantity and the learner was easy to keep busy. GPU-accelerated simulators flip that assumption: when a single GPU produces millions of environment steps per second, the learner, not the actor, becomes the constraint, and the design question changes from "how many actors do I need" to "how do I make the learner consume transitions fast enough to use them all before they go stale." That shift reshapes the rest of this chapter, because off-policy correction (<a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a> covers the optimization background) and replay-buffer design both exist to let a learner safely consume experience that its current policy did not generate.</p>
+<p>It also reframes the synchronous-versus-asynchronous choice that <a href="../../part-6-multi-agent-systems/module-30-multi-agent-reinforcement-learning/index.html">Chapter 30</a> revisits for multi-agent settings. When actors and learner run on the same GPU in lockstep, the rollout is naturally synchronous and there is no policy staleness; when thousands of CPU actors stream into a remote learner, some actors are always running a slightly old policy, and the system must tolerate that lag. The throughput math is the same in both regimes, but where the bottleneck sits decides which complications you must engineer around, and that is the thread <a href="section-20.4.html">Section 20.4</a> picks up by giving the surplus transitions a place to live.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Massively Parallel On-GPU Simulation (2024 to 2026)</div>
+<p>The dominant rollout-scaling trend of the past few years moves the environment onto the accelerator. NVIDIA's Isaac Lab (the successor to Isaac Gym) and Google DeepMind's Brax and MuJoCo XLA (MJX) run tens of thousands of robotics environments as one batched GPU simulation, and the Madrona engine generalizes the idea to many environment types, reporting millions of environment steps per second from a single GPU. Recent work pushes this further with end-to-end JAX RL stacks where simulation, policy inference, and the learner update all stay on-device and compile into one graph, removing the CPU-to-GPU transfer and the network hop entirely for single-node training. The research questions have shifted accordingly: how to scale these on-GPU rollouts across multiple GPUs without reintroducing the serialization tax, how to keep thousands of parallel environment states in limited GPU memory, and how to balance a learner against a simulator that can now out-produce it. The actor-count inequality of Section 2 still holds; the frontier is making $r_a$ so large that $M$ collapses toward one very busy device.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.3.1: Size the Actor Fleet <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A learner processes a batch of $b = 1024$ transitions per gradient step and each step takes $t_\ell = 20$ milliseconds. Each CPU actor sustains $r_a = 800$ environment steps per second. Using the inequality $M \ge b / (t_\ell\, r_a)$ from Section 2, compute the minimum number of actors needed to keep the learner fed. Now suppose you replace the CPU actors with a single GPU-accelerated simulator producing $2 \times 10^6$ steps per second; explain in words what becomes the new bottleneck and why adding more simulators would not help.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.3.2: Measure Your Own Vectorization Curve <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 20.3.1 to sweep the batch size $B$ over the values 1, 4, 16, 64, 256, and 1024, recording environment-steps-per-second at each. Plot or tabulate throughput against $B$. Identify the point where the curve flattens, the batch size beyond which adding more environments per process stops helping, and explain what fixed cost has been fully amortized at that point. Relate the flattening to the CPU-GPU split of Section 3: would the flattening point move if the per-step work were a GPU forward pass instead of CPU arithmetic?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.3.3: The Serialization Tax <span class="exercise-type analysis">Analysis</span></div>
+<p>An actor produces transitions whose observations are raw $84 \times 84 \times 4$ uint8 image stacks (one byte per value). At 1,000 environment steps per second, estimate the bytes per second one actor must serialize and ship to the learner. For a fleet of 80 such actors, compare the aggregate transition bandwidth against a 10 gigabyte-per-second network link, using the same style of estimate as the communication-cost reasoning in <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>. At what fleet size does the network, rather than the simulator, become the binding constraint, and what two changes from Section 4 would you make to push that limit back?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-20.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 20.2</span><span class="nav-title">The Actor-Learner Architecture</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 20</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Reinforcement Learning Infrastructure</span></a>
+<a class="next" href="section-20.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 20.4</span><span class="nav-title">Distributed Replay Buffers</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

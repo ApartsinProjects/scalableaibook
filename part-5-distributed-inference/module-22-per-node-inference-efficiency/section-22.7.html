@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 22.7: Continuous Batching and Speculative Decoding. How in-flight batching keeps the GPU full across uneven request lengths, and how a draft model turns memory-bound decoding into parallel verification, both without changing the output." name="description"/>
+<title>Section 22.7: Continuous Batching and Speculative Decoding | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 22: Per-Node Inference Efficiency: A Prerequisite</a></div>
+<h1>Continuous Batching and Speculative Decoding</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They told me to wait for the slowest request in my batch. I waited. The sun set. The slowest request was generating a sonnet."</p>
+<cite>A GPU Slot Held Hostage by the Longest Sequence</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>An autoregressive model emits one token per forward pass, and different requests want different numbers of tokens, so the naive way of serving them leaves the accelerator idle most of the time.</strong> Two single-node techniques recover that lost throughput without touching the model's output. Continuous batching refuses to let a finished request hold its slot hostage: it swaps sequences in and out of the running batch at the granularity of a single token, keeping the GPU full. Speculative decoding refuses to let the large model spend a full forward pass on every token: a small draft model guesses several tokens ahead and the large model verifies the whole guess in one parallel pass, accepting the longest correct prefix. Both are per-node mechanisms; this section builds them so that the distributed serving scheduler of <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a> can multiply their per-GPU gains across an entire fleet.</p>
+</div>
+<p>The previous sections of this chapter made each token cheaper: <a href="section-22.5.html">Section 22.5</a> paged the KV cache so more sequences fit in memory, and <a href="section-22.6.html">Section 22.6</a> made the attention kernel itself read fewer bytes. Those wins are real, but they assume the GPU is actually busy. For large-language-model serving that assumption is usually false, because generation is sequential and requests are uneven. This section attacks the two largest sources of idle silicon directly. The first is scheduling waste: a batch that must wait for its slowest member. The second is the sequential nature of decoding itself: a forward pass that produces only one token while the hardware could have produced several. Neither technique changes what the model outputs; both change how fast it gets there.</p>
+
+<h2>1. Prefill and Decode Are Two Different Workloads <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Serving one request to a transformer splits into two phases with opposite hardware characters. The prefill phase processes the entire prompt at once: every prompt token attends to every earlier token in a single large matrix multiplication, so prefill is compute-bound, the kind of dense arithmetic a GPU loves. The decode phase then generates the answer one token at a time; each new token requires a forward pass that reads the whole model's weights and the growing KV cache just to produce a single vector. That per-token pass moves a great deal of memory for very little arithmetic, so decode is memory-bandwidth-bound and leaves the compute units mostly idle. A request is therefore a short compute-heavy burst followed by a long memory-heavy trickle, and the trickle is where serving systems spend most of their time.</p>
+<p>This asymmetry is the root cause of both techniques in this section. Continuous batching exists because the memory-bound decode phase has spare compute to absorb other requests, so you should keep as many sequences decoding together as memory allows. Speculative decoding exists because a single decode pass is so memory-bound that verifying several proposed tokens costs almost the same as generating one, so you should make each expensive pass do more work. A third optimization, chunked prefill, follows from the same observation: a long prompt's compute-bound prefill can starve the latency-sensitive decode steps of other requests, so serving engines split a large prefill into smaller chunks and interleave them with ongoing decode, smoothing the latency of every request sharing the GPU.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Decode Is Memory-Bound, So the GPU Has Compute to Spare</div>
+<p>One decode step reads the entire model and KV cache to emit a single token, so it is starved for bytes, not for arithmetic. That single fact drives the whole section. Because decode wastes compute, you can pack more sequences into the batch almost for free (continuous batching), and you can verify several speculative tokens in one pass for almost the cost of one (speculative decoding). When you see an inference optimization for autoregressive models, ask what it does with the idle compute that memory-bound decoding leaves on the table.</p>
+</div>
+
+<h2>2. Static Batching Wastes the GPU on the Longest Sequence <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Generic model servers batch requests to amortize the cost of a forward pass, a practice <a href="../module-23-distributed-inference-systems/index.html">Chapter 23</a> treats as dynamic batching: the server waits a few milliseconds, collects whatever requests arrive, runs them as one batch, and returns all the results together. That works beautifully when every request does the same amount of work, as in image classification, where each input takes exactly one forward pass. It fails for text generation, because the requests in a batch finish at wildly different times. One user asks for a yes-or-no answer (eight tokens) while another asks for an essay (two hundred tokens), yet a static batch cannot return the short answer until the whole batch is done. Until then the short request's slot sits occupied but idle, a bubble of wasted GPU, and no new request can take its place.</p>
+<p>Continuous batching, also called in-flight batching, removes the bubble by operating at the token level rather than the request level. After every decode step the scheduler checks which sequences have emitted their end-of-sequence token, evicts them from the running batch, frees their KV-cache pages, and admits waiting requests into the freed slots, all before the next step. The batch is thus never the same from one step to the next; it is a continuously refreshed set of whatever sequences are currently live. The short request leaves the instant it finishes and a new one begins immediately, so the GPU stays full instead of waiting for the essay. Figure 22.7.1 contrasts the two schedules, and the simulation that follows measures the difference.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Top panel: static batching where four GPU slots all wait for the longest request, leaving idle bubbles. Bottom panel: continuous batching where finished slots are immediately refilled with queued requests. Right inset: speculative decoding where a draft model proposes tokens and the target model verifies them in one pass.">
+<defs>
+<marker id="arr227" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.t227 { font:600 14px sans-serif; fill:#14385c; }
+.tc227 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s227 { font:11.5px sans-serif; fill:#5a626c; }
+.sc227 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.work227 { fill:#cfe3d2; stroke:#2f6b3a; stroke-width:1.2; }
+.idle227 { fill:#f4d9d2; stroke:#b05a3c; stroke-width:1.2; stroke-dasharray:3 3; }
+.fill227 { fill:#d6e4f4; stroke:#14385c; stroke-width:1.2; }
+.draft227 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.4; }
+.tgt227 { fill:#e8e2f4; stroke:#5a3fa0; stroke-width:1.4; }
+.l227 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr227); }
+</style>
+<!-- STATIC panel -->
+<text class="t227" x="20" y="24">Static batching: every slot waits for the longest request</text>
+<!-- 4 slots, each 11 cells wide; work then idle bubble -->
+<!-- slot 0: 9 work, 2 idle -->
+<g>
+<rect class="work227" x="20" y="36" width="270" height="20"/><rect class="idle227" x="290" y="36" width="60" height="20"/>
+<rect class="work227" x="20" y="60" width="120" height="20"/><rect class="idle227" x="140" y="60" width="210" height="20"/>
+<rect class="work227" x="20" y="84" width="330" height="20"/>
+<rect class="work227" x="20" y="108" width="90" height="20"/><rect class="idle227" x="110" y="108" width="240" height="20"/>
+</g>
+<text class="s227" x="356" y="51">slot 1</text>
+<text class="s227" x="356" y="75">slot 2</text>
+<text class="s227" x="356" y="99">slot 3</text>
+<text class="s227" x="356" y="123">slot 4</text>
+<text class="sc227" x="185" y="146">time &#8594; (red dashed = idle bubble, batch blocked until longest finishes)</text>
+<!-- CONTINUOUS panel -->
+<text class="t227" x="20" y="190">Continuous batching: finished slots refill immediately</text>
+<g>
+<rect class="work227" x="20" y="202" width="150" height="20"/><rect class="fill227" x="170" y="202" width="180" height="20"/>
+<rect class="work227" x="20" y="226" width="90" height="20"/><rect class="fill227" x="110" y="226" width="130" height="20"/><rect class="fill227" x="240" y="226" width="110" height="20"/>
+<rect class="work227" x="20" y="250" width="330" height="20"/>
+<rect class="work227" x="20" y="274" width="120" height="20"/><rect class="fill227" x="140" y="274" width="210" height="20"/>
+</g>
+<text class="s227" x="356" y="217">slot 1</text>
+<text class="s227" x="356" y="241">slot 2</text>
+<text class="s227" x="356" y="265">slot 3</text>
+<text class="s227" x="356" y="289">slot 4</text>
+<text class="sc227" x="185" y="312">time &#8594; (blue = a freshly admitted request; almost no idle gap)</text>
+<!-- SPECULATIVE inset -->
+<text class="t227" x="20" y="356">Speculative decoding: draft proposes, target verifies in one pass</text>
+<rect class="draft227" x="20" y="372" width="150" height="44" rx="6"/>
+<text class="tc227" x="95" y="392">Draft model</text>
+<text class="sc227" x="95" y="408">cheap, sequential</text>
+<text class="sc227" x="220" y="390">propose</text>
+<text class="sc227" x="220" y="404">k tokens</text>
+<line x1="172" y1="394" x2="282" y2="394" class="l227"/>
+<rect class="tgt227" x="284" y="372" width="170" height="44" rx="6"/>
+<text class="tc227" x="369" y="392">Target model</text>
+<text class="sc227" x="369" y="408">one parallel pass</text>
+<text class="sc227" x="520" y="390">accept longest</text>
+<text class="sc227" x="520" y="404">correct prefix</text>
+<line x1="456" y1="394" x2="590" y2="394" class="l227"/>
+<rect class="work227" x="592" y="372" width="44" height="20"/><rect class="work227" x="640" y="372" width="44" height="20"/><rect class="work227" x="688" y="372" width="44" height="20"/><rect class="idle227" x="736" y="372" width="44" height="20"/>
+<text class="sc227" x="662" y="408">3 accepted, 1 rejected &#8594; resample</text>
+<path class="l227" d="M 369 418 L 369 440 L 95 440 L 95 418"/>
+<text class="sc227" x="232" y="456">loop: target's accepted tokens seed the next draft round</text>
+</svg>
+<figcaption><strong>Figure 22.7.1:</strong> The two single-node throughput techniques. Top, static batching holds all four slots until the longest request finishes, so finished slots (red dashed) sit idle. Middle, continuous batching evicts a finished sequence and admits a queued one (blue) at the next token step, keeping the GPU full. Bottom, speculative decoding: a cheap draft model proposes $k$ tokens, the target model verifies them in one parallel forward pass, accepts the longest correct prefix (here three of four), and feeds the result back into the next draft round. Section 3 quantifies the batching gain and Section 4 the speculative speedup.</figcaption>
+</figure>
+<p>The simulation in Code 22.7.1 models both schedules in pure Python. It draws two hundred requests with decode lengths between eight and two hundred tokens, runs them through eight GPU slots under each policy, and reports utilization (the fraction of slot-time that did real work) and throughput (inverse of the total ticks taken). The static scheme pads each batch to its longest member; the continuous scheme refills a slot the moment its request finishes.</p>
+<pre><code class="language-python">import random
+random.seed(7)
+
+B = 8                  # number of parallel slots on the GPU
+N_REQUESTS = 200       # total requests to serve
+out_lens = [random.randint(8, 200) for _ in range(N_REQUESTS)]  # decode lengths
+
+def simulate_static(out_lens, B):
+    useful, total, i = 0, 0, 0
+    while i &lt; len(out_lens):
+        batch = out_lens[i:i + B]
+        longest = max(batch)        # every slot is held until the longest finishes
+        total += B * longest        # all B slots occupied for `longest` ticks
+        useful += sum(batch)        # but each slot only worked for its own length
+        i += B
+    return useful, total
+
+def simulate_continuous(out_lens, B):
+    useful, total = 0, 0
+    queue = list(out_lens)
+    slots = [queue.pop(0) if queue else 0 for _ in range(B)]
+    while any(s &gt; 0 for s in slots) or queue:
+        active = sum(1 for s in slots if s &gt; 0)
+        total += B                  # all B slots are available this tick
+        useful += active            # only the active ones did work this tick
+        for k in range(B):
+            if slots[k] &gt; 0:
+                slots[k] -= 1
+            if slots[k] == 0 and queue:     # finished -> refill immediately
+                slots[k] = queue.pop(0)
+    return useful, total
+
+us_u, us_t = simulate_static(out_lens, B)
+co_u, co_t = simulate_continuous(out_lens, B)
+print(f"static   util : {100*us_u/us_t:5.1f}%   makespan ticks: {us_t//B}")
+print(f"continuous util: {100*co_u/co_t:5.1f}%   makespan ticks: {co_t//B}")
+print(f"throughput gain: {us_t/co_t:4.2f}x  (continuous vs static)")
+</code></pre>
+<div class="code-caption"><strong>Code 22.7.1:</strong> A pure-Python schedule simulator. Both policies do the identical total decode work; they differ only in how much slot-time is wasted waiting for the longest sequence in each batch.</div>
+<pre><code class="language-text">static   util :  60.0%   makespan ticks: 4334
+continuous util:  96.6%   makespan ticks: 2691
+throughput gain: 1.61x  (continuous vs static)</code></pre>
+<div class="code-caption"><strong>Output 22.7.1:</strong> Static batching wastes forty percent of the GPU on bubbles and finishes in 4,334 ticks; continuous batching runs at 96.6 percent utilization and finishes the same work in 2,691 ticks, a 1.61x throughput gain with no change to any output.</div>
+<p>The numbers in Output 22.7.1 are the whole argument for continuous batching. Identical work, identical model, identical outputs, yet the in-flight scheduler delivers about 1.6 times the throughput on this length distribution simply by never letting a slot idle behind a longer sequence. Real engines see larger gains when the length spread is wider, which is the common case for chat and code workloads. Continuous batching is the default in every modern serving engine for exactly this reason.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: vLLM and TGI Schedule Continuously by Default</div>
+<p>The scheduler in Code 22.7.1 is a teaching model; in production you do not write it. vLLM's engine performs token-level continuous batching coupled to its paged KV cache (the <a href="section-22.5.html">Section 22.5</a> mechanism), so eviction and admission cost only a page-table update, and Hugging Face Text Generation Inference (TGI) ships the same in-flight batching out of the box. Turning a single-request generate loop into a continuously batched server is one configuration object rather than the dozens of lines of slot bookkeeping above:</p>
+<pre><code class="language-python"># pip install vllm
+from vllm import LLM, SamplingParams
+
+llm = LLM(model="meta-llama/Llama-3.1-8B-Instruct",
+          max_num_seqs=256)        # up to 256 sequences batched in flight at once
+params = SamplingParams(max_tokens=200)
+
+# Hand the engine a whole queue; it admits, evicts, and refills slots per token,
+# overlapping short and long requests automatically. No manual scheduling.
+outputs = llm.generate(prompts, params)
+</code></pre>
+<div class="code-caption"><strong>Code 22.7.2:</strong> The same continuous-batching policy as Output 22.7.1, now a single <code>max_num_seqs</code> setting. The engine handles eviction, KV-page recycling, and admission that the hand-written simulator spelled out.</div>
+</div>
+
+<h2>3. Speculative Decoding Turns Sequential Work Into Parallel Work <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Continuous batching fills the GPU across requests; speculative decoding attacks the sequential cost within a single request. Decoding is slow because it is inherently serial: token $t+1$ cannot be computed until token $t$ exists, so a length-$L$ answer needs $L$ memory-bound forward passes of the large model. Speculative decoding breaks that chain with a division of labor. A small, cheap draft model generates a guess of the next $k$ tokens quickly. The large target model then runs a single forward pass over the prompt plus all $k$ proposed tokens at once, which a transformer can do in parallel because it scores every position simultaneously. Comparing the target's own distribution at each position to the draft's proposal, the system accepts the longest prefix the target agrees with and resamples the first disagreement from a corrected distribution.</p>
+<p>The decisive property is that this procedure is exact: with the standard rejection-sampling acceptance rule, the accepted tokens are distributed exactly as if they had been sampled from the target model alone. Speculative decoding changes the speed of generation and nothing about its output distribution. The win comes from arithmetic intensity. One target forward pass is so memory-bound that processing $k+1$ positions costs almost the same wall-clock time as processing one, so every accepted draft token is a target pass avoided. If the draft and target agree on a fraction $a$ of tokens, a single verification pass yields, in expectation,</p>
+$$\mathbb{E}[\text{tokens accepted}] = \frac{1 - a^{k+1}}{1 - a},$$
+<p>the mean of a truncated geometric run of agreements plus one bonus token that the target supplies for free at the end of the accepted prefix. Writing $T$ for the latency of one target forward pass and $D \ll T$ for one draft pass, the expected speedup over plain decoding is</p>
+$$\text{speedup}(a, k) = \frac{T \cdot \mathbb{E}[\text{tokens accepted}]}{T + k\,D} = \frac{1 - a^{k+1}}{1 - a} \cdot \frac{T}{T + k\,D}.$$
+<p>The numerator rewards a high acceptance rate; the denominator charges for the $k$ draft passes that may be wasted if the target rejects early. Code 22.7.3 evaluates this expression across acceptance rates for a draft that is about seven times cheaper than the target.</p>
+<pre><code class="language-python">def expected_speedup(a, k, T, D):
+    accepted = (1 - a ** (k + 1)) / (1 - a)   # mean tokens per verification pass
+    cost = T + k * D                          # 1 target pass + k draft passes
+    return accepted * T / cost                # baseline cost per token is T
+
+T, D, k = 1.0, 0.15, 4                         # target=1.0, draft=0.15, propose 4
+for a in (0.5, 0.7, 0.8, 0.9):
+    acc = (1 - a ** (k + 1)) / (1 - a)
+    print(f"accept rate a={a:.1f} : mean accepted/pass = {acc:4.2f}"
+          f"  ->  {expected_speedup(a, k, T, D):4.2f}x speedup")
+</code></pre>
+<div class="code-caption"><strong>Code 22.7.3:</strong> The speculative-decoding speedup model. Acceptance rate <code>a</code> is the single most important quantity; it is governed by how well the draft model imitates the target on the live token stream.</div>
+<pre><code class="language-text">accept rate a=0.5 : mean accepted/pass = 1.94  ->  1.21x speedup
+accept rate a=0.7 : mean accepted/pass = 2.77  ->  1.73x speedup
+accept rate a=0.8 : mean accepted/pass = 3.36  ->  2.10x speedup
+accept rate a=0.9 : mean accepted/pass = 4.10  ->  2.56x speedup</code></pre>
+<div class="code-caption"><strong>Output 22.7.3:</strong> Speedup climbs sharply with the acceptance rate: a draft that matches the target ninety percent of the time more than doubles decoding throughput, while a poorly aligned draft (fifty percent) barely helps after paying for its own forward passes.</div>
+<p>Output 22.7.3 explains why speculative decoding lives or dies on the acceptance rate. A draft model that mirrors the target closely turns four memory-bound target passes into one and yields better than a 2.5x speedup; a weak draft spends its budget on guesses the target throws away and the verification overhead eats most of the gain. The engineering problem is therefore to make the draft both cheap and well-aligned, which is exactly where the recent variants compete.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Autocomplete With a Receipt</div>
+<p>Speculative decoding is the model letting an eager intern (the draft) finish its sentences, then proofreading the whole paragraph in one glance and crossing out the first wrong word. The intern is fast and often right; the senior author still signs off on every token, so the published text reads exactly as if the senior had written it alone. You get the intern's speed with the author's distribution, and the only cost is the occasional crossed-out guess.</p>
+</div>
+
+<h2>4. The Variants: Better Drafts, Fewer Passes <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The original formulation uses a separate small model as the draft, which works but requires shipping and serving a second model whose distribution must track the target. A family of variants removes that cost by drawing the draft from the target model itself. Medusa attaches a handful of extra prediction heads to the target so it proposes several future tokens in one pass with no separate model. EAGLE drafts at the feature level rather than the token level, predicting the target's own hidden states to raise the acceptance rate, and its successors push that idea further. Self-speculation uses a subset of the target's own layers as the draft, so a single set of weights both proposes and verifies. The simplest variant of all, n-gram or prompt-lookup decoding, skips a neural draft entirely and proposes tokens by copying repeated spans from the prompt, which is remarkably effective for summarization and code editing where the output echoes the input.</p>
+<p>All of these are single-GPU mechanisms: the draft, the verification, and the acceptance test happen inside one accelerator's forward passes. They compose cleanly with continuous batching, since a verified multi-token step is just a different kind of step in the in-flight schedule, and with the paged KV cache of <a href="section-22.5.html">Section 22.5</a>, since accepted tokens extend the cache while rejected ones are simply not committed. What none of them do by themselves is coordinate across machines. Deciding which replica drafts, how a speculative step interacts with cross-node scheduling, and when to disaggregate prefill from decode are fleet-level questions answered by the distributed serving scheduler of <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a>, which treats the per-node throughput this section creates as the unit it replicates and load-balances.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: A Per-Node Multiplier the Fleet Inherits</div>
+<p>This chapter is the labeled scale-up exception in a scale-out book, and continuous batching with speculative decoding is where that exception pays off most directly. Every factor of throughput won here, the 1.6x from never idling a slot and the 2x from verifying multiple tokens per pass, multiplies the effective capacity of each GPU before a single request is routed across the network. <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a> takes these per-node numbers as given and asks the distributed question: how many such nodes, arranged how, with prefill and decode possibly split across different machines, meet a fleet-wide latency and throughput target. The per-node mechanism and the fleet scheduler are two layers of the same throughput stack; this section builds the lower one.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Self-Drafting and Chunked Prefill (2024 to 2026)</div>
+<p>The active frontier is making the draft nearly free and the schedule smoother. The EAGLE line (EAGLE-2 and EAGLE-3, 2024 to 2025) drafts at the feature level with a dynamic draft tree and reports acceptance rates and end-to-end speedups well beyond the original separate-model scheme, and Medusa-style multi-head drafting has been folded into production engines. On the scheduling side, chunked prefill (popularized through Sarathi-Serve and now standard in vLLM and TensorRT-LLM) slices a long prompt's compute-bound prefill into smaller pieces and interleaves them with ongoing decode, which stabilizes inter-token latency under mixed traffic and pairs naturally with continuous batching. A parallel thread, prefill/decode disaggregation, runs the two phases on separate hardware pools so each is provisioned for its own bottleneck; <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a> develops that fleet-level idea. The common theme is treating the idle compute of memory-bound decode as a resource to be spent, by drafting, by chunking, or by disaggregating.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Chat Endpoint That Tripled Its QPS Without New GPUs</div>
+<p><strong>Who:</strong> An inference platform engineer running a customer-support chat model on a fixed pool of eight GPUs.</p>
+<p><strong>Situation:</strong> Traffic mixed one-line confirmations with long troubleshooting answers, and the server used static batching with a fixed batch of sixteen.</p>
+<p><strong>Problem:</strong> Measured GPU utilization sat near sixty percent because short requests waited on long ones, and tail latency spiked whenever a long prompt landed mid-batch.</p>
+<p><strong>Dilemma:</strong> Buy more GPUs to hit the throughput target, the expensive scale-out reflex, or first extract the throughput already being wasted inside each existing GPU.</p>
+<p><strong>Decision:</strong> They exhausted the per-node ceiling first, enabling continuous batching, then layering speculative decoding with a small distilled draft and chunked prefill to tame the long prompts.</p>
+<p><strong>How:</strong> They switched to a vLLM engine with <code>max_num_seqs=256</code>, attached an EAGLE-style draft achieving roughly eighty percent acceptance, and enabled chunked prefill, all configuration changes rather than new code.</p>
+<p><strong>Result:</strong> Utilization rose from sixty to above ninety percent (the continuous-batching gain of Output 22.7.1) and per-stream decoding roughly doubled (the speculative gain of Output 22.7.3), tripling sustained queries per second on the same eight GPUs and removing the tail spikes.</p>
+<p><strong>Lesson:</strong> Spend the idle compute inside each node before buying more nodes; the per-node multiplier is the cheapest throughput in the system, and the fleet of <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a> inherits every bit of it.</p>
+</div>
+
+<h2>5. When These Techniques Earn Their Keep <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Neither technique is universally free. Continuous batching needs a length spread to exploit; a workload where every request emits the same number of tokens (fixed-length classification or scoring) gets little from it, because there are no early finishers to evict. It also raises memory pressure, since more sequences decode concurrently and each holds a KV cache, which is precisely why it is built on top of the paged cache of <a href="section-22.5.html">Section 22.5</a> rather than alongside it. Speculative decoding helps most when decoding is the bottleneck and the batch is small, the latency-sensitive regime; at very large batch sizes the GPU is already compute-saturated by the batch itself, the spare compute that speculation feeds on is gone, and the extra draft passes can even slow things down. A negative acceptance rate scenario, a draft that disagrees with the target often, can leave you worse off than plain decoding once verification overhead is counted, as the $a = 0.5$ row of Output 22.7.3 hints.</p>
+<p>The practical rule is to layer them in the order this section presents them. First make each token cheap (<a href="section-22.5.html">Section 22.5</a> and <a href="section-22.6.html">Section 22.6</a>), then keep the GPU full across requests (continuous batching), then make each expensive pass produce more tokens (speculative decoding), and finally compile the whole stack for the target hardware, which <a href="section-22.8.html">Section 22.8</a> takes up next. Each layer assumes the one below it is in place, and together they set the per-node throughput that the distributed serving chapters multiply across a fleet.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.7.1: Where Does the Bubble Go? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Static batching in Output 22.7.1 wasted forty percent of the GPU. Explain, in terms of the decode-length distribution, why the wasted fraction grows as the spread between the shortest and longest request in a batch grows, and why it shrinks to nearly zero when all requests have equal length. Then argue why an image-classification server (one forward pass per input, identical work) gains essentially nothing from continuous batching, and name one autoregressive workload where the spread, and therefore the gain, would be unusually large.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.7.2: Find the Break-Even Acceptance Rate <span class="exercise-type coding">Coding</span></div>
+<p>Using the <code>expected_speedup</code> function from Code 22.7.3, hold $T = 1.0$ and $D = 0.15$ fixed and find, for each draft length $k \in \{2, 4, 8\}$, the acceptance rate $a$ at which the speedup drops to exactly $1.0$ (speculation stops helping). Plot or tabulate the break-even $a$ against $k$ and explain the trend: why does a longer proposed draft demand a higher acceptance rate just to break even? Relate your answer to the $k\,D$ term in the denominator of the speedup formula.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.7.3: Continuous Batching Under a Memory Cap <span class="exercise-type analysis">Analysis</span></div>
+<p>Extend the continuous-batching simulator in Code 22.7.1 so that admitting a request requires free KV-cache pages, with a fixed total page budget and each sequence consuming pages proportional to its current length. When the budget is full, new requests must wait in the queue even if a slot is logically free. Analyze how utilization and makespan change as you tighten the page budget, and explain why this couples continuous batching to the paged KV cache of <a href="section-22.5.html">Section 22.5</a>: what is the failure mode if the scheduler admits sequences it cannot find pages for?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-22.6.html"><span class="nav-label">Previous</span><span class="nav-num">Section 22.6</span><span class="nav-title">FlashAttention and Efficient Attention</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 22</span><span class="nav-num">Contents</span><span class="nav-title">Per-Node Inference Efficiency</span></a>
+<a class="next" href="section-22.8.html"><span class="nav-label">Next</span><span class="nav-num">Section 22.8</span><span class="nav-title">Compilation</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

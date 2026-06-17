@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 15.6: PyTorch Distributed Data Parallel. How DDP wraps a model, registers backward hooks that bucket gradients and fire NCCL all-reduces overlapped with the backward pass, and turns the whole chapter into a few lines of almost-normal training code." name="description"/>
+<title>Section 15.6: PyTorch Distributed Data Parallel | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Data-Parallel Deep Learning</a></div>
+<h1>PyTorch Distributed Data Parallel</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They wrapped me in one line of code and told everyone I was easy. Behind the curtain I was registering hooks, packing buckets, and racing the backward pass on every step. I never complained, because that is the job."</p>
+<cite>A DistributedDataParallel Wrapper Keeping Up Appearances</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Everything this chapter built by hand (the exact gradient identity, the synchronous step, the ring all-reduce, the overlap of communication with computation) ships in PyTorch as a single wrapper called <code>DistributedDataParallel</code>, so that a distributed training loop looks almost exactly like a single-machine one.</strong> You run one process per GPU, wrap your model once, give each process a different slice of the data, and launch with <code>torchrun</code>. From that moment, every backward pass silently buckets the gradients, fires a NCCL all-reduce per bucket, and overlaps that network traffic with the rest of backpropagation, so by the time the optimizer steps, every replica already holds the averaged gradient. This section is the chapter's payoff: it shows the anatomy of a real DDP job, explains why DDP replaced the older single-process <code>DataParallel</code>, and reproduces DDP's core contract in a few dozen lines of pure Python so the magic is no longer magic.</p>
+</div>
+<p>By this point in the chapter you can derive data-parallel training from first principles. The gradient of an average loss is itself an average, so splitting a batch across $K$ workers and averaging their gradients reproduces the single-machine gradient exactly, a fact established back in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>. The combine step is an all-reduce, the collective built in <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>, and the previous section showed how to hide its cost by overlapping it with the backward pass. What remains is to stop writing all of that yourself. PyTorch <code>DistributedDataParallel</code> (DDP) is the tool that packages the entire chapter into production code, and using it well is mostly a matter of understanding what it does on your behalf so you can reason about the cases where it needs help.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 410" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of DistributedDataParallel: two GPU processes each run a forward and backward pass on different data shards; during the backward pass, completed-gradient buckets trigger NCCL all-reduce operations that overlap with ongoing backward computation, and after the step both replicas hold the identical averaged gradient.">
+<defs>
+<marker id="arr156" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr156o" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.b156 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w156 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g156 { fill:#eef6ee; stroke:#2f7d32; stroke-width:1.6; }
+.t156 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s156 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.o156 { font:600 11px sans-serif; fill:#b86b1f; text-anchor:middle; }
+.l156 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr156); }
+.ar156 { fill:none; stroke:#b86b1f; stroke-width:1.8; marker-end:url(#arr156o); stroke-dasharray:5 4; }
+</style>
+<text class="t156" x="200" y="24">GPU 0 (rank 0)</text>
+<text class="t156" x="660" y="24">GPU 1 (rank 1)</text>
+<rect class="w156" x="70" y="38" width="260" height="34" rx="7"/>
+<text class="s156" x="200" y="60">data shard 0 (DistributedSampler)</text>
+<rect class="w156" x="530" y="38" width="260" height="34" rx="7"/>
+<text class="s156" x="660" y="60">data shard 1 (DistributedSampler)</text>
+<rect class="b156" x="70" y="86" width="260" height="40" rx="7"/>
+<text class="t156" x="200" y="111">forward (identical weights)</text>
+<rect class="b156" x="530" y="86" width="260" height="40" rx="7"/>
+<text class="t156" x="660" y="111">forward (identical weights)</text>
+<line x1="200" y1="72" x2="200" y2="84" class="l156"/>
+<line x1="660" y1="72" x2="660" y2="84" class="l156"/>
+<rect class="b156" x="70" y="150" width="260" height="120" rx="7"/>
+<text class="t156" x="200" y="171">backward pass</text>
+<rect class="g156" x="86" y="182" width="100" height="30" rx="5"/>
+<text class="s156" x="136" y="201">bucket 2</text>
+<rect class="g156" x="86" y="218" width="100" height="30" rx="5"/>
+<text class="s156" x="136" y="237">bucket 1</text>
+<rect class="g156" x="214" y="182" width="100" height="66" rx="5"/>
+<text class="s156" x="264" y="219">still</text>
+<text class="s156" x="264" y="234">computing</text>
+<rect class="b156" x="530" y="150" width="260" height="120" rx="7"/>
+<text class="t156" x="660" y="171">backward pass</text>
+<rect class="g156" x="546" y="182" width="100" height="30" rx="5"/>
+<text class="s156" x="596" y="201">bucket 2</text>
+<rect class="g156" x="546" y="218" width="100" height="30" rx="5"/>
+<text class="s156" x="596" y="237">bucket 1</text>
+<rect class="g156" x="674" y="182" width="100" height="66" rx="5"/>
+<text class="s156" x="724" y="219">still</text>
+<text class="s156" x="724" y="234">computing</text>
+<line x1="200" y1="126" x2="200" y2="148" class="l156"/>
+<line x1="660" y1="126" x2="660" y2="148" class="l156"/>
+<path class="ar156" d="M 186 197 L 546 197"/>
+<path class="ar156" d="M 186 233 L 546 233"/>
+<text class="o156" x="366" y="192">all-reduce bucket 2</text>
+<text class="o156" x="366" y="228">all-reduce bucket 1</text>
+<text class="o156" x="366" y="258">(NCCL, overlapped</text>
+<text class="o156" x="366" y="272">with backward)</text>
+<rect class="b156" x="230" y="320" width="400" height="56" rx="8"/>
+<text class="t156" x="430" y="344">averaged gradient on every replica</text>
+<text class="s156" x="430" y="362">optimizer.step() runs locally, no extra sync</text>
+<path class="l156" d="M 200 270 L 200 296 L 360 296 L 360 318"/>
+<path class="l156" d="M 660 270 L 660 296 L 500 296 L 500 318"/>
+</svg>
+<figcaption><strong>Figure 15.6.1:</strong> What <code>DistributedDataParallel</code> does on every step. Two processes, one GPU each, run forward and backward on different data shards. As soon as a bucket of gradients finishes in the backward pass, DDP launches a NCCL all-reduce for that bucket (dashed orange arrows) while the rest of the backward pass keeps computing, so communication overlaps computation. When backward finishes, every replica already holds the identical averaged gradient and the optimizer steps locally with no further synchronization.</figcaption>
+</figure>
+
+<h2>1. The Anatomy of a DDP Job <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A DDP training script is built from five moving parts, and once you can name them the rest is detail. First, each process joins a process group so the workers can find each other and run collectives. Second, you wrap your model in <code>DistributedDataParallel</code>, which broadcasts the initial weights from rank 0 and registers the backward hooks that will do the gradient averaging. Third, you give the data loader a <code>DistributedSampler</code> so each process reads a disjoint slice of the dataset rather than all of it. Fourth, you launch the whole thing with <code>torchrun</code>, which spawns one process per GPU and sets the environment variables (rank, world size, master address) that the process group reads. Fifth, you guard checkpoint saving so that only rank 0 writes the file, because all replicas hold identical weights and writing from all of them at once would be wasteful at best and corrupt the file at worst.</p>
+<p>The code below is the skeleton of essentially every single-node-multi-GPU DDP job. It needs a real multi-GPU machine and the NCCL backend to run, so we show it illustratively here and reproduce its core behavior in pure Python later in the section; read it for shape, not to execute.</p>
+<pre><code class="language-python"># Save as train_ddp.py, launch with:  torchrun --nproc_per_node=4 train_ddp.py
+import os, torch, torch.nn as nn, torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
+
+def main():
+    dist.init_process_group(backend="nccl")          # 1. join the K-worker group
+    rank       = dist.get_rank()
+    local_rank = int(os.environ["LOCAL_RANK"])        # which GPU on this machine
+    torch.cuda.set_device(local_rank)                 # pin this process to one GPU
+
+    model = MyModel().cuda(local_rank)
+    model = DDP(model, device_ids=[local_rank])       # 2. wrap: broadcast + hooks
+
+    sampler = DistributedSampler(train_set)           # 3. disjoint shard per rank
+    loader  = DataLoader(train_set, batch_size=64, sampler=sampler)
+    opt     = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+    for epoch in range(num_epochs):
+        sampler.set_epoch(epoch)                      # reshuffle shards each epoch
+        for x, y in loader:
+            x, y = x.cuda(local_rank), y.cuda(local_rank)
+            opt.zero_grad()
+            loss = loss_fn(model(x), y)
+            loss.backward()                           # hooks fire all-reduce here
+            opt.step()                                # every rank already averaged
+
+        if rank == 0:                                 # 5. save once, from rank 0
+            torch.save(model.module.state_dict(), "ckpt.pt")
+
+    dist.destroy_process_group()
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+<div class="code-caption"><strong>Code 15.6.1:</strong> The five-part skeleton of a DDP job: <code>init_process_group</code>, the <code>DDP</code> wrap, the <code>DistributedSampler</code>, the ordinary training loop where <code>loss.backward()</code> triggers the all-reduce, and the rank-0 checkpoint guard. The training loop differs from a single-machine loop by only the sampler and the rank guard.</div>
+<p>The striking thing about Code 15.6.1 is how little of it is distributed-systems code. There is no explicit all-reduce, no manual gradient gathering, no bucket management; <code>loss.backward()</code> looks exactly as it does on one machine. That is the entire point of DDP, and it is the reason it is the default tool for the data-parallel case. The synchronization that earlier sections spelled out by hand has been folded into the backward pass itself, which is exactly the overlap strategy the previous section motivated.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: DDP Is a Backward Hook, Not a New Training Algorithm</div>
+<p>DDP does not change your model, your loss, or your optimizer. It registers a hook on each parameter that fires the moment that parameter's gradient is ready during the backward pass. The hook drops the gradient into a bucket; when a bucket fills, DDP launches a NCCL all-reduce for it while the backward pass keeps computing the next layers' gradients. By the time <code>backward()</code> returns, every replica holds the same averaged gradient, so each process can call <code>optimizer.step()</code> independently and stay bit-for-bit in sync. The algorithm is still ordinary synchronous SGD; DDP is just the plumbing that makes the all-reduce free by hiding it behind computation.</p>
+</div>
+
+<h2>2. Why DDP Replaced DataParallel <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>PyTorch once shipped an easier-looking class called <code>DataParallel</code> (note: no "Distributed"). It ran in a single process and, on each step, scattered the input batch across the local GPUs, replicated the model to each, gathered the outputs back to the primary GPU, and computed the backward there. It needed no launcher and no process group, which made it tempting, and it is the wrong tool for almost every real job. Because it lives in one Python process, it is throttled by the Global Interpreter Lock, so the single driver thread becomes a bottleneck that the extra GPUs cannot relieve. It re-replicates the model to every GPU on every forward pass, which is pure overhead. It routes all outputs and the loss through one primary GPU, creating a memory and bandwidth hotspot that scales badly. And it cannot cross machine boundaries at all.</p>
+<p><code>DistributedDataParallel</code> fixes each of these by construction. It runs one process per GPU, so there is no shared interpreter lock and no single driver thread. It replicates the model exactly once, at construction, and thereafter only exchanges gradients. It never funnels activations through a primary device; each process keeps its own forward and backward entirely local and the only cross-device traffic is the gradient all-reduce. And it works identically across one machine or a thousand, because the process group abstraction does not care whether ranks share a host. The practical guidance from the PyTorch team is blunt and worth internalizing: use <code>DistributedDataParallel</code>, not <code>DataParallel</code>, even on a single machine with multiple GPUs.</p>
+<div class="table-caption"><strong>Table 15.6.1:</strong> The two PyTorch data-parallel wrappers compared. <code>DistributedDataParallel</code> wins on every axis that matters for real training, which is why it is the default.</div>
+<table>
+<thead>
+<tr><th scope="col">Property</th><th scope="col">DataParallel (legacy)</th><th scope="col">DistributedDataParallel</th></tr>
+</thead>
+<tbody>
+<tr><td>Processes</td><td>One, many threads</td><td>One per GPU</td></tr>
+<tr><td>GIL bottleneck</td><td>Yes, single driver thread</td><td>No, independent processes</td></tr>
+<tr><td>Model replication</td><td>Every forward pass</td><td>Once, at construction</td></tr>
+<tr><td>Cross-GPU traffic</td><td>Scatter inputs, gather outputs</td><td>Gradient all-reduce only</td></tr>
+<tr><td>Multi-machine</td><td>No</td><td>Yes, identical code</td></tr>
+<tr><td>Comm / compute overlap</td><td>No</td><td>Yes, bucketed during backward</td></tr>
+</tbody>
+</table>
+
+<h2>3. Correctness Details DDP Quietly Enforces <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>For the averaged gradient to equal the single-machine gradient, several invariants must hold, and DDP enforces or assumes each of them. Every replica must start from identical weights, which DDP guarantees by broadcasting rank 0's parameters and buffers when you wrap the model; this is why you do not need to seed every process identically yourself. Each process owns exactly one GPU, the configuration DDP is tuned for. The gradient is averaged, not merely summed, so that the effective update matches a single batch of size $K$ times the per-process batch; DDP divides the all-reduced sum by the world size for you. With $K$ processes each using a local batch of $B$, the global batch is $KB$, and the synchronized gradient is</p>
+$$\bar{g} = \frac{1}{K} \sum_{k=1}^{K} g_k, \qquad g_k = \frac{1}{B}\sum_{i \in \mathcal{B}_k} \nabla \ell(w; x_i, y_i),$$
+<p>which is exactly the mean gradient over the global batch when the shards are equal in size. Equal shard sizes matter: the <code>DistributedSampler</code> pads the last shards so every rank sees the same number of batches, because a rank that runs out of data early would leave the others waiting forever at the next all-reduce. The one place this exactness leaks is batch normalization, whose statistics are computed per process over only the local batch of $B$ examples, not the global $KB$. When that local batch is small, swapping the layers for <code>SyncBatchNorm</code> (which all-reduces the mean and variance across replicas) restores the single-machine semantics at the cost of an extra collective.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Deadlock That Looks Like a Hang</div>
+<p>The most common DDP support ticket is not a crash; it is a job that simply stops. One rank takes a branch that skips a layer, or hits a shorter data shard, and never produces a gradient for some parameter. The other ranks reach that parameter's all-reduce and wait. Forever. There is no error, no stack trace, just every GPU pinned at 100 percent utilization doing nothing, because a collective is a barrier and a barrier with one absent participant never returns. The cure is to make every rank execute the same set of all-reduces every step, which is exactly why <code>DistributedSampler</code> pads shards to equal length and why <code>find_unused_parameters=True</code> exists for genuinely dynamic graphs.</p>
+</div>
+
+<h2>4. Gradient Accumulation and no_sync <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Sometimes the global batch you want is larger than the GPUs can hold even after splitting it $K$ ways. The standard remedy is gradient accumulation: run several forward and backward passes, summing gradients in the <code>.grad</code> buffers, and step the optimizer only once every few micro-batches. Under DDP this creates a subtlety. By default DDP all-reduces on every backward pass, so naive accumulation would synchronize gradients on every micro-batch, paying the communication cost many times for a single optimizer step. That is wasteful: you only need the averaged gradient on the step where you actually call <code>optimizer.step()</code>. DDP exposes the <code>no_sync()</code> context manager precisely for this. Inside it, the backward hooks still accumulate gradients locally but skip the all-reduce; you run all but the last micro-batch inside <code>no_sync()</code>, then run the final micro-batch outside it so a single all-reduce synchronizes the accumulated total.</p>
+<pre><code class="language-python"># Accumulate over `accum` micro-batches, all-reduce only on the last one.
+for i, (x, y) in enumerate(loader):
+    is_last = (i + 1) % accum == 0
+    ctx = model.no_sync() if not is_last else contextlib.nullcontext()
+    with ctx:                                     # skip all-reduce until the end
+        loss = loss_fn(model(x), y) / accum       # scale so the mean is correct
+        loss.backward()                           # local grad accumulation
+    if is_last:
+        opt.step(); opt.zero_grad()               # one all-reduce already fired
+</code></pre>
+<div class="code-caption"><strong>Code 15.6.2:</strong> Gradient accumulation under DDP. Wrapping the non-final micro-batches in <code>no_sync()</code> suppresses their all-reduce, so the full accumulation costs one collective instead of <code>accum</code> of them. The loss is divided by <code>accum</code> so the accumulated gradient is a mean, not a sum.</div>
+<p>This is the deep link back to communication-efficient optimization. Skipping the all-reduce on intermediate micro-batches is the same idea as the local-update schemes of <a href="../../part-3-distributed-ml/module-10-distributed-optimization/section-10.5.html">Section 10.5</a>: do more local computation between synchronizations so the network cost is amortized over more work. Gradient accumulation is the simplest, exact instance of that trade, because the local steps here are merely accumulating into one gradient rather than taking independent optimizer steps, so the result is identical to a single large batch.</p>
+
+<h2>5. Reproducing DDP's Contract in Pure Python <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The clearest way to demystify DDP is to build its core contract without any GPUs or NCCL. The demonstration below defines a tiny <code>MiniDDP</code> wrapper around a plain parameter vector. It holds $K$ replicas initialized identically (DDP's broadcast from rank 0), and on every step it computes each replica's gradient on its own data shard, then averages the gradients across replicas by walking them in fixed-size buckets and all-reducing one bucket at a time, exactly as DDP's backward hooks do. After training, it checks two things that DDP promises: that all replicas remain bit-for-bit identical, and that the synchronized trajectory matches an ordinary single-process run over the full batch.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+N, d, K, STEPS, LR = 4096, 16, 4, 30, 0.05
+
+X = rng.standard_normal((N, d))                  # one shared regression problem
+w_true = rng.standard_normal(d)
+y = X @ w_true + 0.1 * rng.standard_normal(N)
+w_init = np.zeros(d)
+
+def full_grad(w, Xb, yb):                         # mean-squared-error gradient
+    n = len(yb)
+    return (2.0 / n) * (Xb.T @ (Xb @ w - yb))
+
+# Reference: ordinary single-process training over the whole batch.
+w_ref = w_init.copy()
+for _ in range(STEPS):
+    w_ref -= LR * full_grad(w_ref, X, y)
+
+class MiniDDP:
+    """On each step, bucket the per-replica gradients and all-reduce (sum then
+    divide by world size) so every replica applies the identical averaged grad,
+    exactly as torch DDP does inside its backward hook."""
+    def __init__(self, w0, world_size, bucket_size):
+        self.world_size, self.bucket_size = world_size, bucket_size
+        self.replicas = [w0.copy() for _ in range(world_size)]   # identical init
+
+    @staticmethod
+    def _all_reduce_buckets(grads, bucket_size):
+        P = grads[0].size
+        out = [np.empty_like(g) for g in grads]
+        for start in range(0, P, bucket_size):                   # one all-reduce
+            stop = min(start + bucket_size, P)                   # per bucket
+            stacked = np.stack([g[start:stop] for g in grads])
+            averaged = stacked.sum(axis=0) / len(grads)          # SUM / world_size
+            for r in range(len(grads)):
+                out[r][start:stop] = averaged
+        return out
+
+    def step(self, shards, lr):
+        local = [full_grad(self.replicas[r], X[s], y[s])         # local grad only
+                 for r, s in enumerate(shards)]
+        synced = self._all_reduce_buckets(local, self.bucket_size)
+        for r in range(self.world_size):
+            self.replicas[r] -= lr * synced[r]
+
+shards = np.array_split(np.arange(N), K)                         # disjoint shards
+ddp = MiniDDP(w_init, world_size=K, bucket_size=5)               # 16 params, bk 5
+for _ in range(STEPS):
+    ddp.step(shards, LR)
+
+spread = max(np.max(np.abs(ddp.replicas[r] - ddp.replicas[0])) for r in range(K))
+err    = np.max(np.abs(ddp.replicas[0] - w_ref))
+print("world size K              :", K)
+print("steps                     :", STEPS)
+print("max spread across replicas:", f"{spread:.2e}")
+print("max |DDP - single-process|:", f"{err:.2e}")
+print("final loss (single)       :", f"{np.mean((X @ w_ref - y) ** 2):.6f}")
+print("final loss (mini-DDP)     :", f"{np.mean((X @ ddp.replicas[0] - y) ** 2):.6f}")
+</code></pre>
+<div class="code-caption"><strong>Code 15.6.3:</strong> A miniature DDP in pure Python. The <code>_all_reduce_buckets</code> method is the heart of it: flatten each replica's gradient, walk it in fixed-size buckets, and average each bucket across replicas, mirroring the bucketed NCCL all-reduce that real DDP fires from its backward hooks.</div>
+<pre><code class="language-text">world size K              : 4
+steps                     : 30
+max spread across replicas: 0.00e+00
+max |DDP - single-process|: 2.22e-16
+final loss (single)       : 0.045429
+final loss (mini-DDP)     : 0.045429
+</code></pre>
+<div class="code-caption"><strong>Output 15.6.3:</strong> The four replicas stay exactly identical (spread of zero) and the synchronized trajectory matches the single-process reference to machine epsilon ($2.2 \times 10^{-16}$), with indistinguishable final losses. The bucketed all-reduce reproduces single-machine training exactly, which is DDP's whole promise.</div>
+<p>The two reported quantities are the two guarantees DDP makes. A spread of exactly zero across replicas means the workers never drift apart, because they apply the same averaged gradient every step from the same starting point. A difference of $2.2 \times 10^{-16}$ from the single-process run, the smallest representable gap in double precision, means the bucketing and averaging changed nothing about the answer. Real DDP adds GPUs, NCCL, and overlap with the backward pass, but the contract it enforces is precisely the one this forty-line wrapper demonstrates: many replicas, one trajectory, identical to training on one machine.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: DDP Is the One Idiom That Replaces the Whole Chapter</div>
+<p>The miniature wrapper in Code 15.6.3 is roughly forty lines, and a faithful real version would need process-group setup, NCCL bindings, bucket scheduling, overlap with the backward pass, gradient division, and unused-parameter handling, easily several hundred lines of careful systems code. PyTorch collapses all of it to a single wrap:</p>
+<pre><code class="language-python">model = DDP(model, device_ids=[local_rank])   # the entire chapter, in one line
+# ...then train normally; loss.backward() does the bucketed all-reduce for you.
+</code></pre>
+<div class="code-caption"><strong>Code 15.6.4:</strong> The DDP idiom. One constructor call replaces the manual replication, bucketing, and all-reduce of Code 15.6.3, and the library internally handles process-group transport, bucket scheduling, and the overlap of communication with the backward pass.</div>
+<p>That single line is why <code>loss.backward()</code> in Code 15.6.1 needs no modification: DDP has already wired the gradient averaging into the autograd graph. You write almost-normal training code and get synchronous data parallelism that is exact to floating-point rounding and overlapped for free.</p>
+</div>
+
+<h2>6. When the Wrapper Is Not Enough <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>DDP solves the data-parallel case completely, and the data-parallel case is the one where the whole model fits on one GPU and only throughput binds. The moment the model itself no longer fits, DDP has nothing to offer, because it replicates the full model to every process. That is the boundary where this chapter ends and the next begins: sharded data parallelism and model parallelism, which split the parameters themselves across devices rather than replicating them. The collectives change too, from a single all-reduce to the reduce-scatter and all-gather pair that sharded methods rely on, a transition foreshadowed when this book first introduced collective communication. Within its lane, though, DDP is close to optimal, and the right instinct is to reach for it first and only graduate to heavier machinery when a memory ceiling, not a throughput ceiling, forces the move.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The DataParallel Job That Would Not Scale</div>
+<p><strong>Who:</strong> A computer-vision team at a robotics startup training an image segmentation model on an eight-GPU server.</p>
+<p><strong>Situation:</strong> They had wrapped their model in <code>nn.DataParallel</code> a year earlier because it was a one-line change and it worked on their four-GPU prototype box.</p>
+<p><strong>Problem:</strong> Moving to eight GPUs barely improved throughput; GPU 0 sat near full memory while the others idled, and one CPU core was pinned at 100 percent.</p>
+<p><strong>Dilemma:</strong> Buy a larger single GPU to fit the bottlenecked primary device, a scale-up move that did nothing about the idle GPUs, or rewrite the training loop for <code>DistributedDataParallel</code>, which meant a launcher, a process group, and a sampler change.</p>
+<p><strong>Decision:</strong> They migrated to DDP, because the symptoms (one busy CPU core, a memory hotspot on the primary GPU, poor scaling) were the textbook signature of the GIL bottleneck and output-gathering that DDP removes by design.</p>
+<p><strong>How:</strong> They replaced the <code>DataParallel</code> wrap with a <code>DistributedDataParallel</code> wrap, added a <code>DistributedSampler</code>, guarded the checkpoint save with a rank check, and launched with <code>torchrun --nproc_per_node=8</code>, about thirty lines following Code 15.6.1.</p>
+<p><strong>Result:</strong> Throughput scaled close to linearly with the eight GPUs, the memory hotspot vanished because each process kept its activations local, and per-epoch time dropped by roughly a factor of six over the old <code>DataParallel</code> run.</p>
+<p><strong>Lesson:</strong> <code>DataParallel</code>'s one-line convenience hides a single-process bottleneck that gets worse with more GPUs. For anything beyond a quick experiment, start with DDP; the extra setup is small and the scaling is real.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Compiled and Communication-Optimized DDP (2024 to 2026)</div>
+<p>DDP's design is stable, but the machinery around it keeps getting faster. PyTorch 2.x integrates DDP with <code>torch.compile</code>, so the framework can reorder and fuse the all-reduce buckets against the compiled backward graph rather than scheduling them with runtime heuristics, tightening the overlap that Figure 15.6.1 depicts. A second thread pushes gradient compression and low-precision collectives into the DDP communication hook API, letting bf16 or quantized all-reduces cut the bytes on the wire with little accuracy loss, in the lineage of the communication-avoiding methods this book tracks. A third thread is the gradual handoff from DDP to <code>FullyShardedDataParallel</code> as the default for large models, where parameters, gradients, and optimizer state are sharded rather than replicated; the 2024 to 2026 releases blur the line by letting FSDP behave like DDP for models that still fit, so the same code path scales from one-GPU-fits to does-not-fit. The constant across all three is the principle from <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>: the all-reduce is the cost to engineer down, and the wrapper is where that engineering hides.</p>
+</div>
+<p>You now have the practical tool that packages this entire chapter. The exact gradient identity, the synchronous step, the ring all-reduce, and the overlap with backpropagation all live inside a single wrapper that lets you write almost-normal training code. The next section turns to <a href="section-15.7.html">Horovod</a>, an alternative framework that brought the same all-reduce-based data parallelism to TensorFlow, Keras, and PyTorch alike, and that pioneered some of the overlap techniques DDP now uses, so that you can recognize the shared idea wearing a different library's clothes.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.6.1: Trace the Hang <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A colleague reports that their four-GPU DDP job runs the first few hundred steps fine, then hangs with all GPUs at 100 percent utilization and no error. Their model has a branch (<code>if x.mean() &gt; 0: out = self.extra_layer(out)</code>) that depends on the input. Using the deadlock mechanism described in Section 3, explain exactly why the job hangs, why it can run for a while before doing so, and name two distinct fixes (one at the model level, one at the DDP-construction level). Why is a missing all-reduce a silent hang rather than a crash?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.6.2: Add no_sync to MiniDDP <span class="exercise-type coding">Coding</span></div>
+<p>Extend the <code>MiniDDP</code> class in Code 15.6.3 with a gradient-accumulation mode that mirrors <code>no_sync()</code>. Give each replica an internal gradient buffer; on accumulation steps, add the local gradient to the buffer and skip <code>_all_reduce_buckets</code>; on the final step of each accumulation window, add the local gradient, all-reduce the accumulated buffer once, apply the update, and clear the buffer. Verify that accumulating over <code>accum</code> micro-shards of size $B$ produces the same final weights as one all-reduced step over a shard of size <code>accum * B</code>, and count how many all-reduce calls each version makes. Confirm the bucketed all-reduce count drops by the factor you expect.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.6.3: Bucket Size Versus Overlap <span class="exercise-type analysis">Analysis</span></div>
+<p>Real DDP exposes a <code>bucket_cap_mb</code> knob that controls how large each gradient bucket grows before its all-reduce fires. Reason about the trade-off using the $\alpha + \beta n$ communication-cost model from <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>, where $\alpha$ is per-message latency and $\beta$ is the per-byte cost. Argue why very small buckets pay the latency term $\alpha$ too many times, why very large buckets leave little of the backward pass to overlap with (so the all-reduce is exposed at the end), and sketch what an ideal bucket size depends on (model depth, layer sizes, network latency, backward-pass duration). Why is there no single best bucket size across all models?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-15.5.html"><span class="nav-label">Previous</span><span class="nav-num">Section 15.5</span><span class="nav-title">Overlapping Communication and Computation</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 15</span><span class="nav-num">Contents</span><span class="nav-title">Data-Parallel Deep Learning</span></a>
+<a class="next" href="section-15.7.html"><span class="nav-label">Next</span><span class="nav-num">Section 15.7</span><span class="nav-title">Horovod</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

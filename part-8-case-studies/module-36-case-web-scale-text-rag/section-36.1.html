@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 36.1: Problem Definition. Framing a retrieval-augmented generation system over billions of web documents, stating its scale and SLO requirements, and decomposing the end-to-end pipeline onto the six axes of distribution." name="description"/>
+<title>Section 36.1: Problem Definition | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Case Studies and Capstone Projects</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 36: Web-Scale Text Processing and Distributed RAG</a></div>
+<h1>Problem Definition</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"One user pressed Enter. By the time the answer came back, I had fanned the question out across a thousand shards, gathered their best guesses, and reassembled myself before anyone noticed I was never in one place to begin with."</p>
+<cite>A Single Query, About to Fan Out Across a Thousand Shards</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A retrieval-augmented generation system over the open web is the moment every axis of distribution in this book is forced to operate at once, in a single product, under a clock.</strong> The corpus is billions of documents that no machine can hold; the embeddings that make it searchable cost thousands of accelerator-hours to compute; the index that serves them spans hundreds of nodes; and the generator that reads the retrieved passages must answer thousands of users per second within a latency budget a person will actually wait for. This chapter takes one such system apart end to end. This opening section states the problem precisely, fixes the scale numbers that make a single machine impossible, decomposes the pipeline into the stages the rest of the chapter builds, and maps each stage onto the six axes of distribution from <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Chapter 1</a>. Everything that follows is engineering against the requirements written down here.</p>
+</div>
+<p>Retrieval-augmented generation, or RAG, answers a question by first finding relevant passages in a corpus and then conditioning a language model on those passages while it writes the answer. On a laptop, over a few thousand documents, RAG is a weekend project: embed the documents, drop the vectors into an in-memory index, and call a model. The interesting version, and the one this chapter studies, is the version that serves the open web. When the corpus is measured in billions of pages, refreshed continuously, and queried by a live user population, every component that was trivial on the laptop becomes a distributed system in its own right. The purpose of this case study is to show how the machinery built in Parts II through VII assembles into one coherent product, and where the seams between those parts actually fall.</p>
+<p>We will treat the system as a concrete target rather than an abstraction. Throughout the chapter, the running specification is a web-scale RAG service with a corpus on the order of ten billion documents, a freshness requirement measured in hours for the most active slice of the web, a query path that must return grounded answers within a latency a user tolerates, and a cost envelope that rules out brute force. Those four pressures, corpus size, freshness, latency and throughput, and cost, are the requirements; the rest of the chapter is the design that satisfies them.</p>
+
+<h2>1. The Requirements: Four Numbers That Rule Out One Machine <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A problem definition is only useful if it commits to numbers, because the numbers decide which ceilings bind and therefore which axes of distribution we must reach for. We fix four requirements and carry them through the entire chapter. The first is corpus size: the system indexes on the order of $N_{\text{docs}} = 10^{10}$ documents, each split into a handful of retrievable passages. The second is freshness: a meaningful fraction of the web changes daily, and the most active pages must be re-crawled and re-indexed within hours, not weeks, so the pipeline is never a one-time batch job but a continuously running flow. The third is the service-level objective, or SLO, on the query path: the system must sustain a throughput measured in thousands of queries per second while keeping per-query latency inside a budget on the order of a second, including both retrieval and generation. The fourth is cost: the design must hit the first three at a price that a real operator would pay, which immediately disqualifies any approach that scans the whole corpus per query or re-embeds the whole corpus per update.</p>
+<p>These four requirements interact, and the interaction is the whole subject. Freshness fights cost, because re-embedding more often burns more accelerator time. Latency fights corpus size, because a larger index means more candidates to search per query. Throughput fights latency, because every concurrent query competes for the same retrieval and generation hardware. A single machine fails all four at once and for independent reasons: it cannot store the corpus, cannot embed it in any reasonable time, cannot hold the index, and cannot serve the request volume. The next section makes that failure quantitative.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Case Study Is a Constraint-Satisfaction Problem Across Axes</div>
+<p>Earlier chapters each optimized one axis in isolation: how to process data, how to train, how to serve. A real system is the joint problem, where improving one axis pressures another. Web-scale RAG is the cleanest example in the book because all six axes are simultaneously load-bearing and visibly in tension. The skill this chapter teaches is reading a specification, locating which ceiling each requirement hits, and assigning each to the axis and the earlier chapter that owns its remedy, before writing a line of system code.</p>
+</div>
+
+<h2>2. Why a Single Machine Is Not Even Close <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The argument for distribution here is not rhetorical; it falls out of arithmetic on the four requirements. Take the corpus of $N_{\text{docs}} = 10^{10}$ documents, split each into a few passages, and embed every passage into a vector of dimension $d$ stored in half precision. The number of vectors to store and search is</p>
+$$N_{\text{vec}} = N_{\text{docs}} \cdot c, \qquad S_{\text{index}} = N_{\text{vec}} \cdot d \cdot b,$$
+<p>where $c$ is passages per document, $d$ is the embedding dimension, and $b$ is bytes per dimension. With $c = 3$, $d = 1024$, and $b = 2$ bytes, the index alone runs to tens of terabytes of raw vectors, far past the memory of any single node. The number of shards the index must be split into is the index size divided by the memory each node can devote to it,</p>
+$$K_{\text{shard}} = \left\lceil \frac{S_{\text{index}}}{M_{\text{node}}} \right\rceil,$$
+<p>which for a node offering tens of gigabytes of fast memory to the index lands in the hundreds. The compute to build the index once is equally decisive. If embedding costs a fixed throughput $r$ passages per second on one accelerator, the total one-pass embedding work is</p>
+$$T_{\text{embed}} = \frac{N_{\text{vec}}}{r},$$
+<p>independent of how we parallelize it; parallelizing only divides the wall-clock by the fleet size. Finally, the query path obeys Little's law: the number of queries in flight at any instant is the arrival rate times how long each one stays in the system,</p>
+$$C = \lambda \cdot L,$$
+<p>so a throughput $\lambda$ of thousands of queries per second at a latency $L$ near a second means thousands of queries are being served concurrently, which no single server's compute or memory can hold. Figure 36.1.1 shows the four pressures and the stages they fall on; Code 36.1.1 puts real numbers behind every one of these formulas.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 880 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="End-to-end web-scale RAG pipeline drawn as a distributed dataflow. A continuous crawl feeds a clean and dedup stage, then chunk and embed, then a sharded vector index. At query time a user query is embedded, fanned out across index shards, the candidates are ranked, passages are passed to a sharded language-model generator, and the grounded answer returns. An offline evaluation loop reads from generation back to the corpus. Each stage is annotated with its scale and the axis of distribution it loads.">
+<defs>
+<marker id="arr361" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr361b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.box361 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.qbox361 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.t361 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s361 { font:10.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.a361 { font:italic 10px sans-serif; fill:#8a5a12; text-anchor:middle; }
+.l361 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr361); }
+.le361 { fill:none; stroke:#b86b1f; stroke-width:1.5; stroke-dasharray:5 4; marker-end:url(#arr361b); }
+.hdr361 { font:700 12px sans-serif; fill:#14385c; text-anchor:start; }
+</style>
+<text class="hdr361" x="30" y="26">Offline build path (continuous)</text>
+<rect class="box361" x="30" y="42" width="130" height="62" rx="8"/>
+<text class="t361" x="95" y="66">Crawl</text>
+<text class="s361" x="95" y="84">~10^10 pages</text>
+<text class="a361" x="95" y="124">distribute data</text>
+<rect class="box361" x="200" y="42" width="140" height="62" rx="8"/>
+<text class="t361" x="270" y="62">Clean &amp; Dedup</text>
+<text class="s361" x="270" y="80">~30 TB text</text>
+<text class="a361" x="270" y="124">distribute data</text>
+<rect class="box361" x="380" y="42" width="140" height="62" rx="8"/>
+<text class="t361" x="450" y="62">Chunk &amp; Embed</text>
+<text class="s361" x="450" y="80">~4,000 GPU-h</text>
+<text class="a361" x="450" y="124">distribute inference</text>
+<rect class="box361" x="560" y="42" width="150" height="62" rx="8"/>
+<text class="t361" x="635" y="62">Sharded Index</text>
+<text class="s361" x="635" y="80">~60 TB, ~768 shards</text>
+<text class="a361" x="635" y="124">distribute the model</text>
+<line class="l361" x1="160" y1="73" x2="196" y2="73"/>
+<line class="l361" x1="340" y1="73" x2="376" y2="73"/>
+<line class="l361" x1="520" y1="73" x2="556" y2="73"/>
+<text class="hdr361" x="30" y="206">Online query path (per request, SLO-bound)</text>
+<rect class="qbox361" x="30" y="222" width="120" height="58" rx="8"/>
+<text class="t361" x="90" y="244">User Query</text>
+<text class="s361" x="90" y="262">embed query</text>
+<rect class="qbox361" x="190" y="222" width="150" height="58" rx="8"/>
+<text class="t361" x="265" y="244">Fan-out Retrieve</text>
+<text class="s361" x="265" y="262">scatter to shards</text>
+<text class="a361" x="265" y="300">coordinate the cluster</text>
+<rect class="qbox361" x="380" y="222" width="120" height="58" rx="8"/>
+<text class="t361" x="440" y="244">Rank</text>
+<text class="s361" x="440" y="262">gather, re-rank</text>
+<rect class="qbox361" x="540" y="222" width="150" height="58" rx="8"/>
+<text class="t361" x="615" y="244">RAG Generate</text>
+<text class="s361" x="615" y="262">sharded LLM</text>
+<text class="a361" x="615" y="300">distribute inference</text>
+<rect class="qbox361" x="730" y="222" width="120" height="58" rx="8"/>
+<text class="t361" x="790" y="244">Answer</text>
+<text class="s361" x="790" y="262">grounded</text>
+<line class="l361" x1="150" y1="251" x2="186" y2="251"/>
+<line class="l361" x1="340" y1="251" x2="376" y2="251"/>
+<line class="l361" x1="500" y1="251" x2="536" y2="251"/>
+<line class="l361" x1="690" y1="251" x2="726" y2="251"/>
+<path class="l361" d="M 635 104 L 635 180 L 265 180 L 265 218"/>
+<text class="s361" x="448" y="173">serves the query path</text>
+<text class="hdr361" x="30" y="372">Evaluation loop (offline, closes the loop)</text>
+<rect class="box361" x="300" y="388" width="280" height="52" rx="8"/>
+<text class="t361" x="440" y="410">Evaluate: retrieval quality, faithfulness, cost</text>
+<text class="a361" x="440" y="430" fill="#8a5a12">distribute intelligence / coordinate</text>
+<path class="le361" d="M 615 280 L 615 340 L 560 340 L 560 386"/>
+<path class="le361" d="M 300 414 L 95 414 L 95 108"/>
+<text class="a361" x="200" y="360">feeds corpus &amp; ranking back</text>
+</svg>
+<figcaption><strong>Figure 36.1.1:</strong> The end-to-end web-scale RAG pipeline as a distributed dataflow. The offline build path (top) crawls, cleans, embeds, and shards the corpus continuously; the online query path (middle) embeds a query, fans it out across index shards, ranks the candidates, and conditions a sharded generator on the retrieved passages; the evaluation loop (bottom, dashed) measures quality and cost and feeds corrections back into crawling and ranking. Each stage is labeled with its approximate scale (from Code 36.1.1) and the axis of distribution it loads most heavily.</figcaption>
+</figure>
+
+<p>The diagram fixes the vocabulary for the chapter. The top row is the offline build path that runs continuously to satisfy the freshness requirement; the middle row is the online query path that runs per request under the latency SLO; the dashed bottom loop is the evaluation that keeps both honest. The numbers on each box come from the same back-of-envelope model, which we now run with real arithmetic so that no estimate in this chapter is a guess.</p>
+
+<pre><code class="language-python">import math
+
+N_docs            = 10_000_000_000   # corpus size (requirement 1)
+chunks_per_doc    = 3                 # retrievable passages per document
+bytes_per_chunk   = 1024             # cleaned text per passage, bytes
+dim               = 1024             # embedding dimension d
+bytes_per_dim     = 2                # fp16 vector storage, b
+embed_rate        = 2000             # passages/sec on one accelerator, r
+mem_per_node_gb   = 80              # memory one node devotes to the index
+
+n_vec   = N_docs * chunks_per_doc                       # total vectors N_vec
+text_tb = n_vec * bytes_per_chunk / 1e12               # cleaned text storage
+S_index = n_vec * dim * bytes_per_dim                  # index size in bytes
+vec_tb  = S_index / 1e12
+shards  = math.ceil(S_index / (mem_per_node_gb * 1e9)) # K_shard
+gpu_h   = n_vec / embed_rate / 3600                    # T_embed in GPU-hours
+
+print(f"total vectors N_vec        : {n_vec:,}")
+print(f"cleaned text storage       : {text_tb:,.1f} TB")
+print(f"fp16 vector index S_index  : {vec_tb:,.1f} TB")
+print(f"index shards K_shard       : {shards:,}")
+print(f"one-pass embed T_embed     : {gpu_h:,.0f} GPU-hours")
+
+for fleet in (1, 1000):                                 # wall-clock = T_embed / fleet
+    print(f"  embed wall-clock on {fleet:>4} GPUs : {gpu_h/fleet:>10,.1f} h "
+          f"({gpu_h/fleet/24:,.1f} days)")
+
+for qps, lat in ((5000, 0.8), (20000, 0.8)):            # Little's law: C = lambda * L
+    print(f"  QPS={qps:>6}, latency={lat}s -> queries in flight C = {qps*lat:,.0f}")
+</code></pre>
+<div class="code-caption"><strong>Code 36.1.1:</strong> The four-requirement back-of-envelope model for the running specification. Each printed quantity corresponds to one formula in this section: $N_{\text{vec}}$, $S_{\text{index}}$, $K_{\text{shard}}$, $T_{\text{embed}}$, the embedding wall-clock under a fleet, and Little's-law concurrency $C$.</div>
+<pre><code class="language-text">total vectors N_vec        : 30,000,000,000
+cleaned text storage       : 30.7 TB
+fp16 vector index S_index  : 61.4 TB
+index shards K_shard       : 768
+one-pass embed T_embed     : 4,167 GPU-hours
+  embed wall-clock on    1 GPUs :    4,166.7 h (173.6 days)
+  embed wall-clock on 1000 GPUs :        4.2 h (0.2 days)
+  QPS=  5000, latency=0.8s -> queries in flight C = 4,000
+  QPS= 20000, latency=0.8s -> queries in flight C = 16,000
+</code></pre>
+<div class="code-caption"><strong>Output 36.1.1:</strong> Real output. Building the index once on a single accelerator would take roughly half a year; the vector index alone is over sixty terabytes and must be split across hundreds of nodes; and the query path keeps thousands of requests in flight at once. Every number here is a wall the single machine hits, and each maps to a different axis of distribution.</div>
+<p>The output settles the question. The single accelerator needs about $173$ days to embed the corpus once, which alone violates the freshness requirement before any user has typed a query. The index is over sixty terabytes and demands on the order of $768$ shards. The query path keeps thousands of requests in flight simultaneously. None of these is a marginal overshoot that a faster chip would absorb; each is one to three orders of magnitude beyond a single node, and each lands on a different stage of the pipeline. That separation is exactly what makes the six-axis decomposition the right tool.</p>
+
+<h2>3. Decomposing the Pipeline Onto the Six Axes <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The six axes of distribution from <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>, distribute data, distribute training, distribute the model, distribute inference, coordinate the cluster, and distribute intelligence, give us a map onto which every stage of Figure 36.1.1 places cleanly. Mapping the stages is the planning act of the whole chapter: it tells us which earlier part of the book owns each stage and which later section of this chapter develops it. Table 36.1.1 is that map, and it doubles as the chapter's table of contents.</p>
+<div class="table-caption"><strong>Table 36.1.1:</strong> Each pipeline stage assigned to the axis of distribution it loads most heavily, the earlier chapter that owns the underlying machinery, and the later section of this chapter that builds it.</div>
+<table>
+<thead>
+<tr><th scope="col">Pipeline stage</th><th scope="col">Primary axis</th><th scope="col">Owning earlier chapter</th><th scope="col">Built in this chapter</th></tr>
+</thead>
+<tbody>
+<tr><td>Crawl the web</td><td>Distribute data</td><td><a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/index.html">Ch 6</a> (MapReduce)</td><td><a href="section-36.2.html">Section 36.2</a></td></tr>
+<tr><td>Clean and deduplicate</td><td>Distribute data</td><td><a href="../../part-2-distributed-data/module-07-spark-dataframes/index.html">Ch 7</a>, <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/index.html">Ch 8</a></td><td><a href="section-36.3.html">Section 36.3</a></td></tr>
+<tr><td>Shard and index</td><td>Distribute the model</td><td><a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Ch 25</a> (vector search)</td><td><a href="section-36.4.html">Section 36.4</a></td></tr>
+<tr><td>Chunk and embed</td><td>Distribute inference</td><td><a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Ch 15</a> (encoders)</td><td><a href="section-36.5.html">Section 36.5</a></td></tr>
+<tr><td>Retrieve and rank</td><td>Coordinate the cluster</td><td><a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Ch 25</a></td><td><a href="section-36.6.html">Section 36.6</a></td></tr>
+<tr><td>RAG generation and orchestration</td><td>Distribute inference</td><td><a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Ch 24</a>, <a href="../../part-6-multi-agent-systems/module-32-distributed-agent-orchestration/index.html">Ch 32</a></td><td><a href="section-36.7.html">Section 36.7</a></td></tr>
+<tr><td>Evaluate end to end</td><td>Distribute intelligence</td><td><a href="../../part-1-foundations/module-05-evaluating-distributed-ai/index.html">Ch 5</a></td><td><a href="section-36.8.html">Section 36.8</a></td></tr>
+<tr><td>Extend and rebuild</td><td>Coordinate the cluster</td><td><a href="../module-41-capstone-project-design/index.html">Ch 41</a> (capstone)</td><td><a href="section-36.9.html">Section 36.9</a></td></tr>
+</tbody>
+</table>
+<p>Reading the table top to bottom traces the dataflow of Figure 36.1.1, and reading the third column traces the path back through the book. The crawl and the cleaning stages are pure data distribution: they are MapReduce and Spark jobs over a petabyte-class stream, owned by <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a> and <a href="../../part-2-distributed-data/module-07-spark-dataframes/index.html">Chapter 7</a>, with the storage and loading machinery of <a href="../../part-2-distributed-data/module-08-distributed-storage-data-loading/index.html">Chapter 8</a> underneath. Embedding is distributed inference applied to a fixed corpus rather than a live request stream, which is why it borrows the encoder and batching techniques of <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>. Sharding the index is distributing a structure too large for one node, the same partitioning logic that splits a model across devices, here applied to the vector store of <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a>. Retrieval and ranking are a scatter-gather over those shards, a cluster-coordination problem. Generation is distributed LLM serving from <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>, multiplied across the fleet to meet the throughput SLO. Orchestration that holds the per-query flow together is the agent-orchestration material of <a href="../../part-6-multi-agent-systems/module-32-distributed-agent-orchestration/index.html">Chapter 32</a>. Evaluation closes the loop. No stage is new machinery; the contribution of this chapter is the assembly and the seams.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Scale-Out Moment of an Entire Product</div>
+<p>Most chapters mark a single primitive being scaled out. This case study marks the thesis itself: a complete, user-facing product in which scale-out is not one optimization but the only way the product can exist. Six axes that earlier chapters treated separately are here load-bearing at the same instant, and the design is the act of keeping them coherent. When you reach the capstone in <a href="../module-41-capstone-project-design/index.html">Chapter 41</a>, this is the worked example you will imitate: read the requirements, locate each ceiling, assign it to an axis, and defend the assignment with the arithmetic of Code 36.1.1. Scale-out stops being a technique and becomes the shape of the system.</p>
+</div>
+
+<h2>4. The Build Path Versus the Query Path <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>One structural decision organizes the rest of the chapter, and it is visible as the two horizontal bands in Figure 36.1.1. The offline build path and the online query path have opposite cost profiles and must be engineered against opposite metrics. The build path is throughput-bound and latency-tolerant: it processes the whole corpus, so it is measured in total accelerator-hours and dollars, and a passage embedded a few minutes late costs nothing. The query path is latency-bound and throughput-replicated: each request must finish inside the SLO, so it is measured in tail latency and in how many concurrent requests the fleet sustains, and being a few seconds slow costs a user. Conflating these two paths is the most common design error in real RAG systems, because the techniques that make the build path cheap, enormous batches and relaxed deadlines, are exactly the techniques that ruin the query path.</p>
+<p>The two paths meet at one artifact: the sharded index. The build path produces it; the query path consumes it. Freshness is precisely the rate at which updates flow from the build path into the index that the query path is already serving, which is why the index cannot be a static file but must be a live, incrementally updated structure, a point <a href="section-36.5.html">Section 36.5</a> takes up in detail. The concurrency the query path must hold, the $C = \lambda L$ from Output 36.1.1, is the budget that <a href="section-36.7.html">Section 36.7</a> spends on replicated generation. Keeping the two paths logically separate while letting them share exactly one artifact is the architectural spine of the chapter.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The RAG Demo That Could Not Become a Product</div>
+<p><strong>Who:</strong> A founding engineer at an early-stage company building a research-assistant product over a large document collection.</p>
+<p><strong>Situation:</strong> A prototype over fifty thousand documents worked beautifully in a notebook: one embedding pass, an in-memory index, one model call per query.</p>
+<p><strong>Problem:</strong> The first real customer arrived with two hundred million documents and a contractual sub-second latency requirement, and the notebook architecture fell over on every axis at once.</p>
+<p><strong>Dilemma:</strong> Scale the prototype up on one very large machine, which postponed the wall by a single order of magnitude and still capped throughput at one server, or re-architect into a distributed build path and query path before the corpus grew further.</p>
+<p><strong>Decision:</strong> They re-architected, treating embedding as an offline batch job, sharding the index across nodes, and replicating the generator behind a queue, the exact split of Figure 36.1.1.</p>
+<p><strong>How:</strong> They ran the back-of-envelope model of Code 36.1.1 on the customer's numbers first, which told them the index needed dozens of shards and the embedding pass needed a fleet, and they sized the cluster from those numbers rather than from guesses.</p>
+<p><strong>Result:</strong> The product met the latency SLO at the customer's volume, and because the build and query paths were separated, growing the corpus tenfold later meant adding shards and embedding workers without touching the serving code.</p>
+<p><strong>Lesson:</strong> A RAG prototype and a RAG product are different systems. Doing the arithmetic of Section 2 before writing code is what turns the demo into something that survives its first real corpus.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Laptop RAG That Hides Every Distributed Problem</div>
+<p>It is worth seeing the system this chapter does not study, because it shows exactly which problems scale removes the luxury of ignoring. A few lines of a modern RAG framework give a working pipeline on a small corpus:</p>
+<pre><code class="language-python"># pip install langchain-community faiss-cpu sentence-transformers
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+
+emb   = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+store = FAISS.from_texts(documents, emb)          # embeds + indexes, all in RAM
+hits  = store.similarity_search(query, k=5)        # exact scan over the whole index
+answer = llm(prompt_with(hits))                    # one model call, one machine
+</code></pre>
+<div class="code-caption"><strong>Code 36.1.2:</strong> A complete single-machine RAG pipeline in five lines. It silently assumes the corpus fits in RAM, the embedding pass finishes instantly, the index lives in one process, and one model call meets the deadline. Each of those four assumptions is one of the four requirements from Section 1, and each fails at web scale; the rest of this chapter is what those five lines become when none of them hold.</div>
+</div>
+
+<h2>5. What This Chapter Builds, Section by Section <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>With the requirements fixed, the scale proven, and the axes mapped, the path through the chapter is set. <a href="section-36.2.html">Section 36.2</a> builds the distributed crawler that produces the raw corpus. <a href="section-36.3.html">Section 36.3</a> cleans and deduplicates that corpus at scale, the stage that most determines final answer quality. <a href="section-36.4.html">Section 36.4</a> builds the sharded lexical index over the cleaned corpus, the term-to-document structure too large for one node. <a href="section-36.5.html">Section 36.5</a> embeds the cleaned passages across a fleet, spending the $T_{\text{embed}}$ budget of Output 36.1.1 and writing the resulting vectors into the live index, the artifact both paths share. <a href="section-36.6.html">Section 36.6</a> builds the fan-out retrieval and ranking that turn a query into candidate passages. <a href="section-36.7.html">Section 36.7</a> conditions a replicated, sharded generator on those passages to produce grounded answers inside the latency SLO, and orchestrates the per-query flow. <a href="section-36.8.html">Section 36.8</a> closes the loop with end-to-end evaluation of retrieval quality, faithfulness, and cost. <a href="section-36.9.html">Section 36.9</a> hands the pipeline back as a staged project that grows a single-machine baseline into the full distributed system one milestone at a time. Each section opens with the slice of Figure 36.1.1 it owns and the requirement from Section 1 it must satisfy.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Where Web-Scale RAG Is Moving (2024 to 2026)</div>
+<p>The boundary of this problem is shifting on every axis at once. Long-context generators have reopened the question of how much retrieval is even needed, yet careful studies continue to find that retrieval beats context-stuffing on cost and on faithfulness at web scale, so the pipeline of Figure 36.1.1 remains the economical design. On the index side, learned and disk-resident approximate-nearest-neighbor structures in the DiskANN and SPANN lineage push billions of vectors per node and cut the shard count $K_{\text{shard}}$ that Section 2 computed. On the generation side, RAG is folding into agentic loops that retrieve iteratively and decide when they have read enough, which is where this case study connects forward to the agentic applications of <a href="../module-40-case-distributed-llm-agentic/index.html">Chapter 40</a> and the shared-memory retrieval of <a href="../../part-6-multi-agent-systems/module-32-distributed-agent-orchestration/index.html">Chapter 32</a>. The constant across all of it is the four-requirement tension of Section 1: every advance is judged by whether it improves one of corpus size, freshness, latency, or cost without surrendering the other three.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Half-Year That Becomes Four Hours</div>
+<p>Output 36.1.1 says one accelerator needs about $173$ days to embed the corpus once. A fleet of a thousand does the same work in roughly four hours. Nothing about the total compute changed; the $4{,}167$ accelerator-hours are spent either way. Scale-out did not make the work smaller, it made the wait survivable. That trade, identical total cost for a wall-clock a human can stand, is the bargain underneath every chapter of this book, and it is rarely as vivid as it is here.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 36.1.1: Read the Requirements, Name the Ceilings <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each of the four requirements in Section 1 (corpus size, freshness, query latency and throughput, cost), name the single pipeline stage in Figure 36.1.1 that it pressures hardest, the axis of distribution from Table 36.1.1 that stage sits on, and one concrete failure that occurs if that stage is left on a single machine. Then identify which two of the four requirements are in the most direct tension with each other and explain why satisfying one cheaply makes the other harder.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 36.1.2: Resize the System <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 36.1.1 to model a corpus ten times larger ($N_{\text{docs}} = 10^{11}$) and an embedding dimension of $1536$ instead of $1024$. Report the new index size $S_{\text{index}}$, shard count $K_{\text{shard}}$, and embedding budget $T_{\text{embed}}$, and compute the fleet size needed to keep the one-pass embedding wall-clock under twelve hours. Then add a freshness model: assume one percent of the corpus must be re-embedded every day and compute the steady-state number of embedding accelerators that requirement alone demands, independent of the initial build.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 36.1.3: The Concurrency Budget <span class="exercise-type analysis">Analysis</span></div>
+<p>Using Little's law $C = \lambda L$ from Section 2, suppose the query path must sustain $\lambda = 12{,}000$ queries per second at a target $p50$ latency of $0.7$ seconds, of which retrieval consumes $0.2$ seconds and generation consumes the rest. Estimate the number of concurrent queries in each of the two stages separately, and argue from those two numbers which stage dominates the fleet sizing. Discuss how the answer changes if a long tail makes the $p99$ latency three times the $p50$, and connect your reasoning to the replicated-serving treatment forthcoming in <a href="section-36.7.html">Section 36.7</a> and the LLM-serving economics of <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html"><span class="nav-label">Chapter Overview</span><span class="nav-num">Chapter 36</span><span class="nav-title">Web-Scale Text Processing and Distributed RAG</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 36</span><span class="nav-num">Contents</span><span class="nav-title">Web-Scale Text Processing and Distributed RAG</span></a>
+<a class="next" href="section-36.2.html"><span class="nav-label">Next</span><span class="nav-num">Section 36.2</span><span class="nav-title">Distributed Crawling</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

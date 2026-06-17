@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 24.1: Why Large-Model Serving Spans Many Machines. How a large model's weights plus KV cache exceed one GPU, why prefill and decode are split across machines, and the two SLOs (TTFT and TPOT) that drive every distributed-serving decision." name="description"/>
+<title>Section 24.1: Why Large-Model Serving Spans Many Machines | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 24: Distributed LLM Serving</a></div>
+<h1>Why Large-Model Serving Spans Many Machines</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I was asked to hold the model and remember the conversation. I could do one of those. They sent for more of me."</p>
+<cite>A GPU That Ran Out of Memory Mid-Sentence</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A large language model cannot be served from one machine, and the reason is not throughput but a single request: the model's weights plus the memory it must keep to continue a conversation already exceed what one accelerator can hold.</strong> The remedy is to split the model itself across several GPUs so that one forward pass runs on many devices at once, and then, at fleet scale, to notice that answering a prompt has two phases with opposite resource profiles and to put those phases on different machines. This chapter is the large-language-model deepening of distributed inference: where <a href="../module-23-distributed-inference-systems/index.html">Chapter 23</a> served many independent copies of a model that fits, here one copy does not fit, so the serving plan starts from memory arithmetic and ends with two latency targets that pull in different directions. This first section establishes why a single machine is impossible, and names the two service-level objectives that organize everything that follows.</p>
+</div>
+<p>The single-node mechanisms that make a transformer cheap to run, the key-value cache that turns quadratic decoding into linear decoding, paged attention that stops that cache from fragmenting memory, continuous batching that keeps the accelerator busy, and speculative decoding that spends a small model to save the big one, were the subject of <a href="../module-22-per-node-inference-efficiency/index.html">Chapter 22</a>. We treated them there as the per-node prerequisite, the scale-up baseline that distribution multiplies. This chapter assumes them and asks the next question. Once you have wrung out one GPU, what do you do when the model and its working memory still will not fit, or when one GPU cannot meet the latency a user expects? The answer is to span machines, and the shape of that span follows directly from where the memory goes.</p>
+
+<h2>1. One Request Already Overflows One GPU <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Start with a single user sending a single prompt. Two pools of memory must coexist on the accelerator. The first is the model weights, fixed in size: a model with $P$ parameters stored at $b$ bytes each occupies $P b$ bytes regardless of how many requests are in flight. The second is the key-value cache, the per-request memory that holds the attention keys and values for every token already seen, so that each new token attends to the past without recomputing it. The cache grows with the conversation. For a model with $L$ layers and hidden width $H$, every token stores keys and values across all layers, costing</p>
+$$\text{KV bytes per token} = 2 \cdot L \cdot H \cdot b_{\text{kv}},$$
+<p>where the leading $2$ counts keys and values separately and $b_{\text{kv}}$ is the bytes per stored number. The total memory a single GPU of capacity $M$ must hold for a batch of $R$ concurrent requests each of context length $C$ is therefore</p>
+$$\text{Mem} = \underbrace{P\,b}_{\text{weights}} \; + \; \underbrace{2\,L\,H\,b_{\text{kv}} \cdot C \cdot R}_{\text{KV cache}} \;\le\; M.$$
+<p>The weights term is a one-time cost; the cache term scales with both how long the conversations are and how many of them run at once. The crucial observation, the one that forces this entire chapter, is that for a large model the weights alone can exceed $M$, and even when they do not, the cache term overtakes them as context lengths grow into the tens or hundreds of thousands of tokens. Neither term is optional: you cannot drop the weights, and you cannot answer a long prompt without remembering it.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: LLM Serving Is Memory-Bound Before It Is Compute-Bound</div>
+<p>For classical model serving, you add machines when request volume outgrows one server's throughput, and a single replica always fits. For large-model serving the binding ceiling appears one request in: the weights plus the key-value cache exceed one GPU's memory. The model must be split across devices not to go faster but to exist at all. Every distributed-serving decision in this chapter starts from the memory inequality above, not from a requests-per-second target.</p>
+</div>
+<p>The fix for the weights term is to shard the model across GPUs so that each device holds only a slice of every layer and the devices cooperate on each forward pass. Splitting a single matrix multiply across GPUs and summing their partial results is tensor parallelism, the subject of <a href="section-24.2.html">Section 24.2</a>, and the summation it relies on is the same all-reduce collective introduced for training in <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>. The fix for the cache term, when the cache outgrows the GPUs that hold the weights, is to distribute the key-value cache itself, which <a href="section-24.4.html">Section 24.4</a> develops. Before either fix, it pays to see the overflow in numbers.</p>
+
+<h2>2. The Fit Calculator: Counting GPUs From Memory <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The inequality above is small enough to evaluate directly, and doing so turns "the model is too big" from a slogan into a count of machines. Given the weight bytes and the per-token cache cost, the minimum number of GPUs is the total memory divided by one GPU's capacity, rounded up,</p>
+$$N_{\text{GPU}} = \left\lceil \frac{P\,b + 2\,L\,H\,b_{\text{kv}}\,C\,R}{M} \right\rceil.$$
+<p>This is a lower bound: it assumes weights and cache can be packed perfectly across devices with no replication or overhead, which real tensor-parallel layouts only approximate. Even as a lower bound it is decisive. The code below evaluates it for three model sizes at two operating points, a short prompt with modest concurrency and a long-context workload with high concurrency, using bf16 weights and an 80 GB accelerator.</p>
+<pre><code class="language-python">import math
+
+# (name, params_billions, hidden H, layers L)
+models = [("8B", 8, 4096, 32), ("70B", 70, 8192, 80), ("405B", 405, 16384, 126)]
+B_WEIGHT, B_KV, GPU_GB = 2, 2, 80          # bf16 weights, fp16 KV, one 80 GB GPU
+
+def kv_bytes_per_token(H, L):              # keys + values, all layers
+    return 2 * L * H * B_KV
+
+# (context length C, concurrent requests R)
+points = [(8_000, 32), (128_000, 256)]
+
+print(f"{'Model':>6} {'ctx':>8} {'reqs':>5} {'weights GB':>11} {'KV GB':>9} {'total GB':>9} {'GPUs':>6}")
+for name, pb, H, L in models:
+    w = pb * 1e9 * B_WEIGHT
+    for C, R in points:
+        kv = kv_bytes_per_token(H, L) * C * R
+        total = w + kv
+        gpus = math.ceil(total / (GPU_GB * 1e9))     # the memory lower bound on devices
+        print(f"{name:>6} {C:>8} {R:>5} {w/1e9:>11.1f} {kv/1e9:>9.1f} {total/1e9:>9.1f} {gpus:>6}")
+</code></pre>
+<div class="code-caption"><strong>Code 24.1.1:</strong> A pure-Python fit calculator. It computes weight memory, key-value cache memory, and the minimum tensor-parallel GPU count from the memory inequality of Section 1, with no model or framework required.</div>
+<pre><code class="language-text"> Model      ctx  reqs  weights GB     KV GB  total GB   GPUs
+    8B     8000    32        16.0     134.2     150.2      2
+    8B   128000   256        16.0   17179.9   17195.9    215
+   70B     8000    32       140.0     671.1     811.1     11
+   70B   128000   256       140.0   85899.3   86039.3   1076
+  405B     8000    32       810.0    2113.9    2923.9     37
+  405B   128000   256       810.0  270582.9  271392.9   3393</code></pre>
+<div class="code-caption"><strong>Output 24.1.1:</strong> Even the smallest model needs two GPUs at modest concurrency, and the cache, not the weights, dominates as context grows. The 405B model at long context demands thousands of GPUs, almost all of it key-value cache.</div>
+<p>Read the first column of numbers and the thesis of the chapter falls out. The 8B model has only 16 GB of weights, comfortably inside one 80 GB GPU, yet at a 32-request batch of 8,000-token contexts it already needs two GPUs because the cache adds 134 GB. The 70B model's weights alone, at 140 GB, overflow a single device before any user connects. And the cache term is explosive: at 128,000-token contexts with 256 concurrent requests, the 70B model's cache reaches roughly 86 terabytes, swamping its weights by a factor of six hundred and demanding over a thousand GPUs. The lesson the table teaches, and the reason large-model serving is a distributed-systems problem rather than a single-box optimization, is that the memory you must reserve to remember conversations grows without bound while the weights stay fixed. Section 24.4 returns to this table when it distributes the cache itself.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Model Is the Cheap Part</div>
+<p>It is a strange inversion. We spend months and millions training the weights, then in production those weights are the smallest line in the memory budget. For a long-context, high-concurrency workload the model is rounding error and the cache is the bill. The accelerators in a serving fleet spend most of their silicon not on the model you trained but on its short-term memory of what each user just said.</p>
+</div>
+
+<h2>3. Sharding the Model, and the Two Phases of a Request <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Because one GPU cannot hold the model, the forward pass is spread across several. Each device holds a slice of every weight matrix, performs its part of each layer's matrix multiplications, and the devices exchange partial results so that the layer's output is correct as if one machine had computed it. Figure 24.1.1 shows the progression: a model and its growing cache overflowing one GPU on the left, the same model sharded across four cooperating GPUs in the middle, and on the right the two phases of generation that, at fleet scale, motivate splitting the work even further across machines.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 440" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three panels: a single GPU overflowing with model weights and an expanding KV cache; the same model sharded across four cooperating GPUs joined by an all-reduce; and the prefill phase (compute-bound, sets TTFT) feeding the decode phase (memory-bound, sets TPOT).">
+<defs>
+<marker id="arr241" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b241 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w241 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.k241 { fill:#eaf3ec; stroke:#2f7d4f; stroke-width:1.4; }
+.over241 { fill:#fbeceb; stroke:#b23b32; stroke-width:1.6; }
+.t241 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s241 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l241 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr241); }
+</style>
+<text class="t241" x="135" y="24">One GPU: does not fit</text>
+<rect class="over241" x="60" y="40" width="150" height="120" rx="8"/>
+<text class="s241" x="135" y="58">GPU memory M</text>
+<rect class="w241" x="72" y="70" width="126" height="34" rx="4"/>
+<text class="t241" x="135" y="92">weights P&#183;b</text>
+<rect class="k241" x="72" y="110" width="126" height="30" rx="4"/>
+<text class="s241" x="135" y="129">KV cache (growing)</text>
+<path class="l241" d="M 135 150 L 135 178" stroke="#b23b32"/>
+<text class="s241" x="135" y="196" fill="#b23b32">overflow</text>
+<line x1="232" y1="100" x2="276" y2="100" class="l241"/>
+<text class="t241" x="430" y="24">Tensor-parallel: one model, four GPUs</text>
+<rect class="b241" x="300" y="44" width="62" height="92" rx="6"/>
+<rect class="b241" x="372" y="44" width="62" height="92" rx="6"/>
+<rect class="b241" x="444" y="44" width="62" height="92" rx="6"/>
+<rect class="b241" x="516" y="44" width="62" height="92" rx="6"/>
+<text class="s241" x="331" y="74">GPU 0</text>
+<text class="s241" x="403" y="74">GPU 1</text>
+<text class="s241" x="475" y="74">GPU 2</text>
+<text class="s241" x="547" y="74">GPU 3</text>
+<text class="s241" x="331" y="110">slice</text>
+<text class="s241" x="403" y="110">slice</text>
+<text class="s241" x="475" y="110">slice</text>
+<text class="s241" x="547" y="110">slice</text>
+<rect class="b241" x="360" y="166" width="158" height="34" rx="6"/>
+<text class="t241" x="439" y="187">all-reduce</text>
+<path class="l241" d="M 331 138 L 331 158 L 430 158 L 430 164"/>
+<path class="l241" d="M 403 138 L 403 164"/>
+<path class="l241" d="M 475 138 L 475 164"/>
+<path class="l241" d="M 547 138 L 547 158 L 448 158 L 448 164"/>
+<text class="s241" x="439" y="218">partial sums combined per layer</text>
+<line x1="600" y1="100" x2="644" y2="100" class="l241"/>
+<text class="t241" x="755" y="24">Two phases of one request</text>
+<rect class="w241" x="660" y="44" width="190" height="66" rx="8"/>
+<text class="t241" x="755" y="68">PREFILL</text>
+<text class="s241" x="755" y="86">read whole prompt at once</text>
+<text class="s241" x="755" y="102">compute-bound &#183; sets TTFT</text>
+<path class="l241" d="M 755 112 L 755 138"/>
+<rect class="k241" x="660" y="142" width="190" height="78" rx="8"/>
+<text class="t241" x="755" y="166">DECODE</text>
+<text class="s241" x="755" y="184">one token at a time</text>
+<text class="s241" x="755" y="200">memory-bound &#183; sets TPOT</text>
+<text class="s241" x="755" y="216">reads the whole KV cache each step</text>
+<text class="s241" x="440" y="262">Weights are sharded so the model fits (24.2); the cache is distributed when it overflows (24.4);</text>
+<text class="s241" x="440" y="280">prefill and decode have opposite profiles, so at fleet scale they run on different machines (24.5).</text>
+</svg>
+<figcaption><strong>Figure 24.1.1:</strong> From impossible to distributed. Left: weights plus a growing key-value cache overflow one GPU. Middle: tensor parallelism shards every layer across four GPUs that combine partial results with an all-reduce, so one model runs as one forward pass on many devices. Right: a single request has a compute-bound prefill phase that sets time-to-first-token and a memory-bound decode phase that sets time-per-output-token; their opposite profiles motivate the disaggregation of Section 24.5.</figcaption>
+</figure>
+<p>The right panel of Figure 24.1.1 introduces the structural fact that the rest of the chapter exploits. Generating an answer is not one uniform computation; it is two phases. In the prefill phase the model reads the entire prompt at once, computing keys and values for every prompt token in parallel and producing the first output token. Prefill is compute-bound: it performs large matrix multiplications over many tokens simultaneously and saturates the accelerator's arithmetic units. In the decode phase the model generates the rest of the answer one token at a time, and each step must read the entire key-value cache to attend to the past while doing comparatively little arithmetic. Decode is memory-bound: it is limited by how fast the device can stream the cache out of memory, not by how fast it can multiply. One request, two opposite bottlenecks.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Per-Node Economics, Multiplied Across the Fleet</div>
+<p>Chapter 22 derived the key-value cache and paged attention as single-GPU optimizations, the scale-up baseline. This section takes those same per-node quantities, the bytes per token and the prefill-versus-decode split, and multiplies them across a serving fleet until they force a multi-machine architecture. The cache that paged attention packed efficiently into one GPU's memory now overflows the GPUs that hold the model, so it must be distributed (Section 24.4). The prefill and decode phases that shared one accelerator now run on separate pools of machines (Section 24.5). This is the book's recurring move: a primitive that lived on one node returns, scaled out, as the organizing principle of a distributed system. The arithmetic did not change; the number of machines it implies did.</p>
+</div>
+
+<h2>4. Two SLOs, Not One: TTFT and TPOT <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Because a request has two phases, its quality of service has two numbers, and collapsing them into a single latency figure hides the trade-off that distributed LLM serving exists to manage. The first is time-to-first-token (TTFT), the delay from when the user submits a prompt to when the first output token appears. TTFT is set almost entirely by prefill: a long prompt or a busy prefill queue makes the user wait before anything streams. The second is time-per-output-token (TPOT), sometimes called inter-token latency, the average gap between successive tokens once generation has begun. TPOT is set by decode: it determines how fast the answer streams out, and a user reads comfortably when it stays below roughly the speed of reading aloud.</p>
+<p>These two objectives pull in different directions. Batching more requests together raises decode throughput, which is good for serving many users cheaply, but a larger batch lengthens each decode step and inflates TPOT for everyone in it. Prioritizing a new request's prefill to lower its TTFT steals accelerator time from the decode steps of requests already streaming, raising their TPOT. A serving system that optimizes one number in isolation will quietly wreck the other. This is why the right success metric is not latency but goodput, the rate of requests served while meeting both SLOs at once, a notion <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.3.html">Section 5.3</a> defined for distributed systems in general and that Chapter 24 specializes to the TTFT-and-TPOT pair.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Disaggregating Prefill From Decode (2024 to 2026)</div>
+<p>The clearest recent answer to the two-SLO tension is to stop running prefill and decode on the same machines. DistServe (Zhong et al., 2024) assigns prefill and decode to separate GPU pools, each tuned for its own bottleneck and SLO, and reports large goodput gains over co-located serving because a slow prefill no longer stalls another user's decode. Splitwise (Patel et al., 2024, Microsoft) splits the two phases across different hardware generations, sending compute-heavy prefill to GPUs with high arithmetic throughput and memory-bound decode to cheaper memory-rich GPUs, then transfers the key-value cache between them over fast interconnect. Mooncake (Moonshot AI, 2024) takes the idea further with a key-value-cache-centric, disaggregated architecture built around a distributed cache pool that lets prefill results be reused and decode be scheduled independently. <a href="section-24.5.html">Section 24.5</a> develops this prefill/decode disaggregation in full; for now, note that the frontier has accepted the premise of this section, that the two phases are different enough to deserve different machines.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Chatbot That Streamed Fast but Started Slow</div>
+<p><strong>Who:</strong> An inference platform engineer running a 70B assistant for a customer-support product.</p>
+<p><strong>Situation:</strong> Users pasted long support transcripts, often 10,000 tokens, then asked a short question and expected an immediate reply.</p>
+<p><strong>Problem:</strong> The dashboard showed a healthy median latency, but complaints spiked: the assistant felt sluggish to start even though it typed quickly once it began.</p>
+<p><strong>Dilemma:</strong> The single latency metric averaged a slow prefill into a fast decode and looked fine; raising the batch size to cut cost would have made the start even slower, while shrinking it to speed the start would have raised the per-token cost across the fleet.</p>
+<p><strong>Decision:</strong> They split the metric into TTFT and TPOT, discovered TTFT at the 95th percentile was over four seconds while TPOT was excellent, and treated prefill as the binding constraint.</p>
+<p><strong>How:</strong> They moved to a prefill/decode-disaggregated layout (the approach of <a href="section-24.5.html">Section 24.5</a>), giving long prompts a dedicated prefill pool so a new transcript no longer queued behind other users' decode steps.</p>
+<p><strong>Result:</strong> The 95th-percentile TTFT fell below one second with TPOT unchanged, and goodput under the dual SLO rose because the two phases stopped contending for the same accelerators.</p>
+<p><strong>Lesson:</strong> One latency number is a trap for LLM serving. Measure TTFT and TPOT separately, find which phase binds, and place the phases on machines that can each meet its own target.</p>
+</div>
+
+<h2>5. The Road Through This Chapter <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The memory inequality and the two SLOs together set the agenda for everything that follows, and it is worth seeing the whole route before taking the first step. <a href="section-24.2.html">Section 24.2</a> shards a single forward pass across GPUs with tensor parallelism, the direct fix for weights that overflow one device. <a href="section-24.3.html">Section 24.3</a> extends the split across nodes with pipeline parallelism when even a tensor-parallel group spans more machines than one server holds. <a href="section-24.4.html">Section 24.4</a> distributes the key-value cache itself, the term that dominated Output 24.1.1. <a href="section-24.5.html">Section 24.5</a> disaggregates prefill from decode, the architectural answer to the two-SLO tension. <a href="section-24.6.html">Section 24.6</a> schedules requests and runs continuous batching across nodes so the fleet stays busy without violating either SLO. <a href="section-24.7.html">Section 24.7</a> reuses shared prompt prefixes and serves many fine-tuned adapters from one fleet. <a href="section-24.8.html">Section 24.8</a> serves mixture-of-experts models whose experts live on different machines, the inference companion to the expert parallelism of <a href="../../part-4-parallel-deep-learning/module-17-expert-parallelism-moe/index.html">Chapter 17</a>. <a href="section-24.9.html">Section 24.9</a> grounds all of it in the production engines that implement these ideas.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: vLLM Shards the Model From One Argument</div>
+<p>Code 24.1.1 told you how many GPUs a model needs; making it run across them is, in a modern engine, a single argument. vLLM, TensorRT-LLM, and SGLang each take a tensor-parallel degree and handle the weight sharding, the per-layer all-reduce, the paged key-value cache, and continuous batching that this chapter unpacks over the following sections. With vLLM the entire setup is:</p>
+<pre><code class="language-python">from vllm import LLM, SamplingParams
+
+# tensor_parallel_size shards every layer across 4 GPUs; the engine wires up the
+# per-layer all-reduce, paged KV cache, and continuous batching for you.
+llm = LLM(model="meta-llama/Llama-3.1-70B-Instruct", tensor_parallel_size=4)
+
+out = llm.generate(["Summarize this support transcript: ..."],
+                   SamplingParams(max_tokens=256))
+print(out[0].outputs[0].text)
+</code></pre>
+<div class="code-caption"><strong>Code 24.1.2:</strong> The 70B model that overflowed one GPU in Output 24.1.1, served across four with one argument. The hundreds of lines of weight sharding, collective scheduling, and cache paging that Sections 24.2 through 24.4 build by hand collapse to <code>tensor_parallel_size=4</code>, which <a href="section-24.9.html">Section 24.9</a> opens up.</div>
+</div>
+<p>We have the reason a single machine is impossible, the calculator that turns it into a GPU count, and the two service-level objectives that every later design must honor. The most direct response to weights that do not fit is to split one matrix multiply across devices and combine their answers, and that is exactly where the next section begins, with tensor-parallel inference in <a href="section-24.2.html">Section 24.2</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.1.1: Where Does the Memory Go? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the two terms of the memory inequality in Section 1, explain in words why a 7B model can serve a single short prompt on one GPU but needs several GPUs to serve hundreds of concurrent 100,000-token conversations, even though the weights never change size. Identify which term grows, what it scales with, and why the weights becoming "rounding error" (the Fun Note) is the expected outcome rather than a surprise. State which later section addresses the term that grows.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.1.2: Extend the Fit Calculator <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 24.1.1 in two ways. First, add a column for the fraction of total memory spent on the key-value cache, and confirm it approaches 1 as context length grows. Second, add a grouped-query-attention factor: real models share key-value heads across query heads, dividing the cache term by a ratio $g$ (try $g = 8$). Recompute the GPU counts for the 70B long-context row with and without grouped-query attention, and report how many GPUs the optimization saves. Explain why grouped-query attention attacks the cache term specifically and leaves the weight term untouched.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.1.3: Two SLOs in Tension <span class="exercise-type analysis">Analysis</span></div>
+<p>A serving system processes a batch of $R$ requests. Argue from the prefill-versus-decode distinction of Section 3 why increasing $R$ tends to lower the per-request cost (good for throughput) while raising TPOT (bad for the streaming SLO), and why admitting a new long prompt lowers nothing but the new user's TTFT while raising the TPOT of everyone already decoding. Sketch why a single latency number cannot capture this trade-off and why goodput under both SLOs, as defined in <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.3.html">Section 5.3</a>, is the metric that can. Predict qualitatively how prefill/decode disaggregation (Section 24.5) changes the trade-off.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html"><span class="nav-label">Chapter Overview</span><span class="nav-num">Chapter 24</span><span class="nav-title">Distributed LLM Serving</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 24</span><span class="nav-num">Contents</span><span class="nav-title">Distributed LLM Serving</span></a>
+<a class="next" href="section-24.2.html"><span class="nav-label">Next</span><span class="nav-num">Section 24.2</span><span class="nav-title">Tensor-Parallel Inference</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

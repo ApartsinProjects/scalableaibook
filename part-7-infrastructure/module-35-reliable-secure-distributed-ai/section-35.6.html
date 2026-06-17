@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 35.6: Privacy and Differential Privacy in Distributed Learning. The formal (epsilon, delta)-DP definition, sensitivity, the Laplace and Gaussian mechanisms, composition and the moments accountant, DP-SGD, and the central, local, and shuffle trust models for private distributed training." name="description"/>
+<title>Section 35.6: Privacy and Differential Privacy in Distributed Learning | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Cluster, Edge, and Reliable Infrastructure</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 35: Reliable and Secure Distributed AI</a></div>
+<h1>Privacy and Differential Privacy in Distributed Learning</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I hold a privacy budget the way I hold a battery charge: every query spends a little, nothing ever refunds it, and one day I simply have nothing left to answer with."</p>
+<cite>A Privacy Budget, Spent One Query at a Time</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Distributed and federated training is exactly where privacy becomes a first-class engineering problem, because many parties' data flows into one shared model, and the model itself can leak the records it was trained on.</strong> Differential privacy gives us the only widely accepted formal answer: a quantitative, composable guarantee that the trained model would have come out nearly the same whether or not any single person's data was included. This section develops the machinery that <a href="../module-34-edge-fog-on-device/section-34.9.html">Section 34.9</a> introduced from the edge-deployment side and then deferred: the formal $(\varepsilon, \delta)$ definition, the sensitivity of a query, the Laplace and Gaussian mechanisms that inject calibrated noise, the composition rules that make a privacy budget deplete over many training steps, and DP-SGD, the per-example clip-and-noise procedure that is the workhorse for private distributed learning. We close on where the noise is added, central versus local versus shuffle, because in a distributed system that choice is the whole ballgame.</p>
+</div>
+<p>A trained model is a lossy summary of its training data, and lossy is not the same as private. Membership-inference attacks, the threat introduced in <a href="section-35.3.html">Section 35.3</a>, recover whether a specific person's record was in the training set by probing the model's confidence; reconstruction attacks can pull verbatim training examples out of an overparameterized network. In a single-tenant setting one might wave this away, but distributed AI rarely is single-tenant. Federated learning (<a href="../../part-3-distributed-ml/module-14-federated-decentralized-learning/index.html">Chapter 14</a>) pools gradients from thousands of phones or hospitals; a recommendation model ingests the behavior of millions of users; a medical model is trained across institutions that are legally forbidden from sharing raw records. When many parties' data converges into one artifact, the question stops being "is this model accurate?" and becomes "what does releasing this model reveal about any one contributor?" Differential privacy answers that question with a number you can budget, spend, and audit.</p>
+
+<h2>1. The Formal Definition of Differential Privacy <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Differential privacy is a property of a randomized algorithm, not of a dataset or an output. Let $\mathcal{M}$ be a randomized mechanism that takes a dataset and returns some release (a statistic, a set of model weights, a gradient). Call two datasets $D$ and $D'$ <em>neighboring</em> if they differ in the record of exactly one individual, one row added, removed, or changed. The mechanism $\mathcal{M}$ satisfies $(\varepsilon, \delta)$-differential privacy if, for every pair of neighboring datasets and every measurable set of outcomes $S$,</p>
+$$\Pr[\mathcal{M}(D) \in S] \;\le\; e^{\varepsilon}\,\Pr[\mathcal{M}(D') \in S] \;+\; \delta.$$
+<p>Read the inequality as a promise to the individual whose record is the difference between $D$ and $D'$: whatever the mechanism outputs, the probability of that output barely changes whether your data was present or absent. The multiplier $e^{\varepsilon}$ caps how much more (or less) likely any outcome becomes because of your participation, so a small $\varepsilon$ (the <em>privacy loss</em> or <em>privacy budget</em>) means strong privacy and a large $\varepsilon$ means weak privacy. The additive $\delta$ is a small failure probability, the slack within which the clean multiplicative bound is allowed to break; one typically fixes $\delta$ well below $1/N$ for a dataset of $N$ people, often $10^{-5}$, so that the guarantee does not quietly permit leaking a whole record with non-negligible probability. The pure form $\varepsilon$-DP is the special case $\delta = 0$.</p>
+<p>Two structural properties make this definition usable at scale, and both matter enormously for distributed systems. The first is <em>post-processing immunity</em>: any function applied to a differentially private release, with no further access to the raw data, is still differentially private with the same $\varepsilon$. Once a gradient or a model update has been privatized, every downstream averaging, broadcasting, and optimizer step the cluster performs is free of additional privacy cost. The second is <em>composition</em>: running several private mechanisms on the same people accumulates privacy loss, and the budgets add up. Composition is what turns a per-query guarantee into the central accounting problem of private training, since a training run is thousands of queries against the same individuals, and we treat it in Section 3.</p>
+
+<h2>2. Sensitivity and the Laplace and Gaussian Mechanisms <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>To satisfy the definition you add random noise to the answer, and the right amount of noise is set by how much one person can move that answer. For a vector-valued query $f$, its <em>sensitivity</em> is the largest change a single individual can cause, measured in the norm that matches the noise distribution. The $L_1$ sensitivity is $\Delta_1 f = \max_{D \sim D'} \lVert f(D) - f(D') \rVert_1$ and the $L_2$ sensitivity is $\Delta_2 f = \max_{D \sim D'} \lVert f(D) - f(D') \rVert_2$, where $D \sim D'$ ranges over neighboring datasets. Sensitivity is the bridge from "what does this query compute?" to "how much noise hides one person?"</p>
+<p>The <strong>Laplace mechanism</strong> achieves pure $\varepsilon$-DP by adding noise drawn from a Laplace distribution with scale $b = \Delta_1 f / \varepsilon$ to each coordinate of the answer. Its heavier tails are calibrated to $L_1$ sensitivity. The <strong>Gaussian mechanism</strong>, which dominates machine learning because gradients live naturally in $L_2$ and Gaussian noise composes gracefully, adds noise $\mathcal{N}(0, \sigma^2 I)$ and satisfies $(\varepsilon, \delta)$-DP when</p>
+$$\sigma \;\ge\; \frac{\Delta_2 f \,\sqrt{2 \ln(1.25/\delta)}}{\varepsilon}.$$
+<p>The structure of this formula is the entire intuition of the field on one line. Noise grows with sensitivity $\Delta_2 f$ (the more one person can move the answer, the more you must hide), shrinks as the budget $\varepsilon$ grows (paying more privacy buys a cleaner answer), and grows only logarithmically with $1/\delta$ (tightening the failure slack is cheap). The released quantity is therefore the true answer plus zero-mean noise whose magnitude you control; at moderate $\varepsilon$ the noise is small relative to the signal, which is exactly what the demonstration in Section 5 measures. Figure 35.6.1 places these two mechanisms inside the larger pipeline that DP-SGD will instantiate.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 880 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A four-stage pipeline showing per-example gradients being clipped to a fixed norm, summed, perturbed with Gaussian noise, and averaged into a private model update.">
+<defs>
+<marker id="arr356" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b356 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.c356 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.n356 { fill:#eef6ee; stroke:#2f7d32; stroke-width:1.6; }
+.t356 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s356 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l356 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr356); }
+</style>
+<text class="t356" x="90" y="30">Per-example grads</text>
+<rect class="b356" x="30" y="48" width="120" height="40" rx="7"/>
+<text class="s356" x="90" y="73">g_1, g_2, ..., g_B</text>
+<text class="t356" x="300" y="30">Clip to norm C</text>
+<rect class="c356" x="225" y="48" width="150" height="40" rx="7"/>
+<text class="s356" x="300" y="67">g_i &#183; min(1, C/||g_i||)</text>
+<text class="s356" x="300" y="82">bounds sensitivity</text>
+<text class="t356" x="540" y="30">Sum + Gaussian noise</text>
+<rect class="n356" x="450" y="48" width="180" height="40" rx="7"/>
+<text class="s356" x="540" y="67">&#931; clip(g_i) + N(0, &#963;&#178;C&#178;I)</text>
+<text class="s356" x="540" y="82">&#963; from the accountant</text>
+<text class="t356" x="785" y="30">Average</text>
+<rect class="b356" x="710" y="48" width="140" height="40" rx="7"/>
+<text class="s356" x="785" y="73">private update / B</text>
+<line x1="150" y1="68" x2="221" y2="68" class="l356"/>
+<line x1="375" y1="68" x2="446" y2="68" class="l356"/>
+<line x1="630" y1="68" x2="706" y2="68" class="l356"/>
+<rect class="b356" x="300" y="150" width="280" height="92" rx="10"/>
+<text class="t356" x="440" y="178">Privacy accountant</text>
+<text class="s356" x="440" y="200">tracks &#949; spent across all T steps</text>
+<text class="s356" x="440" y="220">RDP / moments accountant composition</text>
+<path class="l356" d="M 540 92 L 540 146"/>
+<text class="s356" x="440" y="262">when the budget is exhausted, training must stop</text>
+</svg>
+<figcaption><strong>Figure 35.6.1:</strong> The DP-SGD pipeline of Section 4, with the Gaussian mechanism of Section 2 at its core. Each per-example gradient is clipped to a fixed $L_2$ norm $C$ (which fixes the sensitivity), the clipped gradients are summed and perturbed with Gaussian noise of scale $\sigma C$, and the result is averaged into a private update. A privacy accountant (Section 3) tallies the budget $\varepsilon$ spent across all $T$ steps and halts training when the budget is gone.</figcaption>
+</figure>
+
+<h2>3. Composition: Why the Budget Depletes Over Training <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>A single noisy query is private; a thousand of them against the same people are far less so, because an adversary can average away noise across repeated looks. This is the central tension of private training, where every gradient step is one more query against the same individuals. Basic composition is the pessimistic accounting: running $T$ mechanisms, each $(\varepsilon_0, \delta_0)$-DP, yields at worst $(T\varepsilon_0,\, T\delta_0)$-DP. The budget grows linearly in the number of steps, which for a training run of tens of thousands of steps is ruinous; a per-step $\varepsilon_0$ small enough to keep $T\varepsilon_0$ tolerable would drown the gradient in noise.</p>
+<p>The escape is that privacy loss is a random variable, and across many independent steps it concentrates. <em>Advanced composition</em> shows the total $\varepsilon$ grows like $\sqrt{T}$ rather than $T$ (for fixed per-step $\varepsilon_0$ and a small added $\delta$), already a decisive improvement. The tool that made DP deep learning practical goes further still. The <strong>moments accountant</strong> of Abadi et al. (2016), and its cleaner modern reformulation as <strong>Renyi differential privacy</strong> (RDP, Mironov 2017), track the privacy loss through its moment-generating function rather than through worst-case $\varepsilon$ at each step. RDP composes by simple addition of Renyi divergences across steps and converts to a final $(\varepsilon, \delta)$ bound only once, at the end. Because DP-SGD also samples a small random minibatch each step, it earns <em>privacy amplification by subsampling</em>: a record not selected in a given step is not queried, so its per-step loss is scaled down by the sampling rate $q = B/N$. The accountant folds clipping bound $C$, noise multiplier $\sigma$, sampling rate $q$, and step count $T$ into one tight final budget, schematically</p>
+$$\varepsilon \;\approx\; \frac{q\,\sqrt{T \,\ln(1/\delta)}}{\sigma},$$
+<p>which exposes the three levers an engineer actually turns: more noise (larger $\sigma$) lowers $\varepsilon$, more steps (larger $T$) raises it as $\sqrt{T}$, and a smaller sampling rate $q$ lowers it. The accountant is what lets you declare a target like "$\varepsilon = 8$ at $\delta = 10^{-5}$" before training and then choose $\sigma$ and $T$ to land on it.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Privacy Is a Budget, and Composition Is the Bill</div>
+<p>The single most important mental shift in differential privacy is to stop thinking of a private release as a one-time event and start thinking of $\varepsilon$ as a finite resource that every query, every gradient step, and every model checkpoint deducts from. There is no refund and no regeneration; once a population's budget is spent, any further release on the same people either weakens the guarantee or must be refused. Distributed training is brutal on this budget precisely because it issues thousands of correlated queries against the same individuals, which is why the entire field of private deep learning rests on composition theorems (advanced composition, RDP, the moments accountant) that bend the bill down from linear in $T$ to roughly $\sqrt{T}$, and on subsampling amplification that discounts the people a step never touched.</p>
+</div>
+
+<h2>4. DP-SGD: The Workhorse of Private Distributed Training <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>DP-SGD is the standard recipe for training a model under a differential-privacy guarantee, and it is a small modification of the ordinary stochastic gradient descent built in <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a>. Ordinary SGD averages the per-example gradients in a minibatch and steps. The trouble is that a single outlier example can produce an enormous gradient, so the sensitivity of the minibatch gradient is unbounded, and unbounded sensitivity means no finite amount of noise can privatize it. DP-SGD fixes this with two changes, both visible in Figure 35.6.1. First, it computes <em>per-example</em> gradients and <strong>clips</strong> each one to a fixed $L_2$ norm $C$, replacing $g_i$ by $g_i \cdot \min\!\left(1, C / \lVert g_i \rVert_2\right)$. After clipping, no single example can contribute more than $C$ to the sum, so the $L_2$ sensitivity of the summed gradient is exactly $C$. Second, it adds Gaussian noise calibrated to that sensitivity before averaging:</p>
+$$\tilde{g} \;=\; \frac{1}{B}\left( \sum_{i=1}^{B} g_i \cdot \min\!\Big(1, \frac{C}{\lVert g_i \rVert_2}\Big) \;+\; \mathcal{N}\!\left(0, \sigma^2 C^2 I\right) \right).$$
+<p>The noisy averaged gradient $\tilde{g}$ then drives the usual optimizer update. By post-processing immunity, everything after this point (momentum, weight decay, the broadcast of the new weights to every worker) costs no additional privacy. The per-step privacy is governed by the noise multiplier $\sigma$, and the total privacy across all $T$ steps is whatever the accountant of Section 3 reports for the chosen $(\sigma, C, q, T)$. Clipping introduces bias (it shrinks large gradients) and the noise introduces variance, and these are the two ways privacy degrades accuracy; choosing $C$ near the median gradient norm and $\sigma$ just large enough to hit the budget is the practical balancing act.</p>
+<p>The scale-out consequence is the heart of this section. In data-parallel DP-SGD the clipping is purely local (each worker clips its own per-example gradients), so it needs no communication, but the noise must be added <em>once</em> for the global batch, not once per worker. If $K$ workers each independently added the full $\mathcal{N}(0, \sigma^2 C^2 I)$ before the all-reduce, the averaged noise would shrink by $\sqrt{K}$ and the privacy guarantee would silently collapse. The fix is to make each worker add its $1/K$ share of the variance, or to designate one party to add the noise after aggregation. Where exactly the noise enters, and who is trusted to add it, is the trust-model question of Section 6, and it is the question that separates a privacy guarantee that holds from one that merely looks like it does.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Opacus Wraps Per-Example Clipping and the Accountant</div>
+<p>Implementing DP-SGD by hand means computing per-example gradients (which the standard backward pass does not give you), clipping each, adding correctly scaled noise, and running an RDP accountant, easily a few hundred lines done wrong in subtle ways. PyTorch's Opacus collapses all of it into a single <code>PrivacyEngine.make_private</code> call that rewires the model, optimizer, and data loader; TensorFlow Privacy offers the equivalent <code>DPKerasAdamOptimizer</code>. The library handles vectorized per-sample gradients, the noise scaling, and the budget accounting:</p>
+<pre><code class="language-python">from opacus import PrivacyEngine
+
+privacy_engine = PrivacyEngine()
+model, optimizer, data_loader = privacy_engine.make_private(
+    module=model,
+    optimizer=optimizer,            # ordinary SGD/Adam, untouched by you
+    data_loader=data_loader,
+    noise_multiplier=1.1,           # sigma: the lever the accountant tracks
+    max_grad_norm=1.0,              # C: the per-example L2 clipping bound
+)
+# ... train as usual; per-example clip + Gaussian noise happen inside .step()
+eps = privacy_engine.get_epsilon(delta=1e-5)   # budget spent SO FAR
+</code></pre>
+<div class="code-caption"><strong>Code 35.6.1:</strong> The entire DP-SGD modification of a PyTorch training loop, expressed through Opacus. Roughly two hundred lines of correct per-example gradient handling, noise calibration, and RDP accounting collapse to one <code>make_private</code> call plus a budget query; the noise multiplier and clip norm are the only knobs the engineer sets.</div>
+</div>
+
+<h2>5. A Private Mean You Can Run <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>To make the noise-versus-budget trade tangible without the machinery of a full training loop, the program below privatizes the single most common federated query: the population mean of a per-party record. It is DP-SGD's clip-and-noise step stripped to one dimension. Each of $N = 50{,}000$ parties contributes one real value; we clip every record to $[0, C]$ so that one party can move the released sum by at most $C$ (the sensitivity of the sum is $C$, hence the sensitivity of the mean is $C/N$), then add Gaussian noise calibrated by the very formula $\sigma = \Delta_2 f \sqrt{2 \ln(1.25/\delta)} / \varepsilon$ from Section 2. The program sweeps $\varepsilon$ and reports the error of the private release against the true clipped mean.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+
+# A federated cohort: N parties each contribute one real-valued record. We want
+# to release the population MEAN privately.
+N = 50_000
+true_records = rng.normal(loc=0.7, scale=0.25, size=N)
+true_mean = true_records.mean()
+
+# Gaussian mechanism for a clipped mean. Clipping each record to [0, C] bounds
+# the L2 sensitivity of the SUM to C, so the mean's sensitivity is C / N.
+C, delta = 1.0, 1e-5
+clipped = np.clip(true_records, 0.0, C)
+true_clipped_mean = clipped.mean()
+
+def gaussian_sigma(eps, sensitivity, delta):
+    # sigma = Delta * sqrt(2 ln(1.25/delta)) / eps   (the Section 2 formula)
+    return sensitivity * np.sqrt(2.0 * np.log(1.25 / delta)) / eps
+
+def private_mean(eps, trials=2000):
+    sens = C / N                                      # sensitivity of the MEAN
+    sigma = gaussian_sigma(eps, sens, delta)
+    releases = true_clipped_mean + rng.normal(0.0, sigma, size=trials)
+    rmse = np.sqrt(np.mean((releases - true_clipped_mean) ** 2))
+    return sigma, rmse, releases.mean()
+
+print(f"true clipped mean       : {true_clipped_mean:.6f}")
+print(f"{'epsilon':>8} {'sigma (mean)':>14} {'RMSE':>12} {'avg release':>13} {'rel err %':>10}")
+for eps in [0.1, 0.5, 1.0, 2.0, 5.0, 10.0]:
+    sigma, rmse, avg = private_mean(eps)
+    rel = 100.0 * rmse / abs(true_clipped_mean)
+    print(f"{eps:>8.1f} {sigma:>14.2e} {rmse:>12.2e} {avg:>13.6f} {rel:>10.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 35.6.2:</strong> A complete $(\varepsilon, \delta)$-private mean over a federated cohort, built directly from the Gaussian mechanism. Clipping fixes the sensitivity; <code>gaussian_sigma</code> calibrates the noise to the chosen budget; the sweep reports root-mean-square error and the average release across two thousand draws.</div>
+<pre><code class="language-text">true clipped mean       : 0.686441
+ epsilon   sigma (mean)         RMSE   avg release  rel err %
+     0.1       9.69e-04     9.74e-04      0.686403      0.142
+     0.5       1.94e-04     1.92e-04      0.686443      0.028
+     1.0       9.69e-05     9.49e-05      0.686441      0.014
+     2.0       4.84e-05     4.78e-05      0.686443      0.007
+     5.0       1.94e-05     1.96e-05      0.686441      0.003
+    10.0       9.69e-06     9.48e-06      0.686441      0.001</code></pre>
+<div class="code-caption"><strong>Output 35.6.2:</strong> Error falls in exact inverse proportion to $\varepsilon$, as the Gaussian formula predicts: halving the budget doubles the noise. Even at a stringent $\varepsilon = 1$ the private mean is within $0.014\%$ of the truth, and the release stays unbiased (the average over many draws sits on the true clipped mean), because the noise is zero-mean. Strong privacy and an accurate aggregate coexist once the cohort is large.</div>
+<p>The lesson of Output 35.6.2 is the quiet good news of differential privacy at scale: noise that is calibrated to one person's sensitivity is dwarfed by an aggregate over many people. The mean's sensitivity is $C/N$, so it shrinks as the cohort grows, and a population statistic over fifty thousand parties is essentially undisturbed even at a tight budget. The hard case is not the aggregate; it is the high-dimensional, low-redundancy model parameter, where the gradient noise of DP-SGD genuinely costs accuracy, which is why the privacy-utility trade in deep learning is real and is the subject of the next section's honest accounting.</p>
+
+<h2>6. Central, Local, and Shuffle: Where the Noise Is Added <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>In a distributed system the formal $\varepsilon$ is only half the story; the other half is who is trusted to see the data before the noise is added, and that defines three trust models with sharply different guarantees. In the <strong>central model</strong>, a trusted curator (the federated server, say) collects the raw per-party contributions, aggregates them, and adds the noise once to the aggregate. This wastes the least utility, because a single noise draw hides every contributor, but it requires every party to trust the curator with their cleartext data, which is often exactly the trust that federated learning exists to avoid.</p>
+<p>In the <strong>local model</strong>, each party adds noise to its own contribution <em>before</em> it ever leaves the device, so no one, not even the server, ever sees a clean record. This is the strongest trust assumption (you trust no one) and it is what powers deployed systems like randomized-response telemetry collection. The price is severe: with $N$ parties each adding independent noise, the aggregate noise grows like $\sqrt{N}$ relative to the central model, so local DP needs vastly more participants or a much larger $\varepsilon$ to reach the same accuracy. The <strong>shuffle model</strong> sits between the two: parties add modest local noise, and a trusted shuffler (which can be realized cryptographically) randomly permutes the messages so the server sees the perturbed reports stripped of their origin. That anonymity amplifies privacy, recovering much of the central model's accuracy while assuming far less trust than the central curator, and it has become the favored design point for large-scale private analytics.</p>
+<p>This is where privacy meets the secure-aggregation machinery of <a href="../../part-3-distributed-ml/module-14-federated-decentralized-learning/index.html">Chapter 14</a> and the robust-aggregation methods of <a href="section-35.5.html">Section 35.5</a>. Secure aggregation lets the server learn only the sum of the client updates, never any individual update, which manufactures a <em>distributed</em> form of the central model: clients can add their $1/K$ shares of the Gaussian noise locally, the cryptographic sum reconstructs the central-model noise scale, and no party ever trusts the server with a clean gradient. The interaction with robust aggregation is a genuine tension worth naming: DP adds zero-mean noise that a Byzantine-robust aggregator (a coordinate-wise median, a trimmed mean) may distort, and a malicious client can hide a poisoning attack inside the privacy noise. Composing privacy and robustness so that neither defeats the other is an active design problem, not a solved one.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Privacy Is a Tax That Only Distribution Has to Pay</div>
+<p>A model trained on one machine from one owner's data needs no differential privacy against that owner; the privacy problem is created by scale-out itself. The instant many parties' data converges into one shared artifact, whether that is a federated model pooling gradients from a million phones (<a href="../../part-3-distributed-ml/module-14-federated-decentralized-learning/index.html">Chapter 14</a>) or a clinical model trained across hospitals (<a href="../../part-8-case-studies/module-37-case-federated-medical-ai/index.html">Chapter 37</a>), the question "what does the shared model leak about any one contributor?" is forced into existence. Differential privacy is the formal answer, and where its noise is injected, central, local, or shuffle, is a distributed-systems decision about trust, not a statistics decision. Privacy thus joins communication and fault tolerance as one of the standing taxes of doing AI across many machines, and like them it is a cost to be engineered down, not eliminated.</p>
+</div>
+
+<h2>7. The Privacy-Utility Trade, Without Illusions <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Differential privacy is not free, and a section that pretended otherwise would mislead. For a simple aggregate over a large cohort, as Output 35.6.2 showed, the cost is negligible. For training a high-capacity model under DP-SGD, the cost is real: at a strong budget such as $\varepsilon = 1$ the clipping bias and gradient noise can cost several points of accuracy, and the gap is widest for small datasets, large models, and underrepresented subgroups whose signal is the first thing the noise erases. The levers are the ones the accountant exposed: a larger budget $\varepsilon$, more data $N$ (which both shrinks aggregate sensitivity and improves amplification), larger batches, and pretraining on public data so that private fine-tuning spends its budget on a smaller adaptation. Reporting a model's accuracy without its $(\varepsilon, \delta)$ is as incomplete as reporting it without the test set, and a guarantee with $\varepsilon$ in the dozens, while common in practice, is a much weaker promise than its presence might suggest.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Federated Keyboard That Shipped a Budget, Not Just a Model</div>
+<p><strong>Who:</strong> A privacy engineer on a mobile keyboard team training a next-word prediction model across millions of phones via federated learning.</p>
+<p><strong>Situation:</strong> Legal and policy review would not approve shipping a model trained on users' typed text without a formal, defensible privacy guarantee, not merely a promise that raw keystrokes stayed on-device.</p>
+<p><strong>Problem:</strong> Federated learning keeps raw text local, but the aggregated model updates can still memorize rare phrases (a credit card number typed once), exactly the membership and reconstruction leakage of <a href="section-35.3.html">Section 35.3</a>.</p>
+<p><strong>Dilemma:</strong> Local DP on each phone would have needed an enormous $\varepsilon$ or far more users to stay accurate, while a central curator adding the noise would have required trusting the server with clean per-user updates, which the on-device design existed to avoid.</p>
+<p><strong>Decision:</strong> They combined secure aggregation with DP-SGD, the distributed central model of Section 6: each client clipped its update to a fixed norm and added its share of the Gaussian noise, and the cryptographic sum reconstructed a central-model noise scale without any party trusting the server.</p>
+<p><strong>How:</strong> They fixed a target of $\varepsilon \approx 8$ at $\delta = 10^{-6}$, used an RDP accountant to choose the noise multiplier and round count, and pretrained on a public corpus so the private federated phase only fine-tuned.</p>
+<p><strong>Result:</strong> The shipped artifact carried a stated $(\varepsilon, \delta)$ guarantee that survived review, with a next-word accuracy regression small enough to accept, because the budget was spent on a fine-tune rather than a from-scratch train.</p>
+<p><strong>Lesson:</strong> In federated deployment the deliverable is the model <em>and</em> its privacy budget; choosing the trust model (here, distributed central via secure aggregation) and amortizing the budget through public pretraining is what makes a strong guarantee compatible with a usable model.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Tighter Accounting and Private Foundation Models (2024 to 2026)</div>
+<p>Two threads dominate current work. The first is sharper privacy accounting: numerical <em>privacy loss distribution</em> (PLD) accountants now compute the exact composed $(\varepsilon, \delta)$ for DP-SGD far more tightly than the closed-form moments bound, and they are the default in Google's <code>dp_accounting</code> library and in recent Opacus releases, often shaving the reported $\varepsilon$ by a meaningful factor at no change to the training. The second is scaling DP to foundation models: differentially private fine-tuning of large language models (in the lineage of Li et al. and Yu et al., 2022, extended through 2024 to 2026) shows that parameter-efficient methods (LoRA, prompt tuning) under DP-SGD reach accuracy once thought impossible at single-digit $\varepsilon$, because adapting few parameters spends little budget. A parallel and sobering line studies extraction and memorization in LLMs, quantifying how much these models leak <em>without</em> DP and thereby motivating it. Federated DP at the scale of billions of devices, with shuffle-model amplification and secure aggregation composed end to end, remains the open systems frontier, and it is the one most relevant to the distributed deployments this book targets.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Number That Embarrasses Everyone</div>
+<p>Ask a room of practitioners what $\varepsilon$ their production model ships with, and watch the eye contact evaporate. Many real deployments carry an $\varepsilon$ in the tens or even hundreds, a regime where the multiplicative bound $e^{\varepsilon}$ is so enormous that the formal guarantee is closer to a ritual than a shield. This is not hypocrisy so much as an honest reckoning with the privacy-utility trade: a weak guarantee that is actually computed and accounted for is still infinitely more than the silent $\varepsilon = \infty$ of training with no privacy at all. The budget you can name is the budget you can argue about, and that is the first step to lowering it.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 35.6.1: Read the Definition Like an Adversary <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A colleague proposes "averaging privacy": add Gaussian noise to a model's <em>final</em> released weights, once, with $\sigma$ chosen for a single Gaussian-mechanism query at $\varepsilon = 2$, and call the whole training run $(\varepsilon = 2, \delta)$-private. Using the composition discussion of Section 3 and post-processing immunity from Section 1, explain precisely why this argument is wrong: which queries against the individuals were already made before the final noise was added, and why post-processing immunity does not rescue the claim. Then state what <em>would</em> make a single-shot output-perturbation guarantee valid.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 35.6.2: The Distributed-Noise Bug <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 35.6.2 to a data-parallel setting with $K = 8$ workers, each holding $N/K$ records and each computing a clipped partial sum. Implement two variants of the combine step: (a) each worker independently adds the <em>full</em> $\mathcal{N}(0, \sigma^2 C^2)$ before the all-reduce, and (b) each worker adds only $\mathcal{N}(0, \sigma^2 C^2 / K)$. Measure the effective noise on the final averaged mean for both and show that variant (a) leaves a factor-$\sqrt{K}$ too little noise after averaging, silently breaking the intended guarantee, while variant (b) reconstructs the correct central-model noise scale. Relate your result to the scale-out warning at the end of Section 4.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 35.6.3: Budget Across the Levers <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the schematic relation $\varepsilon \approx q\sqrt{T \ln(1/\delta)} / \sigma$ from Section 3, suppose a DP-SGD run uses sampling rate $q = 0.01$, $T = 10{,}000$ steps, $\delta = 10^{-5}$, and you want $\varepsilon \le 8$. Solve for the minimum noise multiplier $\sigma$. Then determine how $\sigma$ must change if you double the number of steps to $T = 20{,}000$, and separately if you instead halve the sampling rate to $q = 0.005$. Comment on which lever, more steps or a smaller batch, an engineer can move most cheaply, and connect the $\sqrt{T}$ scaling to why advanced composition and the moments accountant of Section 3 were necessary for deep learning to be private at all.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-35.5.html"><span class="nav-label">Previous</span><span class="nav-num">Section 35.5</span><span class="nav-title">Byzantine-Robust Aggregation</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 35</span><span class="nav-num">Contents</span><span class="nav-title">Reliable and Secure Distributed AI</span></a>
+<a class="next" href="section-35.7.html"><span class="nav-label">Next</span><span class="nav-num">Section 35.7</span><span class="nav-title">Auditability and Governance Across a Fleet</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

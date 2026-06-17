@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 16.5: PyTorch FSDP. How Fully Sharded Data Parallel implements ZeRO-3-style sharding with a gather-compute-free cycle per unit, the wrapping-policy memory/communication trade-off, prefetch overlap, FSDP versus DDP, and FSDP2." name="description"/>
+<title>Section 16.5: PyTorch FSDP | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 16: Model, Pipeline, and Sharded Parallelism</a></div>
+<h1>PyTorch FSDP</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They told me I was the whole model. Turns out I was one fourth of three layers, gathered into existence for a few microseconds at a time, then politely freed."</p>
+<cite>A Shard That Believes It Is the Whole Model</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Fully Sharded Data Parallel (FSDP) is PyTorch's native way to train a model that does not fit on one device: it keeps every parameter sharded across the data-parallel workers at rest, and reconstitutes each layer's full weights only for the microsecond it is being used, then throws them away again.</strong> Section 16.4 described the idea abstractly as ZeRO-3: shard parameters, gradients, and optimizer state across the data-parallel group, and pay an all-gather to materialize a layer when you need it. FSDP is the implementation that turns that idea into roughly five lines of PyTorch. The whole method reduces to one repeated cycle, performed unit by unit through the forward and backward passes: <strong>all-gather the unit's full parameters, run compute, free the gathered copy, reduce-scatter the gradients</strong>. Everything else (the wrapping policy, the prefetch, the FSDP2 rewrite) is about making that cycle cheaper or its memory peak lower. This section makes the cycle concrete, runs it in miniature, and shows you the production call.</p>
+</div>
+<p>In <a href="../module-15-data-parallel-deep-learning/section-15.6.html">Section 15.6</a> we used <code>DistributedDataParallel</code> (DDP), which replicates the entire model on every worker and synchronizes gradients with an all-reduce. DDP is the right tool exactly when the model, its gradients, and its optimizer state all fit comfortably on one device; the replication is then free of extra memory cost and the only communication is the gradient all-reduce. The moment the model stops fitting, replication is no longer an option, and <a href="section-16.4.html">Section 16.4</a> showed the escape: stop replicating and start sharding. FSDP is the PyTorch component that does the sharding for you. It wraps the model in a tree of <em>units</em>, shards the parameters of each unit across the data-parallel group, and inserts the gather-compute-free cycle automatically around every unit's forward and backward. You write almost the same training loop you wrote for DDP; FSDP changes what lives in memory and what crosses the network underneath it.</p>
+
+<h2>1. The Gather, Compute, Free Cycle <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Picture the model as an ordered list of FSDP units, each unit being a group of layers (often a single transformer block). At rest, unit $u$ does not hold its full weight matrix anywhere; instead each of the $K$ workers in the data-parallel group holds a $1/K$ slice of it. This is the ZeRO-3 state from <a href="section-16.4.html">Section 16.4</a>: parameters, gradients, and optimizer state all sharded $K$ ways. The total parameter memory per worker is therefore the whole model divided by $K$, not the whole model. The catch is that no single worker can run a matrix multiply against a $1/K$ slice; it needs the full weight. FSDP supplies it just in time.</p>
+<p>When the forward pass reaches unit $u$, FSDP issues an <strong>all-gather</strong>: every worker sends its slice of unit $u$ and receives the others, so each worker briefly holds the complete weights of unit $u$. The worker runs the unit's forward compute, producing activations, and then immediately <strong>frees</strong> the gathered full weights, returning to holding only its slice. The peak full-parameter memory is therefore one unit at a time, never the whole model. The backward pass mirrors this: FSDP all-gathers unit $u$ again to compute its gradient, frees the weights, and then issues a <strong>reduce-scatter</strong> so that each worker ends up holding the averaged gradient for only its own slice. Reduce-scatter is the collective that <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> introduced as the second half of a ring all-reduce; here it does double duty as both the gradient average and the re-sharding. Figure 16.5.1 traces the full cycle for one unit.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 880 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The FSDP gather-compute-free cycle for a single unit: four worker shards all-gather into full parameters, run compute to produce activations and gradients, free the full parameters, and reduce-scatter the gradients back to shards, with a prefetch arrow overlapping the next unit's all-gather with the current compute.">
+<defs>
+<marker id="arr165" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr165o" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.b165 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.s165box { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.4; }
+.g165 { fill:#eaf3ec; stroke:#2f7d4f; stroke-width:1.6; }
+.t165 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.t165o { font:600 12px sans-serif; fill:#b86b1f; text-anchor:middle; }
+.sm165 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l165 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr165); }
+.l165o { fill:none; stroke:#b86b1f; stroke-width:1.8; stroke-dasharray:5 4; marker-end:url(#arr165o); }
+</style>
+<text class="t165" x="80" y="30">Sharded at rest</text>
+<rect class="s165box" x="30" y="46" width="100" height="26" rx="5"/><text class="sm165" x="80" y="63">worker 1 slice</text>
+<rect class="s165box" x="30" y="78" width="100" height="26" rx="5"/><text class="sm165" x="80" y="95">worker 2 slice</text>
+<rect class="s165box" x="30" y="110" width="100" height="26" rx="5"/><text class="sm165" x="80" y="127">worker 3 slice</text>
+<rect class="s165box" x="30" y="142" width="100" height="26" rx="5"/><text class="sm165" x="80" y="159">worker 4 slice</text>
+<line x1="135" y1="107" x2="215" y2="107" class="l165"/>
+<text class="t165" x="178" y="98">all-</text><text class="t165" x="178" y="125">gather</text>
+<rect class="b165" x="220" y="64" width="130" height="86" rx="10"/>
+<text class="t165" x="285" y="100">Full unit u</text>
+<text class="sm165" x="285" y="120">params resident</text>
+<text class="sm165" x="285" y="136">(one unit only)</text>
+<line x1="355" y1="107" x2="425" y2="107" class="l165"/>
+<text class="t165" x="390" y="98">compute</text>
+<rect class="g165" x="430" y="64" width="130" height="86" rx="10"/>
+<text class="t165" x="495" y="98">Forward /</text>
+<text class="t165" x="495" y="116">backward</text>
+<text class="sm165" x="495" y="136">acts, grads</text>
+<line x1="495" y1="155" x2="495" y2="205" class="l165"/>
+<text class="t165" x="600" y="180">free full params</text>
+<rect class="b165" x="430" y="210" width="130" height="50" rx="10"/>
+<text class="t165" x="495" y="232">Free unit u</text>
+<text class="sm165" x="495" y="250">back to slice</text>
+<line x1="430" y1="235" x2="135" y2="235" class="l165"/>
+<text class="t165" x="285" y="226">reduce-scatter grads</text>
+<rect class="s165box" x="30" y="200" width="100" height="70" rx="6"/>
+<text class="sm165" x="80" y="230">grad slice</text>
+<text class="sm165" x="80" y="248">per worker</text>
+<rect class="b165" x="640" y="64" width="160" height="86" rx="10"/>
+<text class="t165o" x="720" y="98">Prefetch unit u+1</text>
+<text class="sm165" x="720" y="120">all-gather next unit</text>
+<text class="sm165" x="720" y="136">during this compute</text>
+<path class="l165o" d="M 560 95 L 636 95"/>
+<text class="t165o" x="720" y="180">overlap hides</text>
+<text class="t165o" x="720" y="198">communication</text>
+<text class="sm165" x="440" y="330">The cycle repeats unit by unit: gather, compute, free, reduce-scatter. Peak full-parameter</text>
+<text class="sm165" x="440" y="348">memory is one unit; the prefetch (dashed) overlaps the next gather with the current compute.</text>
+</svg>
+<figcaption><strong>Figure 16.5.1:</strong> The FSDP gather-compute-free cycle for one unit. Parameters live sharded across the $K$ workers (left). FSDP all-gathers the full unit just before compute, runs the forward or backward, frees the full copy, and reduce-scatters the gradients back to per-worker slices. The dashed orange arrow is the prefetch of Section 4: the next unit's all-gather is launched during the current unit's compute so the communication hides behind useful work.</figcaption>
+</figure>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Sharding Trades Memory for Communication, One Unit at a Time</div>
+<p>FSDP never holds the whole model in full form on any worker. It holds one unit in full, for as long as that unit is computing, and one unit's worth of sharded slices for everything else. The memory bill drops from "whole model" to "whole model over $K$, plus one resident unit". The price is an extra all-gather per unit in the forward pass and another in the backward pass, on top of the reduce-scatter that replaces DDP's all-reduce. You are not getting the memory saving for free; you are paying for it in communication volume, and the rest of this section is about keeping that bill small.</p>
+</div>
+
+<h2>2. The Wrapping Policy and Its Trade-Off <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The single most consequential choice in FSDP is the <strong>wrapping policy</strong>: how the layers of your model are grouped into units. Each unit is the granularity at which FSDP all-gathers and frees. The two extremes bound the trade-off. If you wrap the entire model as one giant unit, FSDP all-gathers everything at once, which means the full model is briefly resident, and you have saved nothing on peak memory; you have merely added communication. If you wrap every individual layer as its own unit, peak full-parameter memory is one layer, the smallest possible, but you pay an all-gather and a free for every single layer, and many small collectives are far less efficient than a few large ones because each carries a fixed latency cost (the $\alpha$ term of the $\alpha\text{-}\beta$ model from <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>).</p>
+<p>The principle is therefore: <strong>more, smaller units lower the memory peak but raise the communication cost; fewer, larger units do the reverse.</strong> The sweet spot for transformers is almost always to wrap one transformer block per unit, which is both a natural memory granularity and a large enough chunk that the all-gather is bandwidth-bound rather than latency-bound. PyTorch ships a <code>transformer_auto_wrap_policy</code> that does exactly this when you name the block class. Let $M$ be the whole-model parameter count, $K$ the number of workers, and $U$ the number of units; the per-worker peak parameter memory is approximately</p>
+$$\text{peak} \approx \underbrace{\frac{M}{K}}_{\text{resting shards}} + \underbrace{\max_u m_u}_{\text{one resident unit}},$$
+<p>where $m_u$ is the size of unit $u$. Shrinking the largest unit shrinks the second term; the first term is fixed by $K$. The miniature in Section 5 measures exactly this peak and confirms it stays at one unit.</p>
+
+<h2>3. FSDP Versus DDP: A Decision, Not a Default <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>FSDP and DDP solve the same problem (data-parallel training across $K$ workers) with opposite memory strategies, and the choice between them is a measurement, not a slogan. DDP replicates: every worker holds a full copy of the model, gradients, and optimizer state, and the only communication is one gradient all-reduce per step. FSDP shards: every worker holds $1/K$ of each, and pays all-gathers to reconstitute units on demand. Table 16.5.1 lays the two side by side.</p>
+<div class="table-caption"><strong>Table 16.5.1:</strong> DDP and FSDP compared along the dimensions that decide which to use. The rule is simple: use the least sharding that fits.</div>
+<table>
+<thead>
+<tr><th scope="col">Dimension</th><th scope="col">DDP (Section 15.6)</th><th scope="col">FSDP (this section)</th></tr>
+</thead>
+<tbody>
+<tr><td>Parameters per worker</td><td>full model</td><td>$M / K$ plus one unit</td></tr>
+<tr><td>Optimizer state per worker</td><td>full</td><td>$1 / K$</td></tr>
+<tr><td>Communication per step</td><td>one gradient all-reduce</td><td>all-gather per unit (forward and backward) plus reduce-scatter</td></tr>
+<tr><td>When it is the right tool</td><td>model, grads, optimizer all fit on one device</td><td>they do not fit; you must shard</td></tr>
+<tr><td>Communication volume</td><td>lower</td><td>higher (roughly $1.5\times$ the bytes)</td></tr>
+</tbody>
+</table>
+<p>The decision rule fits in one line: <strong>use DDP when the model fits on one device, and FSDP when it does not.</strong> DDP moves fewer bytes, so when replication is affordable it is faster; FSDP moves more bytes but makes training possible at all when the model is too large to replicate. There is a middle ground, hybrid sharding, where FSDP shards within a node and replicates across nodes, trading some memory saving for less inter-node traffic; it is the natural choice when a node's combined GPU memory holds the model but a single GPU does not.</p>
+
+<h2>4. Prefetching: Hiding the All-Gather Behind Compute <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The extra all-gathers are FSDP's central cost, and the central remedy is the overlap idea that runs through this whole book: launch the communication early, on a separate stream, so it finishes while the device is busy with compute it could do anyway. We first met this in <a href="../../part-1-foundations/module-04-communication-primitives/section-4.10.html">Section 4.10</a> as overlapping the gradient all-reduce with the backward pass; FSDP applies the same principle to the all-gather. While unit $u$ is running its forward compute, FSDP issues the all-gather for unit $u+1$ in the background, so that by the time compute reaches unit $u+1$ its full parameters are already resident and the device never stalls waiting on the network. This is <strong>forward prefetch</strong>. The backward pass does the same in reverse, prefetching the all-gather of the next unit to be differentiated. The dashed arrow in Figure 16.5.1 is exactly this overlap.</p>
+<p>When prefetch works perfectly, the all-gather of every unit is fully hidden behind the compute of the previous unit, and FSDP's wall-clock per step approaches DDP's despite moving more bytes. When it does not (because a unit's compute is too short to cover its successor's gather, or the interconnect is too slow), the exposed all-gather time is the price you pay for not fitting in DDP. Profiling the overlap, and resizing units so that compute covers communication, is the core tuning loop for FSDP, and it is the same overlap accounting that <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> taught for collectives in general.</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Parameter That Exists Only When Observed</div>
+<p>There is something pleasingly quantum about an FSDP parameter. At rest it is smeared across four workers as four slices, none of which is the real weight. It snaps into full existence the instant a matrix multiply observes it, lives for the duration of that one operation, and dissolves back into slices the moment compute moves on. A whole transformer block is, most of the time, a superposition of fragments that have never met. The all-gather is the act of measurement, and like any good measurement it is expensive, which is why we try to do it while looking the other way.</p>
+</div>
+
+<h2>5. The Cycle in Miniature, Verified <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>FSDP needs a real multi-GPU cluster to run, so to <em>see</em> the gather-compute-free cycle we implement it in pure Python on one machine, simulating the $K$ workers as $K$ row-slices of each weight matrix held in a list. The model is a four-layer linear network, wrapped as four units (one per layer). At rest each unit is stored sharded; during the forward and backward pass we all-gather each unit just before compute, free it after, and reduce-scatter its gradients. We track the peak number of full parameters resident at any moment and check it against the whole-model count. To prove the sharding changes nothing about the math, we run an ordinary unsharded baseline with identical initialization and compare the two loss curves.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+K = 4                                  # simulated FSDP workers (shards)
+dims = [16, 32, 32, 16, 8]             # 4 weight matrices -> 4 FSDP units
+N, lr, steps = 256, 0.05, 40
+
+# ... (synthetic task and shared init W0 elided; full script in the book repo) ...
+
+def shard(W):        return np.array_split(W, K, axis=0)      # K row-slices
+def all_gather(s):   return np.concatenate(s, axis=0)         # rebuild full unit
+def reduce_scatter(g): return np.array_split(g, K, axis=0)    # grads back to slices
+
+units = [shard(W.copy()) for W in W0]            # persistent SHARDED state
+peak_full_params = 0
+for _ in range(steps):
+    acts, pre, h = [Xin], [], Xin
+    for u in range(4):
+        full_W = all_gather(units[u])            # ALL-GATHER unit u
+        peak_full_params = max(peak_full_params, full_W.size)  # one unit resident
+        z = h @ full_W; pre.append(z); h = np.maximum(z, 0); acts.append(h)
+        del full_W                               # FREE gathered params
+    g = (2.0 / target.size) * (h - target)
+    for u in reversed(range(4)):
+        g = g * (pre[u] > 0)
+        full_W = all_gather(units[u])            # re-gather for backward
+        full_grad = acts[u].T @ g; g = g @ full_W.T
+        del full_W                               # FREE again
+        grad_shards = reduce_scatter(full_grad)  # REDUCE-SCATTER grads
+        units[u] = [s - lr * gs for s, gs in zip(units[u], grad_shards)]
+</code></pre>
+<div class="code-caption"><strong>Code 16.5.1:</strong> The FSDP cycle stripped to its essence. State lives sharded in <code>units</code>; every unit is gathered to full form only inside its own <code>for u</code> iteration and freed (<code>del full_W</code>) before the next, so <code>peak_full_params</code> can never exceed the largest single unit. The reduce-scatter re-shards each gradient onto its owning worker.</div>
+<pre><code class="language-text">workers K                       : 4
+whole-model parameters          : 2176
+largest single FSDP unit        : 1024
+peak resident full params (FSDP): 1024
+peak / whole-model ratio        : 0.471
+baseline final loss             : 4.771891e-02
+FSDP     final loss             : 4.771891e-02
+max loss-curve gap (all steps)  : 0.00e+00</code></pre>
+<div class="code-caption"><strong>Output 16.5.1:</strong> The sharded run and the unsharded baseline produce bit-identical loss curves (maximum gap $0$ across all forty steps), while peak resident full parameters stay at one unit (1024 of 2176, ratio 0.471). Sharding changed the memory profile and nothing about the result, exactly as the ZeRO-3 identity of <a href="section-16.4.html">Section 16.4</a> promises.</div>
+<p>The gap of exactly zero is the same lesson as the gradient identity of <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>: rearranging where the arithmetic happens, and when each weight is materialized, does not change the arithmetic. Peak full-parameter residency held at the largest unit (1024 numbers) rather than the whole model (2176), so a model twice this size would still fit in the same resident budget by adding workers. That is the entire value proposition of FSDP, demonstrated without a GPU.</p>
+
+<h2>6. FSDP in Production, and FSDP2 <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>In real PyTorch you do not write the cycle; you declare the wrapping policy and FSDP inserts the gathers, frees, and reduce-scatters for you. The code below shows the shape of a production wrap. It needs a multi-process launch (<code>torchrun</code>) and a real cluster, so we present it illustratively rather than running it here.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: torch FSDP Wraps the Whole Cycle in One Call</div>
+<p>Code 16.5.1 spelled out the gather, free, and reduce-scatter by hand across roughly twenty lines. PyTorch's <code>FullyShardedDataParallel</code> collapses all of it into a single wrap plus an auto-wrap policy; the all-gathers, frees, reduce-scatters, prefetch scheduling, and stream management are inserted for you and never appear in your training loop.</p>
+<pre><code class="language-python"># Run with: torchrun --nproc_per_node=8 train_fsdp.py
+import functools, torch, torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from mymodel import TransformerBlock, build_model
+
+dist.init_process_group("nccl")               # join the group of K workers
+model = build_model().cuda()
+
+# Wrap one transformer block per FSDP unit: the memory/communication sweet spot.
+policy = functools.partial(transformer_auto_wrap_policy,
+                           transformer_layer_cls={TransformerBlock})
+model = FSDP(model, auto_wrap_policy=policy)   # params now sharded across K workers
+
+opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for batch in loader:                           # the loop looks just like DDP
+    opt.zero_grad()
+    loss = model(batch).loss                   # FSDP all-gathers each unit on demand
+    loss.backward()                            # ... and reduce-scatters its grads
+    opt.step()                                 # optimizer step on local shards only
+</code></pre>
+<div class="code-caption"><strong>Code 16.5.2:</strong> A production FSDP wrap. The only lines that differ from a DDP script (<a href="../module-15-data-parallel-deep-learning/section-15.6.html">Section 15.6</a>) are the import, the <code>auto_wrap_policy</code>, and the <code>FSDP(...)</code> call; the twenty-line cycle of Code 16.5.1 lives entirely inside that wrap. The optimizer sees only this worker's parameter shards, which is why optimizer state is sharded $K$ ways for free.</div>
+</div>
+<p>The original FSDP (now called FSDP1) wrapped each unit as a single flattened parameter, which complicated mixed precision, parameter freezing, and tensor-subclass features. <strong>FSDP2</strong>, the rewrite that became the recommended path in 2024, changes the representation: instead of one flat buffer per unit it shards each parameter individually as a <code>DTensor</code> (a distributed tensor that knows its own sharding), a design often called <strong>per-parameter sharding</strong>. This makes partial freezing, per-parameter dtypes, and composition with tensor parallelism (<a href="section-16.2.html">Section 16.2</a>) clean rather than special-cased, and it removes much of FSDP1's bookkeeping. The gather-compute-free cycle is unchanged; what changed is the data structure the cycle operates on.</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Per-Parameter Sharding and Composable Parallelism (2024 to 2026)</div>
+<p>FSDP2's move to per-parameter <code>DTensor</code> sharding is part of a broader 2024-to-2026 push toward <strong>composable</strong> parallelism in PyTorch. Because every parameter now carries its own sharding metadata, FSDP2 composes cleanly with tensor parallelism and pipeline parallelism through the same <code>DeviceMesh</code> abstraction, the basis of the "torchtitan" reference stack for training large language models with 2D and 3D parallelism in native PyTorch (Liang et al., 2024). The per-parameter representation also unlocks cleaner low-precision training: FSDP2 supports gathering parameters in a reduced dtype and reduce-scattering gradients in another, and integrates with float8 training paths. The research direction is to make data, tensor, pipeline, and expert sharding orthogonal layers you can stack with a few lines rather than a bespoke framework, which is exactly the 3D-parallelism trade-off space that <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a> taught you to cost out and that <a href="section-16.6.html">Section 16.6</a> reaches through DeepSpeed and Megatron-LM.</p>
+</div>
+
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Collective Returns, Re-Sharded</div>
+<p>The all-reduce you computed by hand in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a> and met as DDP's gradient sync in <a href="../module-15-data-parallel-deep-learning/section-15.6.html">Section 15.6</a> has now split into its two halves. FSDP's reduce-scatter is the second half of a ring all-reduce, and its all-gather is the first half, used not to share a finished sum but to materialize a sharded parameter on demand. The same primitives from <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a> are being recombined to buy memory instead of just averaging gradients. When you reach expert parallelism in <a href="../module-17-expert-parallelism-moe/index.html">Chapter 17</a>, the collective will mutate once more, into all-to-all; the lesson is that scale-out methods are mostly distinct recombinations of the same handful of collectives.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The 13-Billion-Parameter Model That Would Not Load</div>
+<p><strong>Who:</strong> An applied scientist at a language-tooling startup fine-tuning a 13-billion-parameter model on eight 40 GB GPUs.</p>
+<p><strong>Situation:</strong> The team's existing pipeline used DDP, which had worked fine for their earlier 1.3-billion-parameter model.</p>
+<p><strong>Problem:</strong> With DDP, every GPU tried to hold the full 13-billion-parameter model plus AdamW state (roughly 12 bytes per parameter for the optimizer alone), about 156 GB of optimizer state, and the job died with an out-of-memory error before the first step.</p>
+<p><strong>Dilemma:</strong> Buy 80 GB GPUs at far higher cost (scale up), or shard the model across the eight GPUs they already had with FSDP (scale out), accepting more communication for a chance at fitting.</p>
+<p><strong>Decision:</strong> They switched to FSDP, because the binding ceiling was memory, not throughput, and sharding addresses memory directly while replication cannot.</p>
+<p><strong>How:</strong> They wrapped the model with <code>transformer_auto_wrap_policy</code> on the block class (Code 16.5.2), enabled forward and backward prefetch, and left the training loop otherwise unchanged.</p>
+<p><strong>Result:</strong> Per-GPU memory dropped from "whole model" to roughly $M/8$ plus one transformer block, the job fit with headroom for a larger batch, and prefetch hid most of the extra all-gather time so the step was only modestly slower than DDP would have been if it had fit.</p>
+<p><strong>Lesson:</strong> When memory is the ceiling and the model cannot be replicated, FSDP is the tool; the extra communication is a price worth paying because the alternative is not slower training but no training at all.</p>
+</div>
+
+<p>FSDP is the modern default for large-model training in PyTorch precisely because it makes the ZeRO-3 idea of <a href="section-16.4.html">Section 16.4</a> a five-line change to a DDP script. You now understand the cycle it runs, the wrapping policy that tunes its memory-versus-communication trade-off, the prefetch that hides its cost, and the rule for choosing it over DDP. The next section steps up to the two frameworks that pioneered and industrialized these ideas at the largest scales, DeepSpeed (which introduced ZeRO) and Megatron-LM (which introduced tensor parallelism), and shows how they compose sharding with the other parallelism axes. That story begins in <a href="section-16.6.html">Section 16.6</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.5.1: Count the Bytes on the Wire <span class="exercise-type analysis">Analysis</span></div>
+<p>A model has $M$ parameters wrapped into $U$ equal FSDP units across $K$ workers, trained in 16-bit precision (2 bytes per parameter). Per training step, write expressions for the total bytes each worker sends-plus-receives for (a) the forward all-gathers, (b) the backward all-gathers, and (c) the gradient reduce-scatter. Compare the sum to DDP's single gradient all-reduce (which moves about $2M$ bytes per worker for a ring algorithm). Confirm the "roughly $1.5\times$" claim of Table 16.5.1, and state what happens to each term as $U$ grows with $K$ fixed.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.5.2: Move the Wrapping Boundary <span class="exercise-type coding">Coding</span></div>
+<p>Starting from Code 16.5.1, change the unit granularity: first wrap all four layers as a <em>single</em> unit (gather everything once), then wrap each layer as its own unit (the current code), and finally an intermediate grouping of two units of two layers each. For each, report <code>peak_full_params</code> and the number of all-gather calls per step. Verify that the loss curve is identical in all three cases and that peak memory and all-gather count move in opposite directions, demonstrating the trade-off of Section 2 numerically.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.5.3: When Does Prefetch Pay Off? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Forward prefetch overlaps unit $u+1$'s all-gather with unit $u$'s forward compute. Suppose unit $u$'s compute takes time $c$ and its successor's all-gather takes time $a$. State the condition on $c$ and $a$ under which prefetch fully hides the communication, and the exposed (non-overlapped) time when it does not. Then argue qualitatively how making units larger (Section 2) affects both $c$ and $a$, and why there can be a unit size that minimizes total step time rather than either memory or communication alone.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-16.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 16.4</span><span class="nav-title">Sharded Data Parallelism: ZeRO Stages 1-3</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 16</span><span class="nav-num">Contents</span><span class="nav-title">Model, Pipeline, and Sharded Parallelism</span></a>
+<a class="next" href="section-16.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 16.6</span><span class="nav-title">DeepSpeed and Megatron-LM</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

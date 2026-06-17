@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 5.4: Communication-to-Computation Ratio. The diagnostic metric that explains why a distributed job stops scaling, how to measure it from a step breakdown, and how to read it to choose between more workers, bigger batches, compression, and overlap." name="description"/>
+<title>Section 5.4: Communication-to-Computation Ratio | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Distributed AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 5: Evaluating Distributed AI Systems</a></div>
+<h1>Communication-to-Computation Ratio</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They kept adding workers and asking me to go faster. I kept spending more of my day on the phone. Nobody asked which of those two facts caused the other."</p>
+<cite>A GPU Idling on a Communication Barrier</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>When a distributed job refuses to go faster as you add machines, one number usually explains it: the ratio of time spent communicating to time spent computing.</strong> Speedup curves (Section 5.2) and throughput numbers (Section 5.3) tell you <em>that</em> a job has stopped scaling; they do not tell you <em>why</em>. The communication-to-computation ratio is the diagnostic that does. A ratio near zero means each worker is busy with useful arithmetic and the cluster will keep rewarding more hardware. A ratio near or above one means the workers spend as much time waiting on the network as doing math, and adding machines only buys more waiting. This section defines the ratio, shows how to measure it from a profiled training step, and turns it into a decision rule for the four levers you actually pull: more workers, bigger batches, gradient compression, or better overlap.</p>
+</div>
+<p>The previous sections of this chapter gave you outcome metrics. Speedup and efficiency say how far a job is from linear scaling; goodput and tail latency say how much useful work survives contention and stragglers. Those are the symptoms. To treat the disease you need a metric that points at the mechanism, and for distributed training the dominant mechanism is the cost of moving gradients between machines. <a href="../module-04-communication-primitives/section-4.1.html">Chapter 4</a> opens with the thesis that communication, not computation, is what ultimately bounds large-scale training; this section turns that thesis into a quantity you can read off a profiler and act on. The communication-to-computation ratio, written $R$ throughout, is the single most useful diagnostic in your evaluation toolkit precisely because it converts a vague complaint ("it does not scale") into a measured cause.</p>
+
+<h2>1. Defining the Ratio <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Decompose one step of a distributed worker into the time it spends on useful arithmetic and the time it spends moving data. Let $T_{\text{comp}}$ be the compute time of a step (forward and backward passes, the actual floating-point work) and let $T_{\text{comm}}$ be the communication time exposed on the critical path, meaning the network time that is <em>not</em> hidden behind compute. The communication-to-computation ratio is their quotient,</p>
+$$R = \frac{T_{\text{comm}}}{T_{\text{comp}}}.$$
+<p>The wall-clock time of a step, when communication is not overlapped, is $T_{\text{step}} = T_{\text{comp}} + T_{\text{comm}}$. The fraction of that step doing useful work is the per-step scaling efficiency,</p>
+$$E = \frac{T_{\text{comp}}}{T_{\text{comp}} + T_{\text{comm}}} = \frac{1}{1 + R}.$$
+<p>This little identity is the whole reason the ratio matters. Efficiency is a falling function of $R$: at $R = 0$ the step is pure compute and $E = 100\%$; at $R = 1$ the worker splits its time evenly and $E = 50\%$; at $R = 4$ it spends four fifths of every step on the network and $E = 20\%$. The word "exposed" in the definition of $T_{\text{comm}}$ is load-bearing, and Section 5 returns to it: modern frameworks overlap much of the all-reduce with the backward pass, so the number that belongs in $R$ is the communication that overlap failed to hide, not the raw transfer time.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Ratio Is the Why Behind the Speedup Curve</div>
+<p>A flattening speedup curve is a symptom; the communication-to-computation ratio is the cause. Because per-step efficiency is exactly $E = 1/(1+R)$, every point on a sub-linear scaling curve can be traced to a value of $R$ at that worker count. When you double the workers and the speedup barely moves, measure $R$: if it climbed from $0.2$ to near $1$, communication is now the bottleneck, and no amount of faster arithmetic will help until you shrink the network term.</p>
+</div>
+
+<h2>2. Why the Ratio Grows With Scale <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The ratio is not a constant of the job; it grows as you add workers, which is exactly why scaling stalls. The communication-cost model of <a href="../module-03-scalability-performance-models/section-3.8.html">Section 3.8</a> gives the shape. For a ring all-reduce of a gradient with $P$ parameters across $K$ workers, the bytes each worker sends are roughly $2(K-1)/K$ times the gradient size, and under the $\alpha$-$\beta$ model the time is approximately</p>
+$$T_{\text{comm}} \approx 2(K-1)\,\alpha + 2\,\frac{K-1}{K}\,P\,\beta,$$
+<p>where $\alpha$ is the per-message latency and $\beta$ is the per-byte transfer cost. The bandwidth term saturates as $K$ grows (the factor $(K-1)/K$ approaches one), but the latency term $2(K-1)\alpha$ keeps climbing linearly in $K$. Meanwhile, if you hold the global batch fixed and add workers, each worker's compute $T_{\text{comp}}$ <em>shrinks</em> because it processes fewer examples. A growing numerator over a shrinking denominator is a ratio that rises fast, which is the analytic reason that fixed-batch strong scaling hits a wall. <a href="../module-04-communication-primitives/section-4.1.html">Chapter 4</a> develops this bound for every collective; here the point is only that $R$ is a function of scale, so you must measure it at the worker count you actually run.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three horizontal bars showing the time of one training step. The top bar is mostly compute with a long exposed-communication tail; the middle bar shrinks the tail through overlap; the bottom bar shrinks it further through compression.">
+<defs>
+<style>
+.lab54 { font:600 13px sans-serif; fill:#14385c; }
+.cmp54 { fill:#cfe0f0; stroke:#14385c; stroke-width:1.4; }
+.com54 { fill:#f6c9a0; stroke:#b86b1f; stroke-width:1.4; }
+.in54  { font:600 12px sans-serif; fill:#14385c; text-anchor:middle; }
+.in54b { font:600 12px sans-serif; fill:#7a3d09; text-anchor:middle; }
+.ax54  { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+</style>
+<text class="lab54" x="20" y="40">Baseline</text>
+<rect class="cmp54" x="150" y="22" width="360" height="34" rx="4"/>
+<text class="in54" x="330" y="44">compute  180 ms</text>
+<rect class="com54" x="510" y="22" width="240" height="34" rx="4"/>
+<text class="in54b" x="630" y="44">exposed comm  120 ms</text>
+<text class="ax54" x="790" y="44">R = 0.67</text>
+
+<text class="lab54" x="20" y="125">+ Overlap</text>
+<rect class="cmp54" x="150" y="107" width="360" height="34" rx="4"/>
+<text class="in54" x="330" y="129">compute  180 ms</text>
+<rect class="com54" x="510" y="107" width="72" height="34" rx="4"/>
+<text class="in54b" x="546" y="129">36</text>
+<text class="ax54" x="790" y="129">R = 0.20</text>
+
+<text class="lab54" x="20" y="210">+ Compress</text>
+<rect class="cmp54" x="150" y="192" width="360" height="34" rx="4"/>
+<text class="in54" x="330" y="214">compute  180 ms</text>
+<rect class="com54" x="510" y="192" width="18" height="34" rx="3"/>
+<text class="in54b" x="519" y="186">9</text>
+<text class="ax54" x="790" y="214">R = 0.05</text>
+
+<line x1="150" y1="250" x2="750" y2="250" stroke="#9aa3ad" stroke-width="1"/>
+<text class="ax54" x="150" y="268">0</text>
+<text class="ax54" x="450" y="268">step time (ms)</text>
+<text class="ax54" x="510" y="268">200</text>
+<rect class="cmp54" x="150" y="280" width="16" height="14"/>
+<text class="ax54" x="232" y="291">compute</text>
+<rect class="com54" x="300" y="280" width="16" height="14"/>
+<text class="ax54" x="402" y="291">exposed communication</text>
+</svg>
+<figcaption><strong>Figure 5.4.1:</strong> One training step, broken into compute (blue) and exposed communication (orange), under three regimes. The compute bar never moves because the arithmetic is the same; what shrinks is the orange tail. Overlap hides most of the all-reduce behind the backward pass, dropping the ratio $R$ from $0.67$ to $0.20$; compressing the exposed remainder drops it to $0.05$. The numbers are the measured outputs of Code 5.4.1.</figcaption>
+</figure>
+
+<h2>3. Measuring It From a Real Step <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>You do not estimate $R$ from a formula in practice; you measure it. The procedure is always the same: profile one steady-state training step, attribute each slice of wall-clock to compute or to communication, then take the quotient. Three tools cover almost every case. The PyTorch profiler (<code>torch.profiler</code>) tags each operator as compute or as an NCCL collective and gives you a per-category time breakdown directly. CUDA events placed around the backward pass and around the all-reduce give you the two raw numbers with microsecond resolution when you want a lightweight in-loop measurement. And <code>nccl-tests</code>, run standalone on the same interconnect, gives you the pure collective time for a gradient of your size, which is the $T_{\text{comm}}$ you would see with zero overlap. Read all three the same way: the only quantities you need are the compute time and the communication time left on the critical path.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: torch.profiler and nccl-tests Hand You the Two Numbers</div>
+<p>You rarely instrument timers by hand. The PyTorch profiler separates compute kernels from communication kernels for you, and a single trace yields both terms of the ratio:</p>
+<pre><code class="language-python">import torch
+from torch.profiler import profile, ProfilerActivity
+
+with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    train_one_step(model, batch)          # forward, backward, all-reduce, optimizer
+    torch.cuda.synchronize()
+
+# Group kernels: NCCL collectives are communication, everything else is compute.
+ev = prof.key_averages()
+comm = sum(e.cuda_time_total for e in ev if "nccl" in e.key.lower())
+comp = sum(e.cuda_time_total for e in ev) - comm
+print(f"R = {comm / comp:.3f}   efficiency = {comp / (comp + comm) * 100:.1f}%")
+</code></pre>
+<div class="code-caption"><strong>Code 5.4.2:</strong> The profiler tags every NCCL kernel for you, so the ratio is a one-line quotient over a category sum. For the standalone all-reduce time on your fabric, <code>nccl-tests</code> (the <code>all_reduce_perf</code> binary) reports bandwidth and time for any message size with no training loop to set up. The profiler replaces dozens of lines of manual CUDA-event bookkeeping and correctly attributes overlap, which hand timers get wrong.</div>
+</div>
+<p>The runnable demo below skips the GPU and works directly from a profiled breakdown, because the arithmetic of the ratio is what we want to make concrete, not the act of capturing a trace. Given a compute time and a raw all-reduce time, it computes $R$ and the resulting efficiency, then shows how the two levers of <a href="../module-04-communication-primitives/section-4.10.html">Section 4.10</a> (overlap) and gradient compression move both numbers. These are the same numbers plotted in Figure 5.4.1.</p>
+<pre><code class="language-python">def scaling_efficiency(t_compute, t_exposed_comm):
+    """Fraction of step time spent on useful compute; the rest is comm stall."""
+    step = t_compute + t_exposed_comm
+    ratio = t_exposed_comm / t_compute          # communication-to-computation ratio
+    eff = t_compute / step                      # = 1 / (1 + ratio)
+    return ratio, eff
+
+
+# Measured per-step times in milliseconds, from a profiler breakdown of one
+# training step on a worker: compute (forward + backward) and the raw all-reduce.
+t_compute = 180.0          # ms of useful FLOPs per step
+t_comm_raw = 120.0         # ms the all-reduce takes if nothing hides it
+
+print("Baseline: no overlap, no compression")
+ratio, eff = scaling_efficiency(t_compute, t_comm_raw)
+print(f"  exposed comm        : {t_comm_raw:6.1f} ms")
+print(f"  comm/compute ratio  : {ratio:6.3f}")
+print(f"  scaling efficiency  : {eff*100:5.1f} %")
+
+print("\nWith overlap: 70% of the all-reduce hides behind the backward pass")
+overlap = 0.70
+t_comm_overlapped = t_comm_raw * (1.0 - overlap)
+ratio, eff = scaling_efficiency(t_compute, t_comm_overlapped)
+print(f"  exposed comm        : {t_comm_overlapped:6.1f} ms")
+print(f"  comm/compute ratio  : {ratio:6.3f}")
+print(f"  scaling efficiency  : {eff*100:5.1f} %")
+
+print("\nWith overlap + 4x gradient compression on the exposed remainder")
+t_comm_compressed = t_comm_overlapped / 4.0
+ratio, eff = scaling_efficiency(t_compute, t_comm_compressed)
+print(f"  exposed comm        : {t_comm_compressed:6.1f} ms")
+print(f"  comm/compute ratio  : {ratio:6.3f}")
+print(f"  scaling efficiency  : {eff*100:5.1f} %")
+</code></pre>
+<div class="code-caption"><strong>Code 5.4.1:</strong> From a step breakdown to the ratio and the efficiency it implies. The same <code>scaling_efficiency</code> function is applied three times as overlap and compression peel time off the exposed-communication term while the compute term stays fixed.</div>
+<pre><code class="language-text">Baseline: no overlap, no compression
+  exposed comm        :  120.0 ms
+  comm/compute ratio  :  0.667
+  scaling efficiency  :  60.0 %
+
+With overlap: 70% of the all-reduce hides behind the backward pass
+  exposed comm        :   36.0 ms
+  comm/compute ratio  :  0.200
+  scaling efficiency  :  83.3 %
+
+With overlap + 4x gradient compression on the exposed remainder
+  exposed comm        :    9.0 ms
+  comm/compute ratio  :  0.050
+  scaling efficiency  :  95.2 %
+</code></pre>
+<div class="code-caption"><strong>Output 5.4.1:</strong> The baseline ratio of $0.667$ means the worker wastes 40% of every step waiting on the network. Overlap alone cuts the ratio to $0.20$ and lifts efficiency to 83%; adding compression on the leftover takes it to $0.05$ and 95%. The compute term never changed; only the exposed-communication term did.</div>
+
+<h2>4. Reading the Ratio: A Decision Rule <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The value of $R$ tells you which lever to pull, and pulling the wrong one wastes money. Table 5.4.1 is the rule the rest of this book quietly follows whenever it sizes a job. The guiding principle is simple: when $R$ is small you are compute-bound and the cluster will reward more hardware, so scale out; when $R$ is large you are communication-bound and more hardware only adds more waiting, so first attack the communication term itself.</p>
+<div class="table-caption"><strong>Table 5.4.1:</strong> Reading the communication-to-computation ratio $R$ and choosing the lever that actually helps. The thresholds are rules of thumb, not laws; measure at your real worker count.</div>
+<table>
+<thead>
+<tr><th scope="col">Regime</th><th scope="col">What it means</th><th scope="col">The lever to pull</th></tr>
+</thead>
+<tbody>
+<tr><td>$R \lesssim 0.1$</td><td>Compute-bound; the network is nearly free.</td><td>Add workers or shrink the batch per worker; scaling out is efficient.</td></tr>
+<tr><td>$0.1 \lesssim R \lesssim 0.5$</td><td>Healthy; communication is visible but overlap can hide most of it.</td><td>Maximize overlap (Section 4.10); only then add workers.</td></tr>
+<tr><td>$0.5 \lesssim R \lesssim 1$</td><td>Communication is eating into scaling; efficiency is below 67%.</td><td>Raise compute per step with a bigger local batch, or compress gradients.</td></tr>
+<tr><td>$R \gtrsim 1$</td><td>Communication-bound; the worker waits more than it works.</td><td>Stop adding workers; compress, batch larger, or reduce sync frequency.</td></tr>
+</tbody>
+</table>
+<p>Map the four levers onto the formula and each one becomes obvious. Adding workers lowers $T_{\text{comp}}$ per worker (fixed global batch) and raises $T_{\text{comm}}$, so it <em>increases</em> $R$ and is only safe when $R$ starts small. A bigger local batch raises $T_{\text{comp}}$ while leaving the gradient size, and hence $T_{\text{comm}}$, unchanged, so it <em>decreases</em> $R$ directly; this is why large-batch training is the first reflex of anyone fighting a communication wall. Gradient compression cuts the bytes in $T_{\text{comm}}$ and so cuts $R$ at the source. Overlap cuts the <em>exposed</em> fraction of $T_{\text{comm}}$ without touching the bytes at all, which is why it is the cheapest lever and the one to exhaust first.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Cluster That Got Slower at 64 Workers</div>
+<p><strong>Who:</strong> An ML platform engineer scaling a vision-transformer pretraining job on a cloud GPU cluster.</p>
+<p><strong>Situation:</strong> Going from 16 to 32 workers nearly doubled throughput, but going from 32 to 64 added only 10%, and 128 workers were slower in wall-clock than 64.</p>
+<p><strong>Problem:</strong> The team's instinct was to request a larger quota and push past 128, assuming the plateau was a scheduling artifact.</p>
+<p><strong>Dilemma:</strong> Buy more workers on a hunch, which is fast to try but expensive if wrong, or stop and measure the communication-to-computation ratio at each worker count to find the actual cause.</p>
+<p><strong>Decision:</strong> They profiled one step at 32 and 64 workers with <code>torch.profiler</code> and found $R$ had jumped from $0.35$ to $1.4$: the global batch was fixed, so per-worker compute had halved while the all-reduce latency term kept climbing.</p>
+<p><strong>How:</strong> Rather than add workers, they doubled the per-worker batch (restoring $T_{\text{comp}}$) and turned on gradient bucketing with computation overlap, then measured again.</p>
+<p><strong>Result:</strong> At 64 workers $R$ fell back to $0.3$, efficiency rose to 77%, and throughput scaled almost linearly to 128 workers, at lower cost than the larger quota they had nearly bought.</p>
+<p><strong>Lesson:</strong> A plateau in the speedup curve is a question, and the ratio answers it. They were communication-bound, so the fix was to shrink communication and grow compute per step, not to add machines that would only wait longer.</p>
+</div>
+
+<h2>5. Overlap, and Why "Exposed" Is the Word That Matters <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Everything above hinges on $T_{\text{comm}}$ being the communication left on the critical path, not the raw transfer time. The reason is the overlap trick of <a href="../module-04-communication-primitives/section-4.10.html">Section 4.10</a>: gradients become ready layer by layer during the backward pass, so a framework can start the all-reduce of the last layer's gradients while still computing the earlier layers' gradients. The network work then happens <em>under</em> the compute, and only the part that does not fit behind compute is exposed. If the raw all-reduce takes $120$ ms and overlap hides $70\%$ of it, the exposed term is $36$ ms, and that $36$ is what belongs in $R$, as Output 5.4.1 shows. Using the raw $120$ ms instead would tell you the job is communication-bound when it is comfortably compute-bound, and you would reach for the wrong lever.</p>
+<p>This is also why the ratio and the overlap trick must be read together. Overlap does not reduce the bytes moved, so it does not change the bandwidth term of the cost model; it changes only how much of that term lands on the critical path. There is a ceiling: once compute is fully packed with hidden communication, any further all-reduce time spills into the open and overlap can hide no more. Past that point the only remaining moves are the ones that touch the bytes themselves, compression and a larger local batch, or the ones that change how often you synchronize at all, which is where local-update methods enter. Measuring $R$ with the <em>exposed</em> term tells you exactly where on this progression a job sits.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Driving the Exposed Ratio Toward Zero (2024 to 2026)</div>
+<p>Because the exposed communication term is what caps scaling, recent work attacks it from three directions at once. Local-update training in the DiLoCo lineage (Douillard et al., 2024) lets workers take many optimizer steps between syncs, slashing how often the all-reduce runs and pushing the effective ratio low enough for genuinely over-the-internet and geo-distributed training; the streaming variant (Douillard et al., 2025) overlaps even those infrequent syncs. On the compression side, methods descended from PowerSGD and the work on 1-bit and 4-bit optimizers cut the bytes per collective with little accuracy loss, shrinking $T_{\text{comm}}$ at the source. And compute-communication overlap is now scheduled at the kernel and compiler level (for example the fine-grained overlap in DeepSeek-V3's training stack, 2024 to 2025), so that more of the all-reduce hides behind matrix multiplies. We give these methods the evaluation machinery they deserve in <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a>; the through-line is that the field now treats the exposed ratio as the primary quantity to engineer down, and reports it alongside accuracy.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Office-Hours Test</div>
+<p>A quick way to feel the ratio: imagine each worker is a student doing homework who must phone a study group to compare answers after every problem. If the problems take an hour and the calls take a minute, $R$ is tiny and adding students helps. If the problems take a minute and the calls take an hour, the group spends its night on the phone, and inviting more students just adds more callers to the line. Distributed training is the same study group, and overlap is doing the next problem while still on the call.</p>
+</div>
+
+<p>The ratio is the diagnostic; the next section turns the time you measure into money and energy. A worker that spends 40% of every step waiting on the network is not just slow, it is burning power and rented GPU-hours while idle, and <a href="section-5.5.html">Section 5.5</a> shows how to put a dollar and a joule figure on exactly that waste, closing the loop from "it does not scale" to "here is what the stall costs."</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.4.1: From Curve to Cause <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A team reports a strong-scaling efficiency of 50% at 64 workers with a fixed global batch. Using $E = 1/(1+R)$, state the value of $R$ this implies. Then explain, in terms of $T_{\text{comp}}$ and $T_{\text{comm}}$, why holding the global batch fixed while quadrupling the workers from 16 to 64 is almost guaranteed to push $R$ up, and name which single lever from Table 5.4.1 would most directly restore compute per step without changing the gradient size.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.4.2: Measure the Levers <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 5.4.1 into a function <code>sweep(t_compute, t_comm_raw, overlap, compress)</code> that returns $R$ and efficiency for any overlap fraction and any compression factor. Sweep <code>overlap</code> from 0 to 0.9 in steps of 0.1 at a fixed 4x compression, and plot or print efficiency against overlap. Identify the overlap fraction at which efficiency first exceeds 90%, and explain why, past full overlap of the compressible remainder, further overlap stops helping. Confirm your baseline matches Output 5.4.1.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.4.3: Predict the Wall <span class="exercise-type analysis">Analysis</span></div>
+<p>Take the ring all-reduce time $T_{\text{comm}} \approx 2(K-1)\alpha + 2\frac{K-1}{K}P\beta$ from Section 2 with $P = 10^9$ parameters at 2 bytes each, $\alpha = 5\ \mu s$, and $\beta$ corresponding to 50 GB/s. Assume a fixed global batch so that per-worker compute is $T_{\text{comp}} = 4000/K$ ms. Compute $R$ at $K = 8, 32, 128, 512$ workers, find the worker count where $R$ first exceeds 1, and discuss how 70% overlap shifts that crossover. Relate your crossover point to the threshold rows of Table 5.4.1.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-5.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 5.3</span><span class="nav-title">Throughput, Goodput, and Tail Latency</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 5</span><span class="nav-num">Contents</span><span class="nav-title">Evaluating Distributed AI Systems</span></a>
+<a class="next" href="section-5.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 5.5</span><span class="nav-title">Cost, Utilization, and Energy Accounting</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

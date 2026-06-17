@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 13.2: Graph Partitioning. How to split a graph across machines to minimize cross-machine communication: the balanced edge-cut objective, vertex-cut partitioning for power-law graphs, multilevel METIS, and streaming heuristics." name="description"/>
+<title>Section 13.2: Graph Partitioning | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Distributed Machine Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 13: Distributed Graph Machine Learning</a></div>
+<h1>Graph Partitioning</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They sliced me into eight pieces and told me to act like one graph. Every time two of my vertices want to talk, somebody pays the network bill."</p>
+<cite>A Social Network Cut Down the Middle</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Distributing a graph means assigning its vertices and edges to machines, and the quality of that assignment decides how much the machines must talk for the rest of the job.</strong> A graph computation moves information along edges. If an edge connects two vertices on different machines, every step that crosses it sends a message over the network. So the goal of graph partitioning is to spread the work evenly while severing as few of those crossing connections as possible: balance the load and minimize the cut. This problem is NP-hard in general, so practice runs on multilevel solvers like METIS for graphs that fit offline and on fast streaming heuristics for graphs that do not. The previous section established why graphs resist distribution; this section gives the first and most consequential lever for controlling that cost, and it ties directly to the partitioning ideas of <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.3.html">Section 2.3</a> and the communication-cost models of <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.8.html">Section 3.8</a>.</p>
+</div>
+<p>In the previous section we saw why graphs are uniquely hard to distribute: their structure is irregular, their access patterns jump unpredictably across the whole vertex set, and the interesting ones follow a power-law degree distribution where a handful of hub vertices touch a large fraction of all edges. None of that goes away. What we can control is how the graph is laid out across machines, because that layout determines which edge traversals stay local and which become network messages. Every iteration of PageRank, every round of message passing in a graph neural network, every breadth-first wave of a connected-components scan pays a communication cost proportional to the number of edges that cross between machines. Partition well once, and you save on that cost on every iteration that follows. Partition carelessly, and you pay the tax forever.</p>
+<p>This section builds the partitioning objective precisely, contrasts the two dominant strategies (cut the edges versus cut the vertices), explains why the second one rescues power-law graphs, and then shows the two families of algorithms that actually produce partitions in practice. We close with a runnable demonstration that a simple heuristic beats random placement by a wide margin, which is the whole reason partitioning earns a section of its own.</p>
+
+<h2>1. The Balanced Partitioning Objective <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Let the graph be $G = (V, E)$ with $n = |V|$ vertices and $m = |E|$ edges, to be spread across $K$ machines. A partition is an assignment $P : V \to \{1, \dots, K\}$ that places each vertex on one machine. Two quantities matter. The first is the <strong>edge cut</strong>, the number of edges whose endpoints land on different machines:</p>
+$$\mathrm{cut}(P) = \bigl|\{ (u,v) \in E : P(u) \neq P(v) \}\bigr|.$$
+<p>Each cut edge is a connection that, during computation, must be serviced by sending a message from one machine to another, so $\mathrm{cut}(P)$ is a direct proxy for per-iteration communication volume. The second quantity is <strong>balance</strong>. If one machine holds far more vertices than the others, it becomes a straggler that the rest wait on at every synchronization barrier, exactly the straggler problem introduced in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.3.html">Section 2.3</a>. We require that no machine hold more than a small factor $\varepsilon$ above the even share. Writing $V_k = \{ v : P(v) = k \}$ for the vertices on machine $k$, the balanced minimum-edge-cut problem is</p>
+$$\min_{P}\ \mathrm{cut}(P) \quad \text{subject to} \quad \max_{k}\, |V_k| \;\le\; (1 + \varepsilon)\,\frac{n}{K}.$$
+<p>This is the classic balanced graph partitioning problem, and it is NP-hard even for $K = 2$ (it contains the minimum bisection problem). We do not solve it exactly at scale; we approximate it, and the rest of the section is about how well and how cheaply. A useful sanity check before optimizing: a uniformly random assignment cuts a fraction $1 - 1/K$ of all edges in expectation, because two endpoints land on the same machine with probability $1/K$. For $K = 8$ that is $87.5\%$ of edges cut, a number we will see confirmed almost exactly in the demonstration below, and the baseline every real partitioner must beat.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Cut Is a One-Time Cost That Buys a Per-Iteration Discount</div>
+<p>Computing a good partition is itself expensive, and you pay that cost once, before the graph job starts. The cut it achieves, however, is paid back on every single iteration of the computation that follows: every PageRank round, every GNN layer, every label-propagation sweep sends messages in proportion to the cut. A graph algorithm that runs for hundreds of iterations amortizes even an expensive partitioning step many times over. This is why investing real compute in partitioning is rational, and why a cheap partition that cuts twice as many edges can cost more in the end than an expensive one that cuts half as many.</p>
+</div>
+
+<h2>2. Edge-Cut versus Vertex-Cut Partitioning <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>There are two fundamentally different ways to slice a graph, and choosing between them is the single most important partitioning decision for real-world graphs. The objective above describes <strong>edge-cut</strong> partitioning: you assign each vertex to exactly one machine, and the edges that span machines are the cut. Edges are the thing you sever. This is intuitive and works well when the graph is roughly uniform, because a balanced vertex assignment then automatically balances the edges too.</p>
+<p>The alternative is <strong>vertex-cut</strong> partitioning: you assign each <em>edge</em> to exactly one machine, and a vertex that has edges on several machines is <em>replicated</em>, with one copy (a "mirror") on each machine that holds one of its edges and one designated "master" copy that keeps the authoritative value. Now vertices, not edges, are the thing you cut. The cost is no longer a count of crossing edges but the total number of vertex replicas you must keep synchronized; the communication per iteration is proportional to how many mirror copies exist, because each iteration the masters must reconcile with their mirrors.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The same five-vertex graph partitioned two ways. On the left, edge-cut: vertices are split between two machines and the single edge between them is cut. On the right, vertex-cut: the high-degree hub vertex is replicated as a master and a mirror, edges are split between machines, and only the hub copy must be synchronized.">
+<defs>
+<marker id="arr132" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.mA132 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.mB132 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.v132 { fill:#14385c; }
+.vh132 { fill:#b86b1f; }
+.vm132 { fill:#ffffff; stroke:#b86b1f; stroke-width:2; stroke-dasharray:4 3; }
+.e132 { stroke:#5a626c; stroke-width:1.8; fill:none; }
+.ecut132 { stroke:#c0392b; stroke-width:2.2; stroke-dasharray:6 4; fill:none; }
+.t132 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s132 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.lab132 { font:600 12px sans-serif; fill:#ffffff; text-anchor:middle; }
+.sync132 { fill:none; stroke:#b86b1f; stroke-width:1.6; stroke-dasharray:3 3; marker-end:url(#arr132); }
+</style>
+<!-- Left: edge-cut -->
+<text class="t132" x="220" y="26">Edge-cut: split vertices, sever the crossing edge</text>
+<rect class="mA132" x="40" y="48" width="170" height="250" rx="10"/>
+<rect class="mB132" x="240" y="48" width="170" height="250" rx="10"/>
+<text class="s132" x="125" y="288">Machine 1</text>
+<text class="s132" x="325" y="288">Machine 2</text>
+<!-- intra edges machine 1 -->
+<line class="e132" x1="100" y1="110" x2="150" y2="170"/>
+<line class="e132" x1="100" y1="110" x2="100" y2="220"/>
+<line class="e132" x1="150" y1="170" x2="100" y2="220"/>
+<!-- cut edge -->
+<line class="ecut132" x1="150" y1="170" x2="300" y2="150"/>
+<!-- intra edge machine 2 -->
+<line class="e132" x1="300" y1="150" x2="330" y2="230"/>
+<circle class="v132" cx="100" cy="110" r="13"/>
+<circle class="v132" cx="150" cy="170" r="13"/>
+<circle class="v132" cx="100" cy="220" r="13"/>
+<circle class="vh132" cx="300" cy="150" r="15"/>
+<circle class="v132" cx="330" cy="230" r="13"/>
+<text class="lab132" x="300" y="154">h</text>
+<text class="s132" x="225" y="178" fill="#c0392b">1 cut edge</text>
+<!-- Right: vertex-cut -->
+<text class="t132" x="660" y="26">Vertex-cut: split edges, replicate the hub vertex</text>
+<rect class="mA132" x="480" y="48" width="170" height="250" rx="10"/>
+<rect class="mB132" x="680" y="48" width="170" height="250" rx="10"/>
+<text class="s132" x="565" y="288">Machine 1</text>
+<text class="s132" x="765" y="288">Machine 2</text>
+<line class="e132" x1="540" y1="110" x2="590" y2="170"/>
+<line class="e132" x1="540" y1="110" x2="540" y2="220"/>
+<line class="e132" x1="590" y1="170" x2="540" y2="220"/>
+<line class="e132" x1="590" y1="170" x2="590" y2="170"/>
+<line class="e132" x1="770" y1="150" x2="800" y2="230"/>
+<circle class="v132" cx="540" cy="110" r="13"/>
+<circle class="vh132" cx="590" cy="170" r="15"/>
+<circle class="v132" cx="540" cy="220" r="13"/>
+<circle class="vm132" cx="770" cy="150" r="15"/>
+<circle class="v132" cx="800" cy="230" r="13"/>
+<text class="lab132" x="590" y="174">h</text>
+<text class="lab132" x="770" y="154" fill="#b86b1f">h</text>
+<text class="s132" x="590" y="200" fill="#b86b1f">master</text>
+<text class="s132" x="770" y="180" fill="#b86b1f">mirror</text>
+<path class="sync132" d="M 605 165 Q 690 120 757 148"/>
+<text class="s132" x="680" y="118" fill="#b86b1f">sync hub value</text>
+</svg>
+<figcaption><strong>Figure 13.2.1:</strong> The same graph, two partitioning strategies. Left, edge-cut assigns whole vertices to machines; the single edge spanning the boundary (red dashed) is the cut, and its traversal becomes a network message. Right, vertex-cut assigns whole edges to machines; the high-degree hub vertex $h$ is replicated as a master copy and a dashed mirror, and only that one hub value must be synchronized across the boundary. When the hub has very high degree, replicating the one hub is far cheaper than cutting all of its edges.</figcaption>
+</figure>
+<p>Why does this second strategy matter so much? The answer is the power-law structure from the previous section. In a power-law graph a few hub vertices have enormous degree. Under edge-cut partitioning, a hub is stuck on one machine, and almost all of its many edges become cut edges, swamping the network. Under vertex-cut partitioning, the hub's edges are spread evenly across machines and the hub itself is replicated; the communication cost is the number of machines the hub is replicated onto, which is bounded by $K$, rather than its full degree. For a hub of degree one million on an eight-machine cluster, that is the difference between roughly a million cut edges and at most eight replicas. This is the central insight behind PowerGraph, the system that made vertex-cut the default for natural graphs, and it is why modern graph engines and distributed GNN frameworks partition edges rather than vertices for power-law data.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Partitioning Is Sharding, Specialized to Irregular Structure</div>
+<p>Partitioning and sharding are the same scale-out move seen in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.3.html">Section 2.3</a>: divide state across machines so each holds a piece, then pay communication only where pieces interact. A hash-sharded key-value store cuts no structure because keys are independent; a graph cuts a great deal of structure because its keys (vertices) are wired together. Vertex-cut replication is the graph-world cousin of replicating a hot key across shards to spread its read load. The same primitive returns again as sharded parameters in <a href="../module-11-parameter-servers-embeddings/index.html">parameter-server embeddings</a> and as sharded model weights in Part IV; here it is specialized to the one case where the shard boundaries themselves carry the cost.</p>
+</div>
+
+<h2>3. Multilevel Partitioning: The METIS Recipe <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Given that exact balanced partitioning is NP-hard, how do production tools get good partitions on graphs with millions of vertices? The dominant offline answer is the <strong>multilevel</strong> method, embodied by METIS and its parallel sibling ParMETIS. The idea is to make the graph small enough to partition well, partition the small version, then carefully carry that partition back up to the full graph. It runs in three phases:</p>
+<p><strong>Coarsen.</strong> Repeatedly collapse the graph into a smaller one by matching pairs of adjacent vertices and merging each matched pair into a single heavier "super-vertex" whose edges are the union of its constituents' edges. A graph of millions of vertices coarsens, over many rounds, down to a few hundred. Crucially, a cut in the coarse graph corresponds to a cut in the original, so optimizing the small graph optimizes the large one.</p>
+<p><strong>Partition.</strong> On the tiny coarsest graph, run a relatively expensive, high-quality partitioning algorithm directly. Because the graph is now small, even an algorithm that would be hopeless on the full graph runs in an instant and finds a near-optimal balanced cut.</p>
+<p><strong>Uncoarsen and refine.</strong> Project the partition back up one level at a time, splitting each super-vertex back into its constituents and inheriting the assignment. At every level, run a local refinement pass (the Kernighan-Lin or Fiduccia-Mattheyses heuristic) that swaps boundary vertices between machines whenever a swap reduces the cut without breaking balance. Refinement at each scale polishes the boundary that coarsening could only approximate.</p>
+<p>The result is a partitioner that runs in near-linear time and routinely beats simpler methods by a wide margin on cut quality. Its limitation is structural: the whole graph, plus its coarsened copies, must fit in memory on the partitioning machine (or across the ParMETIS cluster), and the graph must be available all at once. When the graph is too big for that, or arrives as a stream, we need a different approach.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: metis and dgl.distributed Partition for You</div>
+<p>You almost never implement multilevel partitioning by hand. The <code>metis</code> Python binding wraps the battle-tested C library, and for distributed graph neural networks DGL's <code>partition_graph</code> drives METIS and then writes out the per-machine subgraphs, halo nodes, and ID mappings that <a href="section-13.3.html">distributed training</a> consumes:</p>
+<pre><code class="language-python"># pip install metis  (needs the METIS C library)  /  pip install dgl
+import metis
+# parts[i] is the machine assigned to vertex i; edgecut is the achieved cut.
+(edgecut, parts) = metis.part_graph(adjacency_list, nparts=8, ufactor=30)
+
+# For a distributed GNN, DGL partitions and serializes everything in one call:
+import dgl
+dgl.distributed.partition_graph(
+    g, graph_name="my_graph", num_parts=8,
+    part_method="metis",          # multilevel edge-cut under the hood
+    out_path="partitioned/")      # writes per-machine subgraphs + halo nodes
+</code></pre>
+<div class="code-caption"><strong>Code 13.2.1:</strong> A multilevel partitioning step that would be hundreds of lines of coarsen-partition-refine logic collapses to one <code>metis.part_graph</code> call, or one <code>dgl.distributed.partition_graph</code> call that also produces the halo (boundary) nodes each machine needs for <a href="section-13.3.html">vertex-centric computation</a>. The <code>ufactor</code> and <code>num_parts</code> arguments set the balance tolerance $\varepsilon$ and the machine count $K$ from Section 1.</div>
+</div>
+
+<h2>4. Streaming and Heuristic Partitioners <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>When a graph is too large to load, or it materializes as a stream of edges from a crawler or a log, multilevel partitioning is not an option, because it needs random access to the whole graph at once. <strong>Streaming partitioners</strong> make a single pass over the vertices (or edges), assigning each one as it arrives using only the information seen so far, and never revisiting a decision. They give up some cut quality for the ability to run in one pass with bounded memory.</p>
+<p>The workhorse heuristic is <strong>linear deterministic greedy</strong> (the basis of methods such as Fennel): when a vertex arrives, place it on the machine that already holds the most of its neighbors, subject to a penalty that grows as a machine fills toward its capacity. Following the neighbors keeps related vertices together and pushes the cut down; the capacity penalty keeps the load balanced. The same idea applies in vertex-cut form for power-law graphs, where each arriving edge is placed to minimize the number of new vertex replicas it creates. These one-pass rules cut far fewer edges than random placement while costing only a single scan, which is exactly what the next demonstration measures.</p>
+<p>The code below builds a synthetic graph with clear community structure (dense clusters joined by a thin set of crossing edges), then partitions it two ways: a uniformly random assignment, and a single-pass greedy heuristic that places each vertex near its already-placed neighbors while respecting a soft capacity limit. It reports the edge cut and the load imbalance for each.</p>
+<pre><code class="language-python">import random
+
+random.seed(7)
+
+# Build a synthetic graph with community structure: C clusters of dense
+# internal connectivity and a few sparse links between clusters. A good
+# partitioner that respects the clusters should cut very few edges.
+C = 8                 # number of communities
+per = 250             # vertices per community
+N = C * per           # total vertices
+K = C                 # number of machines (partitions)
+
+vertices = list(range(N))
+community = [v // per for v in vertices]
+
+edges = set()
+# Dense intra-community edges.
+for c in range(C):
+    members = list(range(c * per, (c + 1) * per))
+    for _ in range(per * 10):             # ~10 internal edges per vertex
+        a, b = random.choice(members), random.choice(members)
+        if a != b:
+            edges.add((min(a, b), max(a, b)))
+# Sparse inter-community edges (a thin "boundary" the partitioner should cut).
+for _ in range(N // 4):
+    a, b = random.randrange(N), random.randrange(N)
+    if community[a] != community[b]:
+        edges.add((min(a, b), max(a, b)))
+edges = list(edges)
+
+# Adjacency for the greedy partitioner.
+adj = [[] for _ in range(N)]
+for a, b in edges:
+    adj[a].append(b)
+    adj[b].append(a)
+
+
+def report(name, assign):
+    cut = sum(1 for a, b in edges if assign[a] != assign[b])
+    loads = [0] * K
+    for v in vertices:
+        loads[assign[v]] += 1
+    imbalance = max(loads) / (N / K)      # 1.0 == perfectly balanced
+    print(f"{name:&lt;22} edge-cut = {cut:6d}  ({100*cut/len(edges):5.1f}% of edges)"
+          f"   load-imbalance = {imbalance:.3f}")
+    return cut
+
+
+# --- Random partitioning: assign each vertex to a uniformly random machine. ---
+rand_assign = [random.randrange(K) for _ in vertices]
+
+# --- Greedy streaming partitioning (a simplified linear-deterministic-greedy
+# rule): stream vertices in order; place each on the machine where it has the
+# most already-placed neighbors, with a penalty that keeps partitions balanced. ---
+greedy_assign = [-1] * N
+cap = N / K                                # target vertices per machine
+loads = [0] * K
+for v in vertices:
+    score = [0.0] * K
+    for u in adj[v]:
+        if greedy_assign[u] != -1:
+            score[greedy_assign[u]] += 1
+    # Score each machine by (placed neighbors there) minus an over-capacity
+    # penalty. The penalty only bites once a machine passes its target load,
+    # so the rule follows the graph's communities until a machine fills up.
+    best, best_score = 0, -1e18
+    for k in range(K):
+        over = max(0.0, loads[k] - cap)    # how far past target this machine is
+        s = score[k] - 0.5 * over
+        # Tie-break toward the least-loaded machine for vertices with no
+        # placed neighbors yet (s == 0 across the board early on).
+        s -= 1e-6 * loads[k]
+        if s &gt; best_score:
+            best_score, best = s, k
+    greedy_assign[v] = best
+    loads[best] += 1
+
+print(f"graph: N = {N} vertices, E = {len(edges)} edges, K = {K} machines\n")
+c_rand = report("random partition", rand_assign)
+c_greedy = report("greedy streaming", greedy_assign)
+print(f"\ngreedy cuts {c_rand / c_greedy:.1f}x fewer edges than random")
+</code></pre>
+<div class="code-caption"><strong>Code 13.2.2:</strong> A pure-Python comparison of random versus one-pass greedy partitioning on a community-structured graph. The greedy rule sees each vertex once and places it by the neighbors-minus-capacity score; no library, no second pass, no global view of the graph.</div>
+<pre><code class="language-text">graph: N = 2000 vertices, E = 19570 edges, K = 8 machines
+
+random partition       edge-cut =  17055  ( 87.1% of edges)   load-imbalance = 1.048
+greedy streaming       edge-cut =   7368  ( 37.6% of edges)   load-imbalance = 1.124
+
+greedy cuts 2.3x fewer edges than random
+</code></pre>
+<div class="code-caption"><strong>Output 13.2.2:</strong> Random placement cuts $87.1\%$ of edges, almost exactly the $1 - 1/K = 87.5\%$ predicted in Section 1. The single-pass greedy heuristic cuts only $37.6\%$, a $2.3\times$ reduction, while keeping every machine within $12\%$ of an even load. Every cut edge it avoids is a message saved on every iteration of the graph job that follows.</div>
+<p>The lesson of Output 13.2.2 is the whole argument for this section in miniature. The greedy partitioner did no more work than a single scan of the vertices, yet it more than halved the communication that every downstream iteration will pay. A multilevel solver like METIS would do better still on cut quality at the cost of needing the whole graph in memory; the streaming heuristic trades a little quality for the ability to run in one pass on a graph that never fully fits. Both beat random by a margin that compounds over the hundreds of iterations a real graph computation runs.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The 87.5% You Could Have Predicted Blindfolded</div>
+<p>Notice that the random partitioner's cut, $87.1\%$, landed within a whisker of the $87.5\%$ the back-of-the-envelope formula promised, with no knowledge of the graph at all. That is the comforting and slightly deflating truth about random partitioning: it is perfectly predictable and almost always bad. It cuts whatever fraction $1 - 1/K$ the arithmetic demands, no matter how beautifully clustered your graph is. Random placement does not even try to find your communities; it scatters them to the wind and bills you for the cleanup every iteration.</p>
+</div>
+
+<h2>5. The Trade-off: Partition Quality versus Partition Cost <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Every partitioning choice sits on a curve trading the cost of computing the partition against the communication it saves afterward. At one end, random or hash partitioning costs almost nothing to compute and cuts the maximum number of edges. At the other end, a multilevel solver invests substantial compute and memory to find a low cut. The streaming heuristic sits in between: cheap, single-pass, and far better than random. The right choice depends on a quantity the cost models of <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.8.html">Section 3.8</a> let you estimate directly: how many iterations the downstream computation runs. The more iterations, the more a good partition pays off, because the partitioning cost is paid once but the cut is paid every iteration.</p>
+<p>Concretely, if partitioning costs $T_{\text{part}}$ and each iteration's communication is proportional to the cut, then over $R$ iterations the total communication time is roughly $T_{\text{part}} + R \cdot \beta \cdot \mathrm{cut}(P)$ for a per-edge message cost $\beta$ from the alpha-beta model of <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.8.html">Section 3.8</a>. A partition that halves the cut is worth a large $T_{\text{part}}$ whenever $R$ is large, and worth almost nothing for a single-pass job. This is the same amortization logic from the Key Insight above, now made quantitative: the break-even number of iterations is where the extra partitioning cost equals the per-iteration savings.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Partitioning a Billion-Edge Social Graph for Nightly GNN Training</div>
+<p><strong>Who:</strong> A machine learning platform engineer at a social network running nightly graph-neural-network training for friend recommendation.</p>
+<p><strong>Situation:</strong> The graph had about 200 million users and 1.5 billion follow edges, far too large to load on one machine, and it changed daily as users joined and connections formed.</p>
+<p><strong>Problem:</strong> The first version hash-partitioned vertices across 16 machines. Training each GNN epoch was dominated by network traffic; profiling showed over $90\%$ of message-passing edges crossed machine boundaries, and the all-to-all neighbor fetches saturated the interconnect.</p>
+<p><strong>Dilemma:</strong> Run ParMETIS for a high-quality edge-cut partition (hours of cluster time each night, and the graph barely fit even coarsened), or use a one-pass streaming vertex-cut partitioner that finished in minutes but cut more edges than METIS would.</p>
+<p><strong>Decision:</strong> They chose a streaming vertex-cut partitioner, because the graph was strongly power-law (a few celebrity accounts with tens of millions of followers) and changed every night, so re-running an expensive offline solver daily was wasteful and the hub vertices would have dominated any edge-cut anyway.</p>
+<p><strong>How:</strong> They streamed the edge list through a greedy vertex-cut rule that placed each edge to minimize new replicas, replicated the celebrity hubs across all 16 machines, and synchronized only the master-mirror hub values each iteration, exactly the pattern in Figure 13.2.1.</p>
+<p><strong>Result:</strong> Cross-machine message volume fell by roughly $4\times$, epoch time dropped from 50 minutes to 13, and the nightly partitioning step itself took under 8 minutes instead of the multi-hour ParMETIS run, so the pipeline comfortably fit its window.</p>
+<p><strong>Lesson:</strong> For power-law graphs that change often, a cheap streaming vertex-cut can beat an expensive offline edge-cut on total wall-clock, because it both attacks the hubs correctly and avoids re-paying a heavy partitioning cost every night.</p>
+</div>
+
+<h2>6. Choosing a Strategy in Practice <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The decision tree is short. If the graph fits in memory, is fairly uniform in degree, and the partition will be reused across many runs, a multilevel edge-cut solver like METIS gives the best cut and is worth its cost. If the graph is power-law (most real social, web, and citation graphs are), prefer vertex-cut so the hubs do not dominate the communication. If the graph is too large to load or arrives as a stream, use a single-pass streaming partitioner, choosing the edge-cut or vertex-cut variant by the same degree-distribution test. And always compare against the random baseline, because its cut of $1 - 1/K$ is the number any real partitioner must beat to justify its existence, as Output 13.2.2 made concrete.</p>
+<p>With a partition in hand, the graph is laid out across machines and we know which edge traversals are local and which are network messages. The next question is how to actually compute over that distributed graph: how a PageRank or a connected-components or a GNN forward pass is expressed so that each machine works on its own vertices and exchanges only the boundary information the partition exposes. That programming model, where each vertex acts as an independent agent passing messages to its neighbors, is the subject of <a href="section-13.3.html">Section 13.3</a> on the Pregel vertex-centric model.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Learned and GNN-Aware Partitioning (2024 to 2026)</div>
+<p>The classic objective minimizes raw edge cut, but distributed GNN training has a subtler cost: it pays for the multi-hop neighborhoods each mini-batch must fetch, not just for one-hop crossing edges. Recent work tailors partitioning to that workload. Systems in the BNS-GCN and partition-aware sampling lineage co-design the partition with the neighbor-sampling strategy so that sampled subgraphs stay local. A 2024-2025 thread applies reinforcement learning and graph-learning models to predict good partitions directly, treating partitioning itself as a learning problem rather than a fixed heuristic, and streaming vertex-cut methods continue to improve their replication factors on trillion-edge graphs. The throughline is that the right cut objective is the one matched to the computation that runs on top of it, a theme we develop further when distributed GNN training and neighbor sampling arrive later in this chapter.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.2.1: When Does Vertex-Cut Win? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Consider a single hub vertex of degree $D$ on a cluster of $K$ machines, with the rest of the graph negligible. Under edge-cut partitioning the hub sits on one machine and (in the worst case) all $D$ of its edges cross to other machines. Under vertex-cut partitioning the hub's edges are spread evenly and the hub is replicated. (a) Write the worst-case cut cost for edge-cut and the replica count for vertex-cut as functions of $D$ and $K$. (b) For $D = 10^6$ and $K = 8$, give both numbers. (c) Explain in one sentence why this single comparison is the core argument behind PowerGraph's vertex-cut design for power-law graphs.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.2.2: Tune the Balance Penalty <span class="exercise-type coding">Coding</span></div>
+<p>Starting from Code 13.2.2, vary the over-capacity penalty coefficient (the $0.5$ in <code>s = score[k] - 0.5 * over</code>) across the values $0.05$, $0.5$, and $5.0$, and record both the edge cut and the load imbalance for each. You should find a clear trade-off: a small coefficient lets the heuristic chase communities and lowers the cut but worsens balance, while a large coefficient enforces balance at the cost of a higher cut. Plot cut against imbalance for your three runs and state which coefficient you would ship for a job whose downstream computation synchronizes at a barrier every iteration, and why.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.2.3: Break-Even Iterations <span class="exercise-type analysis">Analysis</span></div>
+<p>Use the cost model from Section 5, total time $\approx T_{\text{part}} + R \cdot \beta \cdot \mathrm{cut}(P)$. Suppose a streaming partitioner costs $T_{\text{part}} = 1$ minute and yields a cut of $7368$ edges (the greedy result from Output 13.2.2), while a multilevel solver costs $T_{\text{part}} = 20$ minutes and yields a cut of $3000$ edges. Taking $\beta$ such that each cut edge costs $0.001$ minutes of communication per iteration, find the number of iterations $R$ at which the multilevel solver's lower cut repays its higher partitioning cost. State the rule of thumb your answer implies for short jobs versus long-running iterative jobs, and connect it to the amortization argument in the Section 1 Key Insight.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-13.1.html"><span class="nav-label">Previous</span><span class="nav-num">Section 13.1</span><span class="nav-title">Why Graphs Are Hard to Distribute</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 13</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Graph Machine Learning</span></a>
+<a class="next" href="section-13.3.html"><span class="nav-label">Next</span><span class="nav-num">Section 13.3</span><span class="nav-title">The Pregel / Vertex-Centric Model</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

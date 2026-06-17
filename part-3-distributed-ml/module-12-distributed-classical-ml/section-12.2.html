@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 12.2: Distributed Support Vector Machines. Why margin-based classification is harder to distribute than regression, the primal subgradient and dual CoCoA approaches, the cascade SVM, and why kernels scale poorly." name="description"/>
+<title>Section 12.2: Distributed Support Vector Machines | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Distributed Machine Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 12: Distributed Classical Machine Learning</a></div>
+<h1>Distributed Support Vector Machines</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I held one shard of the data and felt certain I had found the boundary. Then worker five spoke up, and the margin moved."</p>
+<cite>A Support Vector Convinced It Was Decisive</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A support vector machine is decided by a handful of points sitting on the margin, and which points those are is a property of the whole dataset, not of any one shard.</strong> That single fact makes the SVM harder to distribute than the regressions of the previous section, where the gradient was a clean average that split with no loss. The objective stays convex, so we are never fighting bad local minima; the difficulty is purely that the data is coupled through the margin. This section shows three ways to live with that coupling: run the same all-reduce subgradient loop on the primal, optimize local dual blocks and combine them periodically in the communication-efficient CoCoA style, or filter support vectors hierarchically with a cascade. It closes with why kernel SVMs scale so poorly that practitioners replace them with random features, turning a quadratic-memory problem back into a linear one we already know how to distribute.</p>
+</div>
+<p>In <a href="section-12.1.html">Section 12.1</a> the loss was an average over examples, and an average splits across workers with no approximation, exactly the gradient identity from <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>. Classification by margin keeps that convenient additive structure in its loss but adds a twist: the optimum depends only on the examples nearest the decision boundary, the support vectors, and those points can land on any worker. A regression coefficient is shaped by every example a little; an SVM boundary is shaped by a few examples a lot, and identifying them is a global question. This section is about distributing a convex objective whose solution is concentrated rather than spread out, and the methods that win are the ones that do most of their work locally and combine rarely.</p>
+
+<h2>1. The Linear SVM Objective and Why the Margin Couples the Data <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The linear soft-margin SVM fits a weight vector $w$ (and, in the simplest form we use here, an implicit bias folded into the features) that classifies an example $x_i$ with label $y_i \in \{-1, +1\}$ by the sign of $w^\top x_i$. The training objective trades a large geometric margin against the hinge penalty paid by points that fall inside or on the wrong side of it,</p>
+$$\min_{w} \; \frac{1}{2}\,\lVert w \rVert^2 \; + \; \frac{C}{N} \sum_{i=1}^{N} \max\!\bigl(0,\; 1 - y_i\, w^\top x_i\bigr),$$
+<p>where $C$ controls how heavily margin violations are penalized relative to the $L^2$ regularizer $\tfrac{1}{2}\lVert w\rVert^2$. The hinge term is a sum over examples, so its gradient is still an average, and that is the good news: the additive structure that made regression easy to distribute survives. The hard news hides in which examples actually contribute. A point with $y_i\, w^\top x_i \ge 1$ sits safely outside the margin and adds nothing to the gradient; only the margin-violating points, the support vectors, push on $w$. At the optimum the solution can be written purely in terms of those few points, and they may be scattered across every shard in the cluster.</p>
+<p>This is the coupling that regression did not have. To know whether a point on worker 3 is a support vector, you need the current $w$, which depends on the support vectors found by all the other workers. No shard can certify its own support set in isolation. The objective is still convex, so any method that drives the global gradient to zero reaches the unique optimum, but a worker looking only at its own data cannot tell when it is done. That tension, a perfectly splittable loss whose solution is a global property, organizes every method below.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Loss Splits, the Solution Does Not</div>
+<p>The hinge loss is a sum over examples, so its (sub)gradient all-reduces exactly like a regression gradient: nothing is approximated when you combine partial subgradients. What does not split is the <em>identity of the support vectors</em>. Those few margin-defining points are a property of the entire dataset, and any worker examining only its shard sees a distorted, local margin. Every distributed SVM method is therefore a way of letting workers do cheap local work while paying just enough communication to agree on a global margin. Methods that communicate every step (primal SGD) are simple; methods that communicate rarely (dual CoCoA, the cascade) are what scale.</p>
+</div>
+
+<h2>2. Distributing the Primal with All-Reduce Subgradient SGD <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The most direct way to distribute the SVM reuses the pattern from <a href="section-12.1.html">Section 12.1</a> verbatim. Because the hinge loss is convex but not differentiable at the kink, we descend on a subgradient instead of a gradient: at each step every worker computes the subgradient of the hinge term over its own shard, counting only its margin-violating points, and the cluster sums these partial subgradients with an all-reduce. Adding back the regularizer term $w$ (which needs no data) gives the full objective subgradient, and a single SGD step updates $w$. This is the same synchronous all-reduce loop that drives data-parallel optimization throughout <a href="../module-10-distributed-optimization/section-10.5.html">Section 10.5</a>; the only SVM-specific part is the hinge subgradient.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of distributed hinge-loss subgradient descent: each of three workers holds a data shard, computes a partial hinge subgradient over only its margin-violating points, and the partials are summed by an all-reduce and added to the regularizer to update the shared weight vector.">
+<defs>
+<marker id="arr122" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b122 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w122 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.g122 { fill:#eef6ee; stroke:#2f7d32; stroke-width:1.6; }
+.t122 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s122 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l122 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr122); }
+</style>
+<text class="t122" x="430" y="26">One synchronous step of distributed hinge-loss subgradient descent</text>
+<rect class="w122" x="40" y="56" width="180" height="78" rx="9"/>
+<text class="t122" x="130" y="82">Worker 1 (shard 1)</text>
+<text class="s122" x="130" y="104">subgradient over its</text>
+<text class="s122" x="130" y="120">margin violators only</text>
+<rect class="w122" x="340" y="56" width="180" height="78" rx="9"/>
+<text class="t122" x="430" y="82">Worker 2 (shard 2)</text>
+<text class="s122" x="430" y="104">subgradient over its</text>
+<text class="s122" x="430" y="120">margin violators only</text>
+<rect class="w122" x="640" y="56" width="180" height="78" rx="9"/>
+<text class="t122" x="730" y="82">Worker K (shard K)</text>
+<text class="s122" x="730" y="104">subgradient over its</text>
+<text class="s122" x="730" y="120">margin violators only</text>
+<rect class="b122" x="300" y="190" width="260" height="56" rx="8"/>
+<text class="t122" x="430" y="214">All-reduce: sum partial subgradients</text>
+<text class="s122" x="430" y="232">one shared hinge subgradient</text>
+<path class="l122" d="M 130 134 L 130 168 L 360 168 L 360 188"/>
+<path class="l122" d="M 430 134 L 430 188"/>
+<path class="l122" d="M 730 134 L 730 168 L 500 168 L 500 188"/>
+<rect class="g122" x="300" y="284" width="260" height="44" rx="8"/>
+<text class="t122" x="430" y="311">update w = w &#8722; lr (w + (C/N) sum)</text>
+<path class="l122" d="M 430 246 L 430 282"/>
+<text class="s122" x="700" y="312">regularizer term needs no data</text>
+</svg>
+<figcaption><strong>Figure 12.2.1:</strong> Distributed primal SVM as all-reduce subgradient descent. Each of the $K$ workers computes the hinge subgradient over only the margin-violating points in its shard, the partial subgradients are summed by an all-reduce, and the regularizer term $w$ (which needs no data) is added before a single SGD step updates the shared weight vector. The structure is identical to the data-parallel loop of <a href="../module-10-distributed-optimization/section-10.5.html">Section 10.5</a>; only the per-example subgradient changes.</figcaption>
+</figure>
+<p>The code below makes the claim of exactness concrete. It trains a linear SVM on two noisy Gaussian blobs two ways: once on a single machine over all the data, and once as $K=6$ workers that each subgradient-descend on their own shard and combine by summing the partials. Because the only combine step is an exact sum, the two runs must agree up to floating-point rounding, just as the regression gradients did in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+N, d, K = 60_000, 20, 6                 # examples, features, workers
+w_star = rng.standard_normal(d)
+X = rng.standard_normal((N, d))
+y = np.where(X @ w_star > 0, 1.0, -1.0) # labels in {-1, +1}
+X += 0.35 * rng.standard_normal((N, d)) # noise so some points violate the margin
+
+C, lr0, epochs = 1.0, 0.5, 30
+shards = np.array_split(np.arange(N), K)
+
+def hinge_subgrad(w, Xb, yb):
+    active = (yb * (Xb @ w)) < 1.0      # only margin-violating points contribute
+    return -(yb[active, None] * Xb[active]).sum(axis=0)   # UNNORMALIZED partial sum
+
+def train(distributed):
+    w = np.zeros(d)
+    for t in range(epochs):
+        lr = lr0 / (1.0 + 0.1 * t)
+        if distributed:
+            parts = [hinge_subgrad(w, X[s], y[s]) for s in shards]
+            data_grad = np.sum(parts, axis=0)            # ALL-REDUCE (sum) of K parts
+        else:
+            data_grad = hinge_subgrad(w, X, y)           # single machine, all data
+        grad = w + (C / N) * data_grad                   # regularizer + hinge term
+        w = w - lr * grad
+    return w
+
+w_single, w_dist = train(False), train(True)
+obj = lambda w: 0.5 * w @ w + C * np.maximum(0.0, 1.0 - y * (X @ w)).mean()
+acc = lambda w: float((np.sign(X @ w) == y).mean())
+
+print("workers K                :", K)
+print("single-machine objective :", f"{obj(w_single):.6f}")
+print("distributed   objective  :", f"{obj(w_dist):.6f}")
+print("max |w_single - w_dist|  :", f"{np.max(np.abs(w_single - w_dist)):.2e}")
+print("single-machine accuracy  :", f"{acc(w_single):.4f}")
+print("distributed   accuracy   :", f"{acc(w_dist):.4f}")
+</code></pre>
+<div class="code-caption"><strong>Code 12.2.1:</strong> A linear SVM trained by distributed hinge-loss subgradient SGD. The <code>distributed</code> path computes one partial subgradient per shard and combines them with a plain sum, the all-reduce; the single-machine path sees all the data at once. The hinge subgradient ignores every point already outside the margin.</div>
+<pre><code class="language-text">workers K                : 6
+single-machine objective : 0.729878
+distributed   objective  : 0.729878
+max |w_single - w_dist|  : 2.16e-15
+single-machine accuracy  : 0.8923
+distributed   accuracy   : 0.8923</code></pre>
+<div class="code-caption"><strong>Output 12.2.1:</strong> Six workers, each blind to five sixths of the data, recover the single-machine weight vector to within $2 \times 10^{-15}$, and the objective and accuracy match exactly. Splitting the hinge subgradient across the cluster changed the answer by nothing beyond floating-point rounding.</div>
+<p>The lesson mirrors <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a> precisely: for the central operation, scale-out is an exact reorganization, not an approximation. The catch is the same one too. Primal subgradient SGD all-reduces a full $d$-length vector on every single step, so for a problem that needs thousands of steps to converge, the cluster pays thousands of synchronizations. When the per-step communication dominates the per-step computation, this simple loop stops scaling, and the next two methods exist to break that one-all-reduce-per-step habit.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Lazy Majority</div>
+<p>Run Code 12.2.1 with a print of how many points are <code>active</code> on a late epoch and you will usually find the vast majority sitting it out, already safely outside the margin and contributing a flat zero to the subgradient. The SVM is the rare model where most of your data does nothing once training warms up. The whole game of distributing it is keeping the network quiet about the silent majority and loud only about the few points still arguing over where the boundary goes.</p>
+</div>
+
+<h2>3. The Dual and Communication-Efficient CoCoA <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>To stop communicating every step, we change what each worker optimizes. The SVM has a dual formulation with one variable $\alpha_i \ge 0$ per training example, bounded above by $C/N$, in which the weight vector is recovered as a label-weighted combination of the inputs, $w = \sum_i \alpha_i\, y_i\, x_i$. The dual objective is</p>
+$$\max_{0 \le \alpha_i \le C/N} \; \sum_{i=1}^{N} \alpha_i \;-\; \frac{1}{2} \Bigl\lVert \sum_{i=1}^{N} \alpha_i\, y_i\, x_i \Bigr\rVert^2 ,$$
+<p>and its structure is the key to communication efficiency. The dual variables $\alpha_i$ are tied to individual examples, so each worker owns the block of $\alpha$ for the examples in its shard. The only thing the workers must share is the single vector $w = \sum_i \alpha_i y_i x_i$, a $d$-length summary that aggregates everyone's contribution. This is exactly the setting of <strong>CoCoA</strong> (Communication-efficient distributed dual Coordinate Ascent), which is the canonical example of the communication-efficient optimization developed in <a href="../module-10-distributed-optimization/section-10.7.html">Section 10.7</a>.</p>
+<p>CoCoA runs in rounds. In each round, every worker takes <em>many</em> coordinate-ascent steps on its own block of dual variables, treating the shared $w$ as fixed, which is pure local computation with no network traffic. Then a single all-reduce sums each worker's change to $w$, the shared model is updated, and the next round begins. By doing tens or hundreds of cheap local updates between communications, CoCoA replaces the one-all-reduce-per-step cost of primal SGD with one all-reduce per round, and the framework comes with convergence guarantees because the local subproblems are constructed to stay faithful to the global dual objective. The trade is the standard local-then-combine bargain from <a href="../module-10-distributed-optimization/section-10.7.html">Section 10.7</a>: a little statistical efficiency per round bought back many times over in reduced communication.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Local Work, Rare Combine</div>
+<p>CoCoA is the SVM speaking the book's recurring sentence: do as much as you can locally, then combine rarely with a collective. The same shape returns as local SGD and DiLoCo in <a href="../module-10-distributed-optimization/section-10.7.html">Section 10.7</a>, as FedAvg in <a href="../module-14-federated-decentralized-learning/index.html">Chapter 14</a> (where workers run whole local epochs before averaging), and as gradient-accumulation across micro-steps in data-parallel deep learning. Whenever communication is the tax, the winning move is to widen the gap between combines while keeping the local subproblem honest about the global objective. The dual block per worker plus one shared $w$ is just the cleanest classical instance of that pattern.</p>
+</div>
+
+<h2>4. The Cascade SVM: Hierarchical Filtering of Support Vectors <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>A third approach exploits a structural fact: most training points are not support vectors, so most of the data can be discarded early if you can identify what to keep. The <strong>cascade SVM</strong> turns that into a tournament. Partition the data across workers and train an independent SVM on each shard. Each local SVM yields a small set of local support vectors; everything else is provably irrelevant to that shard's margin and is thrown away. Pairs of workers then merge their surviving support vectors and train again on the union, halving the number of candidate sets at each level of a binary tree, until one final SVM trains on the support vectors that bubbled up through every round.</p>
+<p>The appeal is that each node in the cascade trains on a tiny fraction of the full data, and the expensive quadratic-program solvers that classical SVM libraries use stay fast because they never see more than a handful of points at once. A single pass up the tree does not in general return the exact global solution, because a point one shard discarded early might have become a support vector once other shards' points joined; the fix is to feed the final support vectors back to the leaves and run another pass, iterating until the support-vector set stops changing, at which point the cascade has converged to the true SVM. In practice a small number of passes suffices, which makes the cascade a communication-light option that moves only compact support-vector sets between levels rather than gradients every step.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Filtering Before Fitting on a Sensor Archive</div>
+<p><strong>Who:</strong> A data scientist at an industrial-monitoring firm building a fault classifier from vibration sensors.</p>
+<p><strong>Situation:</strong> The labeled archive held 40 million windows across a 64-node cluster, far more than any single quadratic-program SVM solver could load at once.</p>
+<p><strong>Problem:</strong> A kernel SVM was accurate on a 100,000-row sample but the solver's memory grew with the square of the row count, so the full dataset was hopeless to fit directly.</p>
+<p><strong>Dilemma:</strong> Subsample to whatever one machine could fit and discard most of the labels, or distribute the fit and keep all the data in play, at the cost of building a distributed training procedure.</p>
+<p><strong>Decision:</strong> They ran a cascade SVM, training fast local solvers per shard and merging only the surviving support vectors up a tree, because the fault windows of interest were a small, margin-defining minority that the cascade was built to surface.</p>
+<p><strong>How:</strong> Each of the 64 leaves trained on its shard; support vectors merged pairwise up six levels, and the final set was fed back to the leaves for one more pass until the support set stabilized.</p>
+<p><strong>Result:</strong> The cascade matched the 100,000-row sample's accuracy while using all 40 million windows, and total training moved gigabytes of support vectors rather than terabytes of raw data across the network.</p>
+<p><strong>Lesson:</strong> When the solution is concentrated in a few points, distribute by filtering toward those points, not by averaging gradients over all of them.</p>
+</div>
+
+<h2>5. Kernel SVMs and Why They Force a Linear Approximation <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Everything so far assumed a linear boundary. The classical power of the SVM came from the kernel trick, replacing inner products $x_i^\top x_j$ with a kernel $k(x_i, x_j)$ that measures similarity in a high-dimensional feature space without ever forming the features. The trouble for scale-out is that the dual then depends on the full $N \times N$ kernel matrix $K_{ij} = k(x_i, x_j)$. That matrix has $N^2$ entries; at ten million examples it would need roughly $4 \times 10^{14}$ bytes, hundreds of terabytes, and no partitioning scheme makes a dense all-pairs object cheap, because every entry couples two examples that may live on different workers. The kernel SVM does not merely communicate a lot; it asks for a quantity that cannot be stored.</p>
+<p>The practical escape is to stop computing the kernel exactly and instead approximate it with explicit features. <strong>Random Fourier features</strong> draw a fixed set of random projections such that the inner product of the transformed inputs approximates a shift-invariant kernel (the Gaussian kernel most famously), turning a kernel SVM into an ordinary linear SVM in an expanded but finite feature space. Once the problem is linear again, every distributed method in this section applies directly: all-reduce subgradient SGD, CoCoA on the dual, or the cascade. The same instinct, replace a quadratic-memory similarity object with linear-size features, reappears in embedding retrieval, where the all-pairs similarity matrix gives way to the approximate nearest-neighbor indexes of <a href="section-12.7.html">Section 12.7</a> and the distributed vector search of <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a>.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: LinearSVC, Random Features, and Spark MLlib</div>
+<p>You rarely hand-roll any of this. On one machine, scikit-learn's <code>LinearSVC</code> solves the linear SVM with a tuned coordinate or trust-region solver, and <code>RBFSampler</code> supplies the random Fourier features that let a linear solver imitate a Gaussian kernel. To go distributed, Spark MLlib's <code>LinearSVC</code> trains across a cluster with the same all-reduce-style aggregation Code 12.2.1 spells out by hand:</p>
+<pre><code class="language-python"># Single machine: kernel approximation + linear SVM in a pipeline
+from sklearn.svm import LinearSVC
+from sklearn.kernel_approximation import RBFSampler
+from sklearn.pipeline import make_pipeline
+clf = make_pipeline(RBFSampler(gamma=0.2, n_components=500), LinearSVC(C=1.0))
+clf.fit(X, y)                       # linear solver, kernel imitated by random features
+
+# Distributed across a cluster: Spark MLlib LinearSVC on a DataFrame
+from pyspark.ml.classification import LinearSVC as SparkLinearSVC
+model = SparkLinearSVC(regParam=0.01, maxIter=100).fit(train_df)   # cluster all-reduce
+</code></pre>
+<div class="code-caption"><strong>Code 12.2.2:</strong> The roughly thirty lines of Code 12.2.1 collapse to a one-line pipeline on a single machine and a one-line estimator on a cluster. scikit-learn handles the solver and the random-feature map; Spark MLlib handles the data partitioning, the per-partition gradient aggregation, and the driver-side combine that Output 12.2.1 reproduced by hand.</div>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Communication-Efficient Convex Learning (2024 to 2026)</div>
+<p>The classical SVM is convex, and convexity is back in fashion precisely because it gives the clean communication-vs-statistics trade that deep learning only approximates. Recent work sharpens the local-then-combine bargain that CoCoA opened: accelerated and variance-reduced distributed dual methods tighten the number of rounds needed for a target accuracy, and federated SVM and kernel-learning variants push the dual-block-per-client structure into the privacy-constrained setting of <a href="../module-14-federated-decentralized-learning/index.html">Chapter 14</a>, where the shared $w$ must be protected as it is combined. On the kernel side, structured and quasi-random feature maps (in the lineage of random Fourier features) keep shrinking the feature count needed to match a kernel, which matters because fewer features means a smaller vector to all-reduce. The throughline of the 2024 to 2026 literature is the one this section teaches: for coupled convex objectives, the quantity to engineer down is the number of communication rounds, and the dual block is the structure that lets you do it with guarantees.</p>
+</div>
+
+<h2>6. Choosing a Distributed SVM <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The three methods are not rivals so much as answers to different binding costs, and Table 12.2.1 lines them up against the question each one answers best. Primal subgradient SGD wins on simplicity and is the right reach when communication is cheap relative to computation, or when you already have the all-reduce loop of <a href="../module-10-distributed-optimization/section-10.5.html">Section 10.5</a> running for everything else. CoCoA wins when communication is the binding tax, because it slashes the number of rounds. The cascade wins when you must keep an exact quadratic-program solver in the loop (often for a kernel on a tractable sample) and the support vectors are a small minority worth filtering toward.</p>
+<div class="table-caption"><strong>Table 12.2.1:</strong> Three ways to distribute a support vector machine, the communication each pays, and when to reach for it.</div>
+<table>
+<thead>
+<tr><th scope="col">Method</th><th scope="col">What each worker does</th><th scope="col">Communication</th><th scope="col">Reach for it when</th></tr>
+</thead>
+<tbody>
+<tr><td>Primal subgradient SGD</td><td>Hinge subgradient over its shard</td><td>One all-reduce of $w$ per step</td><td>Communication is cheap; loop already exists</td></tr>
+<tr><td>Dual CoCoA</td><td>Many local coordinate-ascent steps on its dual block</td><td>One all-reduce of $w$ per round</td><td>Communication is the binding cost</td></tr>
+<tr><td>Cascade SVM</td><td>Exact SVM on a shard, then on merged support vectors</td><td>Support-vector sets up a tree</td><td>An exact solver and a small support set matter</td></tr>
+</tbody>
+</table>
+<p>Underneath all three sits the same observation that the convexity of the SVM is a gift and the coupling through the margin is the price. We never fear a bad local optimum, only the cost of agreeing on a global margin, and the methods that scale are the ones that buy that agreement cheaply. That is why the communication-efficient, local-then-combine family is the throughline of distributed classical machine learning, and it is the same instinct we will carry into the decision trees of <a href="section-12.3.html">Section 12.3</a>, where the coupling reappears in a different guise: the best split, like the best margin, is a global property of data that lives on many machines.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 12.2.1: Where the Coupling Lives <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Explain, in terms of the objective in Section 1, why the hinge-loss subgradient all-reduces exactly (so Output 12.2.1 shows zero error) even though the set of support vectors is a global property no single shard can determine on its own. Then describe a situation in which a worker, looking only at its own shard, would confidently misjudge which of its points are support vectors, and say what information it is missing.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 12.2.2: Trading Communication for Local Work <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 12.2.1 to imitate the CoCoA bargain on the primal side: instead of one all-reduce per SGD step, let each worker take $H$ local SGD steps on its own shard's hinge subgradient before the cluster averages the resulting weight vectors once per round. Sweep $H \in \{1, 5, 20, 50\}$ and, for each, report the final objective and the total number of all-reduces. Plot objective against communication rounds and explain where the local-then-combine trade starts to cost accuracy, connecting your finding to the round-versus-statistics trade of <a href="../module-10-distributed-optimization/section-10.7.html">Section 10.7</a>.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 12.2.3: The Kernel Matrix You Cannot Store <span class="exercise-type analysis">Analysis</span></div>
+<p>For a Gaussian-kernel SVM with $N = 5 \times 10^6$ examples, compute the memory a dense $N \times N$ kernel matrix would require at 4 bytes per entry, and the time to even fill it once if the network or memory system moves 50 gigabytes per second. Now suppose you replace the kernel with $R = 1000$ random Fourier features and train a linear SVM by all-reduce subgradient SGD. State the per-step communication cost in bytes for the random-feature approach and argue from the two numbers why random features convert an impossible problem into the linear, distributable one of Section 2.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-12.1.html"><span class="nav-label">Previous</span><span class="nav-num">Section 12.1</span><span class="nav-title">Distributed Linear and Logistic Regression</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 12</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Classical Machine Learning</span></a>
+<a class="next" href="section-12.3.html"><span class="nav-label">Next</span><span class="nav-num">Section 12.3</span><span class="nav-title">Distributed Decision Trees</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

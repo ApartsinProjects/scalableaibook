@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 9.9: Concept Drift and Distributed Monitoring. Detecting when a deployed model goes stale, measuring drift on streams with PSI and the KS test, and merging monitoring sketches across a serving fleet. Closes Chapter 9 and Part II." name="description"/>
+<title>Section 9.9: Concept Drift and Distributed Monitoring | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Distributed Data Processing for AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 9: Stream Processing and Online AI</a></div>
+<h1>Concept Drift and Distributed Monitoring</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"My accuracy on the validation set was excellent. It is just that the validation set and the world stopped being the same thing about three weeks ago, and nobody told either of us."</p>
+<cite>A Model That Trained Once and Believed Forever</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A deployed model is a photograph of a world that keeps moving, so the central question of production AI is not "is the model accurate?" but "is the model still accurate, and how would we know in time?"</strong> The world that generated the training data drifts: user behavior shifts, an upstream feature pipeline changes units, a competitor launches, a season turns. The model does not announce its own decay; accuracy slips quietly while every system stays green. This final section of the chapter builds the instrument that catches that decay on a live stream, by watching the distribution of inputs and predictions window by window and raising an alert the moment a statistic crosses a line. Because the model runs not on one server but across a fleet of replicas, the instrument must itself be distributed: each replica measures locally, and a coordinator merges those measurements into one cluster-wide verdict using the same mergeable sketches we built for distributed aggregation in <a href="../module-06-mapreduce-distributed-algorithms/section-6.8.html">Section 6.8</a>. With monitoring in place, Part II is complete: we will have carried data from raw bytes all the way to a model that watches its own freshness in production.</p>
+</div>
+<p>Every chapter so far has moved data toward a model: partitioned it (<a href="../module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a>), reshaped it in DataFrames (<a href="../module-07-spark-dataframes/index.html">Chapter 7</a>), loaded it from distributed storage (<a href="../module-08-distributed-storage-data-loading/index.html">Chapter 8</a>), and turned it into an unbounded stream of events that feeds online features and real-time predictions (Sections 9.1 through 9.8). That pipeline assumed something it never checked: that the live data still resembles the data the model learned from. When that assumption fails, the pipeline keeps running flawlessly and the answers quietly get worse. The job of this section is to make that silent failure loud.</p>
+
+<h2>1. Two Ways a Model Goes Stale <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A model learns a relationship between inputs $x$ and a target $y$, which probability gives us the joint distribution $P(x, y) = P(y \mid x)\, P(x)$. Staleness is any change in that joint distribution after deployment, and it comes in two flavors that demand different responses. The first is <strong>data drift</strong> (also called covariate drift): the input distribution $P(x)$ shifts while the underlying rule $P(y \mid x)$ stays fixed. New kinds of traffic arrive, a feature's range moves, a sensor recalibrates. The model's learned mapping is still correct, but it is now being asked questions from a region of input space it saw rarely during training, so its answers there are less reliable. The second is <strong>concept drift</strong>: the rule itself, $P(y \mid x)$, changes. The same input now implies a different outcome. A transaction pattern that meant "legitimate" last year means "fraud" today; a search query that meant one intent now means another. Concept drift is the more dangerous kind, because retraining on fresh inputs alone will not fix it; you need fresh <em>labels</em> that reflect the new rule.</p>
+<p>The practical trouble is that the two often look identical from where we stand. In production we usually see the inputs $x$ and the model's predictions immediately, but the true labels $y$ arrive late or not at all: a loan's default status is known months later, a recommendation's true value is never directly observed. So our earliest warning has to come from what we can see right away, the distributions of features and predictions, and only later can delayed labels confirm whether accuracy actually fell. This is why drift monitoring is layered: fast, label-free distribution checks raise a flag, and slower, label-based metric checks adjudicate it.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: You Monitor Distributions Because You Cannot Wait for Labels</div>
+<p>If true labels arrived instantly, monitoring would be trivial: track accuracy and alert when it drops. They almost never do. The defining constraint of production monitoring is the label delay, so the first line of defense watches the things available with zero delay, the input features and the model's own output distribution, and treats a shift in those as a leading indicator of a coming accuracy drop. Distribution monitoring does not prove the model got worse; it proves the model is now operating in conditions it was not validated for, which is a reason to investigate before the damage shows up in a delayed metric.</p>
+</div>
+
+<h2>2. Measuring Drift on a Window <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>To detect a shift we need a number that compares a fixed <em>reference</em> distribution, captured at deployment from data we trust, against a <em>live</em> distribution measured over a recent window of the stream (windows are exactly the bounded slices of an unbounded stream we defined in <a href="section-9.2.html">Section 9.2</a>). Two comparisons dominate practice. The first is the <strong>Population Stability Index (PSI)</strong>. Bin both distributions into the same $B$ buckets, let $p_b$ be the reference fraction in bucket $b$ and $q_b$ the live fraction, and define</p>
+$$\mathrm{PSI} = \sum_{b=1}^{B} (q_b - p_b)\,\ln\frac{q_b}{p_b}.$$
+<p>PSI is a symmetrized relative-entropy-style score: it is zero when the two histograms match and grows as they diverge. A widely used convention reads $\mathrm{PSI} < 0.1$ as stable, $0.1 \le \mathrm{PSI} < 0.25$ as a moderate shift worth watching, and $\mathrm{PSI} \ge 0.25$ as a material shift that should raise an alert. The second comparison is the <strong>two-sample Kolmogorov-Smirnov (KS) test</strong>, which needs no binning: it takes the largest gap between the two empirical cumulative distribution functions, $D = \sup_x |F_{\text{ref}}(x) - F_{\text{live}}(x)|$, and turns it into a p-value for the hypothesis that both samples came from the same distribution. PSI is cheap, interpretable, and the standard in risk and credit settings; the KS test is distribution-free and good for continuous features where you would rather not choose bins. You apply the same idea to the model's prediction distribution, which catches drift even when no single input feature moved much but the model's overall behavior shifted.</p>
+<p>The code below builds a PSI drift detector over a stream whose generating distribution shifts halfway through. It fixes decile bins from a reference sample, then walks fixed-size windows, computes PSI for each, and flags the window the moment the score crosses the alert line.</p>
+<pre><code class="language-python">import random, math
+random.seed(11)
+
+N_REF, WIN, N_WINDOWS, SHIFT_AT, ALERT, EPS = 20_000, 2_000, 12, 6, 0.25, 1e-6
+
+ref = [random.gauss(0.0, 1.0) for _ in range(N_REF)]      # calibration sample
+ref_sorted, n_bins = sorted(ref), 10
+edges = [-math.inf] + [ref_sorted[k * N_REF // n_bins] for k in range(1, n_bins)] + [math.inf]
+
+def histogram(values):                                    # bin into fixed reference edges
+    counts = [0] * n_bins
+    for v in values:
+        for b in range(n_bins):
+            if edges[b] <= v < edges[b + 1]:
+                counts[b] += 1; break
+    total = sum(counts)
+    return [max(c / total, EPS) for c in counts]          # EPS floors empty bins
+
+p = histogram(ref)                                        # reference probability vector
+def psi(q): return sum((q[b] - p[b]) * math.log(q[b] / p[b]) for b in range(n_bins))
+
+print(f"{'window':>6} | {'gen mean':>8} | {'PSI':>7} | status")
+print("-" * 42)
+for w in range(N_WINDOWS):
+    mu = 0.0 if w < SHIFT_AT else 0.8                     # distribution shifts at window 6
+    q = histogram([random.gauss(mu, 1.0) for _ in range(WIN)])
+    score = psi(q)
+    status = "ALERT" if score >= ALERT else ("watch" if score >= 0.1 else "ok")
+    print(f"{w:>6} | {mu:>8.2f} | {score:>7.4f} | {status}")
+</code></pre>
+<div class="code-caption"><strong>Code 9.9.1:</strong> A windowed PSI drift detector in pure Python. The reference histogram <code>p</code> is fixed once from a trusted calibration sample; each live window is binned into the same edges and scored against it, and the score is compared to the alert threshold.</div>
+<pre><code class="language-text">window | gen mean |     PSI | status
+------------------------------------------
+     0 |     0.00 |  0.0040 | ok
+     1 |     0.00 |  0.0073 | ok
+     2 |     0.00 |  0.0019 | ok
+     3 |     0.00 |  0.0020 | ok
+     4 |     0.00 |  0.0029 | ok
+     5 |     0.00 |  0.0036 | ok
+     6 |     0.80 |  0.6445 | ALERT
+     7 |     0.80 |  0.6117 | ALERT
+     8 |     0.80 |  0.5792 | ALERT
+     9 |     0.80 |  0.5572 | ALERT
+    10 |     0.80 |  0.6023 | ALERT
+    11 |     0.80 |  0.5400 | ALERT
+</code></pre>
+<div class="code-caption"><strong>Output 9.9.1:</strong> While the generating mean holds at zero (windows 0 to 5) PSI stays near $0.003$, far under the line. The instant the mean jumps to $0.8$ at window 6, PSI leaps to $0.64$ and stays there, tripping the alert on the very first shifted window with no false alarm before it.</div>
+<p>The detector did exactly one useful thing, and it did it without a single label: it converted a change in the world into a number that crossed a threshold within one window of the change. The diagram in Figure 9.9.1 shows the shape of that signal and, on its right half, how the same statistic is assembled from many serving replicas rather than one process.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 880 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left: a line chart of a drift statistic staying near zero across early windows, then jumping above a dashed alert line at the shift and remaining high. Right: three serving replicas each emit a local distribution sketch, all merged at a central monitor that computes the cluster-wide drift score and fires an alert.">
+<defs>
+<marker id="arr99" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b99 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w99 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.a99 { fill:#fbeaea; stroke:#a3242a; stroke-width:1.6; }
+.t99 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s99 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.ax99 { stroke:#9aa3ad; stroke-width:1.2; }
+.dr99 { fill:none; stroke:#14385c; stroke-width:2.2; }
+.al99 { fill:none; stroke:#a3242a; stroke-width:1.6; stroke-dasharray:6 4; }
+.l99 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr99); }
+</style>
+<text class="t99" x="210" y="24">Drift statistic per window</text>
+<line class="ax99" x1="60" y1="40" x2="60" y2="230"/>
+<line class="ax99" x1="60" y1="230" x2="380" y2="230"/>
+<text class="s99" x="34" y="70" transform="rotate(-90 34 70)">PSI</text>
+<text class="s99" x="220" y="250">window index (time)</text>
+<line class="al99" x1="60" y1="95" x2="380" y2="95"/>
+<text class="s99" x="345" y="89" fill="#a3242a">alert line</text>
+<polyline class="dr99" points="80,222 110,219 140,224 170,223 200,221 230,222 260,70 290,76 320,80 350,74"/>
+<circle cx="260" cy="70" r="4" fill="#a3242a"/>
+<text class="s99" x="262" y="58" fill="#a3242a">shift detected</text>
+<text class="s99" x="170" y="212">stable: near zero</text>
+<text class="t99" x="690" y="24">Distributed monitoring</text>
+<rect class="w99" x="560" y="46" width="110" height="44" rx="7"/>
+<text class="t99" x="615" y="64">Replica 1</text>
+<text class="s99" x="615" y="80">local sketch</text>
+<rect class="w99" x="560" y="106" width="110" height="44" rx="7"/>
+<text class="t99" x="615" y="124">Replica 2</text>
+<text class="s99" x="615" y="140">local sketch</text>
+<rect class="w99" x="560" y="166" width="110" height="44" rx="7"/>
+<text class="t99" x="615" y="184">Replica R</text>
+<text class="s99" x="615" y="200">local sketch</text>
+<rect class="b99" x="730" y="106" width="120" height="56" rx="8"/>
+<text class="t99" x="790" y="130">Monitor</text>
+<text class="s99" x="790" y="148">merge + score</text>
+<path class="l99" d="M 670 68 L 700 68 L 700 124 L 728 130"/>
+<path class="l99" d="M 670 128 L 726 132"/>
+<path class="l99" d="M 670 188 L 700 188 L 700 140 L 728 136"/>
+<rect class="a99" x="735" y="196" width="110" height="40" rx="7"/>
+<text class="t99" x="790" y="214" fill="#a3242a">ALERT</text>
+<text class="s99" x="790" y="230">retrain trigger</text>
+<path class="l99" d="M 790 162 L 790 194"/>
+<text class="s99" x="440" y="200">the same</text>
+<text class="s99" x="440" y="216">statistic,</text>
+<text class="s99" x="440" y="232">merged from</text>
+<text class="s99" x="440" y="248">R replicas</text>
+</svg>
+<figcaption><strong>Figure 9.9.1:</strong> The drift signal and where it is computed. On the left, the per-window drift statistic from Output 9.9.1 hugs zero while the stream is stable, then jumps past the dashed alert line at the shift and stays high. On the right, the same statistic in production is not computed in one process: each serving replica emits a local distribution sketch, a central monitor merges the sketches (the mergeable-sketch idea from <a href="../module-06-mapreduce-distributed-algorithms/section-6.8.html">Section 6.8</a>) into one cluster-wide histogram, scores it, and fires the alert that triggers retraining.</figcaption>
+</figure>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Dashboard Was Green the Whole Time</div>
+<p>The most expensive drift incidents share a signature: every infrastructure dashboard stayed green. CPU was fine, latency was fine, error rate was zero, uptime was a row of nines. The model served every request successfully and confidently, and was wrong more and more often. Liveness monitoring asks "is the service up?" Drift monitoring asks "is the service right?" Those are different questions, and only one of them has a green light that can lie to you.</p>
+</div>
+
+<h2>3. Monitoring Across a Fleet of Replicas <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Code 9.9.1 measured one stream in one process. A real serving system runs the model on dozens or hundreds of replicas behind a load balancer (the real-time inference fleet of <a href="section-9.8.html">Section 9.8</a>), and the drift question is about the aggregate traffic, not any one replica. The naive approach, shipping every raw prediction and feature vector to a central place to be re-binned, recreates exactly the all-data-to-one-node bottleneck this book keeps teaching you to avoid. The right move is the one from distributed aggregation: each replica maintains a small <strong>mergeable sketch</strong> of its local traffic, and the central monitor combines the sketches.</p>
+<p>For PSI the sketch is simply a per-bin count vector; merging is element-wise addition, which is associative and commutative, so replicas can be combined in any order and partial merges along a tree give the same total as a flat sum. This is the same mergeability property that made distributed counting, distinct-count (HyperLogLog), and quantile sketches work in <a href="../module-06-mapreduce-distributed-algorithms/section-6.8.html">Section 6.8</a>; a histogram is the most basic mergeable sketch there is. Each replica sends a vector of $B$ integers per window instead of thousands of raw records, the monitor sums them into one cluster-wide histogram, normalizes, and scores it against the reference. The bytes on the wire drop by orders of magnitude and the merged score is exact, not an approximation, because summing counts loses nothing.</p>
+<p>The same pattern carries the metrics that arrive with delayed labels. When ground truth finally lands, each replica (or a downstream join job) accumulates a small confusion-matrix sketch, and the monitor merges those into a fleet-wide accuracy, precision, or calibration curve, then watches <em>that</em> across windows as the slower, definitive confirmation of what the distribution alert predicted. Two layers, same mechanics: cheap label-free distribution sketches for early warning, merged label-based metric sketches for confirmation, both built from per-replica summaries that add.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Evidently, NannyML, and river Do the Drift Math for You</div>
+<p>Code 9.9.1 spelled out PSI from histograms to teach the mechanics. In production you reach for a maintained library. <strong>Evidently</strong> computes PSI, the KS test, Wasserstein distance, and prediction-drift reports over reference-versus-current frames in a few lines and renders a dashboard. <strong>NannyML</strong> goes further and <em>estimates</em> model performance under covariate drift before labels arrive, which is precisely the label-delay problem of Section 1. <strong>river</strong> targets online streams directly with incremental drift detectors such as ADWIN and the Page-Hinkley test that update one event at a time:</p>
+<pre><code class="language-python"># pip install evidently river
+from river import drift
+
+detector = drift.ADWIN()                 # adaptive windowing; no fixed window size
+for x in feature_stream:                 # one event at a time, O(1) memory amortized
+    detector.update(x)
+    if detector.drift_detected:
+        trigger_retrain()                # ADWIN found a change point in the stream
+</code></pre>
+<div class="code-caption"><strong>Code 9.9.2:</strong> An online drift detector in five lines with <code>river</code>. ADWIN maintains an adaptive window and flags change points automatically, replacing the fixed-window PSI loop of Code 9.9.1; the library handles windowing, the statistical test, and the memory bound that a from-scratch detector would have to manage by hand.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Feature That Silently Changed Units</div>
+<p><strong>Who:</strong> An ML platform engineer responsible for a fraud-scoring service running across forty inference replicas.</p>
+<p><strong>Situation:</strong> The model had held steady at high precision for months, and the team had stopped looking at it closely.</p>
+<p><strong>Problem:</strong> An upstream team changed a transaction-amount field from cents to dollars, dividing one feature by a hundred across the whole stream, and shipped it without a heads-up.</p>
+<p><strong>Dilemma:</strong> True fraud labels lag by weeks, so waiting for an accuracy drop meant weeks of degraded scoring; but feature-level alerts can be noisy, and nobody wanted a pager that cried wolf.</p>
+<p><strong>Decision:</strong> They trusted the distribution layer: a per-replica PSI sketch on each feature, merged centrally per five-minute window, with an alert at $\mathrm{PSI} \ge 0.25$.</p>
+<p><strong>How:</strong> The amount feature's merged histogram collapsed into the lowest bins; its PSI shot past the line within two windows while every other feature stayed flat, pointing straight at the culprit.</p>
+<p><strong>Result:</strong> The alert fired the same afternoon as the deploy, the units bug was reverted before a single fraud label came back, and no accuracy loss ever materialized.</p>
+<p><strong>Lesson:</strong> Distribution monitoring catches upstream data-contract breaks that no liveness check would ever see, and isolating drift per feature turns a vague "something is off" into a named root cause.</p>
+</div>
+
+<h2>4. From Alert to Action: Triggering Retraining <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>An alert is only useful if it drives an action, and drift has three standard responses ordered by cost. The cheapest, when the shift is covariate and the rule still holds, is to do nothing but watch; not every distribution wobble warrants a retrain, and over-reacting churns models for no accuracy gain. The middle response is an <strong>online update</strong>: keep learning incrementally from the fresh stream so the model tracks a slowly moving target, which is the natural fit when drift is gradual and some labels trickle in. The heaviest response is a full <strong>retrain</strong> on a refreshed dataset, warranted when the alert is sharp and sustained, as in Output 9.9.1, or when delayed labels confirm a real accuracy drop. A mature pipeline wires the merged alert directly into the retraining trigger so the loop closes automatically: detect, validate against a holdout, and promote the new model only if it beats the incumbent.</p>
+<p>The machinery for those updates is the subject of the next part of the book. Online and incremental optimization, mini-batch and streaming SGD, and the question of how to update a model from a moving data distribution without destabilizing it are exactly what <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a> opens with. The full production loop, where drift detection, automated retraining, validation, canary rollout, and rollback live together as a governed system, is the domain of distributed MLOps in <a href="../../part-5-distributed-inference/module-26-mlops-distributed-ai/index.html">Chapter 26</a>. This section builds the sensor; those chapters build the control system the sensor feeds.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Label-Free Performance Estimation (2024 to 2026)</div>
+<p>The sharpest open problem in monitoring is the label delay itself: distribution drift tells you conditions changed, but not by how much accuracy actually fell. A growing line of work estimates model performance directly under covariate shift without waiting for labels. Confidence-based estimators such as NannyML's CBPE (Confidence-Based Performance Estimation) and DLE reweight the model's own predicted probabilities by the drifted input density to project accuracy forward; importance-weighting and density-ratio methods give error bounds under covariate-shift assumptions. In parallel, recent surveys of unsupervised concept-drift detection (Bayram et al., 2022 onward, with active 2024 to 2026 follow-ups) push toward detectors that separate covariate drift from genuine $P(y \mid x)$ drift using only inputs and predictions, and toward calibration-drift monitors that watch whether predicted probabilities stay honest. We arrive at these methods with the right instruments after the optimization and MLOps machinery of Parts III and V; for now, note that the field is racing to close the gap between "the inputs moved" and "and here is what it cost you."</p>
+</div>
+
+<h2>5. Chapter 9 in One View, and the End of Part II <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>This section closes Chapter 9, and Chapter 9 closes Part II. It is worth seeing the whole arc at once. Chapter 9 took the static datasets of the earlier chapters and set them in motion. We started by contrasting batch processing, which sees a complete bounded dataset, with stream processing, which must produce answers over an unbounded, never-finished sequence of events (Section 9.1). We learned to carve that stream into windows so that aggregation has something finite to operate on (Section 9.2), and to separate <em>event time</em> (when something happened) from <em>processing time</em> (when we saw it), because the two diverge whenever events arrive out of order (Section 9.3). Watermarks gave us a principled way to decide when a window is complete enough to emit despite late events (Section 9.4). The Kafka-style distributed log gave the stream a durable, replayable, partitioned backbone that many producers and consumers can share (Section 9.5), and Spark Structured Streaming and Flink gave us the engines that run windowed computations over it at scale (Section 9.6). On that foundation we computed online features (Section 9.7), served real-time predictions from a distributed inference pipeline (Section 9.8), and finally, in this section, watched the deployed model for drift so it does not rot in place.</p>
+<div class="callout key-takeaway">
+<div class="callout-title">Key Takeaway: Part II Built the Data Foundation Everything Else Stands On</div>
+<p>Part II is the data substrate of the whole book. Chapter 6 gave us MapReduce and the shuffle, the first model for computing over data too big for one machine. Chapter 7 raised that to Spark and distributed DataFrames. Chapter 8 handled distributed storage and the data-loading path that feeds training. Chapter 9 set the data in motion as streams, with windows, event time, watermarks, the Kafka log, stream engines, online features, real-time inference, and drift monitoring. Across all four chapters one idea recurs: split the data across machines, summarize each shard with something that <em>merges</em>, and recombine the summaries correctly, whether the summary is a MapReduce partial aggregate, a Spark shuffle partition, or a per-replica drift sketch. The merge that closed this chapter is a direct descendant of the all-reduce that opened the book in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>, and that lineage is the spine the rest of the book climbs.</p>
+</div>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Data Was Always Distributed; Now the Learning Must Be Too</div>
+<p>Part II made one half of the thesis concrete: when the data outgrows one machine, you distribute it, and you summarize each shard with a mergeable operation so the pieces recombine into a correct whole. Every tool in this part, the MapReduce shuffle, the Spark DataFrame, the streaming window, the per-replica drift sketch, is an instance of that single move. But we have been distributing the <em>data path</em> while keeping the <em>model</em> as a thing trained on one box. Part III breaks that last assumption. The same logic that let eight workers compute one exact gradient in Section 1.1 now becomes the engine of training itself: distribute the optimization, merge the gradients, and keep many machines learning as one. The drift alert that ends Part II is, fittingly, the trigger that starts Part III's machinery running.</p>
+</div>
+
+<h2>6. Project Ideas <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>These are open-ended builds that exercise the whole chapter, not just this section. Each is sized for a weekend and grows naturally toward the distributed-training material of Part III.</p>
+<div class="callout exercise">
+<div class="callout-title">Project Idea A: A Streaming Drift Detector With a Real Engine <span class="exercise-type coding">Coding</span></div>
+<p>Take Code 9.9.1 from a single loop to a real stream. Publish a synthetic feature stream into a Kafka topic (Section 9.5) whose distribution shifts at a known offset, consume it in tumbling windows with Spark Structured Streaming or Flink (Section 9.6), and compute a per-window PSI or KS statistic against a fixed reference. Emit an alert event to a second topic when the statistic crosses the threshold, and measure the detection latency: how many windows after the true shift did the alert fire? Then add a second, gradually drifting feature and show that a fixed threshold that catches the sharp shift either misses or lags the gradual one, motivating an adaptive detector like ADWIN from Code 9.9.2.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Project Idea B: Fleet-Merged Monitoring From Per-Replica Sketches <span class="exercise-type coding">Coding</span></div>
+<p>Simulate $R$ serving replicas, each consuming a partition of the stream and maintaining a local per-bin count sketch per window. Implement a central monitor that merges the $R$ sketches by element-wise addition into one cluster-wide histogram and scores it. Verify empirically that the merged PSI equals the PSI you would get by pooling all raw events centrally (it should, exactly), then measure the bytes-on-the-wire saving of shipping sketches versus raw records. For extra credit, route a distribution shift to only a subset of replicas (a bad deploy on part of the fleet) and confirm the merged score still catches it while a single-replica view might miss it.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Project Idea C: Close the Loop With Automated Retraining <span class="exercise-type analysis">Analysis</span></div>
+<p>Wire a drift alert to an action. Train a simple online model (logistic regression or a streaming tree) on the early, stable part of a stream, serve predictions, and let your detector from Project A watch the prediction distribution. When the alert fires, trigger an incremental update or a full retrain on the recent window, promote the new model only if it beats the incumbent on a held-out slice, and plot served accuracy over time with and without the retraining loop. Report the accuracy recovered and the cost paid (retrains triggered, including any false alarms), and discuss where on the do-nothing / online-update / full-retrain spectrum of Section 4 your data falls.</p>
+</div>
+
+<h2>7. Exercises <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.9.1: Data Drift or Concept Drift? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each scenario, classify the staleness as data (covariate) drift, concept drift, or both, and state whether retraining on fresh <em>inputs alone</em> would fix it: (a) a demand-forecasting model after a new product category launches that it never saw in training; (b) a spam classifier after spammers deliberately rewrite their messages to evade it while the words themselves look ordinary; (c) a sensor-fault detector after a firmware update halves the sampling rate of every sensor. For each, name which signal you would watch first given that true labels are delayed, and explain why a label-free distribution check would or would not raise an alert.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.9.2: The Merge Is Exact <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 9.9.1 to simulate three replicas. Split each window's events across the three replicas at random, have each build its own per-bin count vector, and merge the three by element-wise addition before normalizing and computing PSI. Compare the merged PSI to the single-process PSI from Output 9.9.1 on the identical event set. Confirm they match to floating-point rounding, then explain in one paragraph which property of the histogram sketch (and which property of the PSI formula) makes the distributed computation exact rather than approximate, referencing the mergeable sketches of <a href="../module-06-mapreduce-distributed-algorithms/section-6.8.html">Section 6.8</a>.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.9.3: Tuning the Threshold Against Delay <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the detector from Code 9.9.1, sweep the window size (for example 250, 1000, 4000 events) and the alert threshold (for example 0.1, 0.25, 0.5) and, for a fixed shift, record two quantities for each setting: the detection latency in events after the true shift, and the number of false alerts during the stable period. Plot the trade-off. Argue from your numbers why a smaller window detects faster but alerts more noisily, and connect this directly to the watermark lateness trade-off of <a href="section-9.4.html">Section 9.4</a>, where waiting longer also bought completeness at the cost of latency.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-9.8.html"><span class="nav-label">Previous</span><span class="nav-num">Section 9.8</span><span class="nav-title">Distributed Real-Time Inference Pipelines</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 9</span><span class="nav-num">Contents</span><span class="nav-title">Stream Processing and Online AI</span></a>
+<a class="next" href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html"><span class="nav-label">Next: Part III</span><span class="nav-num">Chapter 10</span><span class="nav-title">Distributed Optimization</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

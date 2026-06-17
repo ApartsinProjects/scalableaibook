@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 23.4: Autoscaling on GPU Utilization and Queue Depth. Why web autoscaling signals are wrong for GPU inference, why queue depth and wait time relative to the SLO are the right ones, and how startup lag forces predictive scaling, headroom, and warm pools." name="description"/>
+<title>Section 23.4: Autoscaling on GPU Utilization and Queue Depth | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 23: Distributed Inference Systems</a></div>
+<h1>Autoscaling on GPU Utilization and Queue Depth</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They told me to scale on CPU usage. My CPUs were bored. My GPUs were on fire. My queue had filed a complaint."</p>
+<cite>An Autoscaler Reading the Wrong Dashboard</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Autoscaling a GPU inference fleet means moving the replica count to track demand, but the signals that work for web servers (CPU utilization, requests per second) are blind to the thing that actually predicts a missed deadline: how deep the request queue is relative to the latency budget.</strong> A GPU can be pinned at high utilization and still be healthy, or sit at modest utilization while the queue silently fills behind a batch that is too small. The honest control signal is queue depth and the wait time it implies, read against the Service Level Objective. The hard part is that replicas are expensive and slow to start, a model can take tens of seconds to load, so a controller that reacts only to the queue it sees now is always one startup-time behind the demand that filled it. This section builds the control loop, shows with a runnable simulation why reactive scaling violates the SLO during spikes, and shows how forecasting, headroom, and warm pools close the gap.</p>
+</div>
+<p>The previous sections of this chapter built a serving fleet: replicas behind a load balancer (<a href="section-23.2.html">Section 23.2</a>), batch-aware routing, and the split between online and batch inference. All of that assumed a fixed number of replicas. Real demand is not fixed. It ramps up in the morning, spikes when a feature launches, and falls to nearly nothing overnight. Running the peak number of replicas around the clock wastes most of a very expensive fleet; running too few drops requests the moment load rises. Autoscaling is the controller that sits between these failures, adding replicas when demand grows and removing them when it shrinks. The question this section answers is not whether to autoscale, but what to scale on, because the obvious signals borrowed from web serving give exactly the wrong answer for GPU inference.</p>
+
+<h2>1. Why Web Autoscaling Signals Are Wrong for GPUs <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A stateless web tier autoscales on CPU utilization or requests per second, and for that workload those signals are sound: CPU usage rises smoothly with load, and one request costs roughly one unit of CPU, so a target like "keep average CPU at 60%" keeps latency healthy. Inference on an accelerator breaks both assumptions. GPU utilization, as reported by the driver, measures whether any kernel was running during a sampling window, not how much useful work was done; a model decoding one token at a time can show high utilization while serving a single user, and a poorly batched server can show low utilization while its queue overflows. Utilization is a poor proxy for headroom because the relationship between utilization and spare capacity depends on batch occupancy, not just on the percentage the driver prints.</p>
+<p>Requests per second fails for a different reason. On a GPU the cost of a request is not constant: it depends on the batch it lands in, the sequence length, and whether it triggers a prefill or a decode step (a distinction <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.3.html">Section 5.3</a> draws sharply for LLM serving). Two servers handling the same requests per second can have wildly different queue depths and tail latencies depending on how full their batches are. Scaling on requests per second therefore scales on a number that does not map cleanly to whether deadlines are being met. The signal that does map cleanly is the one the user actually feels: how long requests are waiting, which is exactly the queue depth divided by the service rate.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Scale on the Deadline You Promised, Not the Hardware You Bought</div>
+<p>The right autoscaling signal for inference is queue depth measured against the latency SLO, because that is the only signal that directly predicts a missed deadline. GPU utilization tells you the hardware is busy, not whether requests are on time; requests per second tells you the arrival rate, not whether the fleet can absorb it at the current batch occupancy. Queue depth, divided by the fleet's service rate, gives the wait time every queued request is about to experience (Little's law), and comparing that wait to the SLO budget tells the controller whether it is already too late. Scale the replica count to hold the implied wait under budget, and utilization takes care of itself.</p>
+</div>
+
+<h2>2. Queue Depth, Little's Law, and the Target <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>To turn queue depth into a control target we need to connect it to wait time, and Little's law does exactly that. As derived in <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.4.html">Section 3.4</a>, for a stable system the average number in the system equals the arrival rate times the time in the system, $L = \lambda W$. Read backward, the wait a queued request is about to experience is its position in the queue divided by the rate at which the fleet drains it. If $Q$ is the current queue depth and the fleet of $n$ replicas drains at $\mu$ requests per second per replica, the expected wait of a request entering now is</p>
+$$W \approx \frac{Q}{n\,\mu}.$$
+<p>The SLO fixes a wait budget $W_{\text{SLO}}$, and the controller's job is to keep $W$ under it. Setting $W = W_{\text{SLO}}$ and solving for the replica count gives the control law: the number of replicas needed to hold the queue at the SLO wait is</p>
+$$n^\star = \left\lceil \frac{Q}{\mu\,W_{\text{SLO}}} + \frac{\lambda}{\mu} \right\rceil,$$
+<p>where the first term provides capacity to burn down the standing backlog within the budget and the second term provides capacity to match the incoming arrival rate $\lambda$ so the queue does not refill. This is the equation the controller evaluates on every tick. It is honest about both quantities a deadline depends on: the backlog already waiting and the rate of new work. Scaling on utilization or requests per second captures at most one of these, and never the backlog, which is precisely the term that explodes during a spike.</p>
+<p>The target queue depth is not zero. A queue that is always empty means the fleet is over-provisioned and idle; a healthy serving system runs with a small standing queue that keeps batches full and GPUs fed (the batching trade-off of <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.4.html">Section 3.4</a>). The controller steers toward a target queue depth that is large enough to fill batches and small enough that the implied wait stays well under the SLO. The art is choosing that target and then defending it against demand that moves faster than the fleet can grow.</p>
+
+<h2>3. The Control Loop and the Lag That Breaks It <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>An autoscaler is a feedback controller. It observes a signal (queue depth), compares it to a target, and adjusts an actuator (the replica count) to drive the error toward zero. Figure 23.4.1 draws the loop and marks the one feature that makes inference autoscaling hard: the actuator is slow. A new replica does not appear the instant the controller asks for it; it must be scheduled onto a node, pull the container, load model weights that may be tens of gigabytes, and warm its caches before it can serve, a cost quantified for a single node in <a href="../module-22-per-node-inference-efficiency/index.html">Chapter 22</a>. That startup delay sits inside the control loop as dead time, and dead time is the classic enemy of any controller: by the time the new capacity arrives, the demand that justified it may have grown further or passed entirely.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A control-loop diagram. Incoming request load feeds a queue whose depth is measured. The measured queue depth is compared against a target queue depth; the error drives a controller that requests a replica count. A startup-delay block sits between the controller and the replica pool, shown as a lag, so the replicas that finally become ready arrive after the demand spike, causing an SLO miss marked on the queue.">
+<defs>
+<marker id="arr234" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr234r" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b3261e"/></marker>
+</defs>
+<style>
+.b234 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w234 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.r234 { fill:#fdeceb; stroke:#b3261e; stroke-width:1.6; }
+.t234 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s234 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.rt234 { font:600 12px sans-serif; fill:#b3261e; text-anchor:middle; }
+.l234 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr234); }
+.lr234 { fill:none; stroke:#b3261e; stroke-width:1.8; stroke-dasharray:6 4; marker-end:url(#arr234r); }
+</style>
+<text class="t234" x="80" y="40">Request load</text>
+<path class="l234" d="M 80 52 L 80 96"/>
+<rect class="b234" x="30" y="100" width="160" height="58" rx="8"/>
+<text class="t234" x="110" y="125">Queue</text>
+<text class="s234" x="110" y="144">depth Q = backlog</text>
+<path class="l234" d="M 190 129 L 250 129"/>
+<rect class="b234" x="250" y="100" width="150" height="58" rx="8"/>
+<text class="t234" x="325" y="124">Compare to</text>
+<text class="t234" x="325" y="142">target Q*</text>
+<path class="l234" d="M 400 129 L 460 129"/>
+<rect class="b234" x="460" y="100" width="160" height="58" rx="8"/>
+<text class="t234" x="540" y="124">Controller</text>
+<text class="s234" x="540" y="143">desired replicas n*</text>
+<path class="l234" d="M 620 129 L 680 129"/>
+<rect class="w234" x="680" y="100" width="150" height="58" rx="8"/>
+<text class="t234" x="755" y="120">Startup lag</text>
+<text class="s234" x="755" y="138">load weights,</text>
+<text class="s234" x="755" y="152">warm caches</text>
+<path class="l234" d="M 755 158 L 755 230 L 110 230 L 110 160"/>
+<text class="s234" x="430" y="222">new replicas drain the queue, after the lag</text>
+<rect class="r234" x="300" y="270" width="300" height="62" rx="8"/>
+<text class="rt234" x="450" y="294">SLO miss</text>
+<text class="s234" x="450" y="313">queue grows during the lag,</text>
+<text class="s234" x="450" y="327">waits exceed the budget before capacity arrives</text>
+<path class="lr234" d="M 540 158 L 540 200 L 450 200 L 450 268"/>
+</svg>
+<figcaption><strong>Figure 23.4.1:</strong> The autoscaling control loop for GPU inference. Queue depth $Q$ is measured, compared to a target $Q^\star$, and the controller requests a replica count $n^\star$ from the law in Section 2. The startup-lag block (orange) is dead time: weights must load and caches warm before the new replicas (the feedback arrow back to the queue) can drain it. During that lag the queue keeps growing, and the red path shows the consequence, an SLO miss that lands before the requested capacity is ready. Predictive scaling moves the controller's decision earlier so the lag finishes before the demand arrives.</figcaption>
+</figure>
+<p>Two further details keep the loop stable. The first is hysteresis: if the controller scaled up and down on every twitch of the queue, replicas would flap in and out, paying startup cost constantly and never settling, so a cooldown period after each action and separate, asymmetric thresholds for scaling out versus in damp the oscillation. The second is the scale-in direction, which is gentler than scale-out: removing a replica that is mid-request drops work, so controllers drain a replica before retiring it and scale in slowly, since the cost of being slightly over-provisioned is far lower than the cost of dropping requests. With the loop and its hazards named, we can watch the lag do its damage and then defeat it.</p>
+
+<h2>4. Simulating Reactive, Headroom, and Predictive Scaling <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The simulation below puts three controllers on the same time-varying load: a morning ramp from 200 to 450 requests per second with a sharp spike at the five-minute mark. Each replica serves 40 requests per second and takes 20 seconds to start. The <code>reactive</code> controller scales on the queue and arrivals it observes right now. The <code>headroom</code> controller asks for 40% more replicas than reactive, holding standing spare capacity. The <code>predictive</code> controller looks one startup-time into the demand forecast and sizes for the load that will have arrived by the time new replicas finish booting. We score each on the fraction of requests whose implied wait breaches the SLO, the peak queue reached, and the total replica-seconds consumed as a cost proxy.</p>
+<pre><code class="language-python">import numpy as np
+
+# Discrete-time (1 s) simulation of a queue-depth autoscaler for GPU inference.
+# A time-varying request rate is served by `ready` replicas (MU req/s each).
+# New replicas take STARTUP_S seconds to load the model, so scaling LAGS demand.
+# Three controllers run on the SAME load trace; a request whose implied wait
+# exceeds SLO_WAIT_S counts as an SLO violation.
+
+MU          = 40.0      # requests/sec one ready replica serves
+STARTUP_S   = 20        # seconds a new replica needs to load the model (cold start)
+TARGET_Q    = 40        # queue depth the controller steers toward
+SLO_WAIT_S  = 0.50      # SLO: a request must start service within this wait
+COOLDOWN_S  = 10        # min seconds between scale actions (hysteresis)
+HORIZON     = 600       # simulated seconds
+
+def load_trace(T):
+    t = np.arange(T)
+    base = 200.0 + 250.0 * np.clip((t - 100) / 200.0, 0, 1)        # ramp 200 -&gt; 450
+    spike = 500.0 * np.exp(-((t - 300) ** 2) / (2 * 22.0 ** 2))    # narrow spike at t=300
+    return base + spike
+
+def simulate(controller, T=HORIZON, seed=0):
+    rng = np.random.default_rng(seed)
+    rate = load_trace(T)
+    ready = int(np.ceil(rate[0] / MU * 1.3))    # warm start with margin
+    pending = []                                # ready-times of booting replicas
+    queue = 0.0; last_action = -COOLDOWN_S
+    slo_viol = 0; total = 0; max_q = 0.0; replica_seconds = 0.0
+    for t in range(T):
+        ready += sum(1 for p in pending if p &lt;= t)          # activate finished replicas
+        pending = [p for p in pending if p &gt; t]
+
+        arrivals = int(rng.poisson(rate[t])); total += arrivals
+        capacity = ready * MU
+        wait = queue / max(capacity, 1e-9)                  # Little's law: W = Q / (n*mu)
+        if wait &gt; SLO_WAIT_S:
+            slo_viol += arrivals                            # everyone arriving now misses
+        queue += arrivals
+        queue -= min(queue, capacity)                       # drain at fleet capacity
+        max_q = max(max_q, queue)
+        replica_seconds += ready + len(pending)             # booting replicas already cost money
+
+        if t - last_action &gt;= COOLDOWN_S:                   # cooldown hysteresis
+            desired = max(1, controller(t, queue, arrivals, ready, rate))
+            cur = ready + len(pending)
+            if desired &gt; cur:
+                pending.extend([t + STARTUP_S] * (desired - cur)); last_action = t
+            elif desired &lt; ready:
+                ready = desired; last_action = t
+    return dict(viol_pct=100.0 * slo_viol / max(total, 1), max_q=max_q, repl_sec=replica_seconds)
+
+def reactive(t, queue, arrivals, ready, rate):
+    # match current arrivals, plus capacity to burn down backlog above target
+    demand_rate = arrivals + max(0.0, queue - TARGET_Q) / 3.0
+    return int(np.ceil(demand_rate / MU + 1e-9))
+
+def headroom(t, queue, arrivals, ready, rate):
+    return int(np.ceil(reactive(t, queue, arrivals, ready, rate) * 1.4))   # 40% spare
+
+def predictive(t, queue, arrivals, ready, rate):
+    future = min(t + STARTUP_S, len(rate) - 1)              # forecast one startup ahead
+    needed = int(np.ceil(rate[future] / MU * 1.15))         # 15% headroom on the forecast
+    return max(needed, reactive(t, queue, arrivals, ready, rate))
+
+for name, ctrl in [("reactive       ", reactive),
+                   ("headroom (1.4x)", headroom),
+                   ("predictive     ", predictive)]:
+    r = simulate(ctrl)
+    print(f"{name} : SLO-violating requests = {r['viol_pct']:5.2f}%   "
+          f"peak queue = {r['max_q']:6.0f}   replica-seconds = {r['repl_sec']:7.0f}")
+</code></pre>
+<div class="code-caption"><strong>Code 23.4.1:</strong> A queue-depth autoscaler simulated against a spiky load trace with realistic replica startup lag. The three controllers differ only in the desired-replica law they apply to the same observed queue; <code>simulate</code> scores each on SLO violations, peak queue, and replica-seconds of cost.</div>
+<pre><code class="language-text">reactive        : SLO-violating requests = 33.29%   peak queue =   5034   replica-seconds =    8214
+headroom (1.4x) : SLO-violating requests =  7.71%   peak queue =   1157   replica-seconds =    9657
+predictive      : SLO-violating requests =  0.00%   peak queue =     66   replica-seconds =    7557
+</code></pre>
+<div class="code-caption"><strong>Output 23.4.1:</strong> Real output. Reactive scaling violates the SLO for a third of requests, because the queue explodes during the spike while replicas are still booting. Headroom cuts violations to under 8% by absorbing the spike in standing spare capacity, at about 18% higher cost. Predictive scaling eliminates violations entirely (peak queue 66, never near the budget) and does so at the lowest cost of the three, because scaling ahead of demand avoids the panic over-provisioning the reactive controller does after the spike has already hurt.</div>
+<p>The numbers tell the whole story of this section. The reactive controller is not foolish; it correctly computes the replicas needed for the queue it sees, and it asks for them. It loses because the queue it sees is the queue from twenty seconds ago plus everything that arrived since, and the spike fills the queue faster than any number of requested-but-still-booting replicas can drain it. Headroom buys insurance against this by keeping spare replicas warm, trading a steady cost for fewer misses. Predictive scaling wins outright here because the spike is forecastable: by acting on the load that will arrive once the new replicas are ready, it finishes paying the startup cost before the demand lands. When demand is predictable, moving the decision earlier beats reacting faster.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Fleet Is the Unit, Not the Node</div>
+<p>Chapter 22 made one replica fast: quantization, KV-cache paging, and batching squeeze the most work out of a single accelerator. This section is where that per-node number stops being the answer and becomes an input. The service rate $\mu$ in the control law is precisely the per-node throughput Chapter 22 fought to raise; autoscaling decides how many such nodes the fleet runs at each moment. Scale-out reframes the question from "how fast is one GPU?" to "how many GPUs, right now, keep the queue under the deadline?", and the answer changes second by second with demand. The same per-node economics, multiplied across a fleet whose size is itself a control variable, return amplified in distributed LLM serving (<a href="section-23.5.html">Section 23.5</a> and Chapter 24), where a single model may not even fit on one node.</p>
+</div>
+
+<h2>5. Scale-to-Zero and the Cold-Start Tax <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The autoscaler so far never drops below one replica. For a model with steady traffic that is correct, but many models in a multi-tenant fleet are spiky or rarely called: an internal tool used a few times an hour, a regional model active only in business hours, a long tail of fine-tuned variants. Keeping a warm replica for each of these idles an expensive accelerator almost all the time. Scale-to-zero removes the last replica when a model goes idle, returning the GPU to a shared pool, and spins a replica back up on the next request. It converts a standing cost into a per-activation cost, which is the right trade whenever the idle time dwarfs the request volume.</p>
+<p>The bill for scale-to-zero is the cold start. The first request after the fleet has gone to zero must wait the full startup lag, the same tens of seconds of weight loading that Code 23.4.1 modeled, before it gets any response. For an interactive model that latency is unacceptable, so scale-to-zero is reserved for workloads that tolerate a slow first request: asynchronous jobs, batch endpoints, or low-priority tools where a several-second cold start on the first call is a fair price for not renting an idle GPU all day. The interaction with the warm pool is the crucial design lever: keeping a small number of pre-loaded, model-agnostic replicas (or pre-staged weights on local disk) shrinks the cold start from a full model load to a fast attach, which <a href="section-23.6.html">Section 23.6</a> develops as the standard remedy for large-model loading and cold starts.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Spiky Endpoint That Stopped Burning a GPU All Night</div>
+<p><strong>Who:</strong> An ML platform engineer running a shared inference cluster for a dozen product teams.</p>
+<p><strong>Situation:</strong> A document-summarization model received heavy traffic during business hours and almost none from 8pm to 7am, yet held two dedicated A100-class GPUs around the clock.</p>
+<p><strong>Problem:</strong> The overnight idle GPUs cost as much as the daytime busy ones, and a finance review flagged the model as the cluster's worst utilization offender.</p>
+<p><strong>Dilemma:</strong> Keep the replicas warm and pay for idle hardware to guarantee a fast first request, or scale to zero overnight and risk a slow cold start when the first morning request arrives mid-meeting.</p>
+<p><strong>Decision:</strong> They scaled the model to zero after 15 minutes of no traffic, but staged the model weights on each candidate node's local NVMe and kept a warm pool of two generic GPU replicas the model could attach to.</p>
+<p><strong>How:</strong> A queue-depth autoscaler with a scale-to-zero policy released the GPUs when idle; on the first request, the warm pool attached the locally staged weights instead of pulling them over the network, cutting the cold start from roughly 90 seconds to under 12.</p>
+<p><strong>Result:</strong> Overnight GPU cost for the endpoint fell to nearly zero, daytime SLO compliance was unchanged, and the only visible effect was a single slightly slow request each morning, well within the endpoint's asynchronous budget.</p>
+<p><strong>Lesson:</strong> Scale-to-zero is a cost win whenever idle dominates, but only if the cold start is engineered down with staged weights and a warm pool; the two techniques are a pair, not alternatives.</p>
+</div>
+
+<h2>6. Autoscaling Inside the Cluster's Capacity and Budget <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>An autoscaler does not invent capacity; it requests it from a cluster that has a finite, expensive supply of GPUs shared across many workloads. Scaling a model out to ten replicas only works if ten accelerators are actually free, and during a fleet-wide demand surge every model's autoscaler reaches for the same pool at once. This couples autoscaling to cluster scheduling: the controller's desired replica count is a request that the scheduler may queue, preempt a lower-priority job to satisfy, or refuse. Cost-aware scheduling, developed in <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/index.html">Chapter 33</a>, decides whose scale-out wins when GPUs are scarce, using priorities, quotas, and the option to fall back to cheaper or preemptible hardware for elastic, interruption-tolerant replicas.</p>
+<p>The budget closes the loop. Every replica-second in Output 23.4.1 is real money, and an autoscaler with no upper bound will, faced with a runaway queue from a degraded backend or a traffic flood, scale until it exhausts the cluster or the budget. Production controllers therefore cap the replica count and pair the cap with load shedding: past the maximum fleet size, excess requests are rejected fast rather than queued to a wait that would miss the SLO anyway, preserving goodput for the requests the fleet can actually serve (the goodput-versus-throughput distinction of <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/section-5.3.html">Section 5.3</a>). Autoscaling, scheduling, and budgeting are one decision viewed from three angles: how many replicas, on whose hardware, at what cost.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: KServe and Ray Serve Autoscale on Concurrency for You</div>
+<p>Code 23.4.1 implemented the queue-depth control loop, the cooldown hysteresis, and the desired-replica law by hand, roughly sixty lines. Production serving frameworks expose the same loop as a few lines of configuration and run the controller, metric collection, and pod lifecycle for you. KServe scales on per-replica concurrency (in-flight requests, a direct queue-depth proxy) and supports scale-to-zero out of the box; Ray Serve autoscales each deployment on a target ongoing-requests-per-replica with a min and max bound:</p>
+<pre><code class="language-python"># Ray Serve: autoscale a deployment on queue depth (ongoing requests per replica)
+from ray import serve
+
+@serve.deployment(
+    autoscaling_config={
+        "min_replicas": 0,               # scale-to-zero when idle
+        "max_replicas": 20,              # budget cap; shed load past this
+        "target_ongoing_requests": 8,    # the queue-depth target per replica
+        "upscale_delay_s": 5,            # react fast on scale-out
+        "downscale_delay_s": 120,        # scale in slowly (hysteresis)
+    },
+)
+class Summarizer:
+    def __init__(self):
+        self.model = load_model()        # the slow cold start the warm pool hides
+    async def __call__(self, request):
+        return self.model(await request.json())
+</code></pre>
+<div class="code-caption"><strong>Code 23.4.2:</strong> The same control law as Code 23.4.1, now declarative. <code>target_ongoing_requests</code> is the queue-depth target, the asymmetric up and down delays are the hysteresis, and <code>min_replicas: 0</code> enables scale-to-zero; Ray Serve runs the controller, scrapes the metric, and manages replica startup and draining internally.</div>
+</div>
+
+<h2>7. The Limits of Reactive Control and the Frontier <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The lesson of Output 23.4.1 generalizes: whenever the actuator lag is comparable to the timescale on which demand moves, reactive control cannot win, and the remedy is to act on information about the future. Scheduled scaling encodes known patterns (the morning ramp, the regional business hours) directly, pre-warming the fleet before the daily surge rather than discovering it. Predictive scaling forecasts the near-future load from recent history and seasonality and sizes for it, exactly the controller that scored zero violations above. Both buy the same thing: they move the startup lag out of the critical path, so capacity is ready when demand arrives instead of booting while the queue overflows.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Autoscaling LLM Serving and Killing the Cold Start (2024 to 2026)</div>
+<p>LLM serving has made autoscaling its own research problem, because the signals are richer and the cold starts are brutal. Recent systems autoscale on serving-specific signals rather than utilization: SLO-aware controllers steer on time-to-first-token and inter-token-latency headroom, and several 2024 to 2025 works (in the lineage of vLLM and the disaggregated-serving line) scale prefill and decode replicas independently because the two phases bottleneck on different resources. A parallel thread attacks the cold start directly, since a multi-tenant LLM fleet may host hundreds of fine-tuned variants that cannot all stay warm: fast model snapshotting and restore, layer-streaming that begins serving before all weights have loaded, and live migration of a paged KV cache between nodes have all been reported to cut the tens-of-seconds cold start to low single digits, which is what finally makes aggressive scale-to-zero safe for interactive models. The common thread is that the cost of the startup lag in Code 23.4.1, treated here as a fixed tax, is itself becoming a quantity the field engineers down. We return to these serving-specific controllers in <a href="section-23.5.html">Section 23.5</a> and Chapter 24.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Autoscaler That Chased Its Own Tail</div>
+<p>A team once scaled an LLM endpoint on GPU utilization. A spike arrived, replicas saturated, utilization hit 100%, and the autoscaler dutifully added replicas, which loaded their weights, ran a burst of compute-heavy prefill to warm up, and pushed utilization back to 100%, which the autoscaler read as still overloaded, and scaled again. The fleet quadrupled chasing a utilization number that the act of scaling kept pinned, until a budget cap mercifully stopped it. Queue depth, which actually fell as the new replicas drained the backlog, would have told the truth. The dashboard the controller watches is not a cosmetic choice.</p>
+</div>
+<p>We have the right signal (queue depth against the SLO), the control law that turns it into a replica count, the lag that makes reactive scaling fail on spikes, and the three remedies (headroom, scheduled, and predictive scaling) plus scale-to-zero for the idle tail. What we have assumed throughout is that every replica serves the same single model. Real fleets pack many models onto shared GPUs and must decide which tenant's request runs where, the multi-model, multi-tenant serving problem that <a href="section-23.5.html">Section 23.5</a> takes up next.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.4.1: Why Utilization Lies <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Construct two concrete inference scenarios on one GPU replica: (a) one where GPU utilization reads near 100% but the queue is empty and every request meets a tight SLO, and (b) one where utilization reads near 40% but the queue is deep and requests are missing the SLO. For each, name the property of the workload (batch occupancy, prefill versus decode, sequence length) that decouples utilization from queue depth. Use the two scenarios to argue, in three sentences, why a utilization-target autoscaler would scale the wrong way in at least one of them.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.4.2: Tune the Controller Against the Lag <span class="exercise-type coding">Coding</span></div>
+<p>Starting from Code 23.4.1, run a sweep over the startup lag <code>STARTUP_S</code> from 5 to 120 seconds for all three controllers, and plot SLO-violation percentage against the lag. At what lag does reactive scaling become unusable (say, above 10% violations), and does predictive scaling's advantage grow or shrink as the lag increases? Then add a fourth controller that combines headroom with the predictive forecast, and report whether it beats predictive alone on either violations or replica-seconds. Explain your result in terms of which term of the control law each controller is buying insurance on.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.4.3: Size the Cold-Start Budget <span class="exercise-type analysis">Analysis</span></div>
+<p>A model is called on average once every 20 minutes, each call is asynchronous with a 5-minute deadline, and a warm replica costs $3 per hour while a cold start takes 90 seconds (or 12 seconds with a warm pool, where the pool costs $1 per hour amortized over this model). Compute the daily cost of (a) keeping one warm replica always on, (b) scale-to-zero with a 90-second cold start, and (c) scale-to-zero with the warm pool. Using Little's law to confirm one replica suffices for this arrival rate, state which option you would choose and the single assumption (about the deadline or the arrival pattern) that, if changed, would flip your choice.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-23.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 23.3</span><span class="nav-title">Online vs Batch Inference Across a Fleet</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 23</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Inference Systems</span></a>
+<a class="next" href="section-23.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 23.5</span><span class="nav-title">Multi-Model and Multi-Tenant GPU Serving</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

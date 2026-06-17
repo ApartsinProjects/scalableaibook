@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 17.9: Trade-Offs vs Dense Distributed Models. A balanced verdict on mixture-of-experts: much higher capacity per training FLOP at the cost of all-to-all communication, harder training, and memory-bound serving, plus where MoE wins and where dense is simpler and better." name="description"/>
+<title>Section 17.9: Trade-Offs vs Dense Distributed Models | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 17: Expert Parallelism and Sparse Distributed Models</a></div>
+<h1>Trade-Offs vs Dense Distributed Models</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They gave me thirty-two times the parameters and told me to act surprised when the network bill arrived."</p>
+<cite>An Expert Nobody Routed To</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A mixture-of-experts model buys a large increase in parameter count, and the quality that comes with it, for almost no increase in per-token compute; it pays for that bargain with all-to-all communication, harder training, and serving memory that scales with the full parameter count rather than the active one.</strong> That single sentence is the verdict of this chapter. Sparse scaling decouples capacity from the floating-point cost of a forward pass, which is why it has become the dominant frontier recipe of 2024 to 2026. But the decoupling is not free: the saved compute reappears as bytes on the interconnect, as load-balancing machinery in the training loop, and as memory on every serving replica. This closing section weighs both sides on one scale, says plainly when MoE wins and when a dense model is the better engineering choice, and folds expert parallelism into the larger parallel stack as one more axis whose collective is the all-to-all.</p>
+</div>
+<p>Every previous section of this chapter argued a single mechanism. Section 17.1 separated capacity from FLOPs; Section 17.2 built the mixture-of-experts layer; Section 17.3 routed tokens through a gate; <a href="section-17.4.html">Section 17.4</a> sharded experts across machines; <a href="section-17.5.html">Section 17.5</a> turned that sharding into an all-to-all; Sections 17.6 and 17.7 fought to keep the experts balanced and stable; <a href="section-17.8.html">Section 17.8</a> exposed the serving paradox that an MoE is cheap in compute but expensive in memory. This section does not introduce a new mechanism. It assembles those mechanisms into a decision: for a given system, is sparse scaling worth its costs, or is a dense distributed model the wiser choice? We answer with numbers first and judgment second.</p>
+
+<h2>1. The Case for Sparse Scaling <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The argument for mixture-of-experts is one quantity stated two ways. For a fixed training FLOP budget, a sparse model holds far more parameters than a dense one, and parameter count is the lever that buys model quality. Equivalently, for a fixed parameter count, a sparse model trains and runs at a fraction of the FLOPs. Either framing describes the same decoupling introduced in Section 17.1: total capacity is set by the number of experts, while per-token compute is set only by the few experts each token actually visits. A model with $E$ experts and top-$k$ routing has roughly $E/k$ times the parameters of the dense feed-forward block it replaces, while spending the FLOPs of only $k$ of them.</p>
+<p>This is why the frontier moved. When the binding constraint on model quality is the training compute budget, and that budget is enormous but still finite, sparsity converts spare memory and interconnect bandwidth into extra capacity that dense scaling cannot reach at the same FLOP cost. Production systems in the lineage of the Switch Transformer and the open Mixtral and DeepSeek-V3 families exploit exactly this: they ship hundreds of billions of total parameters while activating only tens of billions per token, and they reach quality that a dense model of the active size cannot match. The bargain is real, and the next subsection puts a number on it.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: MoE Spends Memory and Bandwidth to Buy Capacity Without Buying FLOPs</div>
+<p>Dense scaling raises quality by adding parameters that every token must compute through, so capacity and per-token FLOPs rise together. Sparse scaling breaks that coupling: it adds parameters that only a routed subset of tokens compute through, so capacity rises while per-token FLOPs stay flat. The catch is conservation of difficulty. The compute you did not spend does not vanish; it reappears as the all-to-all that moves tokens to their experts (<a href="section-17.5.html">Section 17.5</a>), the balancing machinery that keeps experts busy (Section 17.6), and the memory that must hold every expert whether it fires or not (<a href="section-17.8.html">Section 17.8</a>). MoE is not cheaper; it relocates the cost from FLOPs to bytes and to systems complexity.</p>
+</div>
+
+<h2>2. Putting Numbers to the Trade-Off <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>A verdict deserves arithmetic. The program below compares a dense model and an MoE model designed to spend the same per-token compute, then reports four quantities that decide the trade-off: capacity (total parameters), per-token compute, communication volume per training step, and serving memory. The two models are matched at equal per-token FLOPs by giving the dense model exactly $k$ feed-forward blocks, so that it activates the same amount of compute the MoE spends on its $k$ routed experts. Everything else, the capacity and the costs, is then read off directly.</p>
+<pre><code class="language-python"># dense vs MoE at EQUAL per-token compute; report capacity, FLOPs, comm, memory.
+d = 4096            # model (hidden) width
+d_ff = 4 * d        # feed-forward inner width per expert
+bytes_per_param = 2 # bf16 weights at serving time
+T = 8192            # tokens per training step
+E, k = 64, 2        # experts, and experts each token is routed to (top-k)
+
+def ffn_params(d, d_ff):      return 2 * d * d_ff          # two matrices
+def ffn_flops_tok(d, d_ff):   return 2 * ffn_params(d, d_ff)  # mul + add
+
+L_dense = k                    # match per-token FLOPs: dense depth = k blocks
+dense_params = L_dense * ffn_params(d, d_ff)
+moe_params   = E * ffn_params(d, d_ff)               # ALL experts are real params
+
+dense_flops = L_dense * ffn_flops_tok(d, d_ff)
+moe_flops   = k * ffn_flops_tok(d, d_ff)             # only k experts fire
+
+dense_comm = 0                                        # FFN-local: no token shuffle
+moe_comm   = 2 * k * T * d * bytes_per_param          # two all-to-alls (dispatch+combine)
+
+dense_serve = dense_params * bytes_per_param          # every param must be resident
+moe_serve   = moe_params   * bytes_per_param
+
+print(f"{'metric':30}{'DENSE':>14}{'MoE':>14}{'MoE/DENSE':>12}")
+print(f"{'capacity (B params)':30}{dense_params/1e9:>14.2f}{moe_params/1e9:>14.2f}{moe_params/dense_params:>11.0f}x")
+print(f"{'per-token compute (GFLOP)':30}{dense_flops/1e9:>14.2f}{moe_flops/1e9:>14.2f}{moe_flops/dense_flops:>11.0f}x")
+print(f"{'comm / step (MiB)':30}{dense_comm/2**20:>14.2f}{moe_comm/2**20:>14.2f}{'new cost':>12}")
+print(f"{'serving memory (GiB)':30}{dense_serve/2**30:>14.2f}{moe_serve/2**30:>14.2f}{moe_serve/dense_serve:>11.0f}x")
+</code></pre>
+<div class="code-caption"><strong>Code 17.9.1:</strong> The chapter's trade-off in one program. Both models spend identical per-token FLOPs by construction (dense depth set to $k$); the comparison then exposes what MoE gains and what it pays. Pure Python, no libraries, so the numbers are auditable by hand.</div>
+<pre><code class="language-text">metric                                 DENSE           MoE   MoE/DENSE
+capacity (B params)                     0.27          8.59         32x
+per-token compute (GFLOP)               0.54          0.54          1x
+comm / step (MiB)                       0.00        256.00    new cost
+serving memory (GiB)                    0.50         16.00         32x
+</code></pre>
+<div class="code-caption"><strong>Output 17.9.1:</strong> At equal per-token compute, the MoE holds 32x the parameters ($E/k = 64/2$) for the same 0.54 GFLOP per token. The bargain is paid in two new currencies: 256 MiB of all-to-all traffic per step that the dense model never moves, and 32x the serving memory because every expert is resident whether it fires or not.</div>
+<p>The numbers make the verdict concrete. The MoE carries thirty-two times the parameters, the ratio $E/k$, at identical per-token compute, which is precisely the quality lever sparse scaling exists to pull. The price sits in the two right-hand rows. The dense model moves no tokens between machines for this layer, while the MoE moves 256 MiB across the interconnect every step, two all-to-alls of $k$ routed copies (<a href="section-17.5.html">Section 17.5</a>); and the dense model fits its layer in half a gigabyte of bf16 weights while the MoE needs sixteen, because serving memory tracks total capacity, not active capacity (<a href="section-17.8.html">Section 17.8</a>). Whether thirty-two times the capacity is worth thirty-two times the memory and a new communication bill is the whole question, and it has no universal answer. It depends on which resource you have in surplus.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two overlaid quadrilaterals on four axes radiating from a center: capacity, FLOPs per token, communication, and serving memory. The dense shape is small and balanced; the MoE shape stretches far along capacity, communication, and serving memory but matches dense on FLOPs per token.">
+<defs>
+<marker id="arr179" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.ax179 { fill:none; stroke:#9aa3ad; stroke-width:1.4; marker-end:url(#arr179); }
+.al179 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.sl179 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.dense179 { fill:rgba(20,56,92,0.14); stroke:#14385c; stroke-width:2; }
+.moe179 { fill:rgba(184,107,31,0.16); stroke:#b86b1f; stroke-width:2; stroke-dasharray:1; }
+.lg179 { font:600 13px sans-serif; }
+</style>
+<!-- center at 410,185 ; four axes -->
+<line class="ax179" x1="410" y1="185" x2="410" y2="40"/>
+<line class="ax179" x1="410" y1="185" x2="715" y2="185"/>
+<line class="ax179" x1="410" y1="185" x2="410" y2="330"/>
+<line class="ax179" x1="410" y1="185" x2="105" y2="185"/>
+<text class="al179" x="410" y="28">capacity (params)</text>
+<text class="al179" x="715" y="178" text-anchor="end">serving memory</text>
+<text class="al179" x="410" y="348">communication (all-to-all)</text>
+<text class="al179" x="108" y="178" text-anchor="start">FLOPs / token</text>
+<!-- dense quad: small on capacity/mem/comm, moderate on flops -->
+<polygon class="dense179" points="410,150 470,185 410,220 270,185"/>
+<!-- moe quad: huge capacity, mem, comm; same flops -->
+<polygon class="moe179" points="410,55 690,185 410,320 270,185"/>
+<text class="sl179" x="410" y="138">low</text>
+<text class="sl179" x="410" y="48">32x</text>
+<text class="sl179" x="700" y="200">32x</text>
+<text class="sl179" x="478" y="200">low</text>
+<text class="sl179" x="410" y="236">~0</text>
+<text class="sl179" x="410" y="335">256 MiB</text>
+<text class="sl179" x="255" y="185">same</text>
+<rect x="600" y="40" width="14" height="14" class="dense179"/>
+<text class="lg179" x="620" y="52" fill="#14385c">Dense</text>
+<rect x="600" y="62" width="14" height="14" class="moe179"/>
+<text class="lg179" x="620" y="74" fill="#b86b1f">MoE</text>
+</svg>
+<figcaption><strong>Figure 17.9.1:</strong> The trade-off on four axes, drawn from Output 17.9.1. The two shapes touch on the left axis (FLOPs per token are equal by construction) and diverge sharply on the other three: the MoE stretches far out on capacity, serving memory, and communication, while the dense model stays small and balanced. Choosing MoE means accepting an elongated shape: you gain on the top axis only by paying on the right and bottom ones.</figcaption>
+</figure>
+
+<h2>3. The Costs, Named Plainly <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Output 17.9.1 quantifies two costs; the chapter has uncovered four, and an honest verdict names all of them. The first is heavier communication. The all-to-all of <a href="section-17.5.html">Section 17.5</a> is the most placement-sensitive collective in the parallel toolbox: unlike an all-reduce, whose volume is fixed by the model size, the all-to-all moves tokens and so its cost rides on the routing decision and on the slowest link any token must cross. This makes the interconnect, not the accelerator, the decisive resource for MoE training, and it is why the 256 MiB per step in our small example becomes the dominant term at frontier scale.</p>
+<p>The second cost is harder training. A dense model trains itself; an MoE must be coaxed into using its experts evenly. Without the load-balancing loss of Section 17.6 and the capacity factors of Section 17.7, routing collapses onto a few popular experts, the rest starve, and the extra parameters are wasted. These mechanisms add hyperparameters, a tuning burden, and failure modes (token dropping, instability) that a dense model simply does not have. The third cost is memory-bound serving, the paradox of <a href="section-17.8.html">Section 17.8</a>: a request touches only $k$ experts of compute but the deployment must keep all $E$ resident, so a serving replica's memory is set by the total parameter count even though its FLOPs are set by the active count. The fourth is plain systems complexity: more moving parts, more places to misconfigure, more interaction with the rest of the parallel stack.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Team That Chose Dense After Pricing the Interconnect</div>
+<p><strong>Who:</strong> An applied-research team at a mid-size company fine-tuning an open model for an internal assistant.</p>
+<p><strong>Situation:</strong> They had budget for eight GPUs on a single node with fast intra-node links, but no fast cross-node fabric, and they wanted the best quality their compute could buy.</p>
+<p><strong>Problem:</strong> A sparse model promised more capacity per training FLOP, and the open MoE checkpoints were tempting, so the instinct was to reach for mixture-of-experts.</p>
+<p><strong>Dilemma:</strong> Adopt an MoE to gain capacity per FLOP, accepting the all-to-all that their slow cross-node link would throttle and the serving memory that would not fit their inference box; or stay dense, simpler and interconnect-light, but capped at the active parameter count.</p>
+<p><strong>Decision:</strong> They stayed dense, because every MoE cost they would pay (all-to-all bandwidth, full-capacity serving memory, balancing tuning) landed exactly on the resources they lacked, while the one MoE benefit (capacity per FLOP) addressed a constraint that compute, not capacity, was already setting for them.</p>
+<p><strong>How:</strong> They scaled the dense model with the sharded-data-parallel methods of <a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>, keeping the whole job inside the fast intra-node fabric.</p>
+<p><strong>Result:</strong> Training and serving stayed within their hardware, with no all-to-all on a slow wire and no balancing instability, at quality competitive with what an MoE would have delivered on their constrained interconnect.</p>
+<p><strong>Lesson:</strong> MoE wins when memory and interconnect are abundant and capacity is the binding constraint. When the interconnect is slow, the inference box is small, or the model already fits, dense is simpler and often better.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Conservation of Difficulty</div>
+<p>There is a folk law of systems engineering: difficulty is conserved, never destroyed. MoE looks like it abolishes the FLOP cost of extra parameters, and in a strict accounting it does. Then you check the network counter and find the difficulty waiting for you there, in bytes, having taken the scenic route through the all-to-all. The capacity was free. The plumbing was not.</p>
+</div>
+
+<h2>4. When MoE Wins, and When Dense Is Better <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The decision reduces to matching the method to the resource that is scarce, exactly the discipline this book opened with in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>. Table 17.9.1 lays the choice out as a set of conditions. Read it as a checklist: the more rows that favor a column, the clearer the call.</p>
+<div class="table-caption"><strong>Table 17.9.1:</strong> When sparse scaling earns its costs, and when a dense distributed model is the simpler and better choice. The deciding question for each row is which resource binds.</div>
+<table>
+<thead>
+<tr><th scope="col">Condition</th><th scope="col">Favors MoE</th><th scope="col">Favors dense</th></tr>
+</thead>
+<tbody>
+<tr><td>Binding constraint on quality</td><td>training FLOP budget (capacity is what you lack)</td><td>memory or latency (capacity is not the bottleneck)</td></tr>
+<tr><td>Interconnect</td><td>fast, uniform fabric for the all-to-all</td><td>slow or non-uniform cross-node links</td></tr>
+<tr><td>Memory budget</td><td>abundant; can hold all experts resident</td><td>limited; only the active parameters fit</td></tr>
+<tr><td>Scale</td><td>large-scale training and high-throughput serving</td><td>small batch, modest scale, single node</td></tr>
+<tr><td>Serving pattern</td><td>large batches that fill expert capacity</td><td>small batches where experts sit idle</td></tr>
+<tr><td>Deployment complexity tolerance</td><td>a platform team to tune balancing and routing</td><td>simplicity prized; few moving parts</td></tr>
+</tbody>
+</table>
+<p>The pattern across the rows is consistent. MoE rewards abundance: abundant memory to hold the experts, an abundant and fast interconnect to move the tokens, and an abundant batch to keep every expert busy. Strip any of those away and the sparse model pays its costs without collecting its benefit. Dense wins the opposite regime: limited memory, small batches, simple deployments, and any setting where the model already fits and only compute or latency binds. Neither answer is universally right, which is the entire point of weighing them.</p>
+
+<h2>5. Expert Parallelism in the Parallel Stack <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Expert parallelism is not a rival to the parallelism axes of <a href="../module-16-model-pipeline-sharded-parallelism/section-16.9.html">Chapter 16</a>; it is one more axis that composes with them. The 3D stack of that chapter, data parallelism replicating the model, pipeline parallelism splitting the layer stack, tensor parallelism splitting a single layer, gains a fourth dimension when a layer is a mixture-of-experts: the expert axis of degree $e$, which places different experts on different devices and multiplies into the device-count identity alongside the others. A frontier configuration is then a tuple $(d, p, t, e)$ whose product must equal the device count exactly, the same hard constraint Section 16.9 formalized.</p>
+<p>What distinguishes the expert axis is its collective. Data parallelism rides an all-reduce, sharded parallelism rides reduce-scatter and all-gather, pipeline parallelism passes point-to-point activations, and tensor parallelism rides an all-reduce on the fastest link. Expert parallelism rides the all-to-all, and as <a href="section-17.5.html">Section 17.5</a> showed, that collective is the most sensitive of all to placement, because its volume depends on data-dependent routing rather than on a fixed model dimension. This is why expert parallelism slots into the stack as a placement problem first: the expert axis wants to live on a fast, uniform slice of the fabric, and a configuration search like the one in Section 16.9 must account for its all-to-all explicitly. The throughline of the whole book holds here precisely as promised in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>: every parallel method is defined by the collective it relies on, and expert parallelism's collective is the all-to-all.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: One More Axis, One More Collective</div>
+<p>The spine of this book is that scale-out distributes an essential activity across machines, and each form of distribution is identified by the collective that recombines the result. Data parallelism (<a href="../module-15-data-parallel-deep-learning/index.html">Chapter 15</a>) recombines with all-reduce; sharded parallelism (<a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>) with reduce-scatter and all-gather; expert parallelism, this chapter, with all-to-all. Sparse scaling adds a new way to grow a model, the expert axis, but it does not escape the framework: it is one more axis in the device grid, with one more collective on the interconnect, subject to the same device-count identity and the same placement discipline as every axis before it. The frontier did not abandon the parallel stack; it extended it.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Expert Axis as One Mesh Dimension</div>
+<p>The hand-wiring of an expert-parallel group, scattering experts across devices and arranging their all-to-all, is exposed by modern frameworks as one more named dimension of a device mesh, exactly like the tensor and pipeline dimensions of <a href="../module-16-model-pipeline-sharded-parallelism/section-16.9.html">Section 16.9</a>. DeepSpeed-MoE and Megatron-LM let you declare an expert-parallel degree alongside the others, and the framework places the experts, builds the all-to-all process group, and overlaps the dispatch with compute for you:</p>
+<pre><code class="language-python"># the (data, pipeline, tensor, expert) grid as one declaration
+from torch.distributed.device_mesh import init_device_mesh
+
+mesh = init_device_mesh(
+    "cuda", (2, 4, 8, 8),                          # dp=2, pp=4, tp=8, ep=8
+    mesh_dim_names=("dp", "pp", "tp", "ep"),       # ep is the expert axis
+)
+expert_group = mesh["ep"].get_group()             # the all-to-all process group
+# the MoE layer's dispatch/combine all-to-all runs over expert_group;
+# DeepSpeed-MoE / Megatron handle placement, the collective, and overlap.
+</code></pre>
+<div class="code-caption"><strong>Code 17.9.2:</strong> The expert axis declared as one mesh dimension. Roughly the dozens of lines of expert placement and all-to-all group construction from <a href="section-17.4.html">Section 17.4</a> and <a href="section-17.5.html">Section 17.5</a> collapse to naming <code>ep</code> in the mesh; the framework wires the rest, just as it does for the dense axes.</div>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Sparse Scaling From 2024 to 2026</div>
+<p>Mixture-of-experts is the live frontier of large-model design, and the 2024-to-2026 literature pushes on exactly the trade-off this section weighs. Fine-grained MoE with many small experts plus a shared always-on expert, the design behind DeepSeek-V3 (DeepSeek-AI, 2024) and DeepSeekMoE, raises capacity-per-FLOP further while easing balancing; its auxiliary-loss-free balancing replaces the load-balancing loss of Section 17.6 with a bias-adjustment scheme that sidesteps the quality cost of the balancing penalty. On the systems side, expert-parallel communication libraries such as DeepEP target the all-to-all directly, overlapping dispatch and combine with compute so the interconnect tax of Output 17.9.1 shrinks toward zero. A parallel thread attacks the serving paradox of <a href="section-17.8.html">Section 17.8</a> with expert offloading and caching, keeping cold experts in cheaper memory so a replica's footprint tracks active rather than total capacity. The common thread is that every cost named in Section 3 is a research target, and the verdict of this chapter is being actively renegotiated as those costs fall.</p>
+</div>
+
+<h2>6. Chapter Summary <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Chapter 17 told one story in seven mechanisms and one verdict. Sparse scaling decouples a model's parameter count from the FLOPs of its forward pass (Section 17.1), and the mixture-of-experts layer realizes that decoupling by replacing one feed-forward block with many experts and routing each token to a few (Sections 17.2 and 17.3). Routing creates a placement problem: experts live on different machines, so dispatching tokens to them and combining the results is an all-to-all collective (<a href="section-17.4.html">Sections 17.4</a> and <a href="section-17.5.html">17.5</a>), the most placement-sensitive collective in the parallel toolbox. Keeping the experts useful demands load balancing and capacity control, with their attendant losses, factors, token dropping, and stability concerns (Sections 17.6 and 17.7). Serving inverts the training economy into a paradox: cheap in active compute, expensive in resident memory (<a href="section-17.8.html">Section 17.8</a>). And the balanced verdict, this section, is that MoE buys large capacity per training FLOP at the price of communication, training difficulty, serving memory, and complexity, a bargain that pays off when memory and interconnect are abundant and capacity binds, and that does not pay off when they are scarce.</p>
+<div class="callout key-takeaway">
+<div class="callout-title">Key Takeaway: Chapter 17 in Five Ideas</div>
+<p><strong>Sparse scaling decouples params from FLOPs.</strong> An MoE holds $E/k$ times the parameters of its dense counterpart at the same per-token compute, which is the entire reason it exists.<br/>
+<strong>Routing and gating select the experts.</strong> A gate sends each token to its top-$k$ experts; the routing decision is data-dependent and drives every downstream cost.<br/>
+<strong>Expert parallelism rides the all-to-all.</strong> Sharding experts across machines turns dispatch and combine into an all-to-all, the collective that makes the interconnect, not the accelerator, decisive.<br/>
+<strong>Load balance and capacity keep it honest.</strong> Balancing losses and capacity factors stop routing from collapsing onto a few experts; without them the extra parameters are wasted.<br/>
+<strong>The serving paradox is memory, not compute.</strong> A request touches $k$ experts but the replica must hold all $E$, so MoE serving is memory-bound even though it is FLOP-light.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.9.1: Read the Trade-Off Off the Numbers <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using only Output 17.9.1, answer three questions and justify each from a single row of the table. (a) A team has a fast interconnect and a large pool of GPU memory but a fixed, modest training FLOP budget; should they prefer dense or MoE, and which number decides it? (b) A second team serves single-request, low-latency traffic on one small inference box; which row of Section 4's table rules MoE out for them? (c) The MoE in Output 17.9.1 holds 32x the parameters. State the general formula for that ratio in terms of $E$ and $k$, and explain why raising $k$ shrinks the capacity advantage while raising the per-token FLOPs.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.9.2: Sweep the Design and Plot the Crossover <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 17.9.1 into a sweep over the number of experts $E \in \{8, 16, 32, 64, 128\}$ at fixed $k = 2$, printing for each the capacity ratio, the communication volume per step, and the serving memory. Then add a column for an estimated all-to-all time assuming an interconnect bandwidth $B$ you choose (for example 100 GB/s), and identify the $E$ at which the all-to-all time would exceed the per-token compute time of the active experts (use a plausible accelerator throughput). This is the point where the interconnect, not the accelerator, becomes the bottleneck, the claim of Section 3.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.9.3: Place the Expert Axis on the Grid <span class="exercise-type analysis">Analysis</span></div>
+<p>You have 64 devices arranged as eight nodes of eight, with a fast intra-node link and a slow cross-node link, the topology of <a href="../module-16-model-pipeline-sharded-parallelism/section-16.9.html">Section 16.9</a>. You must place a 4D configuration $(d, p, t, e)$ with $d \cdot p \cdot t \cdot e = 64$. Argue, from the collective each axis uses, where the expert axis $e$ should live relative to the node boundary, and why putting the all-to-all on the slow cross-node link would be the worst choice. Compare your reasoning to where Section 16.9 places the tensor axis, and explain why the two axes compete for the same fast slice of the fabric.</p>
+</div>
+
+<div class="callout project-ideas">
+<div class="callout-title">Project Ideas</div>
+<p><strong>1. Build an expert-parallel MoE layer and measure all-to-all cost against load balance.</strong> Implement a top-$k$ MoE feed-forward layer with experts sharded across processes using <code>torch.distributed</code>, wiring the dispatch and combine all-to-alls by hand as in <a href="section-17.5.html">Section 17.5</a>. Instrument the all-to-all time and the per-expert token counts, then sweep the routing entropy from balanced to collapsed (by perturbing the gate) and plot how communication time and the worst-expert overflow move together. The deliverable is a curve showing that the all-to-all cost is governed by load balance, not just by token volume.</p>
+<p><strong>2. Reproduce the dense-vs-MoE crossover with real timings.</strong> Take a small dense transformer and a parameter-matched MoE variant, train both for a fixed FLOP budget on a modest dataset, and measure wall-clock, achieved quality, and peak memory. Vary the simulated interconnect by inserting artificial latency into the all-to-all, and find the bandwidth below which the dense model wins on time-to-quality. This turns Table 17.9.1 from a checklist into a measured boundary on your own hardware.</p>
+<p><strong>3. Attack the serving paradox with expert offloading.</strong> Serve an open MoE checkpoint with all experts resident, then implement an offloading cache that keeps only the hottest experts in fast memory and pages the rest from host memory on demand. Measure how serving memory, tail latency, and throughput trade off as the cache size shrinks, and connect the result to the 2024-to-2026 offloading work cited in the research-frontier callout above and in <a href="section-17.8.html">Section 17.8</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-17.8.html"><span class="nav-label">Previous</span><span class="nav-num">Section 17.8</span><span class="nav-title">Serving Distributed MoE Models</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 17</span><span class="nav-num">Contents</span><span class="nav-title">Expert Parallelism and Sparse Distributed Models</span></a>
+<a class="next" href="../module-18-elastic-fault-tolerant-training/index.html"><span class="nav-label">Next</span><span class="nav-num">Chapter 18</span><span class="nav-title">Elastic and Fault-Tolerant Distributed Training</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

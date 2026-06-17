@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 8.1: Why the Storage Layer Determines Scale. Compute keeps getting faster, so the bottleneck moves to feeding it; a cluster of accelerators starves whenever the storage and data path cannot deliver bytes fast enough." name="description"/>
+<title>Section 8.1: Why the Storage Layer Determines Scale | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Distributed Data Processing for AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 8: Distributed Storage and Data Loading</a></div>
+<h1>Why the Storage Layer Determines Scale</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They bought a thousand accelerators and one tired disk. Guess which one set the pace."</p>
+<cite>A Storage Tier That Has Felt the Pressure</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The storage layer is the silent determinant of whether a distributed AI system scales, because compute keeps getting faster while the job of feeding it does not get easier on its own.</strong> A training cluster is a row of expensive accelerators that can each consume billions of bytes per second; if the place the data lives, the network that carries it, and the host that decodes it cannot together deliver bytes at that rate, the accelerators sit idle waiting. An idle accelerator is the most expensive idle resource in the system, so the question "where does the data live and how fast does it arrive?" turns out to govern the throughput of the whole machine. This chapter is about answering that question well: where data lives, how it is encoded, and how it reaches the trainer. This first section establishes why the answer determines scale, and proves the point with a short utilization model.</p>
+</div>
+<p>For most of the previous two chapters the data was something we processed: a corpus to be mapped and reduced, a DataFrame to be filtered and joined. Now the data becomes something we must deliver, repeatedly and fast, to a consumer that has its own appetite. That consumer is a training loop, and a modern training loop is a hungry one. Each step needs a fresh batch of examples, decoded and arranged in accelerator memory, and the accelerator can finish processing that batch in a handful of milliseconds. If the next batch is not ready when the current one finishes, the accelerator waits, and waiting is pure waste. The discipline of arranging storage, encoding, and transport so that the next batch is always ready is what this chapter teaches, and it begins with understanding why the storage layer, not the accelerator, usually sets the ceiling.</p>
+<p>This is the same lesson that ran through the performance models of <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.7.html">Section 3.7</a>, where a computation that cannot fetch its operands fast enough is memory-bound rather than compute-bound, and its speed is governed by bandwidth, not by how many arithmetic units sit idle. A training cluster is the same roofline picture drawn one level up: the operands are training batches, the bandwidth is the data path, and the arithmetic units are the accelerators. It is also the practical consequence of data locality from <a href="../../part-1-foundations/module-02-distributed-systems-concepts/section-2.8.html">Section 2.8</a>: moving the computation to the data is cheap, and moving terabytes of data to the computation every epoch is the cost we spend this chapter learning to control.</p>
+
+<h2>1. Compute Got Fast; Feeding It Did Not <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The headline numbers of AI hardware describe arithmetic throughput: an accelerator that performs hundreds of trillions of operations per second, and a cluster that multiplies that by the number of devices. Those numbers have grown quickly, generation over generation. The numbers that describe getting data into the accelerator have grown much more slowly. A network link, a cloud object store, a local disk, and the host code that decodes a compressed image into a tensor all improve over time, but none of them double on the cadence that arithmetic throughput does. The gap between how fast an accelerator can compute and how fast the rest of the system can feed it widens with every hardware generation, which means the feeding problem gets relatively worse, not better, exactly when the hardware looks most impressive.</p>
+<p>This is why the bottleneck moves. When arithmetic was the scarce resource, you optimized the kernel. Now that arithmetic is abundant and getting cheaper, the scarce resource is the steady supply of decoded examples, so you optimize the data path. The accelerators in a training cluster are not the constraint to be relaxed; they are the appetite to be satisfied. Everything in this chapter, from object storage in <a href="section-8.2.html">Section 8.2</a> to columnar encoding in <a href="section-8.3.html">Section 8.3</a> to the loader itself in <a href="section-8.5.html">Section 8.5</a>, is in service of keeping that appetite fed.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Bottleneck Moves to Whatever Compute Outran</div>
+<p>As accelerator throughput grows faster than storage bandwidth, network bandwidth, and host decode speed, the binding constraint on a training cluster migrates away from arithmetic and toward the data path. The most expensive component in the system, the fleet of accelerators, ends up paced by its slowest supplier. Designing the storage layer is therefore not a preliminary chore before the real work of training; it is the thing that decides how much of your purchased compute you actually get to use.</p>
+</div>
+
+<h2>2. The Data Path, End to End <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>To reason about where a training batch can stall, it helps to see the whole journey a single example takes from rest to readiness. The example starts at rest in storage, often a cloud object store holding compressed shards. It crosses a network to reach the host machine that drives the accelerators. On that host, CPU cores decode and transform it: decompress, parse, augment, collate into a batch tensor. Finally the batch crosses the host-to-accelerator link (PCIe or NVLink) into device memory, where the training step consumes it. Figure 8.1.1 lays out this path and marks the stage that most often becomes the bottleneck.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A four-stage data path: storage on the left feeds across the network to the host, where CPU cores decode and collate, then across the host-to-accelerator link into the accelerator. Each hop is labeled with a typical throughput, and the host decode stage is highlighted as the common bottleneck.">
+<defs>
+<marker id="arr81" markerWidth="10" markerHeight="10" refX="7.5" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.box81 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.hot81 { fill:#fdecec; stroke:#c0392b; stroke-width:2.2; }
+.acc81 { fill:#eaf6ee; stroke:#1e7a46; stroke-width:1.6; }
+.t81 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.ta81 { font:600 14px sans-serif; fill:#1e7a46; text-anchor:middle; }
+.s81 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.lk81 { font:600 11.5px sans-serif; fill:#b86b1f; text-anchor:middle; }
+.l81 { fill:none; stroke:#14385c; stroke-width:2; marker-end:url(#arr81); }
+</style>
+<rect class="box81" x="20" y="90" width="150" height="92" rx="10"/>
+<text class="t81" x="95" y="124">Object storage</text>
+<text class="s81" x="95" y="144">compressed shards</text>
+<text class="s81" x="95" y="162">data at rest</text>
+<line x1="172" y1="136" x2="232" y2="136" class="l81"/>
+<text class="lk81" x="202" y="124">network</text>
+<rect class="hot81" x="234" y="78" width="190" height="116" rx="10"/>
+<text class="t81" x="329" y="108">Host (CPU)</text>
+<text class="s81" x="329" y="130">decode, parse,</text>
+<text class="s81" x="329" y="148">augment, collate</text>
+<text class="s81" x="329" y="174" style="fill:#c0392b;font-weight:600">usual bottleneck</text>
+<line x1="426" y1="136" x2="486" y2="136" class="l81"/>
+<text class="lk81" x="456" y="124">PCIe /</text>
+<text class="lk81" x="456" y="174">NVLink</text>
+<rect class="acc81" x="488" y="90" width="160" height="92" rx="10"/>
+<text class="ta81" x="568" y="124">Accelerator</text>
+<text class="s81" x="568" y="144">training step</text>
+<text class="s81" x="568" y="162">consumes batch</text>
+<rect class="box81" x="690" y="78" width="170" height="116" rx="10"/>
+<text class="t81" x="775" y="108">Step time =</text>
+<text class="t81" x="775" y="130">max(deliver,</text>
+<text class="t81" x="775" y="150">compute)</text>
+<text class="s81" x="775" y="176">slowest hop wins</text>
+<line x1="648" y1="136" x2="688" y2="136" class="l81" stroke-dasharray="4 3"/>
+<text class="s81" x="440" y="248">Each example traverses every hop every epoch; the slowest hop sets the rate.</text>
+<text class="s81" x="440" y="270">A faster accelerator cannot rescue a starved data path; it only idles sooner.</text>
+</svg>
+<figcaption><strong>Figure 8.1.1:</strong> The end-to-end data path for one training batch. Data at rest in object storage crosses the network to the host, where CPU cores decode and collate it (the stage highlighted in red, since host decode is the most common bottleneck), then crosses the PCIe or NVLink link into the accelerator. With prefetching, the step time is the maximum over the delivery time and the compute time, so the slowest hop in the path determines how fast the cluster runs.</figcaption>
+</figure>
+<p>The crucial structural fact, drawn on the right of Figure 8.1.1, is that delivery and compute can overlap. A well-built loader prefetches: while the accelerator works on batch $n$, the host is already fetching and decoding batch $n+1$. When the overlap is perfect, the time per step is not the sum of delivery and compute but the maximum of the two. That single $\max$ is the hinge of the whole argument. As long as delivery is faster than compute, the accelerator never waits and runs at full utilization; the moment delivery falls behind compute, every step inherits the delivery time and the accelerator idles for the difference.</p>
+
+<h2>3. A Utilization Model You Can Run <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The $\max$ relationship is worth making precise, because it explains the cliff that catches so many first distributed training runs. Let the accelerator process a batch at a compute rate, in samples per second, and let the data path deliver samples at a delivery rate. With one batch of $B$ samples, the compute time per step is $t_{\text{compute}} = B / r_{\text{compute}}$ and the delivery time is $t_{\text{deliver}} = B / r_{\text{deliver}}$. Under perfect prefetch overlap the step time is</p>
+$$t_{\text{step}} = \max\!\left(t_{\text{compute}},\, t_{\text{deliver}}\right), \qquad U = \frac{t_{\text{compute}}}{t_{\text{step}}} = \min\!\left(1,\, \frac{r_{\text{deliver}}}{r_{\text{compute}}}\right),$$
+<p>where $U$ is the fraction of wall-clock time the accelerator is actually computing, its utilization. The formula says utilization is flat at $100\%$ as long as the delivery rate meets or beats the compute rate, then falls linearly the instant delivery drops below it. The code below evaluates this model across a range of delivery rates for a fixed accelerator and reports the utilization and the idle time per step, then translates the same numbers into fleet cost for one epoch.</p>
+<pre><code class="language-python"># Model GPU utilization as a function of data-delivery throughput.
+# A training step needs one batch. The accelerator computes a batch in
+# t_compute seconds; the data path delivers a batch in t_deliver seconds.
+# With prefetch overlap, step time = max(t_compute, t_deliver).
+# GPU utilization = t_compute / step_time = fraction of wall-clock busy.
+
+compute_tps = 2000.0   # samples/sec the accelerator can process (compute-bound rate)
+batch = 512            # samples per training step
+t_compute = batch / compute_tps                # seconds of pure compute per step
+
+print(f"{'delivery (samples/s)':>22} | {'I/O:compute ratio':>17} | {'GPU util %':>10} | {'idle/step (ms)':>14}")
+print("-" * 74)
+for deliver_tps in [8000, 4000, 2500, 2000, 1500, 1000, 500]:
+    t_deliver = batch / deliver_tps
+    step = max(t_compute, t_deliver)           # perfect prefetch overlap
+    util = 100.0 * t_compute / step
+    idle_ms = 1000.0 * (step - t_compute)      # accelerator stalled per step
+    print(f"{deliver_tps:>22d} | {deliver_tps/compute_tps:>17.2f} | {util:>10.1f} | {idle_ms:>14.2f}")
+
+# Dollar consequence: 8 accelerators at $3/hr each, one epoch of 5M samples.
+n, gpus, price = 5_000_000, 8, 3.0
+for deliver_tps in [4000, 2000, 1000]:
+    eff = min(compute_tps, deliver_tps)        # epoch throughput is the min of the two
+    secs = n / eff
+    cost = gpus * price * secs / 3600.0
+    print(f"deliver={deliver_tps:>5d} s/s -> epoch {secs/60:6.1f} min, fleet cost ${cost:6.2f}")
+</code></pre>
+<div class="code-caption"><strong>Code 8.1.1:</strong> A pure-Python utilization model. The first loop sweeps the delivery rate past the accelerator's compute rate and reports the utilization $U$ and the per-step idle time; the second loop converts the same throughput into wall-clock and dollar cost for one epoch on an eight-accelerator fleet.</div>
+<pre><code class="language-text">  delivery (samples/s) | I/O:compute ratio | GPU util % | idle/step (ms)
+--------------------------------------------------------------------------
+                  8000 |              4.00 |      100.0 |           0.00
+                  4000 |              2.00 |      100.0 |           0.00
+                  2500 |              1.25 |      100.0 |           0.00
+                  2000 |              1.00 |      100.0 |           0.00
+                  1500 |              0.75 |       75.0 |          85.33
+                  1000 |              0.50 |       50.0 |         256.00
+                   500 |              0.25 |       25.0 |         768.00
+deliver= 4000 s/s -> epoch   41.7 min, fleet cost $ 16.67
+deliver= 2000 s/s -> epoch   41.7 min, fleet cost $ 16.67
+deliver= 1000 s/s -> epoch   83.3 min, fleet cost $ 33.33</code></pre>
+<div class="code-caption"><strong>Output 8.1.1:</strong> Utilization stays pinned at $100\%$ while the delivery rate meets or beats the $2000$ samples/s compute rate, then collapses in step with the shortfall: at half the needed delivery rate the accelerator computes only half the time and the epoch costs twice as much in fleet dollars for an identical result.</div>
+<p>Read the top block of Output 8.1.1 from the bottom up and the cliff is unmistakable. Over-provisioning the data path to four times the compute rate buys nothing; utilization is already $100\%$ at parity. But the moment delivery slips below the compute rate, utilization falls one-for-one with the shortfall, and the idle time per step grows without bound. The bottom block prices the consequence: the runs that deliver $4000$ and $2000$ samples per second finish the epoch in the same $41.7$ minutes for the same cost, because both saturate the accelerators, while the under-fed $1000$-samples-per-second run takes twice as long and costs twice as much to produce a numerically identical model. That doubled cost bought nothing except waiting. The storage layer did not change the answer; it changed the price of the answer.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Scale-Out Is Only as Fast as Its Slowest Supplier</div>
+<p>The book's thesis is that AI at scale is the engineering of work distributed across many machines, and the recurring cost of that distribution is moving data between them. This section pins the cost to a specific, measurable place: the supply of training batches. You can add accelerators (more compute), shard the model (less memory pressure), and tune the kernel (faster steps), but none of it raises utilization above the ceiling set by $r_{\text{deliver}}/r_{\text{compute}}$. Every later technique in this chapter, columnar formats, sharded loaders, streaming, exists to push that ratio back above one so the rest of your scale-out investment can pay off. When a parallel method later disappoints, the data path is the first place to look.</p>
+</div>
+
+<h2>4. The Three Questions This Chapter Answers <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Keeping the delivery rate above the compute rate is a problem with three parts, and the chapter is organized around them. The first is where the data lives: object storage and distributed filesystems, the durable homes that hold petabytes cheaply and serve them in parallel, covered in <a href="section-8.2.html">Section 8.2</a>. The second is how the data is encoded: columnar formats such as Parquet and Arrow and the lakehouse table layers built on them, which decide how many bytes must move and how much CPU decoding costs, covered in <a href="section-8.3.html">Section 8.3</a> and the layout choices of <a href="section-8.4.html">Section 8.4</a>. The third is how the data reaches the trainer: sharded loaders that split the corpus across workers without overlap, and streaming pipelines that hide latency behind compute, covered in <a href="section-8.5.html">Section 8.5</a> and <a href="section-8.6.html">Section 8.6</a>. Each part attacks a different term in the delivery rate, and a system scales only when all three are healthy at once.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The 30% Cluster That Looked Fully Booked</div>
+<p><strong>Who:</strong> An ML platform engineer running a shared training cluster of GPU nodes for a computer-vision team.</p>
+<p><strong>Situation:</strong> Every accelerator was allocated and the scheduling dashboard showed the cluster as fully booked, yet model throughput across the team was stubbornly low and deadlines kept slipping.</p>
+<p><strong>Problem:</strong> A node-level metric revealed the accelerators were busy only about $30\%$ of wall-clock time; the other $70\%$ they sat idle waiting for the next batch, exactly the regime in the bottom rows of Output 8.1.1.</p>
+<p><strong>Dilemma:</strong> The obvious request was more GPU nodes to hit the throughput target, but adding accelerators to an I/O-bound job multiplies idle time, not work; the alternative was to fix the data path, which meant touching every team's loader.</p>
+<p><strong>Decision:</strong> They froze the hardware budget and invested in the storage layer instead, on the evidence that delivery, not compute, was the binding constraint.</p>
+<p><strong>How:</strong> They repacked the image dataset from millions of small files into a few thousand sequential shards (the layout of <a href="section-8.4.html">Section 8.4</a>), moved decode and augmentation off the critical path with more loader workers and prefetching, and cached hot shards on local NVMe.</p>
+<p><strong>Result:</strong> Accelerator utilization rose from roughly $30\%$ to over $85\%$ on the same hardware, nearly tripling effective throughput, and the requested node expansion was cancelled.</p>
+<p><strong>Lesson:</strong> A fully booked cluster is not a fully utilized one. When utilization is low, buy bandwidth, not accelerators; the cheapest speedup is usually in the data path, not the compute.</p>
+</div>
+
+<h2>5. The Idle Accelerator Is the Expensive One <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The recurring lesson of this chapter, the one to carry into every later section, is that an accelerator waiting on input is the most expensive idle resource in a distributed AI system. The reason is purely economic. The accelerators dominate the cost of a training cluster; a host CPU, a network link, and a bucket of object storage are cheap by comparison. So when the cheap components fail to keep the expensive ones busy, you are paying top dollar for hardware that is doing nothing. Output 8.1.1 made this literal: the under-fed epoch cost twice as much for the same model. Spending a little more on storage bandwidth or host CPU to keep utilization near $100\%$ is almost always a bargain against the alternative of idle accelerators billed by the second.</p>
+<p>This is why the data-loader bottleneck earns its own full treatment in <a href="section-8.5.html">Section 8.5</a>, and why it reappears the moment we start training in parallel for real. Data-parallel training, the subject of <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>, replicates the model across many accelerators that each consume their own shard of the data every step. That multiplies the delivery rate the storage layer must sustain by the number of workers, so a data path that comfortably fed one accelerator can starve eight of them at once. The storage layer you design here is the foundation those parallel methods stand on; if it cannot scale, neither can they.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Prefetching Overlap in One Argument</div>
+<p>The $\max$ in our utilization model assumes the loader fetches the next batch while the accelerator works on the current one. You do not implement that overlap by hand; mainstream loaders give it to you through a couple of constructor arguments. In PyTorch, spawning multiple worker processes and prefetching ahead turns the serial fetch-then-compute loop into the overlapped pipeline the model assumes:</p>
+<pre><code class="language-python">from torch.utils.data import DataLoader
+
+loader = DataLoader(
+    dataset,
+    batch_size=512,
+    num_workers=8,       # CPU processes decoding batches in parallel
+    prefetch_factor=4,   # each worker stages batches ahead of the accelerator
+    pin_memory=True,     # faster host-to-accelerator copy over PCIe
+    persistent_workers=True,
+)
+# Each step pops an already-decoded batch; decode of batch n+1 overlaps compute of batch n.
+for batch in loader:
+    train_step(batch)
+</code></pre>
+<div class="code-caption"><strong>Code 8.1.2:</strong> The prefetch overlap behind Code 8.1.1, expressed as four loader arguments instead of a hand-built producer-consumer queue. The library handles the worker processes, the staging buffer, and the pinned-memory transfer that <a href="section-8.5.html">Section 8.5</a> dissects in detail.</div>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Shortening the Data Path (2024 to 2026)</div>
+<p>Because the data path determines utilization, recent systems work attacks every hop in Figure 8.1.1. GPUDirect Storage, now standard in NVIDIA's data-loading stack and exposed through NVIDIA DALI and the Magnum IO libraries, lets storage write directly into accelerator memory over a direct memory access path, skipping the bounce through host CPU memory that the middle of the figure highlights. At the cluster scale, the analysis behind Meta's data-loading work and the MLCommons MLPerf Storage benchmark (introduced 2023 and expanded through 2024 to 2025) quantifies how many accelerators a given storage tier can keep fed, turning "is my data path fast enough?" into a measured number rather than a guess. A parallel line on streaming dataset formats, including the MosaicML Streaming library and WebDataset-style sharding (the subject of <a href="section-8.6.html">Section 8.6</a>), focuses on serving cloud object storage to many workers at the delivery rates large runs demand. The common goal is the same one this section framed: push $r_{\text{deliver}}$ above $r_{\text{compute}}$ and keep it there as the fleet grows.</p>
+</div>
+<p>We now have the claim (the storage layer sets the ceiling on scale), the model that proves it (utilization is $\min(1, r_{\text{deliver}}/r_{\text{compute}})$, and it cliffs the instant delivery falls behind), and the map of the three questions, where the data lives, how it is encoded, and how it reaches the trainer, that the rest of the chapter answers. The next section starts at the first of those questions, the durable home where petabytes of training data actually rest, in <a href="section-8.2.html">Section 8.2</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.1.1: Read the Cliff <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using only the utilization formula $U = \min(1, r_{\text{deliver}}/r_{\text{compute}})$, answer the following without running any code. (a) If an accelerator's compute rate doubles next hardware generation but the data path is unchanged, what happens to utilization on a job that was already at $90\%$? (b) Explain why over-provisioning the data path to four times the compute rate, as in the top rows of Output 8.1.1, is wasted money, and what the right target ratio is. (c) Why does the same model and the same data produce the same trained weights at every delivery rate in Output 8.1.1, even though cost and wall-clock differ? Tie your answer to the exactness argument of <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.1.2: Add the Decode Stage <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 8.1.1 to split the data path into two serial stages that share a fixed host CPU budget: a network fetch stage and a CPU decode stage, where the effective delivery rate is the minimum of the two, $r_{\text{deliver}} = \min(r_{\text{net}}, r_{\text{decode}})$. Sweep the number of CPU decode workers (which scales $r_{\text{decode}}$) while holding the network rate fixed, and plot or print utilization as a function of worker count. Identify the smallest worker count that saturates the accelerator, and explain why adding workers beyond that point, as in the over-provisioned top rows of Output 8.1.1, raises cost without raising utilization.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.1.3: Multiply by the Fleet <span class="exercise-type analysis">Analysis</span></div>
+<p>A single accelerator needs $2000$ samples/s and your object store sustains $50{,}000$ samples/s aggregate read throughput shared across all workers. Data-parallel training (<a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>) replicates the model so each of $K$ accelerators pulls its own batches. Derive the largest $K$ for which the shared store keeps every accelerator at $100\%$ utilization, then state utilization as a function of $K$ beyond that point. Using the roofline framing of <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.7.html">Section 3.7</a>, argue which resource you would scale first to push the ceiling higher, and what it would cost relative to adding more accelerators.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html"><span class="nav-label">Chapter Overview</span><span class="nav-num">Chapter 8</span><span class="nav-title">Distributed Storage and Data Loading</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 8</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Storage and Data Loading</span></a>
+<a class="next" href="section-8.2.html"><span class="nav-label">Next</span><span class="nav-num">Section 8.2</span><span class="nav-title">Object Storage and Distributed Filesystems</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

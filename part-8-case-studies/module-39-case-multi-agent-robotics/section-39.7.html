@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 39.7: Multi-Agent Reinforcement Learning. Learning swarm behaviors with MARL: the centralized-training-decentralized-execution paradigm, value decomposition and multi-agent actor-critic, non-stationarity and credit assignment, emergent communication, and training distributed across massively parallel simulated swarms." name="description"/>
+<title>Section 39.7: Multi-Agent Reinforcement Learning | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Case Studies and Capstone Projects</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 39: Multi-Agent Robotics and Drone Swarms</a></div>
+<h1>Multi-Agent Reinforcement Learning</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I rehearsed the whole formation in a simulator where I could see every drone at once. On the real flight I can see only my three neighbors, and somehow the rehearsal still holds."</p>
+<cite>A Policy, Learning to Cooperate With Copies of Itself</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A swarm behavior worth deploying cannot be hand-coded for every contingency, so we learn it; but a learned policy that needs a global view to act cannot fly on a drone that sees only its neighbors, so we train with global information and execute with local information.</strong> The earlier sections of this chapter built the swarm from the bottom up: the distributed control loops of <a href="section-39.6.html">Section 39.6</a>, the local sensing and consensus that let robots agree without a central authority, and the flocking rules that turn local interactions into global formations. Those rules were designed by hand. This section replaces the designer with a learner. We apply the multi-agent reinforcement learning of <a href="../../part-6-multi-agent-systems/module-30-multi-agent-reinforcement-learning/index.html">Chapter 30</a> to the concrete robotics setting, and the single idea that makes the result deployable is centralized training with decentralized execution: a critic that sees the whole swarm in simulation shapes policies that, once trained, run on each robot using only what that robot can sense. The training itself is a distributed-systems problem, thousands of simulated swarms stepping in parallel on the actor-learner infrastructure of <a href="../../part-4-parallel-deep-learning/module-20-distributed-rl-infrastructure/index.html">Chapter 20</a>, which is why this section belongs in a case study and not in the theory chapter that derived the algorithms.</p>
+</div>
+<p>Chapter 30 developed multi-agent reinforcement learning as theory: Markov games, the non-stationarity that arises when every agent learns at once, the value-decomposition and actor-critic families that tame it. This section does not re-derive that machinery; it assumes it and asks the engineering question a robotics team actually faces. We have a swarm of physical robots, each with a narrow sensor footprint and an onboard computer too small to model the whole group. We want behaviors, coordinated search, formation flight, cooperative transport, that no one wants to specify rule by rule. How do we learn a policy that each robot can run alone, and how do we train it at the scale that learning demands? The answer threads two ideas that recur throughout the book: train where information is cheap and abundant (a simulator), execute where it is scarce (the robot), and parallelize the training across many machines because reinforcement learning is desperately sample-hungry.</p>
+
+<h2>1. The Robotics Setting as a Decentralized Markov Game <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>To learn swarm behavior we first say precisely what kind of problem it is. A team of $n$ robots interacting with a shared world, each seeing only part of it, is a decentralized partially observable Markov decision process, a Dec-POMDP, the cooperative special case of the Markov games studied in <a href="../../part-6-multi-agent-systems/module-30-multi-agent-reinforcement-learning/index.html">Chapter 30</a>. It is specified by the tuple</p>
+$$\langle\, \mathcal{S},\; \{\mathcal{A}_i\}_{i=1}^{n},\; P,\; r,\; \{\Omega_i\}_{i=1}^{n},\; O,\; \gamma \,\rangle,$$
+<p>where $\mathcal{S}$ is the global state of the swarm and its environment, $\mathcal{A}_i$ is robot $i$'s action set (a velocity command, a thrust vector), and the joint action $\mathbf{a} = (a_1,\dots,a_n)$ drives the transition kernel $P(s' \mid s, \mathbf{a})$. The reward $r(s,\mathbf{a})$ is shared by the whole team, which is what makes the task cooperative: there is one number, and every robot is measured against it. Crucially, robot $i$ never sees $s$; it receives only an observation $o_i \in \Omega_i$ drawn from $O(o_i \mid s, i)$, its own local view. The objective is a set of decentralized policies $\pi_i(a_i \mid \tau_i)$, each a function of robot $i$'s own observation history $\tau_i$, that jointly maximize the discounted team return $\mathbb{E}\!\left[\sum_{t} \gamma^t\, r(s_t, \mathbf{a}_t)\right]$. The defining constraint, the one that shapes every algorithm in this section, is that each $\pi_i$ may depend only on $\tau_i$, because at deployment that is all robot $i$ has.</p>
+<p>This formalism makes the central tension explicit. The thing we want to optimize, team return, depends on the global state and the joint action. The thing each robot can condition on, its local observation, is a shadow of that state. If we insist on optimizing only with local information, learning is slow and unstable; if we train with global information we may learn a policy that cannot run on the robot. The resolution is to use global information only while learning, a structure named in the next section.</p>
+
+<h2>2. Centralized Training, Decentralized Execution <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The organizing principle of modern cooperative MARL, and the reason learned swarms are deployable at all, is centralized training with decentralized execution, abbreviated CTDE. During training we run in a simulator, where the global state, every robot's observation, and every robot's action are all visible to the learning algorithm at once; we exploit that visibility to compute well-informed learning signals. At execution we discard the global view entirely: each robot carries only its own policy network and feeds it only its own local observation. Figure 39.7.1 contrasts the two phases. The asymmetry is deliberate and is exactly the simulation-to-reality split that <a href="section-39.8.html">Section 39.8</a> takes up, and it mirrors the train-global, deploy-local pattern that the distributed control of <a href="section-39.6.html">Section 39.6</a> already imposed by hardware necessity.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two-panel diagram. Left panel, training: three actor networks each receive a local observation and emit an action, and a single centralized critic receives the global state plus all actions and emits a team value used to update the actors. Right panel, execution: the same three actors run independently on three robots, each fed only its own local observation, with no critic present.">
+<defs>
+<marker id="arr397" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr397o" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.box397 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.act397 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.crit397 { fill:#eaf3ea; stroke:#2e7d32; stroke-width:1.8; }
+.t397 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.tc397 { font:600 13px sans-serif; fill:#2e7d32; text-anchor:middle; }
+.s397 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l397 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr397); }
+.lo397 { fill:none; stroke:#b86b1f; stroke-width:1.6; marker-end:url(#arr397o); }
+.hd397 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.div397 { stroke:#c2c8d0; stroke-width:1.4; stroke-dasharray:5 4; }
+</style>
+<text class="hd397" x="220" y="24">Centralized training (in simulation)</text>
+<text class="hd397" x="670" y="24">Decentralized execution (on robots)</text>
+<line class="div397" x1="445" y1="40" x2="445" y2="400"/>
+
+<rect class="act397" x="40" y="70" width="100" height="44" rx="8"/>
+<text class="t397" x="90" y="97">Actor 1</text>
+<rect class="act397" x="40" y="150" width="100" height="44" rx="8"/>
+<text class="t397" x="90" y="177">Actor 2</text>
+<rect class="act397" x="40" y="230" width="100" height="44" rx="8"/>
+<text class="t397" x="90" y="257">Actor 3</text>
+<text class="s397" x="90" y="300">local obs in,</text>
+<text class="s397" x="90" y="316">action out</text>
+
+<rect class="crit397" x="250" y="130" width="150" height="84" rx="10"/>
+<text class="tc397" x="325" y="162">Centralized</text>
+<text class="tc397" x="325" y="180">critic</text>
+<text class="s397" x="325" y="200">sees global state</text>
+<text class="s397" x="325" y="234">+ all actions</text>
+
+<path class="l397" d="M 140 92 L 244 150"/>
+<path class="l397" d="M 140 172 L 244 172"/>
+<path class="l397" d="M 140 252 L 244 196"/>
+<path class="lo397" d="M 325 130 C 325 60, 90 60, 90 68"/>
+<path class="lo397" d="M 340 214 C 360 280, 110 290, 92 276"/>
+<text class="s397" x="245" y="56">value / advantage signal updates actors</text>
+
+<rect class="box397" x="500" y="70" width="120" height="60" rx="10"/>
+<text class="t397" x="560" y="96">Robot 1</text>
+<text class="s397" x="560" y="116">Actor 1 only</text>
+<rect class="box397" x="660" y="70" width="120" height="60" rx="10"/>
+<text class="t397" x="720" y="96">Robot 2</text>
+<text class="s397" x="720" y="116">Actor 2 only</text>
+<rect class="box397" x="580" y="170" width="120" height="60" rx="10"/>
+<text class="t397" x="640" y="196">Robot 3</text>
+<text class="s397" x="640" y="216">Actor 3 only</text>
+<text class="s397" x="560" y="160">o&#8321;</text>
+<text class="s397" x="720" y="160">o&#8322;</text>
+<text class="s397" x="640" y="260">o&#8323;</text>
+<path class="l397" d="M 560 145 L 560 132"/>
+<path class="l397" d="M 720 145 L 720 132"/>
+<path class="l397" d="M 640 245 L 640 232"/>
+<text class="tc397" x="670" y="320" style="fill:#b86b1f;">no critic at deployment</text>
+<text class="s397" x="670" y="340">each robot acts on its own observation</text>
+<text class="s397" x="670" y="356">neighbors exchanged only as local messages</text>
+</svg>
+<figcaption><strong>Figure 39.7.1:</strong> Centralized training with decentralized execution. During training (left) a single critic consumes the global state and every robot's action to produce a learning signal that updates all actors; this is cheap because training runs in a simulator that already holds the global state. At execution (right) the critic is gone: each actor network runs on its own robot and is fed only that robot's local observation $o_i$. The policies learned under the critic's guidance remain valid because they were always functions of local observations alone.</figcaption>
+</figure>
+<p>CTDE works because the critic is a training-time scaffold, not part of the deployed agent. The policy $\pi_i$ is, from the first gradient step, a function of $o_i$ only; the centralized critic merely supplies a better estimate of how good robot $i$'s action was, given what everyone else did. Once training ends, the scaffold is removed and the policies stand on their own. The two algorithm families below differ only in the form that the centralized training signal takes: a decomposed value function, or a centralized critic feeding decentralized actors.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Critic Is a Simulator-Only Luxury, the Policy Is the Deliverable</div>
+<p>Everything that needs the global state, the centralized critic, the joint-action value, the privileged observations, lives only in the training simulator, where global state is free because the simulator computes it. The robot ships with the policy network alone. This is why a learned swarm can be honest about its deployment constraint while still being trained with rich information: the constraint binds the policy's inputs, not the trainer's. When you evaluate a MARL method for robotics, the first question is always "what does the policy condition on at execution?", never "what did the critic see during training".</p>
+</div>
+
+<h2>3. Value Decomposition: VDN and QMIX <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The first CTDE family addresses cooperative value-based learning. We want each robot to choose its action greedily from a small per-robot utility $Q_i(\tau_i, a_i)$ that depends only on local information, yet we have only one team reward to learn from. Value decomposition resolves this by positing that the joint action value factorizes through the per-robot utilities. The simplest form, the value decomposition network of Sunehag et al. (2018), takes the factorization to be a sum:</p>
+$$Q_{\text{tot}}(\boldsymbol{\tau}, \mathbf{a}) \;=\; \sum_{i=1}^{n} Q_i(\tau_i, a_i).$$
+<p>Only $Q_{\text{tot}}$ is ever trained against the shared reward, with an ordinary temporal-difference loss on the team return; the per-robot $Q_i$ emerge as the additive pieces. The payoff is the decentralization guarantee: because the sum is increasing in each $Q_i$, maximizing $Q_{\text{tot}}$ over the joint action is the same as each robot independently maximizing its own $Q_i$. That equivalence, $\arg\max_{\mathbf{a}} Q_{\text{tot}} = (\arg\max_{a_1} Q_1, \dots, \arg\max_{a_n} Q_n)$, is precisely the property that makes the greedy policy decentralizable.</p>
+<p>QMIX (Rashid et al., 2018) keeps that property while relaxing the rigid sum. It mixes the per-robot utilities through a network whose weights are constrained to be non-negative, so $Q_{\text{tot}}$ is a monotone function of each $Q_i$:</p>
+$$Q_{\text{tot}}(\boldsymbol{\tau}, \mathbf{a}) \;=\; f_{\text{mix}}\big(Q_1(\tau_1,a_1), \dots, Q_n(\tau_n,a_n);\, s\big), \qquad \frac{\partial Q_{\text{tot}}}{\partial Q_i} \;\ge\; 0 \ \ \forall i.$$
+<p>The mixing network may itself depend on the global state $s$ (available in the simulator), which lets the team value respond to context that no single robot observes, while the monotonicity constraint preserves the same greedy-decentralization equivalence VDN enjoys. The richer mixer represents cooperative value functions that a plain sum cannot, at the cost of a constrained architecture; both share the property that only local utilities are needed to act. The runnable demonstration in Section 6 isolates the additive case so the credit-assignment mechanism is visible in a handful of lines.</p>
+
+<h2>4. Multi-Agent Actor-Critic: MADDPG and MAPPO <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The second CTDE family keeps explicit policies and is the natural choice for the continuous action spaces of robotics, where a robot emits a velocity or a thrust rather than picking from a discrete menu. Here each robot has an actor $\pi_i(a_i \mid o_i; \theta_i)$ trained by policy gradient, but the gradient uses a centralized critic that sees the global state and the joint action. For robot $i$ the policy-gradient update takes the form</p>
+$$\nabla_{\theta_i} J(\theta_i) \;=\; \mathbb{E}\!\left[\, \nabla_{\theta_i} \log \pi_i(a_i \mid o_i)\; A_i\big(s, a_1, \dots, a_n\big) \right],$$
+<p>where the advantage $A_i$ is computed from a critic $Q(s, a_1, \dots, a_n)$ or $V(s)$ that is conditioned on global information. Because the critic knows what the other robots did, the value it reports to robot $i$ is not corrupted by their unseen choices; the environment looks stationary from the critic's vantage even though it does not from any single actor's. This is the mechanism by which the centralized critic of multi-agent deep deterministic policy gradient, MADDPG (Lowe et al., 2017), stabilizes learning, and multi-agent PPO, MAPPO (Yu et al., 2022), applies the same recipe with a clipped on-policy objective and a shared critic, reaching strong results across cooperative benchmarks with surprisingly little tuning. At execution the critic is dropped and only $\pi_i(a_i \mid o_i)$ runs on robot $i$, exactly the asymmetry of Figure 39.7.1.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: PettingZoo Gives You the Dec-POMDP, the Algorithm Library Gives You CTDE</div>
+<p>Writing a multi-agent environment loop, observation routing, per-agent action spaces, shared-reward bookkeeping, by hand is tedious and error-prone. PettingZoo standardizes the Dec-POMDP interface so that swapping environments or algorithms costs a few lines, and it pairs with CTDE implementations in libraries such as Tianshou, MARLlib, or EPyMARL so you rarely implement QMIX or MAPPO yourself:</p>
+<pre><code class="language-python"># pip install pettingzoo
+from pettingzoo.mpe import simple_spread_v3   # cooperative N-agent coverage task
+
+env = simple_spread_v3.parallel_env(N=3, max_cycles=25)  # 3 agents, shared reward
+observations, infos = env.reset(seed=0)
+
+while env.agents:                              # all agents act each step (parallel API)
+    actions = {a: env.action_space(a).sample() for a in env.agents}  # replace with policies
+    observations, rewards, terms, truncs, infos = env.step(actions)
+    # observations[a] is agent a's LOCAL view; rewards[a] is the shared team reward
+env.close()
+</code></pre>
+<div class="code-caption"><strong>Code 39.7.1:</strong> The PettingZoo parallel API expresses a Dec-POMDP directly: each step returns a per-agent dictionary of local observations and the shared reward, the exact signature CTDE algorithms consume. Replacing the random <code>actions</code> with trained per-agent policies, and plugging the environment into a QMIX or MAPPO trainer from a MARL library, turns a roughly two-hundred-line algorithm into an import and a configuration block.</div>
+</div>
+
+<h2>5. Non-Stationarity, Credit Assignment, and Emergent Communication <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Three difficulties make multi-robot learning harder than single-agent learning, and CTDE is best understood as the answer to the first two. The first is non-stationarity. From any one robot's point of view, the environment includes the other robots, and those robots are themselves learning, so the transition and reward dynamics that robot $i$ experiences drift as its teammates change. A policy that was a best response yesterday is stale today. Independent learners, each running a single-agent algorithm and treating the others as part of the world, chase this moving target and frequently fail to coordinate. The centralized critic dissolves the problem during training: conditioned on the joint action, the world is stationary again, because the part that was moving, the other agents' choices, is now an input the critic observes.</p>
+<p>The second difficulty is credit assignment across agents. One shared reward must be apportioned among $n$ contributors, and a robot cannot tell from the team reward alone whether its own action helped or whether a teammate carried the episode. Value decomposition answers this structurally, by learning per-robot utilities that sum or mix to the team value, so the gradient that flows to each $Q_i$ reflects that robot's marginal contribution. Counterfactual methods such as COMA make the apportionment explicit by comparing the realized return against what would have happened had robot $i$ acted differently while teammates held fixed. The demonstration below shows credit assignment failing for independent learners and succeeding for a decomposed value, on a coordination game small enough to read.</p>
+<p>The third, and the one that turns a collection of policies into something resembling a society, is learned communication. When robots may exchange a few bits or a short message vector, MARL can learn not only what to do but what to say, discovering a protocol that no engineer specified. Differentiable inter-agent learning passes gradients through the communication channel so that the act of sending a message is trained end to end against the team objective; the emergent codes are often compact and task-specific. This connects directly to the emergent collective behavior of <a href="../../part-6-multi-agent-systems/module-31-swarm-intelligence/index.html">Chapter 31</a>: there the coordination rules were designed, here they, and the signals that drive them, are discovered.</p>
+
+<h2>6. A Cooperative Game Where Decomposition Wins <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The contrast between independent learners and value decomposition is sharpest on a tiny cooperative game, where we can watch the credit-assignment mechanism work without any neural network in the way. Two robots each choose one of three actions; the team receives a single shared reward that depends on the joint action. The reward matrix has a high-payoff optimum at the joint action $(0,0)$ flanked by miscoordination penalties, plus a safe but mediocre corner. Independent Q-learners, each averaging the reward over whatever the partner happens to be doing, see action $0$ punished while the partner still explores and retreat to the safe corner. The value-decomposition learner trains one shared temporal-difference error through the additive factorization $Q_{\text{tot}} = Q_1 + Q_2$ of Section 3, and discounts the negative surprise of a single unlucky penalty, so the team climbs to the joint optimum. Code 39.7.2 implements both learners in pure NumPy.</p>
+<pre><code class="language-python">import numpy as np
+
+# Two-robot cooperative coordination game; ONE shared team reward per joint action.
+# Optimum 10 at (0,0) is flanked by miscoordination penalties; (1,1)/(2,2) are safe.
+R = np.array([[ 10.0, -10.0, -10.0],
+              [-10.0,   2.0,   0.0],
+              [-10.0,   0.0,   2.0]])
+A, EPISODES, ALPHA, BETA = 3, 8000, 0.05, 0.005   # BETA: discounted rate for penalties
+rng = np.random.default_rng(0)
+
+def eps(t):
+    return max(0.1, 1.0 - t / 4000.0)             # exploration schedule
+
+def run_independent():
+    q0, q1 = np.zeros(A), np.zeros(A)             # each agent: its OWN local utility
+    for t in range(EPISODES):
+        e = eps(t)
+        a0 = rng.integers(A) if rng.random() < e else int(np.argmax(q0))
+        a1 = rng.integers(A) if rng.random() < e else int(np.argmax(q1))
+        r = R[a0, a1]
+        q0[a0] += ALPHA * (r - q0[a0])            # each treats the other as the world
+        q1[a1] += ALPHA * (r - q1[a1])
+    a0, a1 = int(np.argmax(q0)), int(np.argmax(q1))
+    return a0, a1, R[a0, a1]
+
+def run_vdn():
+    q0, q1 = np.zeros(A), np.zeros(A)
+    for t in range(EPISODES):
+        e = eps(t)
+        a0 = rng.integers(A) if rng.random() < e else int(np.argmax(q0))
+        a1 = rng.integers(A) if rng.random() < e else int(np.argmax(q1))
+        r = R[a0, a1]
+        td = r - (q0[a0] + q1[a1])                # central critic: Q_tot = Q1 + Q2
+        lr = ALPHA if td > 0 else BETA            # optimism: discount penalty surprise
+        q0[a0] += lr * td                         # shared error credited to both,
+        q1[a1] += lr * td                         # so argmax-per-agent = argmax-of-sum
+    a0, a1 = int(np.argmax(q0)), int(np.argmax(q1))
+    return a0, a1, R[a0, a1]
+
+print("optimal joint reward :", R.max(), "at joint action (0, 0)\n")
+ni, vd = [], []
+for seed in range(20):
+    rng = np.random.default_rng(seed); ni.append(run_independent()[2])
+    rng = np.random.default_rng(seed); vd.append(run_vdn()[2])
+rng = np.random.default_rng(0); a0, a1, r = run_independent()
+print(f"independent learners : joint action ({a0}, {a1}) -> reward {r:.1f}")
+print(f"   mean over 20 seeds : {np.mean(ni):.2f}"
+      f"   optimum hit {np.mean(np.array(ni) == R.max()) * 100:.0f}% of seeds\n")
+rng = np.random.default_rng(0); a0, a1, r = run_vdn()
+print(f"value decomposition  : joint action ({a0}, {a1}) -> reward {r:.1f}")
+print(f"   mean over 20 seeds : {np.mean(vd):.2f}"
+      f"   optimum hit {np.mean(np.array(vd) == R.max()) * 100:.0f}% of seeds")
+</code></pre>
+<div class="code-caption"><strong>Code 39.7.2:</strong> Independent Q-learners versus an additive value-decomposition learner on a cooperative coordination game. The only structural difference is that VDN trains a single shared temporal-difference error through $Q_{\text{tot}} = Q_1 + Q_2$ and discounts negative surprise, while the independent learners update two separate utilities against the raw reward.</div>
+<pre><code class="language-text">optimal joint reward : 10.0 at joint action (0, 0)
+
+independent learners : joint action (0, 0) -> reward 10.0
+   mean over 20 seeds : 4.40   optimum hit 30% of seeds
+
+value decomposition  : joint action (0, 0) -> reward 10.0
+   mean over 20 seeds : 10.00   optimum hit 100% of seeds
+</code></pre>
+<div class="code-caption"><strong>Output 39.7.2:</strong> Independent learners reach the cooperative optimum on only 30% of seeds (mean team reward 4.40), settling for the safe corner the rest of the time. The value-decomposition learner reaches the optimum on every seed (mean 10.00). The single displayed independent run happens to succeed at seed 0; the twenty-seed average is the honest summary, and it shows the decomposed value solving a credit-assignment problem that defeats the independent baseline.</div>
+<p>The lesson scales from this three-by-three matrix to a real swarm. Shared rewards plus learners that ignore each other produce miscoordination; a CTDE structure that assigns credit through a joint value, whether the additive sum here, the QMIX mixer of Section 3, or the centralized critic of Section 4, converts the same shared signal into coordinated behavior. What this toy omits, and what the next subsection supplies, is the scale: real swarm policies need millions of episodes, and those episodes must be generated in parallel.</p>
+
+<h2>7. Training Distributed Across Many Simulated Swarms <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Reinforcement learning is sample-hungry, and multi-agent reinforcement learning is more so, because the joint behavior space the team must explore grows with the number of robots. A learned swarm policy is trained not on one simulated swarm but on hundreds or thousands of them stepping in parallel, and this is where the distributed RL infrastructure of <a href="../../part-4-parallel-deep-learning/module-20-distributed-rl-infrastructure/index.html">Chapter 20</a> becomes the engine of the case study. The actor-learner architecture introduced there carries over directly: many actor workers, each running one or more simulated swarms, generate trajectories and stream them to one or a few learners that update the shared policy and critic, then broadcast the new weights back. The synchronous-versus-asynchronous trade-off of Chapter 20, sync for reproducible gradients, async for throughput when actors straggle, is the same trade-off here, now applied to swarm rollouts.</p>
+<p>Two scale-out facts make MARL training tractable. First, modern GPU-resident simulators step thousands of independent environments at once on a single accelerator, so the rollout fan-out of <a href="../../part-4-parallel-deep-learning/module-20-distributed-rl-infrastructure/index.html">Chapter 20</a> happens partly inside one device and partly across a cluster of them. Second, parameter sharing, giving all robots in a swarm one policy network with the robot's index or role as an input, collapses $n$ policies into one set of weights, which both shrinks the learner's job and lets a swarm trained at one size generalize to another. The training computation is therefore distributed along two of the six axes of <a href="../../part-1-foundations/module-01-scale-out-ai/index.html">Chapter 1</a> at once, the training axis (parallel rollouts and gradient aggregation) and, when the policy is large, the model axis, while the learned artifact executes at the edge, decentralized, on each robot.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Train Distributed, Execute Decentralized</div>
+<p>This section is the chapter's clearest instance of the book's spine. Training is a scale-out problem: thousands of simulated swarms run in parallel across many machines on the actor-learner infrastructure of <a href="../../part-4-parallel-deep-learning/module-20-distributed-rl-infrastructure/index.html">Chapter 20</a>, with the same synchronous-versus-asynchronous and gradient-aggregation choices that govern every distributed training method in the book. Execution is a decentralized problem: the single artifact that training produces, a policy conditioned on local observations, runs independently on every robot with no central coordinator. The centralized critic is the bridge, a training-time use of global information that buys a deployable, communication-light policy. Distribute where information and compute are cheap; decentralize where they are scarce.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Warehouse Robot Fleet That Stopped Colliding</div>
+<p><strong>Who:</strong> A robotics team operating a fleet of autonomous mobile robots in a fulfillment warehouse.</p>
+<p><strong>Situation:</strong> Hand-tuned path-planning rules handled open aisles well but jammed at intersections, where robots deadlocked waiting for each other under a hand-coded priority scheme.</p>
+<p><strong>Problem:</strong> Each robot sees only a few meters of neighbors through onboard sensors; no robot has a global map of the fleet, and adding a central traffic controller created a single point of failure the operations team had rejected.</p>
+<p><strong>Dilemma:</strong> Keep extending the rule set, which grew more brittle with every new intersection layout, or learn an intersection-negotiation policy, which needed coordinated training the team had never run.</p>
+<p><strong>Decision:</strong> They trained a single shared policy with MAPPO under CTDE: a centralized critic saw the full warehouse state in simulation, while each robot's actor conditioned only on its local sensor view and a few neighbor messages.</p>
+<p><strong>How:</strong> They ran two thousand simulated warehouses in parallel on a GPU cluster using the actor-learner setup of <a href="../../part-4-parallel-deep-learning/module-20-distributed-rl-infrastructure/index.html">Chapter 20</a>, with parameter sharing so one network drove every robot, then deployed the actor to the real fleet unchanged.</p>
+<p><strong>Result:</strong> Intersection deadlocks fell sharply and throughput rose, with no central controller in the loop; each robot ran the same lightweight policy on its onboard computer.</p>
+<p><strong>Lesson:</strong> The global view that made coordination learnable lived only in the simulator's critic. The deployed system stayed decentralized, which is what the hardware and the reliability requirement demanded.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Massively Parallel Swarm Learning (2024 to 2026)</div>
+<p>The frontier of learned swarms is being pushed by simulation throughput. GPU-resident multi-agent simulators in the lineage of Isaac Gym and its successors step tens of thousands of robot environments simultaneously on a single accelerator, compressing what once took a cluster-week into hours and making large drone-swarm policies trainable end to end. On the algorithm side, MAPPO and its descendants remain strong, surprisingly simple baselines across cooperative benchmarks, while work on scalable and mean-field MARL targets swarms of hundreds to thousands of agents where pairwise reasoning is infeasible. A parallel thread asks what swarm policies should condition on: graph-neural-network and attention-based actors that aggregate a variable set of neighbors let one trained policy transfer across swarm sizes, and learned communication is being revisited as a way to coordinate under tight bandwidth. The open problem that this chapter's next section confronts is the reality gap: a policy trained across thousands of simulated swarms must still fly on hardware, which is the sim-to-real transfer of <a href="section-39.8.html">Section 39.8</a>.</p>
+</div>
+
+<h2>8. From Learned Policy to Flying Hardware <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>We now have a learned swarm policy: a single network, conditioned only on a robot's local observation, trained under a centralized critic across many parallel simulated swarms, and shown on a small game to solve the credit-assignment failure that defeats independent learners. Two threads remain open. The policy was trained in simulation, and a simulator is never the world; closing that gap is the sim-to-real problem of <a href="section-39.8.html">Section 39.8</a>, which takes the artifact this section produced and asks what it takes to make it survive contact with real sensors, real dynamics, and real wind. And the coordination the policy learned is a learned cousin of the designed swarm rules of <a href="../../part-6-multi-agent-systems/module-31-swarm-intelligence/index.html">Chapter 31</a>; the next section's transfer techniques are what let the learned version leave the simulator and join the designed version in the air.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 39.7.1: Why the Critic May See What the Actor May Not <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A teammate argues that CTDE is cheating: if the centralized critic can see the global state, the learned policies must secretly depend on it too, and so the swarm will fail the moment that state is unavailable at deployment. Explain precisely why this objection is wrong. In your answer, identify which quantity in the policy-gradient update of Section 4 conditions on global information and which conditions only on local information, and state what each robot actually loads and feeds to its network at execution. Then describe one concrete failure that would occur if an engineer mistakenly let the actor read a critic-only feature during training.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 39.7.2: Make Independent Learning Fail Harder <span class="exercise-type coding">Coding</span></div>
+<p>Starting from Code 39.7.2, deepen the miscoordination penalties (for example, set the off-diagonal entries in the first row and column to $-30$) and rerun. Report how the independent learners' optimum-hit rate over the twenty seeds changes and explain the mechanism in terms of the moving-target dynamics of Section 5. Then test the robustness of the value-decomposition learner by varying the penalty-discount rate <code>BETA</code> from $0.0$ up to <code>ALPHA</code>; find the largest <code>BETA</code> at which the decomposed learner still reaches the optimum on every seed, and explain what role the optimism is playing.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 39.7.3: Size the Rollout Fleet for a Swarm Policy <span class="exercise-type analysis">Analysis</span></div>
+<p>Suppose training a drone-swarm policy needs $2 \times 10^{9}$ environment steps to converge, and a single GPU-resident simulator steps $4{,}096$ parallel swarm environments at $300$ steps per second per environment. Estimate the wall-clock time to gather the required samples on one accelerator, then on a cluster of $16$ such accelerators under the actor-learner architecture of <a href="../../part-4-parallel-deep-learning/module-20-distributed-rl-infrastructure/index.html">Chapter 20</a>, assuming rollout throughput scales linearly with accelerators. State one reason the learner, not the rollout, may become the bottleneck as you add accelerators, and connect it to the synchronous-versus-asynchronous trade-off of Chapter 20.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-39.6.html"><span class="nav-label">Previous</span><span class="nav-num">Section 39.6</span><span class="nav-title">Decentralized Control</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 39</span><span class="nav-num">Contents</span><span class="nav-title">Multi-Agent Robotics and Drone Swarms</span></a>
+<a class="next" href="section-39.8.html"><span class="nav-label">Next</span><span class="nav-num">Section 39.8</span><span class="nav-title">Simulation-to-Real Transfer</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

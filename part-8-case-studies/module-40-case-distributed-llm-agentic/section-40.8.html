@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 40.8: Cost Control Across the Fleet. The cost model of an agent fleet that makes billions of LLM calls, and the levers (routing cascades, prefix and semantic caching, context compression, step budgets, self-hosting) that bring the per-task cost down." name="description"/>
+<title>Section 40.8: Cost Control Across the Fleet | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Case Studies and Capstone Projects</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 40: Distributed LLM and Agentic Applications</a></div>
+<h1>Cost Control Across the Fleet</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"A token, costing a fraction of a cent, multiplied by a billion, is suddenly a budget meeting. Nobody asked me to multiply; I just kept generating."</p>
+<cite>A Token, Unaware of Its Own Arithmetic</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>At fleet scale the binding constraint on an agentic system is not accuracy or latency but money: each agent runs a loop of many model calls, each call burns input and output tokens, and the same per-task price that is invisible on one request becomes the dominant operating cost when billions of tasks run every day.</strong> The earlier sections of this chapter built the agents and showed where their tokens go; this section treats the fleet as an economic system and engineers its cost down. The cost model is multiplicative, so the levers that matter are the ones that attack a multiplied factor: routing cheap-then-expensive, caching whole answers and shared prefixes, compressing context, capping runaway loops, and deciding when to stop renting tokens and self-host the model. The lesson the section drives home is that cost-per-task is a first-class system metric, designed and measured with the same rigor as throughput, not a line item discovered at the end of the month.</p>
+</div>
+<p>An individual agent call is cheap. A single request to a large model, eighteen hundred tokens in and a few hundred out, costs about a penny, and at that price cost feels like a rounding error next to the engineering effort of getting the agent to behave. That intuition survives exactly until the system is deployed across a fleet. The agents of <a href="section-40.6.html">Section 40.6</a> and <a href="section-40.7.html">Section 40.7</a> do not make one call; each task drives a loop of planning, tool use, reflection, and retry, and the fleet runs millions of those tasks a day. The penny is multiplied by the loop length, then by the task volume, and the rounding error becomes the largest variable cost in the system. Controlling that number is the subject of this section, and it draws directly on the MLOps cost discipline of <a href="../../part-5-distributed-inference/module-26-mlops-distributed-ai/index.html">Chapter 26</a>, the per-node serving efficiency of <a href="../../part-5-distributed-inference/module-22-per-node-inference-efficiency/index.html">Chapter 22</a>, and the spot and build-versus-buy economics of <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/section-33.8.html">Section 33.8</a> and <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/section-33.9.html">Section 33.9</a>.</p>
+
+<h2>1. The Cost Model Is Multiplicative <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The reason fleet cost surprises people is that it is a product of factors, not a sum, and products grow faster than intuition expects. Let a fleet handle $R$ tasks per period, let each task run an agent loop of $S$ model calls on average, and let each call consume $t_{\text{in}}$ input tokens and $t_{\text{out}}$ output tokens at per-token prices $p_{\text{in}}$ and $p_{\text{out}}$. The total cost of the period is</p>
+$$C = R \cdot S \cdot \big( t_{\text{in}}\, p_{\text{in}} + t_{\text{out}}\, p_{\text{out}} \big).$$
+<p>Every term is a multiplier. Doubling the task volume doubles the bill; so does doubling the loop length, the context size, or the price of the model. The factors that practitioners underweight are the two in the middle. Agent loops multiply the call count: a task that a human would phrase as one question becomes six model calls once the agent plans, calls a tool, reads the result, reflects, and retries, so the realized $S$ is far above one. Long contexts multiply the input cost: retrieved documents, conversation history, and tool schemas push $t_{\text{in}}$ into the thousands, and because input tokens are billed on every call of the loop, a large context is paid for repeatedly within a single task. The output term is usually smaller in token count but carries a higher unit price, so it cannot be ignored. The combination is what makes a one-cent call into a seven-figure annual line, and it is why cost belongs in the system metrics of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a> alongside latency and throughput.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Attack the Multiplied Factors, Not the Cheapest One</div>
+<p>Because $C = R \cdot S \cdot (t_{\text{in}} p_{\text{in}} + t_{\text{out}} p_{\text{out}})$ is a product, a proportional cut to any single factor cuts the whole bill by that proportion, and cuts to different factors compose multiplicatively. Halving the loop length and halving the per-call price together quarter the cost. The engineering payoff therefore goes to whichever factor is both large and reducible: usually the model price (route to a cheaper model), the call count (cache answers, cap loops), and the input size (compress context). Optimizing the output token count alone, the factor most teams notice first, moves the smallest lever.</p>
+</div>
+
+<h2>2. A Map of the Levers <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Each lever in this section reduces one factor of the cost product, and they are best understood as stations on the path a request travels from arrival to a billed model call. Figure 40.8.1 lays out that path: a request first meets a cache that may answer it outright, then a router that sends it to a small model and escalates to a large one only when needed, then a serving layer whose per-token cost is set by quantization and batching. Each station is annotated with the factor it cuts, so the diagram doubles as a checklist for where a fleet's money actually goes.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A request flows left to right through a semantic cache, a model router with a small-then-large cascade, and a serving layer; each stage is labelled with the cost factor it reduces.">
+<defs>
+<marker id="arr408" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b408 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.c408 { fill:#eaf5ee; stroke:#2f7d4f; stroke-width:1.6; }
+.s408 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.L408 { fill:#fbeaea; stroke:#a23535; stroke-width:1.6; }
+.t408 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.u408 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.g408 { font:600 11px sans-serif; fill:#2f7d4f; text-anchor:middle; }
+.l408 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr408); }
+</style>
+<text class="t408" x="60" y="60">Requests</text>
+<text class="u408" x="60" y="78">R &#215; S calls</text>
+<rect class="b408" x="20" y="90" width="80" height="44" rx="8"/>
+<text class="u408" x="60" y="117">fleet</text>
+<line x1="100" y1="112" x2="150" y2="112" class="l408"/>
+
+<rect class="c408" x="150" y="78" width="130" height="68" rx="10"/>
+<text class="t408" x="215" y="104">Semantic +</text>
+<text class="t408" x="215" y="120">prefix cache</text>
+<text class="g408" x="215" y="138">cuts call count S</text>
+<line x1="280" y1="112" x2="330" y2="112" class="l408"/>
+<text class="u408" x="215" y="166">hit: answer now</text>
+
+<rect class="s408" x="330" y="78" width="140" height="68" rx="10"/>
+<text class="t408" x="400" y="104">Router:</text>
+<text class="t408" x="400" y="120">small model first</text>
+<text class="g408" x="400" y="138">cuts price p</text>
+<path class="l408" d="M 470 100 L 560 100"/>
+<text class="u408" x="515" y="92">escalate</text>
+<path class="l408" d="M 470 124 L 560 124 L 560 220 L 560 240"/>
+<text class="u408" x="600" y="124">answer</text>
+
+<rect class="L408" x="560" y="72" width="130" height="56" rx="10"/>
+<text class="t408" x="625" y="96">Large model</text>
+<text class="u408" x="625" y="114">only when needed</text>
+
+<rect class="s408" x="560" y="240" width="130" height="56" rx="10"/>
+<text class="t408" x="625" y="264">Small model</text>
+<text class="u408" x="625" y="282">handles the rest</text>
+
+<line x1="690" y1="100" x2="760" y2="100" class="l408"/>
+<line x1="690" y1="268" x2="725" y2="268" class="l408"/>
+<path class="l408" d="M 725 268 L 760 268 L 760 128"/>
+<rect class="b408" x="760" y="84" width="110" height="68" rx="10"/>
+<text class="t408" x="815" y="108">Serving layer</text>
+<text class="u408" x="815" y="126">quantize, batch</text>
+<text class="g408" x="815" y="144">cuts price p</text>
+
+<text class="u408" x="400" y="200">context compression cuts t&#8202;&#8202;in on every box above</text>
+<text class="u408" x="400" y="330">step / loop budget caps the multiplier S before it runs away</text>
+<line x1="120" y1="312" x2="700" y2="312" stroke="#5a626c" stroke-width="1" stroke-dasharray="4 3"/>
+</svg>
+<figcaption><strong>Figure 40.8.1:</strong> The cost path of a fleet request and the factor each lever cuts. A cache short-circuits whole calls (lowering the effective $S$); a router sends most traffic to a cheap small model and escalates only a fraction to the large one (lowering the effective $p$); the serving layer's quantization and batching lower the small model's own per-token price (<a href="../../part-5-distributed-inference/module-22-per-node-inference-efficiency/index.html">Chapter 22</a>); context compression lowers $t_{\text{in}}$ everywhere; and a loop budget caps the multiplier $S$ before a runaway agent inflates it.</figcaption>
+</figure>
+
+<h2>3. Routing and Cascades: Pay the Big Model Only When You Must <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The single largest lever is usually the model price, because the gap between a small and a large model is an order of magnitude or more per token, while the small model handles a large share of calls acceptably. A cascade exploits this by trying the cheap model first and escalating to the expensive one only when a confidence check, a verifier, or the small model's own self-report says the answer is inadequate. If the small model costs $c_S$ per call, the large model costs $c_L$, and a fraction $q$ of calls escalate, the expected cost per call under the cascade is</p>
+$$\mathbb{E}[c] = c_S + q\, c_L,$$
+<p>where the $c_S$ is paid on every call (the cheap attempt always runs) and the $c_L$ is paid only on the escalating fraction. When $c_S \ll c_L$ and $q$ is well below one, this expected cost sits far below the $c_L$ that a large-model-only fleet pays on every call. The design problem is to push $q$ down without letting quality fall, which is exactly the routing and confidence-estimation work of the orchestration layer in <a href="../../part-6-multi-agent-systems/module-32-distributed-agent-orchestration/index.html">Chapter 32</a>. A poorly calibrated router that escalates everything recovers the full large-model bill plus the wasted small-model attempts, so the cascade is only as good as its escalation decision.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Routing Cascade With a Caching Layer in a Few Lines</div>
+<p>From scratch a cascade needs a confidence gate, a fallback path, and a deduplicating cache keyed on the prompt; written out that is fifty lines of plumbing. A small wrapper collapses it to the policy itself, and a content-addressed cache (here an in-memory dictionary standing in for a shared Redis or a semantic store) removes the duplicate calls entirely:</p>
+<pre><code class="language-python">import functools, hashlib
+
+cache = {}                                  # in prod: Redis or a semantic vector cache
+
+def cached(fn):                             # whole-answer cache keyed on the prompt
+    @functools.wraps(fn)
+    def wrap(prompt):
+        key = hashlib.sha256(prompt.encode()).hexdigest()
+        if key in cache:
+            return cache[key]               # cache hit: zero model tokens billed
+        out = cache[key] = fn(prompt)
+        return out
+    return wrap
+
+@cached
+def answer(prompt):
+    small = call_small(prompt)              # cheap model first
+    if confidence(small) >= 0.8:            # router's escalation gate
+        return small
+    return call_large(prompt)               # escalate only the hard cases
+</code></pre>
+<div class="code-caption"><strong>Code 40.8.1:</strong> A small-then-large cascade behind a whole-answer cache. The <code>@cached</code> decorator removes repeated calls (cutting the effective $S$) and the <code>confidence</code> gate keeps the escalation rate $q$ low (cutting the effective $p$); the same two factors the model in Code 40.8.2 quantifies.</div>
+</div>
+
+<h2>4. Caching, Compression, and Loop Budgets <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Caching attacks the call count from two directions. Semantic caching stores whole answers and serves a near-identical future request from the store, so a cache hit costs only an embedding lookup rather than a full generation; if a fraction $h$ of calls hit and a hit costs a fraction $\beta$ of a full call, the effective billable call count falls to $R S (1 - h + h\beta)$, and the saving</p>
+$$\text{saving} = h(1 - \beta)$$
+<p>is close to $h$ whenever the lookup is cheap. Prefix and KV caching attack the same calls from inside: the long shared prefix of an agent prompt, the system instructions, tool schemas, and retrieved context, is encoded once and its key-value state reused across the loop, so the per-call input cost on a provider that bills cached input at a discount drops sharply. This is the fleet-scale return on the KV-cache and prefix-reuse machinery of <a href="../../part-5-distributed-inference/module-22-per-node-inference-efficiency/index.html">Chapter 22</a> and the distributed serving of <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>; a per-node efficiency that looked like a single-machine optimization is multiplied across every call of every agent in the fleet. Context compression complements caching by shrinking $t_{\text{in}}$ itself: summarizing history, pruning low-relevance retrieved chunks, and dropping verbose tool output trims the prompt that is billed on every loop step.</p>
+<p>The last lever is defensive rather than optimizing. An agent loop can run away, retrying, re-planning, and re-calling tools without converging, and a single runaway task can cost a thousand times a normal one. A hard step budget that caps $S$ at a maximum, combined with a token budget per task and a wall-clock timeout, bounds the worst case and protects the bill from the long tail. Because the cost model multiplies by $S$, capping $S$ caps the blast radius of any pathological agent directly. These budgets are the cost-side complement to the reliability budgets that the MLOps practice of <a href="../../part-5-distributed-inference/module-26-mlops-distributed-ai/index.html">Chapter 26</a> already tracks per service.</p>
+
+<h2>5. Putting the Levers Together <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The levers compose, and the only honest way to see how much they save is to model the whole product rather than reason about one factor at a time. Code 40.8.2 builds a fleet workload from the cost model of Section 1, then applies the cache of Section 4 and the cascade of Section 3 in sequence, reporting the cost after each. It is deliberately concrete: real per-million-token prices, a realistic loop length, and a context size in the low thousands.</p>
+<pre><code class="language-python">import math
+
+# ---- Fleet workload parameters (one day) ----
+tasks_per_day = 2_000_000        # agent tasks across the fleet in one day
+steps_per_task = 6               # mean LLM calls per agentic loop
+in_tokens = 1800                 # mean prompt tokens per call (long context + history)
+out_tokens = 350                 # mean generated tokens per call
+price_in_L, price_out_L = 3.00, 15.00        # large-model API price, USD / 1M tokens
+
+def call_cost(p_in, p_out, n_in, n_out):
+    return n_in * p_in / 1e6 + n_out * p_out / 1e6
+
+# Baseline: every call hits the large model.
+cost_call_L = call_cost(price_in_L, price_out_L, in_tokens, out_tokens)
+calls_per_day = tasks_per_day * steps_per_task
+baseline = calls_per_day * cost_call_L
+
+# Lever 1 - semantic cache: a fraction of calls answered from the store.
+cache_hit, cache_cost_frac = 0.35, 0.02
+eff_calls = calls_per_day * (1 - cache_hit + cache_hit * cache_cost_frac)
+after_cache = eff_calls * cost_call_L
+
+# Lever 2 - small-then-large cascade on the uncached calls.
+price_in_S, price_out_S = 0.15, 0.60
+escalation_rate = 0.25
+cost_call_S = call_cost(price_in_S, price_out_S, in_tokens, out_tokens)
+cost_call_cascade = cost_call_S + escalation_rate * cost_call_L   # E[c] = c_S + q c_L
+uncached = calls_per_day * (1 - cache_hit)
+cached_residual = calls_per_day * cache_hit * cache_cost_frac * cost_call_L
+after_cascade = uncached * cost_call_cascade + cached_residual
+
+# Lever 3 - context compression on the small model's prompt.
+compress = 0.55
+cost_call_S_c = call_cost(price_in_S, price_out_S, in_tokens * compress, out_tokens)
+after_all = uncached * (cost_call_S_c + escalation_rate * cost_call_L) + cached_residual
+
+for label, c in [("baseline (all large)", baseline), ("+ cache", after_cache),
+                 ("+ cache + cascade", after_cascade), ("+ all three levers", after_all)]:
+    print(f"{label:24s}: ${c:>10,.0f}/day   ({c/baseline-1:+.0%})")
+
+# Break-even: self-host the small model (spot GPU, Ch 33.8) vs the small-model API.
+gpu_hr_spot, node_calls_per_sec = 0.90, 9.0
+cap_day = node_calls_per_sec * 86400
+selfhost_per_call = (24 * gpu_hr_spot) / cap_day          # cost/call at full utilisation
+breakeven_util = selfhost_per_call / cost_call_S_c
+print(f"\nself-host cost/call (full): ${selfhost_per_call:.6f}")
+print(f"API cost/call (small)     : ${cost_call_S_c:.6f}")
+print(f"break-even node utilisation: {breakeven_util:.1%} of one node's capacity")
+</code></pre>
+<div class="code-caption"><strong>Code 40.8.2:</strong> A fleet cost model that applies a semantic cache, a small-then-large cascade, and context compression in sequence, then computes the break-even utilization at which self-hosting the small model on a spot GPU undercuts the small-model API. The expected-cost formula $\mathbb{E}[c] = c_S + q\,c_L$ from Section 3 is the line computing <code>cost_call_cascade</code>.</div>
+<pre><code class="language-text">baseline (all large)    : $   127,800/day   (+0%)
++ cache                 : $    83,965/day   (-34%)
++ cache + cascade       : $    25,406/day   (-80%)
++ all three levers      : $    24,458/day   (-81%)
+
+self-host cost/call (full): $0.000028
+API cost/call (small)     : $0.000358
+break-even node utilisation: 7.7% of one node's capacity
+</code></pre>
+<div class="code-caption"><strong>Output 40.8.2:</strong> The levers compose to an eighty-one percent cut, from $\$127{,}800$ to $\$24{,}458$ per day (about $\$37.7$ million saved per year). The cascade is the dominant move (the jump from minus thirty-four to minus eighty percent), and self-hosting the small model on spot pays off once a node runs above eight percent utilization, which at fleet volume it always does.</div>
+<p>Two results in Output 40.8.2 are worth dwelling on. First, the cascade, not the cache, is the dominant lever here, because the price gap between the small and large model is an order of magnitude and the small model handles three quarters of the uncached traffic; the cache and compression then trim what remains. Second, the break-even on self-hosting is extraordinarily low. A spot GPU node serving the small model costs a fraction of a cent per call at full utilization, far below the small-model API price, so any node kept busier than eight percent of its capacity is cheaper to own than to rent. This is the build-versus-buy crossover of <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/section-33.9.html">Section 33.9</a> made concrete: APIs win on small and bursty volume where you cannot keep a node busy, and self-hosting wins decisively once volume is steady and large, with spot capacity from <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/section-33.8.html">Section 33.8</a> widening the margin further.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: A Per-Node Optimization, Multiplied Across the Fleet</div>
+<p>The KV-cache paging and quantization of <a href="../../part-5-distributed-inference/module-22-per-node-inference-efficiency/index.html">Chapter 22</a> are, on one machine, modest single-node efficiencies. Scaled out across a fleet that makes billions of calls a day, the same optimizations become the difference between a sustainable service and one that loses money on every task. Cost is where scale-up and scale-out meet: per-node efficiency sets the unit price, and the fleet multiplies it by the call count. The book's spine, that distribution multiplies whatever happens on one node, applies to dollars exactly as it applies to gradients and tokens, which is why cost-per-task earns a place beside latency and throughput in the system metrics of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Support Fleet That Halved Its Bill Before Lunch</div>
+<p><strong>Who:</strong> A platform team running a customer-support agent fleet for a software vendor.</p>
+<p><strong>Situation:</strong> The fleet handled roughly two million ticket-resolution tasks a day, each a six-step agent loop, every call routed to the largest available model for safety.</p>
+<p><strong>Problem:</strong> The monthly inference bill crossed four million dollars and was growing faster than ticket volume, because longer conversation histories were inflating the input tokens on every loop step.</p>
+<p><strong>Dilemma:</strong> Drop to a cheaper model fleet-wide and risk quality regressions on the hard tickets, or keep the large model and accept a bill that finance had flagged as unsustainable.</p>
+<p><strong>Decision:</strong> Neither extreme. They installed a cascade that sent every call to a small model first and escalated only on a calibrated confidence gate, fronted by a semantic cache for the many near-duplicate tickets, and added a summarization pass that compressed conversation history.</p>
+<p><strong>How:</strong> The change was the structure of Code 40.8.1 wrapped around their existing agent, plus the prompt-caching discount their provider already offered for the shared system prefix; the escalation gate was tuned on a held-out set of tickets to hold quality within a percent of the all-large baseline.</p>
+<p><strong>Result:</strong> The cache absorbed about a third of calls, the cascade kept three quarters of the rest on the small model, and the bill fell roughly eighty percent, tracking the Output 40.8.2 model closely, with resolution quality statistically unchanged.</p>
+<p><strong>Lesson:</strong> The biggest savings came from the cheapest engineering. Routing and caching, both a few days of work, moved the multiplied factors of the cost product; tuning output length, the factor the team noticed first, would have moved almost nothing.</p>
+</div>
+
+<h2>6. Self-Hosting Versus the API at Fleet Scale <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The break-even line in Output 40.8.2 generalizes into the build-versus-buy decision that every fleet eventually faces. An API charges a fixed price per token and scales perfectly to zero, so it is unbeatable for low or spiky volume where owned hardware would sit idle. Self-hosting converts that variable per-token cost into a fixed hourly cost for GPU nodes, which is only worthwhile when the nodes stay busy. The crossover is a utilization threshold: if a node serving the small model costs $H$ dollars per hour and serves a capacity of $\kappa$ calls per hour, its marginal cost per call at full load is $24H/(\kappa \cdot 24) = H/\kappa$, and self-hosting beats the API once</p>
+$$\frac{H}{\kappa} < c_{\text{API}} \quad\Longleftrightarrow\quad u > \frac{H/\kappa}{c_{\text{API}}},$$
+<p>where $u$ is the fraction of capacity actually used. Output 40.8.2 puts that threshold near eight percent, which a steady fleet clears easily, so the strategic pattern is to keep the large frontier model on the API (it is hard to host, used rarely after the cascade, and changes often) while self-hosting the small workhorse model that absorbs the bulk of the traffic. Spot and preemptible capacity from <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/section-33.8.html">Section 33.8</a> lowers $H$ further, and the quantized, batched serving of <a href="../../part-5-distributed-inference/module-22-per-node-inference-efficiency/index.html">Chapter 22</a> raises $\kappa$, so both terms of the crossover move in the self-hoster's favor as volume grows. The full treatment of when to own the stack lives in <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/section-33.9.html">Section 33.9</a>; here the point is that the cost model tells you exactly where the line sits for your own numbers.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Learned Routing and Cascades (2024 to 2026)</div>
+<p>The escalation gate in Code 40.8.1 is the active research object of the moment. RouteLLM (Ong et al., 2024) trains a router that predicts, per query, whether a small model will match a large one, reporting large cost reductions at matched quality on public benchmarks; FrugalGPT (Chen et al., 2023) framed the cascade-of-models idea that this line extends. A parallel thread studies model-level cost optimization end to end: speculative decoding that drafts with a small model and verifies with a large one, prompt compression methods such as LLMLingua that shrink $t_{\text{in}}$ with a learned compressor, and semantic caches (GPTCache and successors) that decide hits by embedding similarity rather than exact match. The open problems are calibration under distribution shift, so the router does not silently route hard new queries to the weak model, and routing across a heterogeneous fleet of self-hosted and API models at once. The economic stakes are high enough that cost-per-task is becoming a reported metric in serving papers, alongside the latency and throughput the field already tracks.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Reflection Loop That Reflected on the Budget</div>
+<p>A team once shipped an agent whose self-critique step was instructed to "keep improving the answer until it is excellent." Excellence being unbounded, the agent reflected, revised, reflected again, and on a few unlucky tasks looped for hundreds of steps, each one a full large-model call, before a human noticed the spend graph bending upward. The fix was one line: a hard cap on the loop count. The agent's answers were no worse for being told to stop, and the budget meeting was considerably shorter.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 40.8.1: Which Factor to Cut First <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A fleet runs $R$ tasks with mean loop length $S = 8$, context $t_{\text{in}} = 4000$, output $t_{\text{out}} = 200$, on a single large model. A manager proposes cutting output length to $100$ tokens to save money. Using the cost model $C = R \cdot S \cdot (t_{\text{in}} p_{\text{in}} + t_{\text{out}} p_{\text{out}})$ with $p_{\text{in}} = \$3$ and $p_{\text{out}} = \$15$ per million tokens, compute the percentage cost reduction from the manager's proposal. Then compute the reduction from instead halving $S$ with a step budget, or routing eighty percent of calls to a model that is ten times cheaper. Rank the three interventions and explain, in terms of which factor each touches, why the manager's instinct was the weakest of the three.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 40.8.2: Tune the Cascade and Cache <span class="exercise-type coding">Coding</span></div>
+<p>Starting from Code 40.8.2, treat the cache hit rate $h$ and the escalation rate $q$ as variables and sweep each over a realistic range (for example $h \in [0.1, 0.6]$ and $q \in [0.1, 0.5]$). Plot or tabulate the daily cost surface, and find the combination that hits a target of below twenty thousand dollars per day. Then add a quality penalty: assume each percentage point of escalation rate below a baseline $q_0 = 0.30$ costs one point of task accuracy, and find the lowest-cost configuration that keeps accuracy within two points of the all-large baseline. Report the cost and the quality trade-off, and state which lever you would push first given your numbers.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 40.8.3: Where Is the Self-Hosting Line <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the break-even relation $u > (H/\kappa)/c_{\text{API}}$ from Section 6, compute the break-even utilization for three cases: (a) an on-demand node at $H = \$2.50$ per hour, (b) a spot node at $H = \$0.90$ per hour, and (c) the spot node after quantization doubles $\kappa$. Take $\kappa = 9 \times 3600$ calls per hour and the small-model API price from Code 40.8.2. Then argue, with reference to <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/section-33.9.html">Section 33.9</a>, why a fleet would still keep its frontier model on the API even when self-hosting the small model is obviously cheaper, and what operational risk from <a href="../../part-7-infrastructure/module-33-cluster-infrastructure-scheduling/section-33.8.html">Section 33.8</a> the spot-priced break-even quietly assumes away.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-40.7.html"><span class="nav-label">Previous</span><span class="nav-num">Section 40.7</span><span class="nav-title">Distributed Model Serving with vLLM</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 40</span><span class="nav-num">Contents</span><span class="nav-title">Distributed LLM and Agentic Applications</span></a>
+<a class="next" href="section-40.9.html"><span class="nav-label">Next</span><span class="nav-num">Section 40.9</span><span class="nav-title">Evaluation</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

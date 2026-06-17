@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 10.8: Large-Batch Training and Learning-Rate Scaling. How adding workers grows the global batch, why the linear scaling rule with warmup keeps training stable, and where the critical batch size caps the speedup." name="description"/>
+<title>Section 10.8: Large-Batch Training and Learning-Rate Scaling | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Distributed Machine Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 10: Distributed Optimization</a></div>
+<h1>Large-Batch Training and Learning-Rate Scaling</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"They gave me a thousand friends to share the work, then doubled my step size to match. For a while I sprinted. Then I tripped over my own enthusiasm and they invented warmup."</p>
+<cite>An Optimizer That Scaled Its Learning Rate</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>In synchronous distributed SGD, every worker you add enlarges the global batch, and the global batch is the single knob that couples your hardware budget to your optimizer's stability.</strong> Adding workers does not change the math of the gradient (it stays the exact average from <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>); it changes the statistics of each update by averaging over more examples. A larger, lower-variance gradient invites a larger step, and the linear scaling rule makes that precise: raise the learning rate in proportion to the batch, warm it up so the early steps do not diverge, and a $K$-worker run tracks the small-batch run almost exactly, until you cross the critical batch size, past which more workers stop buying convergence speed. This section is about that coupling: how to ride it, and where it runs out.</p>
+</div>
+<p>The previous section reduced the bytes moved per synchronization step. This one asks a complementary question: as you add workers to a synchronous data-parallel job, what actually changes for the optimizer, and how do you keep it converging? The answer is entirely about batch size. With $K$ workers each computing a gradient over a local batch of $B_{\text{loc}}$ examples and an all-reduce averaging them, the optimizer sees one update built from a global batch of $B = K \, B_{\text{loc}}$ examples. Doubling the worker count doubles $B$. Everything stable and everything fragile about large-scale synchronous training follows from that one identity, so we start there and build outward to the rules that tame it.</p>
+
+<h2>1. More Workers Means a Bigger Batch, Which Is Weak Scaling <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Hold the per-worker batch fixed and add workers: the global batch grows linearly, and the number of optimizer updates per pass over the data shrinks by the same factor. This is the defining signature of weak scaling, where the total problem size grows with the worker count rather than staying fixed, the regime introduced in <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.3.html">Section 3.3</a>. Strong scaling would keep the global batch constant and shrink each worker's share, which quickly starves the accelerators; the dominant practice in distributed training is instead to keep each accelerator well-fed at a fixed local batch and let the global batch expand. So the question "how many workers?" is, for the optimizer, identical to the question "how large a batch can I train with and still converge well?"</p>
+<p>That equivalence is why this topic belongs in a chapter on optimization rather than systems. The communication machinery (the all-reduce of <a href="../../part-1-foundations/module-04-communication-primitives/index.html">Chapter 4</a>) is indifferent to batch size; it averages whatever gradients it is given. The optimizer is not indifferent. A gradient averaged over $B$ examples is an estimate of the true gradient whose variance falls roughly like $1/B$. Larger batches give cleaner gradients, and a cleaner gradient is one you can trust to take a larger step along. The rest of this section turns that intuition into a rule, then shows where the rule breaks.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Worker Count Is a Batch-Size Knob in Disguise</div>
+<p>In synchronous data-parallel SGD with a fixed per-worker batch, the global batch size is $B = K \, B_{\text{loc}}$, so choosing the number of workers $K$ <em>is</em> choosing the batch size. Communication averages the gradients exactly regardless of $K$; what changes with $K$ is the variance of each update and therefore the step size the optimizer can safely take. Every large-batch training decision is really a decision about how the optimizer should respond to a lower-variance gradient.</p>
+</div>
+
+<h2>2. The Linear Scaling Rule and Why Warmup Is Mandatory <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The practical recipe that made large-batch training routine is the linear scaling rule of Goyal et al. (2017): when you multiply the batch size by a factor, multiply the learning rate by the same factor. Concretely, if a reference batch $B_0$ trains well at learning rate $\eta_0$, then a batch of size $B$ should use</p>
+$$\eta = \eta_0 \cdot \frac{B}{B_0}.$$
+<p>The heuristic behind it is short. Take $K$ consecutive small-batch SGD steps with learning rate $\eta_0$ on batches $\mathcal{B}_1, \dots, \mathcal{B}_K$. If the parameters barely move across those $K$ steps, the gradients are evaluated at nearly the same point, and the net update is approximately $-\eta_0 \sum_{j=1}^{K} \nabla \ell_{\mathcal{B}_j}(w)$. One large-batch step on the union $\mathcal{B}_1 \cup \dots \cup \mathcal{B}_K$ with learning rate $\eta$ produces $-\eta \cdot \frac{1}{K}\sum_{j=1}^{K}\nabla \ell_{\mathcal{B}_j}(w)$. Matching the two requires $\eta = K \eta_0$, exactly the linear rule. The rule is an approximation, and it names its own failure mode: it holds only while the assumption "the parameters barely move" holds.</p>
+<p>Early in training the parameters move a great deal, the loss surface is steep and curved, and the linear-rule learning rate (now $K$ times larger) overshoots and can diverge on the very first steps. The fix is a warmup: start the learning rate small and ramp it linearly to the scaled value over the first few hundred updates, by which point the parameters have settled into a region where the matching argument is valid. Warmup is not a cosmetic safety margin; it is the repair for the one place the derivation is known to be invalid. Skip it at large $K$ and the run frequently diverges before it begins.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Rule That Survived by Admitting Its Own Flaw</div>
+<p>The linear scaling rule is unusual among deep-learning heuristics because it ships with the exact conditions under which it fails written into its derivation. Most rules of thumb pretend to be universal and quietly disappoint you. This one says, in effect, "I work whenever the weights are not moving much, which is everywhere except the start, so please warm me up at the start." Engineers trust it precisely because it does not oversell.</p>
+</div>
+
+<h2>3. The Critical Batch Size: Where Adding Workers Stops Helping <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The linear scaling rule cannot hold forever, because no fixed number of training examples needs an unboundedly large step. Below some threshold, doubling the batch (and the learning rate) roughly halves the number of optimizer steps to a target loss, so you reach the target in about the same number of passes over the data and the extra workers translate into real speedup. Above that threshold, doubling the batch no longer halves the steps; the gradient is already clean enough that lowering its variance further does little, and you are in the regime of diminishing returns. McCandlish et al. (2018) named this threshold the <em>critical batch size</em> and gave it a predictor: it scales with the gradient noise scale, a measurable ratio of gradient variance to gradient magnitude that tends to grow as training proceeds.</p>
+<p>The critical batch size is the optimization counterpart of the serial bottleneck in <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.5.html">Section 3.5</a>: just as Amdahl's law caps speedup once the parallelizable fraction is exhausted, the critical batch size caps useful worker count once the gradient-variance reduction is exhausted. Past it, adding workers grows the batch beyond what the optimizer can convert into faster convergence, so wall-clock-per-epoch keeps falling but epochs-to-target stops falling, and total time-to-train flattens or worsens. Knowing roughly where this knee sits for your model is what separates a worker count that pays for itself from one that burns budget. Figure 10.8.1 sketches the shape.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two curves of steps-to-target loss versus global batch size on log-log axes. The naive fixed-learning-rate curve climbs steeply with batch size. The linear-scaling-rule curve descends along an ideal one-over-batch line, then bends upward at a marked critical batch size, forming a knee.">
+<defs>
+<marker id="arr108" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.ax108 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr108); }
+.t108 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s108 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.good108 { fill:none; stroke:#1f7a3d; stroke-width:2.6; }
+.bad108 { fill:none; stroke:#b8341f; stroke-width:2.6; stroke-dasharray:7 4; }
+.ideal108 { fill:none; stroke:#5a626c; stroke-width:1.4; stroke-dasharray:3 4; }
+.knee108 { fill:none; stroke:#b86b1f; stroke-width:1.6; stroke-dasharray:5 4; }
+</style>
+<line class="ax108" x1="90" y1="320" x2="800" y2="320"/>
+<line class="ax108" x1="90" y1="320" x2="90" y2="50"/>
+<text class="t108" x="445" y="362">global batch size B  (more workers &#8594;)</text>
+<text class="t108" x="28" y="185" transform="rotate(-90 28 185)">steps to target loss</text>
+<!-- ideal 1/B reference line -->
+<path class="ideal108" d="M 130 90 L 700 300"/>
+<text class="s108" x="250" y="120">ideal: steps &#8733; 1/B</text>
+<!-- linear-scaling-rule curve: tracks ideal then knees up -->
+<path class="good108" d="M 130 95 C 300 175, 470 250, 560 270 C 620 283, 660 270, 720 210"/>
+<!-- naive fixed-lr curve: climbs with batch -->
+<path class="bad108" d="M 130 150 C 280 135, 420 120, 540 105 C 640 92, 710 82, 760 72"/>
+<!-- critical batch marker -->
+<line class="knee108" x1="585" y1="70" x2="585" y2="320"/>
+<text class="t108" x="585" y="60">critical batch size</text>
+<circle cx="560" cy="270" r="4.5" fill="#1f7a3d"/>
+<text class="s108" x="690" y="248">scaled LR: more</text>
+<text class="s108" x="690" y="264">workers stop helping</text>
+<text class="s108" x="660" y="120">naive fixed LR:</text>
+<text class="s108" x="660" y="136">batch hurts convergence</text>
+<text class="s108" x="240" y="300">scaled LR tracks</text>
+<text class="s108" x="240" y="316">the 1/B speedup here</text>
+</svg>
+<figcaption><strong>Figure 10.8.1:</strong> Steps-to-target versus global batch size on log-log axes. With the linear scaling rule plus warmup (solid green), steps fall along the ideal $1/B$ line, so each added worker buys real speedup, until the curve bends up at the critical batch size and further workers stop helping. With a naive fixed learning rate (dashed red), enlarging the batch reduces the updates per epoch without compensating, so steps-to-target climb and convergence degrades. The knee, not the hardware budget, sets the useful worker count.</figcaption>
+</figure>
+
+<h2>4. A From-Scratch Demonstration of the Knee <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The claims above are testable in pure Python without any cluster. The code below trains a logistic-regression model with plain mini-batch SGD on a fixed synthetic dataset, sweeping the global batch from 32 to 4096. For each batch it measures epochs-to-target-loss twice: once with a fixed learning rate (the naive baseline) and once with the linear scaling rule plus warmup. Counting epochs (passes over the data) is the right cost unit, because a larger batch means fewer optimizer updates per epoch, so a fixed learning rate makes less progress per pass while the scaled rule compensates.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+N, d = 20_000, 30
+X = rng.standard_normal((N, d))
+w_star = rng.standard_normal(d)
+p = 1.0 / (1.0 + np.exp(-(X @ w_star)))
+y = (rng.random(N) < p).astype(np.float64)        # noisy binary labels
+
+def loss_grad(w, Xb, yb):
+    pr = 1.0 / (1.0 + np.exp(-(Xb @ w)))
+    g = Xb.T @ (pr - yb) / len(yb)
+    L = -np.mean(yb*np.log(pr+1e-12) + (1-yb)*np.log(1-pr+1e-12))
+    return L, g
+
+full_loss = lambda w: loss_grad(w, X, y)[0]
+
+# Demanding target a little above the optimum, so reaching it takes many epochs.
+w_opt = np.zeros(d)
+for _ in range(4000):
+    w_opt -= loss_grad(w_opt, X, y)[1]
+TARGET = full_loss(w_opt) + 0.010
+
+base_bs, base_lr, MAX_EPOCHS = 32, 0.05, 80          # reference batch and its tuned lr
+
+def epochs_to_target(B, scale_lr):
+    lr = base_lr * (B / base_bs) if scale_lr else base_lr   # linear scaling rule
+    warmup = 5 * max(1, B // base_bs) if scale_lr else 0    # warmup grows with scaling
+    w, steps = np.zeros(d), 0
+    for epoch in range(1, MAX_EPOCHS + 1):
+        perm = rng.permutation(N)
+        for s in range(0, N, B):
+            _, g = loss_grad(w, X[perm[s:s+B]], y[perm[s:s+B]])
+            cur = lr * (steps+1)/warmup if warmup and steps < warmup else lr
+            if not np.all(np.isfinite(g)): return None       # diverged
+            w -= cur * g
+            steps += 1
+        if full_loss(w) <= TARGET:
+            return epoch
+    return None                                              # never reached target
+
+for B in [32, 64, 128, 256, 512, 1024, 2048, 4096]:
+    ef = epochs_to_target(B, scale_lr=False)
+    es = epochs_to_target(B, scale_lr=True)
+    fmt = lambda e: "&gt;80 (stalled)" if e is None else str(e)
+    print(f"{B:&gt;6} | fixed-lr {fmt(ef):&gt;13} | scaled-lr {fmt(es):&gt;13}")
+</code></pre>
+<div class="code-caption"><strong>Code 10.8.1:</strong> Pure-NumPy sweep of global batch size, comparing a fixed learning rate against the linear scaling rule with warmup. The cost metric is epochs-to-target so that fewer-updates-per-epoch at large batch is counted fairly. The same dataset and target are reused for every batch, so differences are attributable to the optimizer schedule alone.</div>
+<pre><code class="language-text">    32 | fixed-lr             2 | scaled-lr             2
+    64 | fixed-lr             4 | scaled-lr             2
+   128 | fixed-lr             8 | scaled-lr             3
+   256 | fixed-lr            16 | scaled-lr             3
+   512 | fixed-lr            31 | scaled-lr             4
+  1024 | fixed-lr            61 | scaled-lr             6
+  2048 | fixed-lr &gt;80 (stalled) | scaled-lr            11
+  4096 | fixed-lr &gt;80 (stalled) | scaled-lr            22
+</code></pre>
+<div class="code-caption"><strong>Output 10.8.1:</strong> The fixed learning rate degrades monotonically: epochs-to-target double with every doubling of the batch, then stall past 1024 because too few updates per epoch make no progress. The scaled learning rate stays cheap and roughly flat through batch 512, the regime where each added worker buys speedup, then bends upward (6, 11, 22 epochs at 1024, 2048, 4096), the critical-batch knee where more workers stop helping even with correct scaling.</div>
+<p>Read the two columns together and the story of this section is in the numbers. The naive column shows why you cannot simply pour workers into a synchronous job and hope: without scaling the learning rate, a bigger batch is strictly worse. The scaled column shows the linear rule doing its job, holding epochs-to-target nearly constant while the batch grows eightfold, then the same column reveals the knee, where even correct scaling cannot recover the $1/B$ ideal because the gradient is already low-variance. The flattening past batch 512 is the demonstration, in miniature, that the useful worker count is bounded by the optimization problem, not by the cluster you can rent.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Scale-Out Reaches an Optimization Ceiling, Not Only a Communication One</div>
+<p>Earlier chapters argued that communication is the tax on scale-out. This section adds a second, independent ceiling that no faster network can lift: the critical batch size. Even with free, instant all-reduce, a synchronous data-parallel job stops converging faster once the global batch passes the knee, because the optimizer cannot use a cleaner gradient it already has. Distribution buys speed only while two separate budgets last, the communication budget of <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.5.html">Section 3.5</a> and the batch-size budget here, and a well-designed training run respects whichever binds first.</p>
+</div>
+
+<h2>5. Layer-Wise Adaptive Methods: Pushing the Knee Outward <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The critical batch size is not a hard constant; it depends on the optimizer. The linear scaling rule applies one global learning rate to every parameter, but in deep networks the ratio of update magnitude to weight magnitude varies enormously across layers, and at very large batch a single global rate is simultaneously too large for some layers and too small for others, which is what makes naive scaling diverge well before the statistical knee. Layer-wise adaptive methods attack this directly by giving each layer its own effective step. LARS (You, Gitman, Ginsburg, 2017) rescales each layer's update so its norm is a fixed fraction of that layer's weight norm, which let ResNet-style networks train at batches in the tens of thousands. LAMB (You et al., 2019) carries the same trust-ratio idea into the Adam family and is the method that trained BERT to its target in 76 minutes at a batch of 32k, a result that would diverge instantly under a single global linearly-scaled rate.</p>
+<p>The lesson for distributed training is that the optimizer choice sets how far you can scale out before the knee bites. Plain momentum SGD with linear scaling and warmup is robust to moderate batches; LARS and LAMB extend the usable range by an order of magnitude or more for the architectures they were designed for, by replacing one fragile global step with many self-calibrated per-layer steps. They do not abolish the critical batch size, they relocate it, which is exactly the leverage you want when the alternative is leaving expensive accelerators underused.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Pretraining Run That Hit a Wall at 4096</div>
+<p><strong>Who:</strong> A research engineer pretraining a mid-size language model on a 64-GPU pod.</p>
+<p><strong>Situation:</strong> Throughput was excellent at a global batch of 1024, and the team wanted to use all 64 GPUs at a local batch of 64, pushing the global batch to 4096.</p>
+<p><strong>Problem:</strong> Applying the linear scaling rule alone, the run diverged in the first few hundred steps, and when warmup was lengthened it converged but needed nearly four times the epochs, erasing the speedup.</p>
+<p><strong>Dilemma:</strong> Cap the job at 1024 and leave 48 GPUs idle, or find an optimizer that converts the larger batch into real progress rather than wasted passes.</p>
+<p><strong>Decision:</strong> They switched the optimizer to LAMB with a longer warmup, on the hypothesis that the divergence was a per-layer step-size mismatch, not a fundamental critical-batch limit at 4096.</p>
+<p><strong>How:</strong> They kept the data-parallel all-reduce unchanged and swapped only the optimizer and its warmup schedule, then measured epochs-to-target at batches 1024, 2048, and 4096 before committing to a full run.</p>
+<p><strong>Result:</strong> At 4096 the LAMB run converged in close to the same epoch count as the 1024 baseline, recovering most of the 4x throughput and keeping the pod fully utilized; the team had relocated the knee, not crossed it.</p>
+<p><strong>Lesson:</strong> When large-batch scaling stalls, the first question is whether the optimizer or the optimization problem is the limit. A layer-wise adaptive method often buys another factor of batch before the true critical size, as Output 10.8.1's knee, applies.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Linear Scaling and Warmup in a Few Lines</div>
+<p>Code 10.8.1 implemented the scaling rule and warmup by hand. In a real PyTorch job you set the scaled learning rate once from the world size and let a scheduler handle warmup, while <code>DistributedDataParallel</code> supplies the global batch by averaging gradients across workers. The whole recipe is a handful of lines:</p>
+<pre><code class="language-python"># Run with: torchrun --nproc_per_node=8 train.py
+import torch, torch.distributed as dist
+from torch.optim.lr_scheduler import LinearLR
+
+dist.init_process_group("nccl")
+K = dist.get_world_size()                         # number of workers == batch multiplier
+
+base_lr, base_bs = 0.05, 32
+lr = base_lr * (K * local_bs) / base_bs           # linear scaling rule from the world size
+opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+
+# Linear warmup over the first 500 steps, then hold the scaled rate.
+warmup = LinearLR(opt, start_factor=1/K, total_iters=500)
+# model = DistributedDataParallel(model)  # averages gradients -> global batch K*local_bs
+</code></pre>
+<div class="code-caption"><strong>Code 10.8.2:</strong> The linear scaling rule plus warmup expressed with stock PyTorch utilities. The roughly twenty lines of manual schedule logic in Code 10.8.1 collapse to a one-line learning-rate formula and a built-in <code>LinearLR</code> warmup; for LARS or LAMB you swap the optimizer for the implementation in NVIDIA Apex or a comparable library, with no change to the data-parallel loop.</div>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Predicting the Knee and Scaling the Optimizer (2024 to 2026)</div>
+<p>Two recent lines sharpen this section's themes. The first is the maximal-update parametrization, muP, and its descendants, which reparametrize a network so that the optimal learning rate is stable across model widths; this lets practitioners tune the learning rate on a small proxy model and transfer it to a large one without re-searching, and recent work (Everett et al., 2024) extends such hyperparameter transfer jointly across width, depth, and batch size, directly easing the large-batch tuning problem this section describes. The second revisits the critical batch size itself for modern language-model pretraining: studies through 2024 to 2025 measure how the critical batch grows with dataset and model size and with the gradient noise scale of McCandlish et al., refining when extra data-parallel workers still pay. A parallel current explores optimizers such as Muon and Lion that claim better large-batch behavior than AdamW, effectively trying to push the knee of Output 10.8.1 further right. The open question is no longer whether a critical batch exists, but how to predict its location cheaply before committing a full pod to a run.</p>
+</div>
+
+<h2>6. The Practical Ceiling and What Comes Next <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Putting the pieces together gives a sober rule for sizing a synchronous data-parallel job. Add workers while the global batch stays below the critical size, scaling the learning rate linearly and warming it up, and use a layer-wise adaptive optimizer if a single global rate begins to diverge before the statistical knee. Stop adding workers near the knee, because past it the extra hardware reduces per-epoch wall-clock without reducing epochs-to-target, so total training time stops improving and cost rises with no return, an Amdahl-shaped ceiling on the optimization side to match the communication-side ceiling of <a href="../../part-1-foundations/module-03-scalability-performance-models/section-3.5.html">Section 3.5</a>. The useful worker count is the smaller of what your network can sustain and what your optimizer can absorb, and Output 10.8.1 shows the second limit can bind well before the first.</p>
+<p>We have treated communication as something to minimize and batch size as something to bound, but we have not yet asked how little communication is fundamentally required to optimize across machines, regardless of cleverness. That lower-bound question, how many bits and rounds any distributed optimizer must pay, is the subject of the next section. It turns the engineering trade-offs of this chapter into the theory that says which of them are avoidable and which are laws.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.8.1: Derive the Rule, Name Its Assumption <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Reproduce the matching argument of Section 2 in your own notation: write the net parameter change of $K$ small-batch SGD steps at learning rate $\eta_0$, write one large-batch step on the union at learning rate $\eta$, and show that equating them requires $\eta = K\eta_0$. State precisely the assumption that makes the two expressions comparable, and explain why that assumption is violated at the start of training but not in the middle. Use this to argue, without any experiment, why warmup is needed at the start specifically and not throughout.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.8.2: Find the Knee, Then Move It <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 10.8.1 in two ways. First, for each batch size also record the final loss reached within the epoch budget, and plot epochs-to-target against batch size on log-log axes to locate the knee numerically for this dataset. Second, replace the global learning rate with a crude per-coordinate trust ratio (scale each coordinate's step by the ratio of the weight magnitude to the gradient magnitude in that coordinate, as a LARS-style proxy) and re-measure. Report whether the knee moves to a larger batch, and explain the result in terms of why a single global rate is too large for some directions and too small for others.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.8.3: Cost Out the Critical Batch <span class="exercise-type analysis">Analysis</span></div>
+<p>Suppose a model has a critical batch size of 2048 examples, each worker holds a fixed local batch of 64, one optimizer step takes 200 ms of compute plus a 50 ms all-reduce that does not change with worker count, and reaching the target needs $2 \times 10^5$ examples processed below the knee. Estimate total time-to-train at 8, 32, and 64 workers, assuming epochs-to-target stays flat up to the critical batch and then doubles for each further doubling beyond it (as in Output 10.8.1). Identify the worker count that minimizes time-to-train, and explain why buying more workers past it is wasted money even though per-epoch wall-clock keeps falling.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-10.7.html"><span class="nav-label">Previous</span><span class="nav-num">Section 10.7</span><span class="nav-title">Communication-Efficient Optimization</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 10</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Optimization</span></a>
+<a class="next" href="section-10.9.html"><span class="nav-label">Next</span><span class="nav-num">Section 10.9</span><span class="nav-title">Communication Complexity and Lower Bounds</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

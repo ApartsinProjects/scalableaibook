@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 11.1: Motivation for Parameter Servers. Why a centralized, sharded store of model parameters was invented, where all-reduce SGD struggles, and how pull-push access to server-held parameters makes asynchronous and sparse updates natural." name="description"/>
+<title>Section 11.1: Motivation for Parameter Servers | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Distributed Machine Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 11: Parameter Servers and Distributed Embeddings</a></div>
+<h1>Motivation for Parameter Servers</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"All-reduce kept asking me to hand it my whole self every step. I have a billion coordinates and most of them did not change. So I moved into a server and let the workers come to me for the few that did."</p>
+<cite>A Parameter Server Under Mild Staleness</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A parameter server keeps the model's parameters on dedicated, sharded server nodes, and lets workers pull the parameters they need and push gradients back, so that training a model too large to replicate, or too sparse to touch fully each step, becomes natural rather than wasteful.</strong> The all-reduce data parallelism of <a href="../module-10-distributed-optimization/section-10.5.html">Section 10.5</a> assumes every worker can hold a full copy of the model and exchange the full gradient every step. That assumption breaks for the two workloads that dominate industrial machine learning: models whose parameters are larger than any single worker's memory, and models so sparse that each step reads a vanishing fraction of them. This section explains why a centralized, sharded store of parameters was invented to answer both, where it still wins today, and how the rest of the chapter builds it out.</p>
+</div>
+<p>By the end of <a href="../module-10-distributed-optimization/index.html">Chapter 10</a> we had a clean and powerful picture of distributed training: every worker holds a full copy of the model, each computes a gradient on its own data shard, and a single all-reduce averages those gradients so that every worker steps in lockstep on the exact full-batch direction. That design is symmetric and elegant, and for dense models that fit comfortably on one device it is the right answer; <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a> turns it into the production training loop. The parameter server exists because two enormous and very common model families violate the assumptions underneath that picture, and violate them so badly that all-reduce stops being merely suboptimal and becomes impossible.</p>
+
+<h2>1. Where All-Reduce Data Parallelism Runs Out <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>All-reduce SGD rests on two quiet assumptions. The first is that every worker can store a full replica of the model: the parameters, and during the backward pass the gradient of every parameter. The second is that the natural unit of communication is the dense full-model gradient, summed coordinate by coordinate across workers each step. Both assumptions are true for a ResNet or a modestly sized transformer. Both are false for the models that run the largest machine learning services on earth.</p>
+<p>Consider the embedding table at the heart of a recommendation or ranking system. Every user identifier, every item identifier, every categorical feature value is mapped to a learned vector, and the number of distinct values runs into the hundreds of millions or billions. A table with $10^9$ rows and a $128$-dimensional embedding holds $1.28 \times 10^{11}$ parameters, roughly half a terabyte at four bytes each. No single accelerator, and few single servers, can hold that. Replicating it on every worker, as all-reduce demands, is out of the question before training even starts.</p>
+<p>Now look at what one training step actually touches. A batch of a few thousand interactions references at most a few thousand distinct users and items, so it reads and updates a few thousand of the billion rows. The gradient for that step is overwhelmingly zero: it is exact, but it is sparse, with only a minute fraction of coordinates nonzero. All-reduce, which sums dense vectors coordinate by coordinate, would communicate the entire half-terabyte gradient (almost all of it zeros) on every step. The communication cost would dwarf the useful work by a factor of a million. The two failures compound: the model is too big to replicate, and the gradient is too sparse to justify dense exchange.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Two Independent Failures, One Shared Cure</div>
+<p>All-reduce data parallelism assumes a model small enough to replicate on every worker and dense enough that exchanging the whole gradient each step is worthwhile. Huge embedding tables break the first assumption (they do not fit), and sparse access breaks the second (each step touches almost nothing). A parameter server cures both at once by never replicating the model and never moving coordinates a worker did not ask for: parameters live in one logical place, sharded across servers, and workers pull and push only the slices they touch.</p>
+</div>
+
+<h2>2. The Parameter-Server Answer <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The idea is to stop treating the model as something every worker owns a copy of, and instead treat it as a shared data structure that lives on its own machines. Dedicated server nodes hold the authoritative parameters. Because the full table is far too large for one server, it is partitioned across many: each server holds a disjoint shard of the rows, so that the combined memory of the server fleet, not of any one node, bounds the model size. Workers hold no permanent copy of the model at all. Instead, each step they perform two operations against the servers. They <em>pull</em> the specific parameters their current batch needs, a handful of embedding rows out of billions. They compute the forward and backward pass locally, producing a sparse gradient over exactly those rows. Then they <em>push</em> that sparse gradient back, and the servers apply it to their shards.</p>
+<p>This push-pull pattern, the subject of <a href="section-11.2.html">Section 11.2</a>, is what makes both hard cases easy. Sparsity is handled for free: a worker pulls and pushes only the rows it touched, so communication scales with the access pattern of the batch rather than with the size of the model. Asynchrony is handled naturally too. Because the servers hold the single authoritative copy and apply each push as it arrives, there is no barrier forcing all workers to finish a step together. A fast worker can pull, compute, and push again while a slow worker is still on its previous step, exactly the asynchronous SGD whose convergence behavior we studied in <a href="../module-10-distributed-optimization/section-10.4.html">Section 10.4</a>. The structure that makes the parameter server attractive for large sparse models is the same structure that lets it tolerate stragglers without a global wait.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of three workers exchanging parameters with three sharded parameter servers. Each worker pulls a few parameter rows and pushes a sparse gradient back. The parameter table is split into three shards, one per server.">
+<defs>
+<marker id="arrPull" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#1f6f43"/></marker>
+<marker id="arrPush" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.srv11 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.wk11 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.t11 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s11 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.pull11 { fill:none; stroke:#1f6f43; stroke-width:1.8; marker-end:url(#arrPull); }
+.push11 { fill:none; stroke:#b86b1f; stroke-width:1.8; stroke-dasharray:5 3; marker-end:url(#arrPush); }
+</style>
+<text class="t11" x="430" y="26">Sharded parameter servers: one logical model, split across nodes</text>
+<rect class="srv11" x="120" y="44" width="180" height="62" rx="9"/>
+<text class="t11" x="210" y="70">Server A</text>
+<text class="s11" x="210" y="90">rows 0 .. 0.33B</text>
+<rect class="srv11" x="340" y="44" width="180" height="62" rx="9"/>
+<text class="t11" x="430" y="70">Server B</text>
+<text class="s11" x="430" y="90">rows 0.33B .. 0.66B</text>
+<rect class="srv11" x="560" y="44" width="180" height="62" rx="9"/>
+<text class="t11" x="650" y="70">Server C</text>
+<text class="s11" x="650" y="90">rows 0.66B .. 1B</text>
+<rect class="wk11" x="90" y="290" width="150" height="60" rx="8"/>
+<text class="t11" x="165" y="316">Worker 1</text>
+<text class="s11" x="165" y="334">batch -&gt; few rows</text>
+<rect class="wk11" x="355" y="290" width="150" height="60" rx="8"/>
+<text class="t11" x="430" y="316">Worker 2</text>
+<text class="s11" x="430" y="334">batch -&gt; few rows</text>
+<rect class="wk11" x="620" y="290" width="150" height="60" rx="8"/>
+<text class="t11" x="695" y="316">Worker 3</text>
+<text class="s11" x="695" y="334">batch -&gt; few rows</text>
+<path class="pull11" d="M 195 106 L 150 286"/>
+<path class="pull11" d="M 420 106 L 425 286"/>
+<path class="push11" d="M 180 290 L 225 110"/>
+<path class="push11" d="M 455 290 L 450 110"/>
+<path class="pull11" d="M 640 106 L 690 286"/>
+<path class="pull11" d="M 360 110 L 690 286"/>
+<path class="push11" d="M 720 290 L 670 110"/>
+<text class="t11" x="60" y="200" fill="#1f6f43" transform="rotate(-90 60 200)">pull rows</text>
+<text class="t11" x="800" y="200" fill="#b86b1f" transform="rotate(-90 800 200)">push sparse grad</text>
+<text class="s11" x="430" y="372">each worker touches only the rows its batch references; untouched rows never move</text>
+</svg>
+<figcaption><strong>Figure 11.1.1:</strong> The parameter-server pattern. The model is one logical table sharded across servers A, B, and C, so total model size is bounded by the server fleet's memory, not any single node. Each worker pulls only the few rows its batch references (solid green), computes locally, and pushes a sparse gradient back (dashed orange). A worker may pull from several servers at once, as Worker 3 does. Communication scales with the access pattern, not the model size, and no global barrier forces the workers to step together.</figcaption>
+</figure>
+<p>Figure 11.1.1 makes the asymmetry visible. Unlike the symmetric all-reduce of <a href="../module-10-distributed-optimization/section-10.5.html">Section 10.5</a>, where there is no central store and every worker is identical, the parameter-server design has two distinct roles: stateless workers that compute, and stateful servers that hold the model. That split is the whole point. It decouples the size of the model (which lives on the servers and grows by adding servers) from the number of workers (which scales compute and grows by adding workers), and it lets the two scale independently.</p>
+
+<h2>3. A Parameter Server in Thirty Lines <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The mechanics are simpler than the terminology suggests. The code below is a complete, single-process parameter server: a flat weight vector standing in for a tiny embedding table, a <code>pull</code> that returns only requested coordinates, and a <code>push</code> that applies a sparse gradient to exactly the coordinates it names. Three workers each drive a different small slice of the vector toward a target, round-robin, and the point of the run is to watch which coordinates move and which do not.</p>
+<pre><code class="language-python"># The parameter server: a flat weight vector of D coordinates, held in one place.
+D = 20
+weights = [0.0] * D          # the single source of truth, held on the server
+lr = 0.5                     # the server applies updates with this step size
+
+def pull(indices):
+    """A worker asks the server for ONLY the coordinates it needs."""
+    return {i: weights[i] for i in indices}
+
+def push(grad):
+    """A worker sends back a sparse gradient; the server updates in place.
+    Only the coordinates present in `grad` are ever touched."""
+    for i, g in grad.items():
+        weights[i] -= lr * g
+
+# Three workers, each touching only a tiny, different slice of the table.
+active = {0: [1, 4], 1: [4, 9, 14], 2: [17]}
+target = 1.0   # every active coordinate should converge toward this value
+
+touched = set()
+for step in range(12):
+    w = step % 3                      # round-robin over the three workers
+    idx = active[w]
+    touched.update(idx)
+    local = pull(idx)                 # PULL only the needed coordinates
+    grad = {i: (local[i] - target) for i in idx}   # sparse local gradient
+    push(grad)                        # PUSH the sparse gradient back
+    if step &lt; 4:
+        print(f"step {step:2d}  worker {w}  pulled {idx}")
+print("  ...")
+
+print()
+print("touched coordinates :", sorted(touched))
+print("untouched stayed 0  :", all(weights[i] == 0.0 for i in range(D) if i not in touched))
+print("final weights       :", "[" + " ".join(f"{x:+.2f}" for x in weights) + "]")
+print("active near target  :", all(abs(weights[i] - target) &lt; 0.1 for i in touched))
+</code></pre>
+<div class="code-caption"><strong>Code 11.1.1:</strong> A minimal parameter server. The server holds the only copy of <code>weights</code>; each worker pulls a sparse slice, forms a gradient over just that slice, and pushes it back. No worker ever holds or communicates the full vector.</div>
+<pre><code class="language-text">step  0  worker 0  pulled [1, 4]
+step  1  worker 1  pulled [4, 9, 14]
+step  2  worker 2  pulled [17]
+step  3  worker 0  pulled [1, 4]
+  ...
+
+touched coordinates : [1, 4, 9, 14, 17]
+untouched stayed 0  : True
+final weights       : [+0.00 +0.94 +0.00 +0.00 +1.00 +0.00 +0.00 +0.00 +0.00 +0.94 +0.00 +0.00 +0.00 +0.00 +0.94 +0.00 +0.00 +0.94 +0.00 +0.00]
+active near target  : True
+</code></pre>
+<div class="code-caption"><strong>Output 11.1.1:</strong> Only the five coordinates any worker referenced (1, 4, 9, 14, 17) ever moved; the other fifteen stayed exactly zero, and every touched coordinate converged toward the target. This is sparse training in miniature: communication and computation both scale with what a batch touches, not with the size of the table.</div>
+<p>The output is the whole argument in miniature. Coordinate 4, the one row two different workers both pulled, received pushes from both and still converged; the servers serialized the concurrent updates, a hint of the contention questions <a href="section-11.4.html">Section 11.4</a> takes up. The fifteen untouched coordinates never moved a bit, because no worker ever pulled or pushed them. Scale this picture up: replace twenty coordinates with a billion embedding rows and three workers with a thousand, shard the vector across many servers instead of one process, and replace the toy gradient with a real recommendation model, and you have the architecture that trains the world's largest sparse models. The logic does not change, only the scale.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Sharding the Model Is the Other Half of Scale-Out</div>
+<p>Data parallelism (<a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>) scaled out the <em>computation</em> by splitting examples across workers while the model stayed replicated. The parameter server scales out the <em>model itself</em> by splitting parameters across servers while the computation stays distributed. These are the two complementary axes of distributed training, and the sharding move you meet here as embedding-table partitioning returns transformed in <a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>, where ZeRO and FSDP shard a dense model's parameters and optimizer state with the same logic of "no node holds the whole model, every node holds a slice." When you meet a sharded-parameter system later, ask what plays the role of the server shard and what plays the role of the pull.</p>
+</div>
+
+<h2>4. Where the Parameter Server Still Wins Today <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>It would be a mistake to read this chapter as history. All-reduce won the dense-model contest: for training a large language model whose every parameter is touched every step, ring or tree all-reduce over a fast interconnect is faster and simpler than routing gradients through a separate server tier, and <a href="section-11.9.html">Section 11.9</a> makes that comparison carefully. But the parameter server did not lose; it specialized. It remains the dominant architecture wherever the model is dominated by huge sparse embedding tables, which is to say across most of the recommendation, ranking, and advertising systems that generate the bulk of industrial machine learning revenue. In those systems a hybrid is now standard: the dense neural-network layers are trained data-parallel with all-reduce, while the enormous sparse embedding tables live on a parameter-server tier and are accessed by pull and push, each part using the architecture suited to its access pattern.</p>
+<p>The reason is structural, not historical. An access pattern that touches a tiny, data-dependent fraction of an enormous model every step is fundamentally a sparse-lookup problem, and a sharded store that serves lookups and applies sparse updates is the natural data structure for it. No amount of interconnect bandwidth makes dense all-reduce of a half-terabyte mostly-zero gradient sensible. The embeddings-at-scale arc that begins here continues through approximate nearest neighbor search in <a href="../module-12-distributed-classical-ml/index.html">Chapter 12</a> and vector databases in <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a>, and culminates in the full distributed recommendation case study of <a href="../../part-8-case-studies/module-38-case-distributed-recommendation/index.html">Chapter 38</a>.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Terabyte Embedding Systems (2024 to 2026)</div>
+<p>The parameter server is very much a live research and engineering frontier, driven by recommendation models whose embedding tables now reach tens of terabytes. Meta's TorchRec and its underlying sharding planner (Ivchenko et al.) treat embedding-table placement across a heterogeneous GPU and host-memory hierarchy as an explicit optimization problem, and NVIDIA's HugeCTR and Merlin push embedding lookups through a GPU-resident cache backed by a parameter-server tier. A vigorous 2024 to 2026 line attacks the memory wall directly: learned hashing and compositional embeddings shrink the table, and hierarchical placement keeps hot rows in GPU memory while cold rows spill to host RAM or SSD, so that an effectively multi-terabyte model serves from a fraction of that in fast memory. The throughline is the one this section opened with: when the model is huge and the access is sparse, the winning systems still keep parameters in a sharded store and move only what a batch touches. We return to these systems with the full machinery in <a href="../../part-8-case-studies/module-38-case-distributed-recommendation/index.html">Chapter 38</a>.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: TorchRec Shards the Embedding Tables for You</div>
+<p>Code 11.1.1 hand-rolled the store, the pull, and the push to expose the mechanics. In production you do not manage shards by hand. PyTorch's TorchRec library takes a declaration of your embedding tables and a planner, and it shards, places, and serves them across the available devices, generating the pull (lookup) and push (sparse gradient) traffic automatically:</p>
+<pre><code class="language-python"># pip install torchrec ; then run under torchrun across the worker+server fleet
+from torchrec import EmbeddingBagCollection, EmbeddingBagConfig
+from torchrec.distributed import DistributedModelParallel
+
+ebc = EmbeddingBagCollection(tables=[
+    EmbeddingBagConfig(name="user_id", num_embeddings=1_000_000_000,
+                       embedding_dim=128, feature_names=["user_id"]),
+    EmbeddingBagConfig(name="item_id", num_embeddings=500_000_000,
+                       embedding_dim=128, feature_names=["item_id"]),
+])
+# The planner decides how to shard each billion-row table across devices;
+# DistributedModelParallel wires up the pull/push collectives end to end.
+model = DistributedModelParallel(ebc)     # sharded, sparse-aware, automatic
+</code></pre>
+<div class="code-caption"><strong>Code 11.1.2:</strong> The same pull-push store as Code 11.1.1, now declared not implemented. Roughly thirty lines of manual sharding, lookup, and sparse-update logic collapse to a table declaration plus one <code>DistributedModelParallel</code> wrap; the library chooses the shard layout, routes lookups, and handles the sparse all-to-all that <a href="section-11.6.html">Section 11.6</a> unpacks.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Recommender That Would Not Fit on Any GPU</div>
+<p><strong>Who:</strong> A machine learning platform engineer at a streaming-media company rebuilding the homepage ranking model.</p>
+<p><strong>Situation:</strong> The new model added per-user, per-item, and per-creator embedding tables totaling 900 GB of parameters, while the dense ranking network on top was under 200 MB.</p>
+<p><strong>Problem:</strong> The team's existing all-reduce data-parallel pipeline required a full model replica on every GPU, and 900 GB fit on no accelerator they could buy.</p>
+<p><strong>Dilemma:</strong> Aggressively shrink the embeddings with hashing and lose ranking quality, or split the system so that the part that does not fit lives somewhere it can, at the cost of a more complex two-tier architecture.</p>
+<p><strong>Decision:</strong> They kept all-reduce for the tiny dense network and moved the embedding tables to a sharded parameter-server tier, because only the tables broke the replication assumption and only the tables had the sparse access pattern that pull and push exploit.</p>
+<p><strong>How:</strong> They declared the tables in TorchRec, let the planner shard them across host memory on the server nodes, and kept the dense network in standard DDP, so each step pulled the few thousand referenced rows and pushed sparse gradients to them.</p>
+<p><strong>Result:</strong> Training fit without shrinking a single table; per-step communication dropped by more than three orders of magnitude versus dense exchange of the full table, because only touched rows moved, exactly as Output 11.1.1 shows in miniature.</p>
+<p><strong>Lesson:</strong> Match the architecture to the access pattern. Dense parts want all-reduce; huge sparse tables want a sharded store with pull and push, and a real system uses both.</p>
+</div>
+
+<h2>5. What This Chapter Builds <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The rest of Chapter 11 turns the sketch above into a working architecture, one concern at a time. <a href="section-11.2.html">Section 11.2</a> formalizes the push-pull protocol and the worker-server interaction. <a href="section-11.3.html">Section 11.3</a> studies how to shard parameters across many servers and route requests to the right shard, the partitioning arc first met in <a href="../../part-1-foundations/module-02-distributed-systems-concepts/index.html">Chapter 2</a>. <a href="section-11.4.html">Section 11.4</a> contrasts synchronous and asynchronous update application, and <a href="section-11.5.html">Section 11.5</a> introduces bounded staleness, the controlled middle ground that caps how far behind any worker may fall. Sections 11.6 and 11.7 dive into sparse models and the terabyte-scale embedding tables of recommendation systems, the workload that justified the architecture in the first place. <a href="section-11.8.html">Section 11.8</a> confronts fault tolerance, because a sharded store of the only copy of the model is a single point of failure unless it is engineered not to be. Finally, <a href="section-11.9.html">Section 11.9</a> places the parameter server against all-reduce in modern systems, drawing the honest line between where each wins.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Server That Remembers Everyone</div>
+<p>An embedding table in a billion-user system is, in a real sense, a learned opinion about every single user and item that has ever appeared. The parameter server is where that institutional memory physically lives. When an engineer says a model "knows" a long-tail user, they mean one specific row, out of a billion, on one specific shard, holds a vector nobody has updated in weeks, waiting patiently to be pulled the next time that user comes back.</p>
+</div>
+<p>With the motivation settled, we can build the protocol. The next section makes the pull and push of Code 11.1.1 precise: what a worker requests, what a server returns, how updates are applied, and what guarantees each side may assume. That construction begins in <a href="section-11.2.html">Section 11.2</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.1.1: Which Architecture Fits? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each model, decide whether all-reduce data parallelism, a sharded parameter server, or a hybrid of both is the natural fit, and justify your choice from the two assumptions in Section 1 (does the model replicate, is the gradient dense): (a) a 7-billion-parameter language model where every parameter is updated every step; (b) a click-prediction model with a 4-billion-row embedding table and a 50 MB dense head; (c) a small image classifier fine-tuned on one GPU. Explain specifically which assumption each model honors or breaks.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.1.2: Make the Untouched Rows Move (and Then Stop Them) <span class="exercise-type coding">Coding</span></div>
+<p>Start from Code 11.1.1. First replace the sparse <code>push</code> with a dense one that subtracts <code>lr * (weights[i] - target)</code> for <em>every</em> coordinate $i$ regardless of what any worker pulled, and confirm that previously untouched coordinates now drift. Then measure, for the sparse version, the total number of coordinate reads and writes across all twelve steps, and compare it to what a dense full-vector exchange would cost at $D = 20$ and again at $D = 10^9$. Report the ratio and explain why it grows without bound as the table grows while the access pattern stays fixed.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.1.3: The Bytes a Batch Actually Moves <span class="exercise-type analysis">Analysis</span></div>
+<p>An embedding table has $10^9$ rows of dimension $128$, stored as 4-byte floats. A training batch references $4{,}000$ distinct rows. Compute (a) the total size of the table, (b) the bytes a parameter-server worker pulls and pushes for one batch (rows referenced, two directions), and (c) the bytes a dense all-reduce of the full gradient would move per worker per step. Express (c) divided by (b) as the communication-saving factor of the parameter server for this workload, and state in one sentence why that factor is the quantitative reason the architecture exists. We make the underlying communication-cost model rigorous in <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html"><span class="nav-label">Chapter Overview</span><span class="nav-num">Chapter 11</span><span class="nav-title">Parameter Servers and Distributed Embeddings</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 11</span><span class="nav-num">Contents</span><span class="nav-title">Parameter Servers and Distributed Embeddings</span></a>
+<a class="next" href="section-11.2.html"><span class="nav-label">Next</span><span class="nav-num">Section 11.2</span><span class="nav-title">Push-Pull Architecture</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

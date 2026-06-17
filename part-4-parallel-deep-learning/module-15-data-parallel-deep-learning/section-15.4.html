@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 15.4: Gradient Synchronization and All-Reduce. Every data-parallel step sums one number per parameter across all replicas; this all-reduce, paid each step and proportional to model size, is what bounds data-parallel training." name="description"/>
+<title>Section 15.4: Gradient Synchronization and All-Reduce | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Parallel Deep Learning and Large Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Data-Parallel Deep Learning</a></div>
+<h1>Gradient Synchronization and All-Reduce</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I compute my gradient in milliseconds, then spend half a second telling everyone else about it. We need to talk about my work-life balance."</p>
+<cite>An All-Reduce That Has Seen Some Gradients</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Data-parallel training is fast at computing gradients and slow at agreeing on them; the agreement step, an all-reduce of one number per parameter performed on every single step, is what actually sets the ceiling on how far the method scales.</strong> Each replica holds a full copy of the model and computes a gradient on its own shard of the batch. For those replicas to stay identical, their gradients must be summed and the sum shared with everyone before the optimizer moves. That sum is a collective all-reduce, and its size is fixed by the model: a billion parameters means a billion numbers crossing the network, every step, no matter how fast the accelerators run. This section turns that observation into a cost model, shows why it grows with model size and bites harder as you add workers, and names NCCL as the machinery that executes it on GPUs. The bucketing and overlap tricks of <a href="section-15.5.html">Section 15.5</a> exist entirely to hide the cost this section measures.</p>
+</div>
+<p>In <a href="section-15.3.html">Section 15.3</a> we established the data-parallel recipe: replicate the model across $K$ workers, give each worker a different slice of the mini-batch, and let each one compute a gradient locally. The replicas start identical and must stay identical, step after step, so that they are genuinely training one model rather than $K$ slowly diverging ones. The mechanism that keeps them locked together is the subject of this section. After every backward pass, before any optimizer update, the $K$ local gradients are combined into one shared average gradient that every worker then applies. Because every worker applies the same update to the same starting weights, the replicas remain bit-for-bit identical, and the cluster behaves as a single model trained on the full batch. The combine is a collective operation, and which collective it is, and what it costs, is the whole story of data-parallel performance.</p>
+
+<h2>1. The Gradient Is an Average, So the Combine Is an All-Reduce <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Recall the exact identity that <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a> proved with a single calculation: the gradient of an average loss is the average of the per-example gradients, and an average decomposes over any partition of the data. Split a mini-batch of $B$ examples into $K$ shards, let worker $k$ compute the sum of gradients over its shard, and the full-batch gradient is</p>
+$$g \;=\; \frac{1}{B} \sum_{i=1}^{B} \nabla \ell(w; x_i, y_i) \;=\; \frac{1}{B} \sum_{k=1}^{K} g_k, \qquad g_k = \sum_{i \in \text{shard}_k} \nabla \ell(w; x_i, y_i).$$
+<p>Every worker needs the same combined gradient $g$, not just its own piece, because every worker must apply the identical update to keep the replicas in sync. That requirement, every participant ends up holding the sum of all participants' contributions, is the exact definition of the all-reduce collective introduced in <a href="../../part-1-foundations/module-04-communication-primitives/section-4.3.html">Section 4.3</a>. A reduce alone would deposit the sum on one worker; a broadcast alone would copy one worker's value to all; all-reduce is the fused operation that does both at once and leaves every worker holding the reduced result. Data-parallel training does not merely use all-reduce occasionally; it is built around one all-reduce per step, and the parameter $K$ in the cost models below is the number of training replicas.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Synchronization Volume Is Set by the Model, Not the Data</div>
+<p>The number of bytes moved by the gradient all-reduce equals the number of parameters times the bytes per parameter, full stop. It does not depend on the batch size, the dataset size, the sequence length, or how fast the GPU computes. A 7-billion-parameter model in 32-bit floats moves 28 gigabytes through the all-reduce on every step whether the batch holds 8 examples or 8,000. This is why the synchronization cost is the defining bottleneck of data parallelism: you pay it in proportion to the model you chose, on every step, and faster accelerators do not reduce it by one byte.</p>
+</div>
+<p>The figure below shows the per-step picture concretely. Four replicas each finish a backward pass holding a different local gradient vector; the all-reduce sums them component by component and hands the identical averaged gradient back to all four, which then take the same optimizer step.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Four model replicas each holding a different local gradient vector feed into a central all-reduce box, which returns the same averaged gradient to all four replicas before the optimizer step.">
+<defs>
+<marker id="arr154" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr154b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.b154 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.w154 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.r154 { fill:#eef6ef; stroke:#2f7d4f; stroke-width:1.8; }
+.t154 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.tw154 { font:600 13px sans-serif; fill:#8a4f12; text-anchor:middle; }
+.s154 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.ld154 { fill:none; stroke:#14385c; stroke-width:1.6; marker-end:url(#arr154); }
+.lu154 { fill:none; stroke:#b86b1f; stroke-width:1.6; stroke-dasharray:5 3; marker-end:url(#arr154b); }
+</style>
+<text class="t154" x="430" y="24">One data-parallel step: each replica computes a local gradient, all-reduce shares the sum</text>
+<rect class="w154" x="40" y="56" width="150" height="66" rx="8"/>
+<text class="tw154" x="115" y="82">Replica 1</text>
+<text class="s154" x="115" y="102">local grad g&#8321;</text>
+<rect class="w154" x="240" y="56" width="150" height="66" rx="8"/>
+<text class="tw154" x="315" y="82">Replica 2</text>
+<text class="s154" x="315" y="102">local grad g&#8322;</text>
+<rect class="w154" x="470" y="56" width="150" height="66" rx="8"/>
+<text class="tw154" x="545" y="82">Replica 3</text>
+<text class="s154" x="545" y="102">local grad g&#8323;</text>
+<rect class="w154" x="670" y="56" width="150" height="66" rx="8"/>
+<text class="tw154" x="745" y="82">Replica 4</text>
+<text class="s154" x="745" y="102">local grad g&#8324;</text>
+<line class="ld154" x1="115" y1="122" x2="380" y2="178"/>
+<line class="ld154" x1="315" y1="122" x2="412" y2="178"/>
+<line class="ld154" x1="545" y1="122" x2="448" y2="178"/>
+<line class="ld154" x1="745" y1="122" x2="480" y2="178"/>
+<rect class="b154" x="300" y="182" width="260" height="62" rx="10"/>
+<text class="t154" x="430" y="208">All-reduce (sum)</text>
+<text class="s154" x="430" y="228">every replica receives g&#8321;+g&#8322;+g&#8323;+g&#8324;</text>
+<rect class="r154" x="300" y="280" width="260" height="56" rx="10"/>
+<text class="t154" x="430" y="305">Averaged gradient g = (1/B) &#8721;&#8342; g&#8342;</text>
+<text class="s154" x="430" y="324">identical on all replicas, optimizer steps in lockstep</text>
+<line class="ld154" x1="430" y1="244" x2="430" y2="278"/>
+<line class="lu154" x1="360" y1="336" x2="115" y2="124"/>
+<line class="lu154" x1="400" y1="336" x2="315" y2="124"/>
+<line class="lu154" x1="460" y1="336" x2="545" y2="124"/>
+<line class="lu154" x1="500" y1="336" x2="745" y2="124"/>
+</svg>
+<figcaption><strong>Figure 15.4.1:</strong> The gradient all-reduce that defines a data-parallel step. Solid arrows carry the four local gradients into the all-reduce; the dashed arrows return the identical averaged gradient $g$ to every replica. Because all replicas apply the same $g$ to the same weights, they remain bit-for-bit identical, and the cluster trains one model. The all-reduce moves one number per parameter and is paid on every step.</figcaption>
+</figure>
+
+<h2>2. Why This Is the Scaling Bottleneck <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The communication-bounds-training thesis of <a href="../../part-1-foundations/module-04-communication-primitives/section-4.1.html">Section 4.1</a> stated the general principle: in a parallel system, the work that grows with the machine count or the model size, and that cannot be made faster by faster local compute, is the work that eventually limits you. Gradient synchronization is the textbook instance. Local gradient computation gets cheaper per worker as you add workers, because a fixed global batch is split more ways and each worker handles fewer examples. The all-reduce does not get cheaper. Its volume is the model size, which is constant, and the best ring algorithms make its time nearly independent of the worker count for large $K$. So as you scale out, the numerator of "communication time" holds steady while the denominator "compute time per worker" shrinks, and the fraction of each step spent communicating climbs toward one. That is the precise sense in which all-reduce, not the GPUs, sets the scaling ceiling.</p>
+<p>The cost of a ring all-reduce was derived in <a href="../../part-1-foundations/module-04-communication-primitives/section-4.4.html">Section 4.4</a>; we use its bandwidth term here. A ring all-reduce of a payload of $S$ bytes across $K$ workers runs a reduce-scatter followed by an all-gather, and each worker sends $2(K-1)/K$ copies of its $S/K$-sized chunks over its slowest link. With per-link bandwidth $B$ and a model of $P$ parameters at $b$ bytes each (so $S = Pb$), the time is</p>
+$$T_{\text{all-reduce}} \;=\; \frac{2(K-1)}{K}\,\frac{Pb}{B} \;\xrightarrow[K\to\infty]{}\; \frac{2Pb}{B}.$$
+<p>Two features of this expression do the explaining. First, it is linear in the parameter count $P$: double the model and you double the synchronization time, every step, forever. Second, the $K$-dependence saturates fast; going from 32 to 512 workers barely changes the factor $2(K-1)/K$, which is already $1.94$ at $K=32$. So the all-reduce time is set almost entirely by the model, and adding workers buys more compute throughput without making the synchronization any cheaper. For the largest models this is brutal: a 70-billion-parameter gradient in 32-bit floats is 280 gigabytes of payload, and even at 100 gigabytes per second of link bandwidth the all-reduce term alone runs into seconds per step. The demonstration below makes these numbers concrete and shows the fraction of the step the all-reduce consumes.</p>
+<pre><code class="language-python"># Ring all-reduce cost model for the per-step gradient synchronization.
+# A gradient has P parameters, 4 bytes each (fp32). Ring all-reduce sends
+# 2*(K-1)/K * (P*bytes) over the slowest link per worker; for large K the
+# bandwidth term approaches 2*(P*bytes)/B and stops shrinking with K.
+BYTES = 4
+B = 100e9            # interconnect bandwidth per link: 100 GB/s (NVLink-class)
+GPU_FLOPS = 300e12   # sustained 300 TFLOP/s per accelerator (mixed precision)
+GLOBAL_TOKENS = 2_000_000   # fixed global batch (tokens) split across K workers
+
+def allreduce_seconds(P, K):
+    # Reduce-scatter then all-gather: 2*(K-1) chunk transfers of size P/K.
+    return 2.0 * (K - 1) / K * (P * BYTES) / B
+
+def compute_seconds(P, K):
+    # Forward+backward ~ 6 FLOPs/param/token; each worker sees GLOBAL/K tokens.
+    return 6.0 * P * (GLOBAL_TOKENS / K) / GPU_FLOPS
+
+models = [
+    ("ResNet-50",   25_000_000),
+    ("BERT-large",  340_000_000),
+    ("GPT-2 1.5B",  1_500_000_000),
+    ("LLaMA 7B",    7_000_000_000),
+    ("70B model",   70_000_000_000),
+]
+K = 64
+
+print(f"Per step at K={K} workers, fixed global batch={GLOBAL_TOKENS:,} tokens, "
+      f"B={B/1e9:.0f} GB/s/link\n")
+print(f"{'model':&lt;13}{'params':&gt;15}{'compute (ms)':&gt;14}"
+      f"{'allreduce (ms)':&gt;16}{'comm fraction':&gt;15}")
+for name, P in models:
+    comp = compute_seconds(P, K)
+    comm = allreduce_seconds(P, K)
+    frac = comm / (comp + comm)
+    print(f"{name:&lt;13}{P:&gt;15,}{comp*1e3:&gt;14.1f}{comm*1e3:&gt;16.1f}{frac:&gt;14.0%}")
+
+print("\nLLaMA 7B (P=7.0e9): comm fraction grows as workers are added")
+print(f"{'workers K':&gt;11}{'compute (ms)':&gt;14}{'allreduce (ms)':&gt;16}{'comm fraction':&gt;15}")
+P = 7_000_000_000
+for k in (2, 8, 32, 128, 512):
+    comp = compute_seconds(P, k)
+    comm = allreduce_seconds(P, k)
+    frac = comm / (comp + comm)
+    print(f"{k:&gt;11}{comp*1e3:&gt;14.1f}{comm*1e3:&gt;16.1f}{frac:&gt;14.0%}")
+</code></pre>
+<div class="code-caption"><strong>Code 15.4.1:</strong> A pure-Python evaluation of the ring all-reduce bandwidth term against a simple compute model, with no libraries beyond the standard runtime. The first table sweeps model size at a fixed worker count; the second fixes the model and sweeps the worker count under a fixed global batch.</div>
+<pre><code class="language-text">Per step at K=64 workers, fixed global batch=2,000,000 tokens, B=100 GB/s/link
+
+model                 params  compute (ms)  allreduce (ms)  comm fraction
+ResNet-50         25,000,000          15.6             2.0           11%
+BERT-large       340,000,000         212.5            26.8           11%
+GPT-2 1.5B     1,500,000,000         937.5           118.1           11%
+LLaMA 7B       7,000,000,000        4375.0           551.2           11%
+70B model     70,000,000,000       43750.0          5512.5           11%
+
+LLaMA 7B (P=7.0e9): comm fraction grows as workers are added
+  workers K  compute (ms)  allreduce (ms)  comm fraction
+          2      140000.0           280.0            0%
+          8       35000.0           490.0            1%
+         32        8750.0           542.5            6%
+        128        2187.5           555.6           20%
+        512         546.9           558.9           51%</code></pre>
+<div class="code-caption"><strong>Output 15.4.1:</strong> The all-reduce time grows in direct proportion to model size (2 ms at ResNet-50 to 5.5 seconds at 70B), while at fixed model size it stays flat as workers are added. With a fixed global batch, compute per worker shrinks as $K$ grows, so the communication fraction climbs from near zero to over half by 512 workers: data parallelism runs out of room when the all-reduce stops being hidden by compute.</div>
+<p>Two trends in Output 15.4.1 carry the whole argument. The all-reduce column of the first table scales linearly with the parameter count, exactly as $T_{\text{all-reduce}} \propto P$ predicts, so the absolute synchronization cost is dictated by the model you train. The second table holds the model fixed and shows the more dangerous trend: as workers are added under a fixed global batch, per-worker compute falls but the all-reduce does not, and the communication fraction marches from under one percent to over fifty. A practitioner reads these two tables together as a single warning: a bigger model makes every all-reduce longer, and more workers make that all-reduce a larger share of the step, so the largest models on the largest clusters are exactly where synchronization dominates.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Chapter 1 All-Reduce, Now the Bottleneck</div>
+<p>The all-reduce you performed by hand in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>, summing one vector per worker and sharing the result, was presented there as the exact and almost magical core of data parallelism. This section is the bill. The same collective, scaled to billions of numbers and run on every step, is what caps how far data parallelism can take you, and it is why Part IV needs more than one parallelism axis. The all-reduce returns again, sliced into reduce-scatter and all-gather, when sharded data parallelism (ZeRO and FSDP) trades memory for communication in <a href="../module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>, and again as all-to-all when experts live on separate machines in <a href="../module-17-expert-parallelism-moe/index.html">Chapter 17</a>. Each time, the first question to ask is which collective runs and how large its payload is.</p>
+</div>
+
+<h2>3. NCCL: The All-Reduce That Actually Runs on GPUs <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The cost model above assumes a competent ring algorithm running on a topology that supports it. On NVIDIA GPUs, the library that supplies both is NCCL, the NVIDIA Collective Communications Library introduced as the GPU-native collectives layer in <a href="../../part-1-foundations/module-04-communication-primitives/section-4.8.html">Section 4.8</a>. NCCL is what `torch.distributed` calls when you select the `nccl` backend, and it is the reason a single line of framework code turns into an efficient multi-GPU all-reduce. It does three things that a naive implementation would not. It discovers the interconnect topology (NVLink and NVSwitch inside a node, InfiniBand or RoCE between nodes) and builds rings and trees that match it, so the slowest link in the formula above is as fast as the hardware allows. It moves gradient buffers GPU-to-GPU directly, bypassing the host CPU and host memory through GPUDirect, which keeps the bandwidth term close to the hardware peak. And it overlaps the reduce-scatter and all-gather phases with the kernels still running on the device, which is the hook that <a href="section-15.5.html">Section 15.5</a> exploits to hide synchronization behind the backward pass.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One Call Replaces the Ring You Just Modeled</div>
+<p>Code 15.4.1 modeled the ring all-reduce cost analytically; running the real thing on a cluster of GPUs is a single call into NCCL through PyTorch, and the dozens of lines of ring scheduling, topology detection, and buffer management that <a href="../../part-1-foundations/module-04-communication-primitives/section-4.8.html">Section 4.8</a> describes are all hidden behind it:</p>
+<pre><code class="language-python"># Run with: torchrun --nproc_per_node=8 thisfile.py
+import torch, torch.distributed as dist
+
+dist.init_process_group("nccl")              # NCCL discovers NVLink/IB topology
+local_grad = compute_shard_gradient()        # this replica's gradient tensor (on GPU)
+
+# One collective: NCCL runs the ring reduce-scatter + all-gather of Section 4.4.
+dist.all_reduce(local_grad, op=dist.ReduceOp.SUM)
+local_grad /= dist.get_world_size()          # SUM -> mean keeps replicas identical
+</code></pre>
+<div class="code-caption"><strong>Code 15.4.2:</strong> The real GPU all-reduce. NCCL builds the topology-matched ring, runs both collective phases GPU-to-GPU, and returns the summed gradient on every replica; in a real training loop <code>DistributedDataParallel</code> (<a href="section-15.6.html">Section 15.6</a>) fires this call for you during the backward pass.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Cluster That Doubled Its GPUs and Got Slower</div>
+<p><strong>Who:</strong> An ML platform engineer scaling a 6-billion-parameter language model from 64 to 128 GPUs.</p>
+<p><strong>Situation:</strong> The team had a deadline and a budget approval to double the GPU count, expecting training wall-clock to roughly halve.</p>
+<p><strong>Problem:</strong> At 128 GPUs the step time fell by only fifteen percent, not by half, and the per-GPU utilization dropped from eighty percent to under fifty.</p>
+<p><strong>Dilemma:</strong> Accept the poor scaling and pay double for a fifteen-percent speedup, or stop and diagnose where the time was actually going before committing more hardware.</p>
+<p><strong>Decision:</strong> They profiled a step and found the gradient all-reduce had grown from a hidden background cost into a quarter of the step, exactly the trend in the second table of Output 15.4.1: more workers, fixed global batch, shrinking per-worker compute, flat all-reduce.</p>
+<p><strong>How:</strong> They confirmed it by reading NCCL timing through the profiler, then held the GPU count at 96, raised the global batch so each worker computed for longer per step, and enabled the bucketed overlap of <a href="section-15.5.html">Section 15.5</a> so the all-reduce ran behind the backward pass.</p>
+<p><strong>Result:</strong> At 96 GPUs with overlap the communication fraction fell back under ten percent and per-GPU utilization returned to the seventies, delivering most of the speedup the naive 128-GPU plan had promised at lower cost.</p>
+<p><strong>Lesson:</strong> Adding workers does not shorten the all-reduce; past a point it only raises the fraction of the step it consumes. Measure the communication fraction before buying more GPUs, and reach for overlap and larger per-worker work before reaching for more hardware.</p>
+</div>
+
+<h2>4. What This Sets Up <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The cost model leaves two honest exits, and the rest of the chapter walks through both. The first is to move fewer bytes: gradient compression, low-precision all-reduce, and the local-update schemes that communicate less often all attack the $Pb$ in the numerator directly, and we meet them as the communication-avoiding frontier below and again with full machinery in <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a>. The second exit, and the one the very next section takes, is to stop paying the all-reduce as a separate phase at all. If the gradient for the last layer is ready the instant its backward pass finishes, its all-reduce can run while the earlier layers are still computing their gradients, so the synchronization disappears behind compute that was happening anyway. Making that overlap practical requires grouping gradients into buckets and launching their collectives as soon as each bucket fills, which is precisely the gradient bucketing and communication-computation overlap of <a href="section-15.5.html">Section 15.5</a>. Everything in this section is the cost that those mechanisms exist to hide.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Shrinking the All-Reduce (2024 to 2026)</div>
+<p>Because the all-reduce payload is fixed by the model and paid every step, recent work attacks the bytes themselves. Low-precision collectives are now routine: gradients are all-reduced in BF16 or FP8 rather than FP32, halving or quartering the payload of the model above, and 2024-2025 systems push FP8 gradient communication into production-scale runs. Structured compression in the PowerSGD and 1-bit-Adam lineage sends low-rank or sign-quantized gradients, cutting the volume by an order of magnitude with small accuracy cost. The most active thread reduces how often the all-reduce fires at all: local-SGD descendants such as DiLoCo (Douillard et al., 2024) let each replica take many local steps between synchronizations, and follow-on work (Streaming DiLoCo and related 2024-2025 systems) overlaps and streams even those rare communications, enabling training across slow or geographically separated links where a per-step all-reduce would be hopeless. The common thread is that the field now treats the per-step all-reduce of this section as a quantity to be engineered down rather than a fixed tax, and the cost model here is the baseline every such method reports against.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Gradient That Travels Farther Than the Data</div>
+<p>There is a quiet irony in large-model data parallelism. Each worker reads a modest slice of training data, a few megabytes of tokens, computes on it for a few milliseconds, and then ships a gradient that can be tens of gigabytes across the network. The summary of the work travels far heavier than the work itself. For a 70-billion-parameter model, a single step's all-reduce moves more bytes than many workers will read from the dataset in an entire epoch. The model, not the data, is what clogs the wires.</p>
+</div>
+<p>We now have the defining cost of data parallelism stated exactly: one all-reduce per step, sized by the model, linear in the parameter count, and an ever-larger share of the step as the cluster grows. That single quantity explains why data parallelism alone cannot train the largest models, why every serious training stack obsesses over communication, and why the next section is about hiding rather than merely accepting this cost. The mechanics of that hiding begin in <a href="section-15.5.html">Section 15.5</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.4.1: Read the Cost Model <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the formula $T_{\text{all-reduce}} = \frac{2(K-1)}{K}\frac{Pb}{B}$, explain in words why doubling the number of workers $K$ barely changes the all-reduce time once $K$ is already large, while doubling the parameter count $P$ doubles it exactly. Then state, without computing, what happens to the communication fraction of a step when you keep the model and cluster fixed but double the global batch size, and tie your answer to the two tables in Output 15.4.1.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.4.2: Extend the Cost Model to Low Precision <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 15.4.1 to add a <code>bytes_per</code> argument to <code>allreduce_seconds</code> and produce three columns for the LLaMA 7B row: the all-reduce time in FP32 (4 bytes), BF16 (2 bytes), and FP8 (1 byte). Recompute the communication fraction at $K = 128$ for each precision. Report how much of the synchronization cost low-precision communication removes, and explain why this attacks the same $Pb$ term that the research-frontier methods target, rather than the $K$-dependence.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.4.3: Find the Crossover Worker Count <span class="exercise-type analysis">Analysis</span></div>
+<p>For the LLaMA 7B model in Output 15.4.1 (fixed global batch of 2,000,000 tokens, $B = 100$ GB/s, 300 TFLOP/s per GPU), derive an expression for the worker count $K^\star$ at which the all-reduce time equals the per-worker compute time, the point where the communication fraction crosses fifty percent. Solve it numerically and compare to the table. Then argue what two levers from this section and <a href="section-15.5.html">Section 15.5</a> would push $K^\star$ higher, letting the model scale to more workers before synchronization dominates.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-15.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 15.3</span><span class="nav-title">Data Parallelism</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 15</span><span class="nav-num">Contents</span><span class="nav-title">Data-Parallel Deep Learning</span></a>
+<a class="next" href="section-15.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 15.5</span><span class="nav-title">Gradient Bucketing and Communication/Computation Overlap</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

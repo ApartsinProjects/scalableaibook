@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 40.1: Problem Definition. Framing a production LLM-powered agentic application that retrieves over a large corpus, reasons across tool-using steps, and serves many users under cost and latency constraints, and decomposing it onto the six axes of distribution." name="description"/>
+<title>Section 40.1: Problem Definition | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VIII: Case Studies and Capstone Projects</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 40: Distributed LLM and Agentic Applications</a></div>
+<h1>Problem Definition</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"A user asked one question. I read three documents, called two tools, and quietly spawned four smaller copies of myself to chase the loose ends. They are still working. I have already answered, and I will never fully know what they found."</p>
+<cite>An Agent, Spawning Helpers It Will Never Fully Supervise</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>An LLM-powered agentic application is the place where every axis of this book runs at once and where the model itself becomes the most expensive moving part.</strong> A single user request no longer maps to a single model call; it unfolds into a multi-step plan that retrieves passages from a corpus too large for one machine, invokes tools, and spawns sub-agents whose calls fan out and multiply, all while the model that powers each step is a multi-accelerator service answering thousands of concurrent streams under a latency budget a person will actually wait through. This chapter is the capstone case study: it assembles retrieval (<a href="../module-36-case-web-scale-text-rag/index.html">Chapter 36</a> and <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a>), distributed LLM serving (<a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>), and agent orchestration (<a href="../../part-6-multi-agent-systems/module-32-distributed-agent-orchestration/index.html">Chapter 32</a>) into one product. This opening section fixes the requirements, proves with arithmetic that the token volume and fan-out demand a serving fleet, decomposes the system into the stages the rest of the chapter builds, and maps each stage onto the six axes of distribution from <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Chapter 1</a>.</p>
+</div>
+<p>An agent, in the sense this chapter uses the word, is a program that wraps a language model in a loop: it reads a goal, decides on an action, takes that action through a tool or a retrieval call, observes the result, and repeats until it judges the goal met. Where a retrieval-augmented question answers itself in one model call conditioned on retrieved text, an agent answers a task in many calls, each conditioned on the accumulated history of what it has already done. The version that fits in a notebook, a single loop calling a hosted model API over a handful of documents, hides every problem this chapter exists to confront. The interesting version is a production assistant or an autonomous task agent that serves a real user population, reasons over a large enterprise or web corpus, and must do so within a cost envelope and a latency budget that an operator would actually sign. The purpose of this case study is to show how the machinery built across Parts II through VII assembles into that product, and where the seams between agent, retriever, and serving fleet actually fall.</p>
+<p>We treat the system as a concrete target. The running specification is a production agentic application serving on the order of two hundred thousand daily active users, each running several multi-step task sessions per day, where every session reasons across roughly a dozen steps, retrieves from a large document corpus at most steps, and occasionally fans out into sub-agents that pursue subtasks in parallel. The model behind each step is a large language model that cannot be served from one accelerator. Four pressures, the multi-step token volume, the sub-agent fan-out, the concurrency under a per-step latency budget, and the cost per task, are the requirements; the rest of the chapter is the design that satisfies them.</p>
+
+<h2>1. The Requirements: An Agent Is Not One Model Call <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A problem definition earns its keep only when it commits to numbers, because the numbers decide which ceilings bind and therefore which axes of distribution we must reach for. We fix five requirements and carry them through the entire chapter. The first is corpus scale: the agent retrieves over a corpus on the order of tens of millions of documents, large enough that the index must be sharded as in <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a>, but the corpus is no longer the headline cost. The second is concurrent users: the system serves roughly two hundred thousand daily active users running several task sessions each, which sets the request arrival rate. The third is the multi-step latency budget: a task is not one call but a chain of about a dozen reasoning and tool-use steps, and the user waits for the whole chain, so each step must finish within a fraction of a second to keep the end-to-end response inside the time a person tolerates. The fourth is token cost: every step consumes prompt tokens (the growing context plus retrieved passages) and emits output tokens, and the bill is the product of steps, tokens per step, and price, summed over every call including those of spawned sub-agents. The fifth is reliability: a single failed step must not abort the whole task, because a twelve-step plan that fails one step in twenty still fails nearly half of all tasks unless steps can be retried and isolated.</p>
+<p>These requirements interact, and the interaction is the whole subject. Multi-step reasoning multiplies token cost, because each step re-reads an ever-larger history. Sub-agent fan-out multiplies it again, because one branching step becomes several calls. Concurrency fights latency, because every in-flight step competes for the same serving fleet. Reliability fights latency, because retries add steps. A single machine fails every requirement at once and for independent reasons: it cannot hold the sharded index, cannot serve the model, cannot sustain the concurrent step volume, and cannot survive its own failures. The next section makes that failure quantitative.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Agent Multiplies Every Cost by Its Step Count and Its Fan-Out</div>
+<p>A one-shot question costs one model call. An agent costs the number of steps in its plan times the number of sub-agents each step spawns, and each of those calls carries a prompt that grows as the agent accumulates history. The two multipliers, depth (steps per task) and width (sub-agents per branching step), turn a modest per-call cost into a token bill and a concurrency load that no single server absorbs. Reading a specification means locating these two multipliers first, because they convert a tolerable single-call system into one that is forced onto a fleet.</p>
+</div>
+
+<h2>2. Why a Single Machine Is Not Even Close <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The argument for distribution falls out of arithmetic on the requirements, not from rhetoric. Start with the work in one task. If a task runs $s$ reasoning steps, a fraction $f$ of which branch into $g$ sub-agents, the effective number of language-model calls per task is</p>
+$$c_{\text{task}} = s \,\bigl(1 + f\,g\bigr),$$
+<p>because every step is one call and each branching step adds $g$ more. With $s = 12$ steps, a branch fraction $f = 0.3$, and a fan-out $g = 3$, a single task already costs roughly twenty-three model calls rather than one. Multiply by the task volume and the per-call tokens to get the daily token bill. If $u$ users each run $t$ tasks per day, the calls and tokens per day are</p>
+$$\text{calls/day} = u\,t\,c_{\text{task}}, \qquad \text{tokens/day} = \text{calls/day}\,\bigl(p_{\text{in}} + p_{\text{out}}\bigr),$$
+<p>where $p_{\text{in}}$ and $p_{\text{out}}$ are input and output tokens per call. The dollar cost is the same product weighted by per-token prices, the multi-step agent cost</p>
+$$\text{cost/day} = \text{calls/day}\,\bigl(p_{\text{in}}\,\pi_{\text{in}} + p_{\text{out}}\,\pi_{\text{out}}\bigr),$$
+<p>with $\pi_{\text{in}}$ and $\pi_{\text{out}}$ the input and output token prices. Finally the serving load. The average rate of model calls is the calls per day spread over a day, and at peak it is several times higher; Little's law then fixes how many calls are in flight at once,</p>
+$$\lambda = \frac{\text{calls/day}}{86400}, \qquad C = \lambda_{\text{peak}}\, L,$$
+<p>where $L$ is the wall-clock latency of one step and $C$ is the number of concurrent decode streams the fleet must hold. Figure 40.1.1 shows the request unfolding from user to fleet; Code 40.1.1 puts real numbers behind every one of these formulas.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 880 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Architecture of a distributed agentic application. A population of users sends task requests to an agent orchestrator. The orchestrator runs a multi-step reasoning loop that on each step either retrieves from a sharded vector index, calls an external tool, or spawns sub-agents that run their own loops. Every reasoning step of every agent and sub-agent issues a call to a replicated, sharded LLM serving fleet of many model replicas. Annotations mark which axis of distribution each region loads.">
+<defs>
+<marker id="arr401" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr401b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.box401 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.qbox401 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.fbox401 { fill:#eef6ef; stroke:#2f6b3a; stroke-width:1.6; }
+.t401 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.tf401 { font:600 13px sans-serif; fill:#2f6b3a; text-anchor:middle; }
+.s401 { font:10.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.a401 { font:italic 10px sans-serif; fill:#8a5a12; text-anchor:middle; }
+.l401 { fill:none; stroke:#14385c; stroke-width:1.7; marker-end:url(#arr401); }
+.lo401 { fill:none; stroke:#b86b1f; stroke-width:1.6; marker-end:url(#arr401b); }
+.hdr401 { font:700 12px sans-serif; fill:#14385c; text-anchor:start; }
+</style>
+<text class="hdr401" x="28" y="24">Users (concurrent, requirement 2)</text>
+<rect class="box401" x="28" y="36" width="140" height="58" rx="8"/>
+<text class="t401" x="98" y="60">User Population</text>
+<text class="s401" x="98" y="78">~200k DAU, multi-task</text>
+
+<text class="hdr401" x="250" y="24">Agent orchestrator (per task, multi-step)</text>
+<rect class="box401" x="250" y="36" width="180" height="58" rx="8"/>
+<text class="t401" x="340" y="60">Agent Orchestrator</text>
+<text class="s401" x="340" y="78">plan, act, observe loop</text>
+<text class="a401" x="340" y="112">coordinate the cluster</text>
+<line class="l401" x1="168" y1="65" x2="246" y2="65"/>
+
+<rect class="qbox401" x="250" y="150" width="180" height="54" rx="8"/>
+<text class="t401" x="340" y="172">Sharded Vector Index</text>
+<text class="s401" x="340" y="190">retrieve passages</text>
+<text class="a401" x="340" y="224">distribute data</text>
+<rect class="qbox401" x="250" y="252" width="180" height="50" rx="8"/>
+<text class="t401" x="340" y="282">External Tools / APIs</text>
+
+<rect class="fbox401" x="250" y="338" width="180" height="86" rx="8"/>
+<text class="tf401" x="340" y="362">Sub-Agent Fleet</text>
+<text class="s401" x="340" y="380">spawned per branching step</text>
+<text class="s401" x="340" y="396">each runs its own loop</text>
+<text class="a401" x="340" y="416" fill="#2f6b3a">distribute intelligence</text>
+
+<path class="l401" d="M 300 94 L 300 146"/>
+<path class="l401" d="M 360 94 L 360 248"/>
+<path class="l401" d="M 340 94 L 340 120 L 410 120 L 410 334 L 360 334 L 360 336"/>
+
+<text class="hdr401" x="560" y="24">LLM serving fleet (every step is a call here)</text>
+<rect class="box401" x="560" y="36" width="290" height="388" rx="10"/>
+<text class="t401" x="705" y="60">Replicated, Sharded LLM Service</text>
+<text class="s401" x="705" y="80">peak ~1,700 calls/s, ~2,400 concurrent</text>
+<rect class="qbox401" x="585" y="100" width="110" height="70" rx="7"/>
+<text class="t401" x="640" y="130">Replica 1</text>
+<text class="s401" x="640" y="148">tensor-parallel</text>
+<rect class="qbox401" x="720" y="100" width="110" height="70" rx="7"/>
+<text class="t401" x="775" y="130">Replica 2</text>
+<text class="s401" x="775" y="148">tensor-parallel</text>
+<rect class="qbox401" x="585" y="200" width="110" height="70" rx="7"/>
+<text class="t401" x="640" y="230">Replica 3</text>
+<text class="s401" x="640" y="248">KV-cache paged</text>
+<rect class="qbox401" x="720" y="200" width="110" height="70" rx="7"/>
+<text class="t401" x="775" y="230">Replica R</text>
+<text class="s401" x="775" y="248">~50 at peak</text>
+<rect class="box401" x="620" y="320" width="170" height="56" rx="8"/>
+<text class="t401" x="705" y="344">Router / Batcher</text>
+<text class="s401" x="705" y="362">continuous batching</text>
+<text class="a401" x="705" y="406">distribute inference / the model</text>
+
+<path class="lo401" d="M 430 60 L 540 60 L 540 130 L 581 130"/>
+<path class="lo401" d="M 430 177 L 500 177 L 500 235 L 581 235"/>
+<path class="lo401" d="M 430 381 L 520 381 L 520 348 L 616 348"/>
+<text class="a401" x="495" y="50">every reasoning step</text>
+<text class="a401" x="495" y="430">becomes a model call</text>
+</svg>
+<figcaption><strong>Figure 40.1.1:</strong> The distributed agentic application as a request-unfolding architecture. A user task enters the agent orchestrator (top), which runs a multi-step plan-act-observe loop; on each step it retrieves from a sharded vector index, calls external tools, or spawns sub-agents (left, green) that run their own loops. Every reasoning step of every agent and sub-agent issues a call to the replicated, sharded LLM serving fleet (right), where a router batches the concurrent streams across many model replicas. The orange arrows trace those calls; each region is labeled with the axis of distribution it loads most heavily, and the peak numbers come from Code 40.1.1.</figcaption>
+</figure>
+
+<p>The diagram fixes the vocabulary for the chapter. The orchestrator on the left holds one task together across its many steps; the sharded index and tools are what each step reaches out to; the sub-agent fleet is where one task becomes many cooperating reasoners; and the serving fleet on the right is the multi-accelerator service that every step of every agent ultimately calls. The numbers on the boxes come from a back-of-envelope model, which we now run with real arithmetic so that no estimate in this chapter is a guess.</p>
+
+<pre><code class="language-python">import math
+
+# Workload requirements for the running agentic specification.
+users_dau          = 200_000       # daily active users (requirement: concurrent users)
+sessions_per_user  = 4             # task sessions per active user per day
+agent_steps        = 12            # mean reasoning/tool steps per task (multi-step)
+subagent_fanout    = 3             # sub-agents spawned per step that branches
+branch_fraction    = 0.30          # fraction of steps that fan out to sub-agents
+tokens_in_per_step = 6_000         # prompt tokens per LLM call (context + retrieved passages)
+tokens_out_per_step= 700           # generated tokens per LLM call
+price_in           = 3.0 / 1e6     # $ per input token
+price_out          = 15.0 / 1e6    # $ per output token
+peak_factor        = 8.0           # peak QPS over the daily average
+step_latency_s     = 1.4           # mean wall-clock latency of one LLM call
+
+# Effective LLM calls per task once sub-agent fan-out is counted: c_task = s (1 + f g).
+calls_per_task = agent_steps * (1 + branch_fraction * subagent_fanout)
+tasks_per_day  = users_dau * sessions_per_user
+calls_per_day  = tasks_per_day * calls_per_task
+
+# Token volume per day (input + output across every call).
+tokens_in_day  = calls_per_day * tokens_in_per_step
+tokens_out_day = calls_per_day * tokens_out_per_step
+tokens_day     = tokens_in_day + tokens_out_day
+
+# Cost: multi-step agent token cost = calls * (tokens_in * price_in + tokens_out * price_out).
+cost_in_day  = tokens_in_day  * price_in
+cost_out_day = tokens_out_day * price_out
+cost_day     = cost_in_day + cost_out_day
+
+# Concurrency: average call rate lambda, then Little's law C = lambda_peak * L at peak.
+avg_qps   = calls_per_day / 86_400
+peak_qps  = avg_qps * peak_factor
+conc_peak = peak_qps * step_latency_s
+
+print(f"effective LLM calls / task    : {calls_per_task:,.1f}")
+print(f"tasks / day                   : {tasks_per_day:,}")
+print(f"LLM calls / day               : {calls_per_day:,.0f}")
+print(f"tokens / day (in+out)         : {tokens_day/1e9:,.1f} billion")
+print(f"token cost / day              : ${cost_day:,.0f}")
+print(f"average LLM-call QPS          : {avg_qps:,.0f}")
+print(f"peak LLM-call QPS (x{peak_factor:.0f})       : {peak_qps:,.0f}")
+print(f"concurrent calls C (peak)     : {conc_peak:,.0f}")
+
+# A single serving replica sustains a bounded number of concurrent decode streams.
+streams_per_replica = 48
+replicas_peak = math.ceil(conc_peak / streams_per_replica)
+print(f"serving replicas at peak      : {replicas_peak:,} "
+      f"(at {streams_per_replica} streams each)")
+</code></pre>
+<div class="code-caption"><strong>Code 40.1.1:</strong> The five-requirement back-of-envelope model for the running specification. Each printed quantity corresponds to one formula in this section: the effective calls per task $c_{\text{task}}$, the daily calls and tokens, the multi-step token cost, the call rate $\lambda$, the Little's-law concurrency $C$, and the serving-replica count it forces.</div>
+<pre><code class="language-text">effective LLM calls / task    : 22.8
+tasks / day                   : 800,000
+LLM calls / day               : 18,240,000
+tokens / day (in+out)         : 122.2 billion
+token cost / day              : $519,840
+average LLM-call QPS          : 211
+peak LLM-call QPS (x8)       : 1,689
+concurrent calls C (peak)     : 2,364
+serving replicas at peak      : 50 (at 48 streams each)</code></pre>
+<div class="code-caption"><strong>Output 40.1.1:</strong> Real output. One task is nearly twenty-three model calls, not one; the system makes over eighteen million calls and burns more than a hundred and twenty billion tokens a day at roughly half a million dollars; and at peak it holds over two thousand decode streams at once, forcing on the order of fifty model replicas. Each number is a wall the single machine hits, and each lands on a different axis of distribution.</div>
+<p>The output settles the question. The fan-out multiplier alone turns one task into almost twenty-three calls, and the daily token volume crosses a hundred billion, which no single accelerator can either serve or afford. The peak concurrency of more than two thousand simultaneous decode streams forces the model onto a replicated, sharded fleet of dozens of nodes, exactly the distributed-serving regime of <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>. And the half-million-dollar daily bill makes cost control a first-class design axis rather than an afterthought. None of these is a marginal overshoot a faster chip would absorb; each is one to three orders of magnitude beyond a single node, and each falls on a different stage of the pipeline. That separation is what makes the six-axis decomposition the right tool.</p>
+
+<h2>3. Decomposing the System Onto the Six Axes <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The six axes of distribution from <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>, distribute data, distribute training, distribute the model, distribute inference, coordinate the cluster, and distribute intelligence, give us a map onto which every stage of Figure 40.1.1 places cleanly. This case study loads five of the six heavily; training is the one axis it consumes only indirectly, because the application assembles models that earlier parts trained rather than training them anew. Mapping the stages is the planning act of the whole chapter: it tells us which earlier part of the book owns each stage and which later section of this chapter develops it. Table 40.1.1 is that map, and it doubles as the chapter's table of contents.</p>
+<div class="table-caption"><strong>Table 40.1.1:</strong> Each stage of the agentic application assigned to the axis of distribution it loads most heavily, the earlier chapter that owns the underlying machinery, and the later section of this chapter that builds it.</div>
+<table>
+<thead>
+<tr><th scope="col">Stage</th><th scope="col">Primary axis</th><th scope="col">Owning earlier chapter</th><th scope="col">Built in this chapter</th></tr>
+</thead>
+<tbody>
+<tr><td>Document processing</td><td>Distribute data</td><td><a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/index.html">Ch 6</a>, <a href="../../part-2-distributed-data/module-07-spark-dataframes/index.html">Ch 7</a></td><td><a href="section-40.2.html">Section 40.2</a></td></tr>
+<tr><td>Embedding the corpus</td><td>Distribute inference</td><td><a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Ch 15</a>, <a href="../module-36-case-web-scale-text-rag/index.html">Ch 36</a></td><td><a href="section-40.3.html">Section 40.3</a></td></tr>
+<tr><td>Sharded vector search</td><td>Distribute the model</td><td><a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Ch 25</a></td><td><a href="section-40.4.html">Section 40.4</a></td></tr>
+<tr><td>RAG at scale</td><td>Distribute inference</td><td><a href="../module-36-case-web-scale-text-rag/index.html">Ch 36</a></td><td><a href="section-40.5.html">Section 40.5</a></td></tr>
+<tr><td>Agent orchestration</td><td>Distribute intelligence</td><td><a href="../../part-6-multi-agent-systems/module-32-distributed-agent-orchestration/index.html">Ch 32</a></td><td><a href="section-40.6.html">Section 40.6</a></td></tr>
+<tr><td>Model serving (vLLM)</td><td>Distribute inference / the model</td><td><a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Ch 24</a></td><td><a href="section-40.7.html">Section 40.7</a></td></tr>
+<tr><td>Cost control</td><td>Coordinate the cluster</td><td><a href="../../part-5-distributed-inference/module-26-mlops-distributed-ai/index.html">Ch 26</a></td><td><a href="section-40.8.html">Section 40.8</a></td></tr>
+<tr><td>Evaluation</td><td>Distribute intelligence / coordinate</td><td><a href="../../part-1-foundations/module-05-evaluating-distributed-ai/index.html">Ch 5</a></td><td><a href="section-40.9.html">Section 40.9</a></td></tr>
+</tbody>
+</table>
+<p>Reading the table top to bottom traces the dataflow of Figure 40.1.1, and reading the third column traces the path back through the book. Document processing is pure data distribution, the MapReduce and Spark jobs of <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a> and <a href="../../part-2-distributed-data/module-07-spark-dataframes/index.html">Chapter 7</a> applied to the corpus the agent will retrieve over. Embedding is distributed inference on a fixed corpus, borrowing the encoder and batching techniques of <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a> and the web-scale pipeline of <a href="../module-36-case-web-scale-text-rag/index.html">Chapter 36</a>. Sharding the vector store is splitting a structure too large for one node, the partitioning logic of <a href="../../part-5-distributed-inference/module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a>. RAG at scale is the retrieval-and-condition loop that <a href="../module-36-case-web-scale-text-rag/index.html">Chapter 36</a> built end to end, here demoted from the whole product to a single tool the agent may call many times. Agent orchestration, the plan-act-observe loop and the sub-agent fan-out, is the distributed-intelligence material of <a href="../../part-6-multi-agent-systems/module-32-distributed-agent-orchestration/index.html">Chapter 32</a>. Model serving is the distributed LLM serving of <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>, replicated and sharded to hold the concurrency of Output 40.1.1. Cost control is the cluster-coordination and MLOps discipline of <a href="../../part-5-distributed-inference/module-26-mlops-distributed-ai/index.html">Chapter 26</a> applied to the token bill. Evaluation closes the loop. No stage is new machinery; the contribution of this chapter is the assembly and the seams.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Intelligence Itself, Distributed Across a Fleet</div>
+<p>Earlier case studies distributed data, the model, or the serving fleet. This one reaches the last axis the book names: it distributes the intelligence. A single user goal is decomposed by an orchestrator into steps, those steps spawn sub-agents that reason in parallel, and each reasoning act is itself served by a fleet of cooperating model replicas. The product exists only because thinking has been spread across many machines that must coordinate to act as one mind, the scale-out moment in its fullest form. When you reach the capstone in <a href="../module-41-capstone-project-design/index.html">Chapter 41</a>, this is the worked example of the sixth axis: read the requirements, find the depth and width multipliers, assign each ceiling to an axis, and defend the assignment with the arithmetic of Code 40.1.1. Scale-out here is not one optimization but the shape of cognition the product is built from.</p>
+</div>
+
+<h2>4. The Build Path Versus the Agentic Query Path <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>One structural decision organizes the rest of the chapter, and it is the same split that organized the RAG case study, now with a different center of gravity. The offline build path (document processing, embedding, sharding the index) is throughput-bound and latency-tolerant: it runs over the corpus, is measured in accelerator-hours and dollars, and a document indexed a few minutes late costs nothing. The online agentic query path (orchestration, retrieval, generation across many steps) is latency-bound and throughput-replicated: each task must finish its whole multi-step chain inside the budget, so it is measured in end-to-end tail latency and in how many concurrent steps the fleet sustains. What is new here, and what separates this chapter from <a href="../module-36-case-web-scale-text-rag/index.html">Chapter 36</a>, is that the query path is no longer one retrieval and one generation; it is a loop whose length and fan-out are decided at runtime by the agent itself, which makes its cost and latency variable rather than fixed.</p>
+<p>That runtime variability is the heart of the chapter. In a one-shot RAG system the cost of a query is known before it runs; in an agentic system the agent decides how many steps to take and how many sub-agents to spawn, so the token bill and the concurrency load are themselves outcomes of the model's behavior, not fixed inputs. This is why cost control (<a href="section-40.8.html">Section 40.8</a>) becomes its own stage rather than a footnote: bounding step counts, caching repeated retrievals, and choosing a smaller model for routine steps are the levers that keep the variable cost of Output 40.1.1 from running away. The two paths meet at two shared artifacts, the sharded index that the build path produces and the query path retrieves from, and the serving fleet that every step of every agent calls. Keeping the paths logically separate while letting them share exactly those two artifacts is the architectural spine of the chapter.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Agent Demo Whose Bill Arrived Before the Product Did</div>
+<p><strong>Who:</strong> A platform engineer at an enterprise software company building an internal assistant that answers employee questions over the company's document corpus.</p>
+<p><strong>Situation:</strong> A prototype agent worked in a notebook: one reasoning loop, a hosted model API, a small local index, perfect demos to the leadership team.</p>
+<p><strong>Problem:</strong> Rolled out to a few thousand employees, the agent's reasoning loop averaged a dozen steps and frequently spawned sub-agents to check related documents, and the first monthly invoice was an order of magnitude over the budget.</p>
+<p><strong>Dilemma:</strong> Cap the agent to a single step and lose the multi-step reasoning that made it useful, or keep the reasoning and re-architect the serving and cost layers before the rollout widened company-wide.</p>
+<p><strong>Decision:</strong> They re-architected, running the back-of-envelope model of Code 40.1.1 on their real step counts and fan-out first, which revealed that the token bill was driven by re-reading a growing context at every step and by unbounded sub-agent spawning.</p>
+<p><strong>How:</strong> They moved to a self-hosted serving fleet with continuous batching, capped sub-agent fan-out, cached repeated retrievals, and routed routine steps to a smaller model, the exact stages of Sections 40.7 and 40.8.</p>
+<p><strong>Result:</strong> Per-task cost fell several-fold while end-to-end latency stayed inside the budget, and because the build and agentic paths were separated, widening to the whole company meant adding serving replicas without touching the orchestration logic.</p>
+<p><strong>Lesson:</strong> An agent prototype and an agent product are different systems, and the difference is the multiplier in $c_{\text{task}}$. Doing the arithmetic of Section 2 before the rollout is what turns the demo into something that survives its own invoice.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Notebook Agent That Hides Every Distributed Problem</div>
+<p>It is worth seeing the system this chapter does not study, because it shows exactly which problems scale removes the luxury of ignoring. A few lines of a modern agent framework give a working multi-step agent on a small corpus:</p>
+<pre><code class="language-python"># pip install langchain langchain-community faiss-cpu
+from langchain.agents import initialize_agent, Tool
+from langchain_community.vectorstores import FAISS
+
+retriever = FAISS.from_texts(documents, emb).as_retriever()   # whole index in RAM
+tools = [Tool("search", retriever.invoke, "search the corpus")]
+agent = initialize_agent(tools, llm, agent="zero-shot-react-description")
+answer = agent.run(task)        # loops, retrieves, and calls the model, all on one box
+</code></pre>
+<div class="code-caption"><strong>Code 40.1.2:</strong> A complete single-machine agent in a handful of lines. It silently assumes the index fits in RAM, the model is a hosted call that always returns, the reasoning loop is cheap because no one counts its steps, and one process can serve every user. Each assumption is one of the five requirements from Section 1, and each fails in production; the rest of this chapter is what these lines become when none of them hold.</div>
+</div>
+
+<h2>5. What This Chapter Builds, Section by Section <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>With the requirements fixed, the scale proven, and the axes mapped, the path through the chapter is set. <a href="section-40.2.html">Section 40.2</a> builds the distributed document-processing pipeline that produces the corpus the agent retrieves over. <a href="section-40.3.html">Section 40.3</a> embeds that corpus across a fleet, the inference pass that turns documents into searchable vectors. <a href="section-40.4.html">Section 40.4</a> shards those vectors into the searchable index, the artifact the agentic path consumes. <a href="section-40.5.html">Section 40.5</a> assembles retrieval and generation into RAG at scale, now reframed as a tool the agent invokes rather than the whole product. <a href="section-40.6.html">Section 40.6</a> builds the agent orchestration: the plan-act-observe loop, tool use, and the sub-agent fan-out that distributes the intelligence. <a href="section-40.7.html">Section 40.7</a> stands up the replicated, sharded model-serving fleet with vLLM that holds the concurrency of Output 40.1.1. <a href="section-40.8.html">Section 40.8</a> brings the variable token cost under control. <a href="section-40.9.html">Section 40.9</a> evaluates the whole system for task success, faithfulness, latency, and cost, and <a href="section-40.10.html">Section 40.10</a> turns it into a project you build yourself. Each section opens with the slice of Figure 40.1.1 it owns and the requirement from Section 1 it must satisfy.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Where Distributed Agentic Systems Are Moving (2024 to 2026)</div>
+<p>The boundary of this problem is shifting on every axis at once. On the orchestration axis, multi-agent frameworks in the lineage of AutoGen, LangGraph, CrewAI, and OpenAI's Swarm are formalizing how a planner agent decomposes a task and supervises a fleet of workers, and recent studies probe when added agents actually help versus when they merely multiply cost. On the serving axis, agent-aware schedulers exploit the fact that an agent's steps share a long, slowly growing prefix, so prefix-caching and disaggregated prefill-versus-decode serving (in the vLLM and SGLang lineage) cut the dominant input-token cost that Output 40.1.1 exposes. On the reasoning axis, long-context and tool-use models are reopening how much retrieval a step needs, yet retrieval keeps winning on cost and faithfulness at corpus scale, which is why the pipeline of Figure 40.1.1 endures. The constant across all of it is the five-requirement tension of Section 1: every advance is judged by whether it improves one of corpus scale, concurrency, multi-step latency, token cost, or reliability without surrendering the others, and the agent's runtime control over its own step count makes that trade sharper here than anywhere else in the book.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Helpers It Will Never Meet</div>
+<p>The epigraph is only a small exaggeration. In Output 40.1.1 the average task spawns enough sub-agents that, across a day, the system launches millions of short-lived reasoners that retrieve, decide, and report back, most of which finish their work and vanish before the parent has assembled the final answer. No human supervises them; the orchestrator counts on the arithmetic, not on watching each one. Distributing the intelligence did not make the thinking smaller, it made the waiting survivable, the same bargain that has underwritten every chapter of this book, now applied to cognition itself.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 40.1.1: Read the Requirements, Name the Ceilings <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each of the five requirements in Section 1 (corpus scale, concurrent users, multi-step latency, token cost, reliability), name the single stage in Figure 40.1.1 that it pressures hardest, the axis of distribution from Table 40.1.1 that stage sits on, and one concrete failure that occurs if that stage is left on a single machine. Then identify which two of the five requirements are in the most direct tension with each other in an agentic system specifically, and explain why the agent's runtime control over its own step count makes that tension worse than it is in the one-shot RAG system of <a href="../module-36-case-web-scale-text-rag/index.html">Chapter 36</a>.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 40.1.2: Resize the Agent <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 40.1.1 to model an agent that reasons more deeply and branches more widely: set the mean step count to $20$, the branch fraction to $0.5$, and the sub-agent fan-out to $4$. Report the new effective calls per task $c_{\text{task}}$, the daily token volume, the daily token cost, and the peak concurrency $C$. Then add a cost lever: assume routine steps (say $70\%$ of all calls) can be routed to a model priced at one fifth of the rates used here, and recompute the daily cost. Report the cost reduction as a percentage and explain which term in the cost formula the lever actually shrinks.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 40.1.3: The Concurrency Budget of a Reasoning Loop <span class="exercise-type analysis">Analysis</span></div>
+<p>Using Little's law $C = \lambda_{\text{peak}} L$ from Section 2, suppose the serving fleet must sustain a peak of $\lambda_{\text{peak}} = 1{,}700$ model calls per second at a per-step latency of $L = 1.4$ seconds. Estimate the concurrent decode streams $C$, and if one serving replica sustains $48$ concurrent streams, the replica count. Now argue how the answer changes if prefix-caching cuts the effective per-step latency to $0.6$ seconds by reusing the shared context across an agent's steps, and connect your reasoning to the replicated-serving treatment forthcoming in <a href="section-40.7.html">Section 40.7</a> and the LLM-serving economics of <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html"><span class="nav-label">Chapter Overview</span><span class="nav-num">Chapter 40</span><span class="nav-title">Distributed LLM and Agentic Applications</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 40</span><span class="nav-num">Contents</span><span class="nav-title">Distributed LLM and Agentic Applications</span></a>
+<a class="next" href="section-40.2.html"><span class="nav-label">Next</span><span class="nav-num">Section 40.2</span><span class="nav-title">Distributed Document Processing</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

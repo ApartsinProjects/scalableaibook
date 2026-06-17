@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 13.5: Distributed Graph Neural Networks. Why a k-layer GNN depends on a k-hop neighborhood, how neighbor explosion makes full-neighbor training infeasible on power-law graphs, and how partitioning mixes remote feature fetches with gradient all-reduce." name="description"/>
+<title>Section 13.5: Distributed Graph Neural Networks | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Distributed Machine Learning</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 13: Distributed Graph Machine Learning</a></div>
+<h1>Distributed Graph Neural Networks</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I asked one node for its opinion. To answer, it had to phone three machines, who each phoned three more, and by the time the gossip came back I had aggregated half the internet."</p>
+<cite>A GNN Layer That Underestimated Its Neighbors</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A graph neural network turns the graph itself into the computation: every layer makes each node gather and transform the features of its neighbors, so a $k$-layer network reads from a node's entire $k$-hop neighborhood.</strong> On a small graph that is harmless. On a web-scale, power-law graph it is ruinous, because a handful of hops pulls in almost the whole graph, and the graph plus its features no longer fits on one machine. Distributing a GNN therefore stacks two problems on top of each other: the graph is partitioned across machines (<a href="section-13.2.html">Section 13.2</a>), so a node's neighbor aggregation must fetch features from remote partitions, and that graph-shaped communication runs alongside the ordinary gradient all-reduce of data-parallel training. This section builds the message-passing model, exposes the neighbor-explosion problem that motivates sampling, and names the two costs every distributed-GNN system must pay.</p>
+</div>
+<p>The previous sections of this chapter treated the graph as something to analyze: partition it well (<a href="section-13.2.html">Section 13.2</a>), iterate vertex-centric computations over it (<a href="section-13.3.html">Section 13.3</a>), and run analytics such as PageRank and connected components across the partitions (<a href="section-13.4.html">Section 13.4</a>). We now make the graph something to learn from. A graph neural network (GNN) is a model whose forward pass is itself a message-passing computation over the graph: it produces an embedding for every node by repeatedly mixing each node's representation with those of its neighbors. The same partitioning and vertex-centric machinery returns, but now it must carry gradients backward as well as features forward, and it must coexist with the data-parallel training loop from <a href="../module-10-distributed-optimization/index.html">Chapter 10</a>.</p>
+
+<h2>1. Message Passing: A GNN Layer Is Aggregate-Then-Update <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Almost every GNN in use, GraphSAGE, GCN, GAT, and their descendants, fits a single template called message passing. Each node carries a feature vector, and each layer rewrites that vector in two steps: aggregate a permutation-invariant summary of the neighbors' current vectors, then update the node's own vector from that summary. Let $h_v^{(\ell)}$ be the representation of node $v$ after layer $\ell$, with $h_v^{(0)}$ the input features, and let $\mathcal{N}(v)$ be the neighbors of $v$. One layer is</p>
+$$h_v^{(\ell+1)} = \sigma\!\Big( W^{(\ell)} \cdot \mathrm{AGG}\big(\{\, h_u^{(\ell)} : u \in \mathcal{N}(v) \cup \{v\}\,\}\big) \Big),$$
+<p>where $\mathrm{AGG}$ is a symmetric reducer (mean, sum, or max), $W^{(\ell)}$ is a shared learnable weight, and $\sigma$ is a nonlinearity. The weight $W^{(\ell)}$ is identical for every node, exactly the parameter sharing that makes the model generalize across a graph of any size. Crucially, the structure of the computation is dictated not by the model but by the graph: which features get aggregated for $v$ is decided by who $v$'s neighbors are. That is what makes a GNN different from the dense and embedding models of <a href="../module-11-parameter-servers-embeddings/index.html">Chapter 11</a>, and what makes it hard to distribute.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A k-Layer GNN Reads a k-Hop Neighborhood</div>
+<p>Stack the layer equation $k$ times and trace the dependency backward. The output $h_v^{(k)}$ depends on layer-$(k{-}1)$ representations of $v$ and its direct neighbors; each of those depends on <em>their</em> neighbors; and so on. By induction, computing the final embedding of a single node requires the input features of every node within $k$ hops of it. The model has only $k$ small weight matrices, but its <em>receptive field</em> is the entire $k$-hop neighborhood. On a graph partitioned across machines, that receptive field is exactly the set of features you may have to fetch from other partitions.</p>
+</div>
+<p>This receptive-field view, made precise in the key insight, is the hinge of the whole section. It explains both why GNNs are expressive (a node sees a growing context as layers deepen) and why they are expensive to distribute (that context crosses partition boundaries). Figure 13.5.1 draws the expansion for a single target node and shows where the boundary crossings appear.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 860 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A target node at the center expands to its 1-hop and 2-hop neighborhoods, with a dashed vertical line separating two machine partitions; several 2-hop neighbors sit on the remote partition and are marked as requiring a feature fetch across the boundary.">
+<defs>
+<marker id="arr135" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr135r" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b86b1f"/></marker>
+</defs>
+<style>
+.n135 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.nt135 { fill:#dfeaf6; stroke:#14385c; stroke-width:2.2; }
+.r135 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.tt135 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.lt135 { font:600 13px sans-serif; fill:#b86b1f; text-anchor:middle; }
+.s135 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.e135 { fill:none; stroke:#9aa3ad; stroke-width:1.4; }
+.f135 { fill:none; stroke:#b86b1f; stroke-width:1.8; stroke-dasharray:5 3; marker-end:url(#arr135r); }
+.part135 { stroke:#14385c; stroke-width:1.4; stroke-dasharray:6 5; }
+</style>
+<text class="tt135" x="230" y="26">Partition A (this machine)</text>
+<text class="lt135" x="640" y="26">Partition B (remote)</text>
+<line class="part135" x1="450" y1="40" x2="450" y2="360"/>
+<!-- edges -->
+<line class="e135" x1="230" y1="200" x2="150" y2="120"/>
+<line class="e135" x1="230" y1="200" x2="150" y2="280"/>
+<line class="e135" x1="230" y1="200" x2="330" y2="140"/>
+<line class="e135" x1="150" y1="120" x2="90" y2="60"/>
+<line class="e135" x1="150" y1="280" x2="90" y2="330"/>
+<line class="e135" x1="330" y1="140" x2="560" y2="100"/>
+<line class="e135" x1="330" y1="140" x2="600" y2="180"/>
+<line class="e135" x1="230" y1="200" x2="540" y2="300"/>
+<!-- 1-hop ring label -->
+<text class="s135" x="230" y="356">solid lines = graph edges; dashed orange = cross-partition feature fetch</text>
+<!-- target -->
+<circle class="nt135" cx="230" cy="200" r="26"/>
+<text class="tt135" x="230" y="204">v</text>
+<text class="s135" x="230" y="240">target node</text>
+<!-- 1-hop -->
+<circle class="n135" cx="150" cy="120" r="20"/><text class="tt135" x="150" y="124">a</text>
+<circle class="n135" cx="150" cy="280" r="20"/><text class="tt135" x="150" y="284">b</text>
+<circle class="n135" cx="330" cy="140" r="20"/><text class="tt135" x="330" y="144">c</text>
+<text class="s135" x="150" y="100">1-hop</text>
+<!-- 2-hop local -->
+<circle class="n135" cx="90" cy="60" r="17"/><text class="tt135" x="90" y="64">d</text>
+<circle class="n135" cx="90" cy="330" r="17"/><text class="tt135" x="90" y="334">e</text>
+<!-- 2-hop remote -->
+<circle class="r135" cx="560" cy="100" r="20"/><text class="lt135" x="560" y="104">f</text>
+<circle class="r135" cx="600" cy="180" r="20"/><text class="lt135" x="600" y="184">g</text>
+<circle class="r135" cx="540" cy="300" r="20"/><text class="lt135" x="540" y="304">h</text>
+<text class="s135" x="600" y="220">2-hop, remote</text>
+<!-- fetch arrows -->
+<path class="f135" d="M 540 100 L 360 134"/>
+<path class="f135" d="M 580 178 L 360 146"/>
+<path class="f135" d="M 520 296 L 256 214"/>
+</svg>
+<figcaption><strong>Figure 13.5.1:</strong> The receptive field of one target node $v$ under a 2-layer GNN. Computing $h_v^{(2)}$ needs the layer-1 vectors of $v$'s neighbors ($a$, $b$, $c$), which in turn need the input features of the 2-hop nodes ($d$, $e$, $f$, $g$, $h$). The graph is split across two machines by the dashed partition line; nodes $f$, $g$, $h$ live on the remote partition, so their features must be fetched across the boundary (orange dashed arrows). Deeper networks push the boundary crossings further out and multiply them.</figcaption>
+</figure>
+
+<h2>2. Neighbor Explosion: Why Full-Neighbor Training Does Not Scale <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The receptive field grows with depth, and on real graphs it grows catastrophically. If every node had a fixed degree $D$, the $k$-hop neighborhood would hold on the order of $D^k$ nodes, already exponential. Real graphs are worse, because they are not regular: social, web, and citation graphs follow a power-law degree distribution with a few enormously high-degree hubs. A short path through even one hub sweeps a huge fraction of the graph into the receptive field. The practical consequence is blunt: on a graph with hundreds of millions of nodes, the 3-hop neighborhood of a single training node can already touch most of the graph, so computing one node's loss "exactly" with all neighbors means reading nearly the whole feature matrix. This is the <em>neighbor explosion</em> problem.</p>
+<p>Naive full-neighbor training, where each layer aggregates over every actual neighbor, is therefore infeasible at scale for two compounding reasons. First, memory: the activations for one mini-batch include every node in the union of the batch's $k$-hop neighborhoods, which can dwarf the batch itself. Second, communication: when the graph is partitioned, every neighbor that lands on another machine is a feature you must pull across the network, and a hub neighbor multiplies those pulls. The standard remedy is to stop insisting on <em>all</em> neighbors and instead aggregate over a bounded random sample of them, which caps the receptive field and the fetch count per layer. That is distributed neighbor sampling, the subject of the very next section.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Six-Handshakes Trap</div>
+<p>The folklore that any two people are separated by about six social hops is, for a GNN engineer, a warning rather than a charming fact. If six hops can connect anyone to anyone, then a six-layer GNN's receptive field for one node is, roughly, everyone. Depth in a GNN is not free context; past a few layers it quietly asks each node to read the entire graph, which is one reason most production GNNs stay shallow.</p>
+</div>
+
+<h2>3. Distributing the GNN: Two Costs That Run at Once <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Put the pieces together. To train a GNN on a graph too big for one machine, we partition the graph structure and the node-feature matrix across $P$ machines (<a href="section-13.2.html">Section 13.2</a>), and we run data-parallel training, where each machine processes a shard of the training nodes and contributes to a shared gradient. A single training step now incurs two distinct communication costs, and a distributed-GNN system is largely an exercise in managing both.</p>
+<p>The first cost is <strong>feature and message communication</strong>: during the forward and backward passes, a machine aggregating a local node's neighbors must fetch the representations of any neighbor that lives on another partition, and push the corresponding gradients back. This cost is graph-shaped; it depends entirely on how many edges cross partition boundaries, which is precisely what the graph-partitioning objective of <a href="section-13.2.html">Section 13.2</a> tries to minimize. The second cost is the familiar <strong>gradient synchronization</strong>: because the weight $W^{(\ell)}$ is shared across all nodes and all machines, the per-machine weight gradients must be combined with an all-reduce, exactly the collective that data-parallel training relies on (<a href="../module-10-distributed-optimization/section-10.5.html">Section 10.5</a>). The two costs interleave within every step: feature fetches gate the forward pass, the all-reduce gates the optimizer update.</p>
+<p>The demonstration below isolates the first, graph-shaped cost on a tiny partitioned graph. It implements one message-passing layer in pure NumPy, runs it for the nodes owned by each of two partitions, and counts how many neighbor features had to be read from the other machine. The point is not the numbers themselves but the mechanism: a node's output literally cannot be computed without reaching across the partition boundary.</p>
+<pre><code class="language-python">import numpy as np
+
+# A small undirected graph: 8 nodes, partitioned across 2 machines.
+# Partition 0 holds nodes {0,1,2,3}; partition 1 holds nodes {4,5,6,7}.
+edges = [(0,1),(1,2),(2,3),(3,4),(4,5),(5,6),(6,7),(2,5),(1,6),(0,7)]
+N, F_in, F_out = 8, 4, 3
+part = {0:0,1:0,2:0,3:0, 4:1,5:1,6:1,7:1}   # node -> partition id
+
+# Build adjacency (including self) as neighbor lists.
+nbr = {v: {v} for v in range(N)}
+for a, b in edges:
+    nbr[a].add(b); nbr[b].add(a)
+
+rng = np.random.default_rng(0)
+H = rng.standard_normal((N, F_in))           # node feature matrix (lives sharded by partition)
+W = rng.standard_normal((F_in, F_out))       # shared layer weight (replicated on every machine)
+
+def message_passing_layer(target_nodes, owner_part):
+    """One GNN layer for nodes owned by owner_part: mean-aggregate neighbor
+    features, then linear transform. Counts how many neighbor features had to be
+    fetched from a REMOTE partition."""
+    out = np.zeros((len(target_nodes), F_out))
+    remote_fetches = 0
+    for i, v in enumerate(target_nodes):
+        agg = np.zeros(F_in)
+        for u in sorted(nbr[v]):
+            agg += H[u]                       # read neighbor feature
+            if part[u] != owner_part:         # neighbor lives on another machine
+                remote_fetches += 1
+        agg /= len(nbr[v])                    # mean aggregation
+        out[i] = agg @ W                      # transform
+    return out, remote_fetches
+
+p0_nodes = [v for v in range(N) if part[v] == 0]
+out0, fetch0 = message_passing_layer(p0_nodes, owner_part=0)
+p1_nodes = [v for v in range(N) if part[v] == 1]
+out1, fetch1 = message_passing_layer(p1_nodes, owner_part=1)
+
+print("partition 0 owns nodes :", p0_nodes)
+print("partition 1 owns nodes :", p1_nodes)
+print("remote fetches (part 0):", fetch0)
+print("remote fetches (part 1):", fetch1)
+print("cross-partition fetches total:", fetch0 + fetch1)
+print("output row for node 2  :", np.array2string(out0[2], precision=3))
+print("node 2 neighbors       :", sorted(nbr[2]),
+      "-> remote:", sorted(u for u in nbr[2] if part[u] != 0))
+</code></pre>
+<div class="code-caption"><strong>Code 13.5.1:</strong> One GNN message-passing layer over a graph split across two partitions. The aggregation loop tags every neighbor read whose owner differs from the node's own partition, turning the abstract "remote feature fetch" into a counter you can watch.</div>
+<pre><code class="language-text">partition 0 owns nodes : [0, 1, 2, 3]
+partition 1 owns nodes : [4, 5, 6, 7]
+remote fetches (part 0): 4
+remote fetches (part 1): 4
+cross-partition fetches total: 8
+output row for node 2  : [ 0.158 -0.794  0.3  ]
+node 2 neighbors       : [1, 2, 3, 5] -> remote: [5]
+</code></pre>
+<div class="code-caption"><strong>Output 13.5.1:</strong> Eight neighbor reads crossed the partition boundary for a single layer over eight nodes, four in each direction, matching the eight boundary edges in the graph. Node 2's embedding depended on node 5, which lives on the other machine, so that feature had to travel across partitions before node 2's output existed.</div>
+<p>Output 13.5.1 makes the dependency concrete: node 2 sits on partition 0, but one of its neighbors (node 5) sits on partition 1, so node 2's layer output cannot be produced without a cross-partition fetch. Scale this from eight nodes to eight hundred million, add a second and third layer so the receptive field reaches two and three hops, and the eight fetches become a torrent that the partitioning of <a href="section-13.2.html">Section 13.2</a>, the sampling of <a href="section-13.6.html">Section 13.6</a>, and the batching strategy of <a href="section-13.7.html">Section 13.7</a> all exist to tame. The all-reduce on $W$'s gradient, by contrast, is the same size no matter how the graph is cut, because it depends only on the model, not the graph.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The All-Reduce Returns, Now Riding on Graph Traffic</div>
+<p>The gradient all-reduce introduced as the exact reorganization of data-parallel training (<a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>) and deepened in distributed optimization (<a href="../module-10-distributed-optimization/section-10.5.html">Section 10.5</a>) reappears here unchanged: the shared weights $W^{(\ell)}$ are synchronized across machines by summing partial gradients. What is new in the graph setting is the second, graph-shaped communication layered on top, the remote feature and message fetches of Output 13.5.1. Distributed GNN training is the first place in this book where a structural, data-dependent communication pattern runs <em>alongside</em> the model-dependent all-reduce, and the art is overlapping the two so neither stalls the accelerators.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: DGL and PyG Hide the Partition Boundary</div>
+<p>Code 13.5.1 tracked remote fetches by hand. Production frameworks do this for you. In Deep Graph Library (DGL), <code>dgl.distributed</code> partitions the graph and feature tensors, serves remote features through a key-value store, and lets you write the same aggregate-then-update layer as if the graph were local; PyTorch Geometric (PyG) offers an equivalent path through its <code>MessagePassing</code> base class plus distributed samplers. The model code shrinks to a few lines:</p>
+<pre><code class="language-python">import dgl, dgl.nn as dglnn, torch.nn as nn
+
+class GraphSAGE(nn.Module):                 # two message-passing layers
+    def __init__(self, in_f, hid, out_f):
+        super().__init__()
+        self.l1 = dglnn.SAGEConv(in_f, hid, aggregator_type="mean")
+        self.l2 = dglnn.SAGEConv(hid, out_f, aggregator_type="mean")
+    def forward(self, blocks, x):           # 'blocks' are the sampled k-hop subgraphs
+        x = torch.relu(self.l1(blocks[0], x))
+        return self.l2(blocks[1], x)
+</code></pre>
+<div class="code-caption"><strong>Code 13.5.2:</strong> A two-layer GraphSAGE in DGL. The ten-line manual loop of Code 13.5.1 collapses to two <code>SAGEConv</code> calls; the library handles neighbor lookup, the remote-feature key-value store, and the boundary crossings the diagram drew by hand. The <code>blocks</code> argument is where neighbor sampling (<a href="section-13.6.html">Section 13.6</a>) plugs in.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Fraud Graph That Would Not Fit</div>
+<p><strong>Who:</strong> A machine learning engineer at a payments company building a transaction-fraud classifier.</p>
+<p><strong>Situation:</strong> The graph linked 400 million accounts and devices through shared-payment and shared-device edges, with rich per-node features, far past the memory of any single GPU server.</p>
+<p><strong>Problem:</strong> A first 3-layer full-neighbor GNN prototype ran fine on a one-million-node sample but exhausted host memory the moment it touched the full graph, because a few hub devices linked to millions of accounts.</p>
+<p><strong>Dilemma:</strong> Keep full-neighbor aggregation and shard the graph across enough machines to hold it, paying heavy cross-partition feature traffic on every hub, or cap each node's neighbors with sampling and accept a stochastic approximation of the aggregation.</p>
+<p><strong>Decision:</strong> They partitioned the graph to minimize cut edges, then capped fan-out with neighbor sampling, because the hubs made full-neighbor receptive fields explode exactly as Section 2 predicts.</p>
+<p><strong>How:</strong> Using DGL's distributed partitioning across eight machines, they served remote features from a key-value store and sampled at most fifteen and then ten neighbors across the two layers, overlapping feature fetches with the gradient all-reduce.</p>
+<p><strong>Result:</strong> Training fit in cluster memory and a step's wall-clock was dominated by feature fetching, not the weight all-reduce, so the next round of tuning targeted partition quality and sample sizes rather than gradient communication.</p>
+<p><strong>Lesson:</strong> On a power-law graph the binding cost is graph-shaped feature traffic, not gradient synchronization; partition well and bound the neighborhood before you optimize anything else.</p>
+</div>
+
+<h2>4. Where This Goes Next <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>We now have the model (message passing, aggregate-then-update), the obstacle (neighbor explosion on power-law graphs), and the two costs of distributing it (graph-shaped feature fetches plus the model-shaped gradient all-reduce). The rest of the chapter attacks the costs in order. <a href="section-13.6.html">Section 13.6</a> introduces distributed neighbor sampling, the direct remedy for neighbor explosion, which bounds the receptive field and therefore the cross-partition fetch count per layer. <a href="section-13.7.html">Section 13.7</a> then weighs mini-batch training, where each step works on a sampled subgraph, against full-graph training, where the entire graph participates in every step, a trade-off between memory, communication, and convergence that only makes sense once you have seen, as in Output 13.5.1, what a single layer over a partitioned graph actually costs.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Graph Foundation Models and Billion-Edge GNNs (2024 to 2026)</div>
+<p>Two fronts are reshaping distributed GNNs. The first is scale: systems work on partition-aware caching of hot (hub) features, GPU-resident feature stores, and communication-avoiding sampling continues to push billion- and trillion-edge training onto modest clusters, with the cross-partition feature fetch of Output 13.5.1 as the quantity being engineered down. The second is generality: the rise of <em>graph foundation models</em> asks whether a single pretrained GNN or graph transformer can transfer across graphs and tasks the way language models transfer across text, with surveys in 2024 to 2025 (for example, Liu et al. and Mao et al. on graph foundation models) mapping the design space. Graph transformers in particular trade local message passing for attention over larger neighborhoods, which raises the receptive-field and communication stakes this section described rather than lowering them. The open question for distribution is whether pretraining on enormous graphs can amortize the per-graph feature-fetch cost across many downstream tasks.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.5.1: Count the Receptive Field <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Consider a graph where every node has exactly degree $D = 10$. Ignoring overlaps, give an upper bound on the number of distinct nodes in the $k$-hop neighborhood of a single node for $k = 1, 2, 3, 4$. At which depth does the bound exceed one million nodes? Now explain in two or three sentences why a single very-high-degree hub anywhere within $k$ hops makes this regular-degree estimate wildly optimistic for a real power-law graph, and connect your answer to the neighbor-explosion argument of Section 2.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.5.2: Measure the Cost of a Bad Cut <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 13.5.1. First, change the partition assignment so that the two partitions are deliberately interleaved (for example, even-numbered nodes on partition 0 and odd-numbered nodes on partition 1) and re-count the total cross-partition fetches. Compare it to the original block partition. Then add a second message-passing layer (feed the layer-1 outputs back in as layer-2 inputs) and report how the remote-fetch count changes when you go from one layer to two. Explain which of the two costs from Section 3, feature communication or gradient all-reduce, your experiment is measuring, and why the other one is unaffected by your partition change.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.5.3: Which Cost Dominates? <span class="exercise-type analysis">Analysis</span></div>
+<p>Suppose a 2-layer GNN has weight matrices totalling $P = 2 \times 10^6$ parameters (4 bytes each), and a training step over one machine's shard fetches $10^7$ remote neighbor features, each a 256-dimensional float32 vector. Estimate the bytes moved by the gradient all-reduce versus the bytes moved by remote feature fetching for that step, and state which dominates. Then describe one change to the graph partition (Section 13.2) and one change to neighbor sampling (Section 13.6) that would each reduce the dominant cost, and argue from your byte estimate why optimizing the smaller cost first would be wasted effort.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-13.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 13.4</span><span class="nav-title">Distributed Graph Analytics</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 13</span><span class="nav-num">Contents</span><span class="nav-title">Distributed Graph Machine Learning</span></a>
+<a class="next" href="section-13.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 13.6</span><span class="nav-title">Distributed Neighbor Sampling</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

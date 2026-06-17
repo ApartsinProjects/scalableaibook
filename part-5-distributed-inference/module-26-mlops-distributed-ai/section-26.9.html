@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 26.9: Rollbacks, Incident Response, and Guardrails. Recovering fast when a deployed AI system misbehaves, and the distributed filtering layer that prevents harm, closing Chapter 26 and Part V." name="description"/>
+<title>Section 26.9: Rollbacks, Incident Response, and Guardrails | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Distributed Inference and Serving</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 26: MLOps for Distributed AI</a></div>
+<h1>Rollbacks, Incident Response, and Guardrails</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I served nine hundred million confident, well-formed, completely wrong answers before anyone noticed. The rollback took eight seconds. The postmortem took eight days."</p>
+<cite>A Production Pointer That Got Promoted Too Soon</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A distributed AI system will eventually misbehave in production, and the difference between a non-event and an outage is how fast you can detect, contain, and reverse the bad behavior across the whole fleet.</strong> Two mechanisms carry that weight. The first is <em>fast rollback</em>: because the model registry (Section 26.3) tracks every version and the serving fleet (<a href="../module-23-distributed-inference-systems/index.html">Chapter 23</a>) addresses production through a single pointer, undoing a bad deploy should be a near-instant pointer swap rather than a rebuild. The second is a <em>guardrail layer</em>: a distributed ring of input and output filters wrapped around the fleet that blocks toxic, malformed, or attacked outputs before a user ever sees them. This closing section puts both to work in one runnable incident, measures the time-to-recovery, and then folds up Chapter 26 and Part V as a whole.</p>
+</div>
+<p>The previous sections of this chapter built the machinery that keeps a fleet healthy under normal conditions: orchestrated pipelines (Section 26.2), a versioned model and prompt registry (Section 26.3), eval-gated CI/CD (Section 26.4), experiment tracking (Section 26.5), fleet monitoring with mergeable sketches (Section 26.6), distributed drift detection (Section 26.7), and progressive delivery with A/B and shadow traffic (Section 26.8). Each of those is a way to <em>avoid</em> a bad day. This section is about the bad day itself: a model that passed every gate still goes wrong in production, and the question becomes how quickly the loop you built can detect the regression, decide what broke, and reverse it. Detection and progressive rollout reduce how often you reach for the rollback lever; they never eliminate the need for the lever.</p>
+
+<h2>1. Fast Rollback as a Pointer Swap <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The single most valuable property of an MLOps stack under pressure is that rolling back a model is cheap, reversible, and fast. That property is not automatic; it is the payoff of three design decisions made earlier and calmly, long before the incident. First, <strong>the registry tracks every version</strong> (Section 26.3), so the previous good model is named, addressable, and reproducible rather than something you must rebuild from a training run. Second, <strong>production is addressed through a pointer</strong>, an alias such as <code>ranker:prod</code> that the serving fleet (<a href="../module-23-distributed-inference-systems/index.html">Chapter 23</a>) resolves on each load, so swapping the alias from <code>v8</code> back to <code>v7</code> changes what every replica serves without redeploying code. Third, <strong>the model version is decoupled from the application code</strong>, so reverting the model does not drag along an unrelated rollback of the API server.</p>
+<p>The prerequisites that make this work are worth stating as a checklist, because each one is easy to skip when shipping and painful to lack when on fire. Keep the previous version <em>warm</em>: a rollback that requires pulling 80&nbsp;GB of weights onto a thousand replicas and re-JIT-compiling is not fast, so the prior version stays loadable, ideally still resident on a held-back slice of the fleet that the canary (Section 26.8) never fully drained. Make every deploy <em>reversible</em> by forbidding irreversible side effects on promotion, such as a one-way schema migration of the feature store that the old model cannot read. And decouple model version from app code so the two roll back independently. If $t_{\text{rollback}}$ is the time to swap the pointer and $t_{\text{warm}}$ is the time to load a cold version, the entire argument of this section is that you want to pay $t_{\text{rollback}} \ll t_{\text{warm}}$ at the moment that matters, which means paying for warmth continuously beforehand.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Rollback Speed Is Bought Before the Incident, Not During It</div>
+<p>A near-instant rollback is not a heroic action taken under pressure; it is the cashing-in of three decisions made in calm: the registry named the previous version, production resolves through a swappable pointer, and the prior model was kept warm on the fleet. An organization that has to ask "which build was good?" or "can the old model even read the new features?" during an outage has already lost the minutes that matter. The lever is cheap to pull only because you paid for it in advance.</p>
+</div>
+
+<h2>2. Incident Response for AI Systems <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Classical site-reliability incident response has four beats: detect, diagnose, mitigate, and learn. AI systems keep all four but change what each one looks like, because the failure is often statistical rather than a crash. A model serving fluent, well-formed, confidently wrong answers throws no exception and returns HTTP 200; the system is "up" while quietly degrading. Figure 26.9.1 shows the loop, with the guardrail layer wrapped around the serving fleet as the first line that never sleeps.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of the AI incident loop. A guardrail filter ring wraps the serving fleet; below it, four stages cycle: detect, diagnose, rollback to the previous registry version, and postmortem, with the postmortem feeding back into the registry and gates.">
+<defs>
+<marker id="arr269" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b269 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.g269 { fill:#eef7ee; stroke:#2f7d32; stroke-width:1.6; }
+.r269 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.t269 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.tg269 { font:600 13px sans-serif; fill:#2f7d32; text-anchor:middle; }
+.s269 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l269 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr269); }
+</style>
+<rect class="g269" x="250" y="20" width="380" height="92" rx="12"/>
+<text class="tg269" x="440" y="46">Guardrail filter ring (around the fleet)</text>
+<text class="s269" x="440" y="68">input filters &#183; PII / toxicity &#183; jailbreak defense</text>
+<text class="s269" x="440" y="86">schema validation &#183; safe fallback on failure</text>
+<rect class="b269" x="330" y="132" width="220" height="44" rx="8"/>
+<text class="t269" x="440" y="159">Serving fleet (Ch 23)</text>
+<rect class="b269" x="70" y="232" width="150" height="64" rx="10"/>
+<text class="t269" x="145" y="262">Detect</text>
+<text class="s269" x="145" y="280">monitor / drift</text>
+<rect class="b269" x="290" y="232" width="150" height="64" rx="10"/>
+<text class="t269" x="365" y="262">Diagnose</text>
+<text class="s269" x="365" y="280">model? data? prompt?</text>
+<rect class="r269" x="510" y="232" width="160" height="64" rx="10"/>
+<text class="t269" x="590" y="262">Rollback</text>
+<text class="s269" x="590" y="280">pointer &#8594; prev version</text>
+<rect class="b269" x="740" y="232" width="120" height="64" rx="10"/>
+<text class="t269" x="800" y="262">Postmortem</text>
+<text class="s269" x="800" y="280">add a gate</text>
+<line x1="440" y1="176" x2="440" y2="226" class="l269"/>
+<line x1="220" y1="264" x2="284" y2="264" class="l269"/>
+<line x1="440" y1="264" x2="504" y2="264" class="l269"/>
+<line x1="670" y1="264" x2="734" y2="264" class="l269"/>
+<path class="l269" d="M 800 232 L 800 130 L 632 130"/>
+<text class="s269" x="700" y="120">feed the lesson back into registry + CI/CD gates</text>
+<path class="l269" d="M 145 232 L 145 150 L 326 150"/>
+<text class="s269" x="150" y="206">a regression, not a crash</text>
+</svg>
+<figcaption><strong>Figure 26.9.1:</strong> The AI incident loop. The guardrail ring (green) filters every request and response around the serving fleet continuously. When a statistical regression slips past it, the four-stage loop runs: detect (monitoring and drift, Sections 26.6 to 26.7), diagnose the cause, roll back the production pointer to the previous registry version, and run a postmortem whose output is a new gate that prevents the same class of failure. The diagnosis and rollback stages are what the demo in Section 4 exercises.</figcaption>
+</figure>
+<p><strong>Detect.</strong> The signal comes from the monitoring and drift machinery of Sections 26.6 and 26.7: a quality metric crossing a threshold, an input distribution shifting, a guardrail block rate spiking, or simply a flood of user reports. The hardest detection problem in AI serving is the silent regression, which is why the mergeable sketches of Section 26.6 compute fleet-wide quality continuously rather than waiting for a complaint.</p>
+<p><strong>Diagnose.</strong> The distinctive AI question is <em>what</em> changed, because the suspects are plural: was it the <em>model</em> (a freshly promoted version), the <em>data</em> (an upstream feature pipeline now emitting nulls), a <em>prompt</em> (a template edit that the prompt registry of Section 26.3 should have versioned), or an <em>upstream service</em> (a retrieval index from <a href="../module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a> returning stale documents)? A registry that versions models <em>and</em> prompts together turns this from guesswork into a diff: line up what was promoted against when the metric turned.</p>
+<p><strong>Mitigate.</strong> Rollback is the blunt, reliable instrument, but it is not the only one. You can <em>fall back</em> to a smaller, older, or more conservative model that you trust more than you trust low latency; you can <em>rate-limit</em> the affected path to cap the blast radius while you investigate; or you can tighten the guardrails to reject the failing output class outright. The goal of mitigation is to stop the bleeding in seconds, not to find the root cause, which is the next stage's job.</p>
+<p><strong>Learn.</strong> The postmortem's deliverable is not a document; it is a new gate. Every incident that a CI/CD eval (Section 26.4) could have caught becomes a new eval; every silent regression a monitor missed becomes a new monitored metric. The loop in Figure 26.9.1 closes by feeding its lesson back into the registry and the gates, so the same failure cannot recur the same way.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>The most expensive AI incidents are rarely the ones where the service falls over; those page someone in minutes. The expensive ones are the quiet regressions that pass every health check, return a crisp HTTP 200, and confidently serve nonsense for a week. A crashed replica is honest about being broken. A confidently wrong model is the colleague who answers every question instantly and is subtly mistaken about half of them.</p>
+</div>
+
+<h2>3. Guardrails: The Distributed Safety Layer <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Rollback reverses a bad <em>model</em>. Guardrails prevent a bad <em>output</em>, including outputs from a model that is behaving exactly as trained but is being asked something it should refuse. In LLMOps this safety layer has become a first-class component, and at fleet scale it is itself a distributed system: a ring of stateless filters that every request and response passes through, sized and replicated alongside the serving tier so it adds bounded latency rather than a bottleneck. The filters fall into a few families:</p>
+<ul>
+<li><strong>Input and output content filters</strong> for toxicity, hate, self-harm, and other policy categories, applied both to what the user sends and to what the model produces.</li>
+<li><strong>PII detection and redaction</strong>, catching emails, card numbers, and identifiers before they are echoed back or logged.</li>
+<li><strong>Jailbreak and prompt-injection defenses</strong>, which detect attempts to override the system instruction ("ignore previous instructions") or to smuggle instructions through retrieved documents and tool outputs.</li>
+<li><strong>Schema and format validation</strong>, which rejects an output that does not parse as the required JSON, violates a function-call signature, or omits a mandatory field.</li>
+<li><strong>A fallback policy</strong> for when any check fails: serve a safe canned response, retry with a more constrained decoding, or escalate to a stronger model, but never pass the failing output through.</li>
+</ul>
+<p>If a single check passes with probability $p_i$ and we run $n$ independent checks, the probability that a genuinely bad output slips through the whole ring is the product $\prod_{i=1}^{n}(1 - r_i)$ of the miss rates $r_i$, so layering complementary filters drives the escape probability down multiplicatively. The cost is latency and false positives, which is why the ring is engineered, profiled, and load-tested exactly like the serving fleet it protects. We return to the adversarial and policy side of this layer (red-teaming, robustness guarantees, secure aggregation) when we treat responsible and secure distributed AI in <a href="../../part-7-infrastructure/module-35-reliable-secure-distributed-ai/index.html">Chapter 35</a>; here the point is operational: the guardrail ring is the first responder in the incident loop, blocking harm in real time while the slower detect-diagnose-rollback cycle runs behind it.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: NeMo Guardrails, Guardrails AI, and Llama Guard</div>
+<p>You do not hand-roll the filter ring. <strong>NeMo Guardrails</strong> (NVIDIA) defines input, output, and dialogue rails declaratively and runs them as a programmable layer in front of any LLM. <strong>Guardrails AI</strong> wraps an LLM call with composable validators (schema, PII, toxicity, competitor mentions) and a re-ask-on-failure policy, so a malformed or unsafe output is automatically retried or replaced. <strong>Llama Guard</strong> (Meta) is a fine-tuned classifier model that scores both prompts and responses against a safety taxonomy and is itself served on the fleet as one of the filters. A robust input-plus-output ring that would be hundreds of lines of bespoke regex and classifier glue collapses to a short rails configuration plus a couple of validator decorators:</p>
+<pre><code class="language-python"># Guardrails AI: validate structure AND safety, auto re-ask on failure.
+from guardrails import Guard
+from guardrails.hub import ToxicLanguage, DetectPII, ValidJson
+
+guard = Guard().use_many(
+    ToxicLanguage(on_fail="exception"),     # block toxic output
+    DetectPII(["EMAIL_ADDRESS", "CREDIT_CARD"], on_fail="fix"),  # redact PII
+    ValidJson(on_fail="reask"),             # enforce schema, retry if broken
+)
+
+safe_output = guard(llm_callable, prompt=user_prompt)  # raises or repairs on a bad output
+</code></pre>
+<div class="code-caption"><strong>Code 26.9.1:</strong> Three guardrail families (toxicity, PII, schema) composed as one validator stack with per-validator failure policies. The library handles the re-ask loop, the redaction, and the exception path that the from-scratch <code>guardrail()</code> function in Code 26.9.2 implements by hand.</div>
+</div>
+
+<h2>4. An Incident, End to End <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The simulation below ties the section together. A bad model, <code>v8</code>, was promoted to production with a high toxicity and schema-failure rate and degraded accuracy. As traffic flows, the guardrail ring blocks the toxic and malformed outputs in real time (serving a safe fallback instead), while a distributed monitor accumulates a rolling window of correctness and fires on a schedule rather than on every request. When the windowed quality crosses the regression threshold, the controller automatically swaps the production pointer back to the warm previous version <code>v7</code>, and we report the time-to-recovery. The code is pure Python with no dependencies.</p>
+<pre><code class="language-python">import random, statistics
+random.seed(7)
+
+# Model registry: every version, with the production pointer (Section 26.3).
+REGISTRY = {
+    "v7": {"toxic_rate": 0.002, "schema_fail": 0.001, "accuracy": 0.94, "warm": True},
+    "v8": {"toxic_rate": 0.090, "schema_fail": 0.140, "accuracy": 0.79, "warm": True},
+}
+production, previous = "v8", "v7"   # a bad model was just promoted; prev kept WARM
+
+def serve(version, prompt_is_attack):
+    m = REGISTRY[version]
+    toxic = random.random() < (m["toxic_rate"] + (0.6 if prompt_is_attack else 0.0))
+    schema_ok = random.random() > m["schema_fail"]
+    correct = random.random() < m["accuracy"]
+    return toxic, schema_ok, correct
+
+def guardrail(toxic, schema_ok):                 # the filter ring around the fleet
+    if toxic:         return "BLOCK_TOXIC"
+    if not schema_ok: return "BLOCK_SCHEMA"
+    return "PASS"
+
+WINDOW, REGRESSION_THRESHOLD = 200, 0.88
+window, clock = [], 0.0
+DETECT_LATENCY, ROLLBACK_LATENCY = 45.0, 8.0     # monitor cadence; warm pointer swap
+guard_blocks = 0
+incident_detected_at = recovered_at = None
+
+for step in range(1, 1201):
+    clock += 0.25
+    attack = random.random() < 0.05              # 5% prompt-injection attempts
+    toxic, schema_ok, correct = serve(production, attack)
+    if guardrail(toxic, schema_ok) != "PASS":
+        guard_blocks += 1
+        correct = True                           # safe fallback response served instead
+    window.append(1 if correct else 0)
+    if len(window) > WINDOW: window.pop(0)
+    # Monitor fires on a schedule, not every request (distributed, batched).
+    if len(window) == WINDOW and clock % DETECT_LATENCY < 0.25:
+        if statistics.mean(window) < REGRESSION_THRESHOLD and incident_detected_at is None:
+            incident_detected_at = clock
+            production = previous                 # AUTO-ROLLBACK: swap to warm prev
+            recovered_at = clock + ROLLBACK_LATENCY
+            window.clear()
+
+post_quality = statistics.mean(window) if window else float("nan")
+print(f"guardrail blocks (toxic/schema) : {guard_blocks}")
+print(f"regression detected at          : {incident_detected_at:.1f}s")
+print(f"rolled back v8 -> v7 (warm)      : pointer swap, {ROLLBACK_LATENCY:.0f}s")
+print(f"time-to-recovery (MTTR)         : {recovered_at - incident_detected_at:.1f}s")
+print(f"post-rollback rolling accuracy  : {post_quality:.3f}")
+print(f"active production version       : {production}")
+</code></pre>
+<div class="code-caption"><strong>Code 26.9.2:</strong> A self-contained incident: the guardrail ring blocks unsafe outputs continuously, the scheduled monitor detects the accuracy regression, and the controller auto-rolls-back the registry pointer to the warm previous version. The MTTR is the gap between detection and the completed pointer swap.</div>
+<pre><code class="language-text">guardrail blocks (toxic/schema) : 158
+regression detected at          : 135.0s
+rolled back v8 -> v7 (warm)      : pointer swap, 8s
+time-to-recovery (MTTR)         : 8.0s
+post-rollback rolling accuracy  : 0.925
+active production version       : v7
+</code></pre>
+<div class="code-caption"><strong>Output 26.9.2:</strong> The guardrail ring blocked 158 unsafe outputs in real time; the monitor caught the regression at 135&nbsp;s; the warm pointer swap recovered in 8&nbsp;s, lifting rolling accuracy from below the 0.88 threshold back to 0.925 on the restored version. Time-to-recovery is dominated by detection latency, not by rollback, which is exactly the property Section 1 argued you should buy in advance.</div>
+<p>Read the numbers as a decomposition of mean-time-to-recovery. The rollback itself cost 8&nbsp;seconds because the previous version was warm and addressed by a pointer; had <code>v7</code> needed a cold load across the fleet, that 8&nbsp;seconds would have been minutes. The 135&nbsp;seconds to detection is the larger term, which is why Sections 26.6 and 26.7 invest so heavily in fast fleet-wide monitoring: in a stack where rollback is a pointer swap, your MTTR is essentially your detection latency. And throughout, the 158 guardrail blocks meant that the worst outputs never reached a user at all, regardless of how long detection and rollback took.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Eight-Second Rollback Behind a Two-Hour Incident</div>
+<p><strong>Who:</strong> An ML platform on-call engineer at a company serving an LLM-based customer-support assistant across a multi-region fleet.</p>
+<p><strong>Situation:</strong> A routine model promotion (<code>v8</code>) passed every CI/CD eval gate and a 5% canary, then went to full traffic overnight.</p>
+<p><strong>Problem:</strong> Within an hour the assistant began emitting confidently wrong refund amounts and occasionally leaking another customer's order details; no replica crashed, every health check stayed green.</p>
+<p><strong>Dilemma:</strong> Roll back the whole model immediately and lose a genuine quality improvement on most queries, or rate-limit and patch the prompt while keeping <code>v8</code>, risking more harmful outputs during the investigation.</p>
+<p><strong>Decision:</strong> Roll back first, diagnose second. The PII leak made any continued exposure unacceptable, and rollback was reversible.</p>
+<p><strong>How:</strong> The on-call swapped the <code>assistant:prod</code> registry alias from <code>v8</code> to the warm <code>v7</code>; the serving fleet (<a href="../module-23-distributed-inference-systems/index.html">Chapter 23</a>) resolved the new pointer on its next health cycle and the bad outputs stopped fleet-wide.</p>
+<p><strong>Result:</strong> The pointer swap completed in well under a minute; the user-visible incident was short. The postmortem then took two hours and produced a new PII-leak eval and a guardrail rule, both added as permanent gates so that class of failure can never reach full traffic again.</p>
+<p><strong>Lesson:</strong> The cheap, reversible action (rollback) buys time for the expensive, irreversible one (understanding). Detection and the postmortem dominate the wall-clock; the rollback, if you engineered it, is the easy part.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Guardrail Frameworks and AI Incident Response (2024 to 2026)</div>
+<p>The safety layer is an active research and engineering frontier. Open guardrail frameworks matured rapidly: NeMo Guardrails, Guardrails AI, and Meta's Llama Guard line (Llama Guard 2 and 3, 2024) standardized programmable input/output rails and safety-classifier models, while work such as Microsoft's prompt-injection and Spotlighting defenses and the OWASP Top 10 for LLM Applications (2024-2025) gave the field a shared threat taxonomy for jailbreaks and indirect prompt injection through retrieved content. In parallel, AI-specific incident response is being formalized: the NIST AI Risk Management Framework Generative AI Profile (2024) and a growing body of LLM observability tooling push toward structured detection, traceable diagnosis across model-prompt-data-retrieval suspects, and auditable rollback. The open problem is closing the loop automatically, turning a detected regression into a verified, low-false-positive auto-rollback decision without a human in the latency path, which is precisely the controller behavior Code 26.9.2 sketches in miniature.</p>
+</div>
+
+<h2>5. Chapter 26 and Part V in One Picture <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>This section closes Chapter 26, and with it Part V. It is worth stepping back to see the whole arc. Chapter 26 took the single served model of <a href="../module-22-per-node-inference-efficiency/index.html">Chapter 22</a> through <a href="../module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a> and asked how to operate a <em>fleet</em> of them reliably and economically over time. The answer was a closed loop: orchestrated data and training pipelines feed a versioned model and prompt registry; eval-gated CI/CD decides what is allowed to ship; experiment tracking records what was tried; fleet-wide monitoring with mergeable sketches and distributed drift detection watch what is live; progressive delivery rolls changes out carefully; and fast rollback with guardrails catches and reverses what still goes wrong. MLOps is the discipline that turns a model you trained once into a service you can change a thousand times without breaking it.</p>
+<div class="callout key-takeaway">
+<div class="callout-title">Key Takeaway: MLOps Closes the Loop</div>
+<p><strong>MLOps for distributed AI is the closed control loop around a serving fleet.</strong> Orchestrated pipelines produce candidates; a model-and-prompt registry versions them; eval-gated CI/CD admits only the ones that clear a bar; experiment tracking remembers what was tried; fleet monitoring with mergeable sketches and distributed drift detection observe production continuously; progressive delivery (A/B, canary, shadow) limits the blast radius of each change; and fast rollback plus a guardrail filter ring detect, contain, and reverse failures. The recurring lesson of Part V holds here too: every one of these capabilities is a distributed system in its own right, and the cost that the whole chapter taught you to control is communication, the price of keeping many machines agreeing on one current truth.</p>
+</div>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Part V Served Distributed Intelligence Reliably and Economically</div>
+<p>Part V completed the serving half of the book's spine. We took a model that one machine could barely hold (<a href="../module-22-per-node-inference-efficiency/index.html">Chapter 22</a>'s per-node prerequisite) and multiplied it across a fleet: distributed inference systems (<a href="../module-23-distributed-inference-systems/index.html">Chapter 23</a>), distributed LLM serving with disaggregated prefill and decode (<a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a>), distributed retrieval and vector search (<a href="../module-25-distributed-retrieval-vector-search/index.html">Chapter 25</a>), and now the MLOps that keeps the whole fleet honest over time. The thesis that scale-out is forced by ceilings and paid for in communication held at every step: we served distributed AI reliably and economically by treating each operational concern, monitoring, drift, rollout, rollback, as one more thing to distribute well. What we did not yet do is let the served models <em>talk to each other</em>. That is Part VI.</p>
+</div>
+
+<h2>6. Project Ideas <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The following projects turn this chapter into something you can build and measure. Each is sized for a small team and a real (or simulated) fleet, and each produces a number you can defend.</p>
+<div class="callout project-ideas">
+<div class="callout-title">Project Ideas: Build the Closed Loop</div>
+<ol>
+<li><strong>Eval-gated deploy pipeline with canary and auto-rollback.</strong> Build a CI/CD pipeline (Section 26.4) that promotes a model only if it clears an offline eval gate, routes 5% canary traffic to it (Section 26.8), watches a live quality metric, and automatically swaps the registry pointer back to the previous warm version if the metric regresses. Report the end-to-end time-to-recovery on an injected regression, decomposed into detection and rollback latency, and show that warming the previous version cuts the rollback term by an order of magnitude.</li>
+<li><strong>A distributed guardrail ring with a latency budget.</strong> Wrap a small served model with an input/output filter stack (toxicity, PII redaction, schema validation, a jailbreak detector) using NeMo Guardrails or Guardrails AI. Load-test it: measure the added p50 and p99 latency, the false-positive rate on benign traffic, and the escape rate on a red-team set. Then replicate the ring and show how it sizes alongside the serving tier so it stays a filter, not a bottleneck.</li>
+<li><strong>An AI postmortem-to-gate harness.</strong> Take a corpus of simulated incidents (a bad model, a null-emitting feature pipeline, an injected prompt, a stale retrieval index) and build the diagnosis step: given the monitored signals and the registry diff, attribute each incident to the right suspect (model, data, prompt, upstream). Measure attribution accuracy, then close the loop by auto-generating a new eval or monitor from each resolved incident.</li>
+</ol>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.9.1: What Broke? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each symptom, name the most likely suspect among model, data, prompt, and upstream service, and the single fastest mitigation: (a) quality dropped sharply at the exact minute a new model version was promoted; (b) quality dropped gradually over two weeks with no deploys; (c) outputs became malformed JSON immediately after a template edit that was not in the registry; (d) latency and error rate spiked only for queries that hit the retrieval path. Explain why rolling back the model would help in some cases and do nothing in others.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.9.2: Decompose the MTTR <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 26.9.2 so the previous version is <em>cold</em> rather than warm: model the rollback as taking a fixed cold-load time (say 90&nbsp;seconds for weights and warmup) instead of the 8-second pointer swap. Re-run and report the new time-to-recovery. Then sweep the monitor cadence <code>DETECT_LATENCY</code> from 5&nbsp;s to 120&nbsp;s and plot MTTR against it for both the warm and cold cases. From the plot, argue which investment, faster detection or a warmer standby, buys more recovery speed in each regime.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.9.3: Size the Guardrail Ring <span class="exercise-type analysis">Analysis</span></div>
+<p>Suppose each output passes through $n$ independent guardrail checks, each adding $\ell = 12$&nbsp;ms of latency and each missing a genuinely bad output with probability $r = 0.2$. Write the escape probability $\prod_{i=1}^{n}(1-r)$ and the total added latency $n\ell$ as functions of $n$, and find the smallest $n$ that drives the escape probability below $10^{-3}$. Now suppose the checks run in parallel rather than in series across replicas of the ring: how does the latency term change, and what new cost (think of the serving fleet of <a href="../module-23-distributed-inference-systems/index.html">Chapter 23</a>) does parallelism trade for it? Reference the evaluation methodology of <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/index.html">Chapter 5</a> to justify how you would measure $r$ without fooling yourself.</p>
+</div>
+
+<p>Part V served single models, and fleets of single models, reliably and economically. Part VI changes the unit of intelligence. Instead of one model answering one request, we will have <em>many</em> models, agents, perceiving, deciding, negotiating, and acting, sometimes cooperatively and sometimes competitively, across machines that must coordinate not just gradients or pointers but goals. The collectives, registries, and monitoring of the last five parts do not disappear; they become the substrate on which distributed <em>decision-making</em> runs. We move from serving intelligence to coordinating it, beginning with the foundations of distributed artificial intelligence in <a href="../../part-6-multi-agent-systems/module-27-distributed-artificial-intelligence/index.html">Chapter 27</a>.</p>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-26.8.html"><span class="nav-label">Previous</span><span class="nav-num">Section 26.8</span><span class="nav-title">A/B Testing and Shadow Deployment at Scale</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 26</span><span class="nav-num">Contents</span><span class="nav-title">MLOps for Distributed AI</span></a>
+<a class="next" href="../../part-6-multi-agent-systems/module-27-distributed-artificial-intelligence/index.html"><span class="nav-label">Next</span><span class="nav-num">Chapter 27</span><span class="nav-title">Distributed Artificial Intelligence</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

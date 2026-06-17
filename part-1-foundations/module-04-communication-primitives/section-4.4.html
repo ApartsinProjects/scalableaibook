@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 4.4: All-Reduce Algorithms, and Why Ring All-Reduce Mattered for Deep Learning. Naive, tree, and ring all-reduce under the alpha-beta model, the bandwidth-optimal ring that scaled deep learning to thousands of GPUs, and when latency-optimal trees win instead." name="description"/>
+<title>Section 4.4: All-Reduce Algorithms, and Why Ring All-Reduce Mattered for Deep Learning | Building Scalable AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Scalable AI</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Distributed AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 4: Communication Primitives for Distributed Training</a></div>
+<h1>All-Reduce Algorithms, and Why Ring All-Reduce Mattered for Deep Learning</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I used to send every partial sum to one poor coordinator and watch it drown. Then someone arranged us in a circle and told me to only ever talk to my right-hand neighbor. I have not been bored or bottlenecked since."</p>
+<cite>An All-Reduce That Found Its Ring</cite>
+</blockquote>
+<figure class="mental-model">
+<img src="images/mm-ring-all-reduce.png" alt="Mental model: Ring All-Reduce" loading="lazy">
+<figcaption><strong>Mental model.</strong> Workers arranged in a ring each pass a chunk to their neighbor; after one trip around, every worker holds the identical complete sum. Bandwidth-optimal gradient synchronization underpins data-parallel training.</figcaption>
+</figure>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>All-reduce is a contract (every worker ends up holding the elementwise sum of every worker's vector); the algorithm that fulfills the contract is a choice, and that choice decides whether data-parallel training scales to thousands of GPUs or chokes at a few dozen.</strong> The previous section, <a href="section-4.3.html">Section 4.3</a>, established <em>why</em> gradients must be all-reduced every step of synchronous data-parallel SGD. This section opens the box and looks at the algorithms inside. Using the alpha-beta cost model from <a href="../module-03-scalability-performance-models/section-3.8.html">Section 3.8</a>, we cost three of them: the naive gather-to-root-then-broadcast (whose price grows linearly with the worker count), the tree (whose latency grows only logarithmically, ideal for small messages), and the ring (whose bytes-on-the-wire cost is nearly independent of how many workers join, which is exactly why it became the workhorse of deep learning). By the end you will be able to predict, before launching a job, which algorithm wins for your message size and worker count, and you will understand the Baidu-and-Horovod story that put ring all-reduce into everyone's training loop.</p>
+</div>
+<p>An all-reduce specifies a result, not a route. Every one of the $K$ workers starts with a vector of $n$ bytes, and every one must finish holding the elementwise sum of all $K$ vectors. Many different communication patterns satisfy that specification, and they differ enormously in cost. A pattern that funnels everything through one machine is correct and simple and does not scale; a pattern that arranges the workers in a circle is correct and a little more intricate and scales almost perfectly. Because the all-reduce fires on every step of synchronous training and the gradient vectors are millions to billions of numbers long, the difference between a good algorithm and a poor one is the difference between a cluster that trains and a cluster that idles. We will cost each candidate with the same two constants, the per-message latency $\alpha$ and the inverse bandwidth $\beta$, that <a href="../module-03-scalability-performance-models/section-3.8.html">Section 3.8</a> established, so that the comparison is arithmetic rather than intuition.</p>
+
+<h2>1. The Naive Algorithm: One Root, One Bottleneck <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The most obvious way to compute an all-reduce is to elect one worker as the root, have everyone send their vector to it, sum the vectors there, and broadcast the result back to everyone. This is two collectives stacked: a reduce (gather and sum to the root) followed by a broadcast (send the answer out). It is easy to reason about and easy to get right, which is why it is where most people start and why it is worth pricing carefully so its failure is concrete rather than vague.</p>
+<p>The trouble is the root's single network link. In the reduce phase that link must receive $K-1$ vectors, one from every other worker, and in the broadcast phase it must send $K-1$ vectors back out. If those transfers serialize on the root's link, the root moves $2(K-1)$ full vectors of $n$ bytes each. Under the alpha-beta model the cost is therefore</p>
+$$T_{\text{naive}}(n, K) = 2(K-1)\,\alpha + 2(K-1)\, n\,\beta.$$
+<p>Both terms grow linearly with $K$. The latency term we might forgive, but the bandwidth term $2(K-1)\,n\beta$ is the killer: every worker you add makes the root push another whole vector through the same fixed-width pipe. Double the workers and you roughly double the time, which is the precise opposite of what scaling out is supposed to buy. The root is a bottleneck not because it computes too slowly but because all the bytes are forced through one link. Every good all-reduce algorithm is, at heart, a scheme for spreading those bytes across many links at once so that no single link carries them all.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Collective's Cost Lives in Its Busiest Link, Not Its Total Work</div>
+<p>All three algorithms in this section move a comparable total number of bytes; what separates them is how those bytes pile up on individual links. The naive algorithm forces $2(K-1)$ vectors through the root's one link, so its bandwidth term scales with $K$. The ring spreads the same traffic so that every link carries only a $1/K$ slice at a time, capping its bandwidth term near $2n\beta$ regardless of $K$. When you cost a collective, find the most loaded link and the number of steps; those two quantities, not the grand total of bytes, set the wall-clock time.</p>
+</div>
+
+<h2>2. Tree All-Reduce: Logarithmic Latency for Small Messages <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The naive algorithm's latency term is bad because the root talks to everyone in sequence. A binary tree fixes that by parallelizing the conversations. Arrange the $K$ workers as the leaves and internal nodes of a binary tree. In the reduce-up phase, each node receives a partial sum from its two children, adds its own contribution, and passes the result to its parent; pairs of siblings at the same depth communicate simultaneously, so the whole reduction completes in $\lceil \log_2 K \rceil$ rounds rather than $K-1$. The broadcast-down phase mirrors it: the root sends the final sum to its children, they to theirs, again in $\lceil \log_2 K \rceil$ parallel rounds. The hop count collapses from linear to logarithmic.</p>
+<p>Each hop, however, still moves a whole $n$-byte vector (the tree does not slice the data), so the bandwidth term keeps the full $n$ per hop. With $2\lceil \log_2 K \rceil$ hops the cost is</p>
+$$T_{\text{tree}}(n, K) = 2\lceil \log_2 K \rceil\,\alpha + 2\lceil \log_2 K \rceil\, n\,\beta.$$
+<p>Compare this to the naive cost term by term. The latency term improved dramatically, from $2(K-1)\alpha$ to $2\lceil \log_2 K\rceil\,\alpha$: at $K=1024$ that is a factor of roughly a hundred fewer hops. The bandwidth term improved too, from $2(K-1)\,n\beta$ to $2\lceil \log_2 K\rceil\, n\beta$, but it still carries the full vector $n$ on every level of the tree, so for a large message the tree moves far more bytes over its critical path than it strictly needs to. The tree is the right tool when $\alpha$ dominates, that is, when messages are small and the hop count is what hurts. It is the wrong tool when $n\beta$ dominates, because it never shrinks the per-hop payload. That gap is exactly the opening the ring exploits.</p>
+
+<h2>3. Ring All-Reduce: Bandwidth Almost Independent of K <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Ring all-reduce is the algorithm that made large-scale data-parallel deep learning practical, and its idea is elegant. Arrange the $K$ workers in a logical ring: each one sends only to its right neighbor and receives only from its left. Split each worker's $n$-byte vector into $K$ equal slices of $n/K$ bytes. The collective then runs in two phases, each of $K-1$ steps, and you met both of them by name in <a href="../module-03-scalability-performance-models/section-3.8.html">Section 3.8</a> when we first costed the ring.</p>
+<p>The first phase is a <strong>reduce-scatter</strong>. On each step, every worker sends one slice to its right neighbor and adds the slice it receives from its left into its own copy. After $K-1$ steps, the slices have circulated so that each worker holds exactly one slice that is the fully summed value across all workers, but no worker yet holds the complete summed vector. The second phase is an <strong>all-gather</strong>. Those completed slices now circulate around the same ring for another $K-1$ steps, each worker forwarding the finished slice it just received, until every worker holds all $K$ completed slices and therefore the whole sum. Across both phases each worker sends $2(K-1)$ messages, and crucially every message carries only an $n/K$ slice, never the whole vector.</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Ring all-reduce shown as two phases across four workers arranged in a circle. In the reduce-scatter phase each worker forwards and accumulates one slice around the ring until each worker owns one fully summed slice. In the all-gather phase those completed slices circulate the same ring until every worker holds the whole summed vector.">
+<defs>
+<marker id="arr44" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.node44 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.done44 { fill:#e9f5ee; stroke:#1f7a4d; stroke-width:1.8; }
+.t44 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s44 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.ph44 { font:600 15px sans-serif; fill:#14385c; text-anchor:middle; }
+.ring44 { fill:none; stroke:#14385c; stroke-width:2.0; marker-end:url(#arr44); }
+.cap44 { font:600 12px sans-serif; fill:#1f7a4d; text-anchor:middle; }
+</style>
+<text class="ph44" x="225" y="30">Phase 1: reduce-scatter (K-1 steps)</text>
+<text class="ph44" x="655" y="30">Phase 2: all-gather (K-1 steps)</text>
+<text class="s44" x="225" y="50">each step forwards + sums one n/K slice</text>
+<text class="s44" x="655" y="50">completed slices circulate the same ring</text>
+
+<rect class="node44" x="170" y="70" width="110" height="46" rx="8"/>
+<text class="t44" x="225" y="92">Worker 0</text>
+<text class="s44" x="225" y="108">slice a</text>
+<rect class="node44" x="320" y="180" width="110" height="46" rx="8"/>
+<text class="t44" x="375" y="202">Worker 1</text>
+<text class="s44" x="375" y="218">slice b</text>
+<rect class="node44" x="170" y="290" width="110" height="46" rx="8"/>
+<text class="t44" x="225" y="312">Worker 2</text>
+<text class="s44" x="225" y="328">slice c</text>
+<rect class="node44" x="20" y="180" width="110" height="46" rx="8"/>
+<text class="t44" x="75" y="202">Worker 3</text>
+<text class="s44" x="75" y="218">slice d</text>
+<path class="ring44" d="M 282 96 Q 345 120 372 178"/>
+<path class="ring44" d="M 375 228 Q 330 285 282 305"/>
+<path class="ring44" d="M 168 308 Q 100 285 78 228"/>
+<path class="ring44" d="M 78 178 Q 110 118 168 96"/>
+<text class="cap44" x="225" y="400">after K-1 steps each worker</text>
+<text class="cap44" x="225" y="416">owns ONE fully summed slice</text>
+
+<rect class="done44" x="600" y="70" width="110" height="46" rx="8"/>
+<text class="t44" x="655" y="92">Worker 0</text>
+<text class="cap44" x="655" y="108">a+b+c+d</text>
+<rect class="done44" x="750" y="180" width="110" height="46" rx="8"/>
+<text class="t44" x="805" y="202">Worker 1</text>
+<text class="cap44" x="805" y="218">a+b+c+d</text>
+<rect class="done44" x="600" y="290" width="110" height="46" rx="8"/>
+<text class="t44" x="655" y="312">Worker 2</text>
+<text class="cap44" x="655" y="328">a+b+c+d</text>
+<rect class="done44" x="450" y="180" width="110" height="46" rx="8"/>
+<text class="t44" x="505" y="202">Worker 3</text>
+<text class="cap44" x="505" y="218">a+b+c+d</text>
+<path class="ring44" d="M 712 96 Q 775 120 802 178"/>
+<path class="ring44" d="M 805 228 Q 760 285 712 305"/>
+<path class="ring44" d="M 598 308 Q 530 285 508 228"/>
+<path class="ring44" d="M 508 178 Q 540 118 598 96"/>
+<text class="cap44" x="655" y="400">after another K-1 steps every</text>
+<text class="cap44" x="655" y="416">worker holds the whole sum</text>
+</svg>
+<figcaption><strong>Figure 4.4.1:</strong> Ring all-reduce in its two phases, drawn for $K=4$ workers each starting with a vector split into four slices ($a, b, c, d$). Left, the reduce-scatter phase: each worker repeatedly forwards one slice clockwise and accumulates the slice it receives, so after K-1 steps each worker owns exactly one fully summed slice. Right, the all-gather phase: those completed slices circulate the same ring for another $K-1$ steps until every worker holds the entire summed vector. Every message carries only an $n/K$ slice, never the full vector, which is what flattens the bandwidth cost.</figcaption>
+</figure>
+<p>Multiplying message count by per-message cost gives the ring all-reduce time, the same formula derived in <a href="../module-03-scalability-performance-models/section-3.8.html">Section 3.8</a>:</p>
+$$T_{\text{ring}}(n, K) = \underbrace{2(K-1)\,\alpha}_{\text{latency term}} + \underbrace{\frac{2(K-1)}{K}\, n\,\beta}_{\text{bandwidth term}}.$$
+<p>The bandwidth term is the prize. The factor $2(K-1)/K = 2 - 2/K$ starts at $1$ when $K=2$ and climbs toward $2$ as $K$ grows, then flattens; doubling the workers from 512 to 1024 nudges it from $1.996$ to $1.998$. So the bytes-on-the-wire cost of a ring all-reduce is essentially $2n\beta$, independent of the number of workers. That is the property the tree never achieves, because the tree carries the full $n$ on every level while the ring carries only $n/K$ per message. The price the ring pays is its latency term $2(K-1)\alpha$, which, like the naive algorithm's, grows linearly with $K$, since the data has to make $2(K-1)$ hops around the circle. The ring trades a logarithmic latency for a flat bandwidth, which is exactly the trade you want when the messages are large.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: It Is the Same Trick as Passing Dishes Around a Table</div>
+<p>Picture a holiday dinner where everyone has cooked one dish and everyone wants a bite of all of them. The naive plan is to pile every dish onto one cousin's plate, let them combine the lot, then serve it back around: that cousin is swamped. The ring plan is to pass dishes one seat to the right, again and again. No single person is ever holding more than one dish at a time, the table stays busy everywhere at once, and after one lap of passing-and-tasting and a second lap of passing-the-finished-mix, everyone has tasted everything. The circle has no head of the table to bottleneck on.</p>
+</div>
+
+<h2>4. Pricing the Three Algorithms Against Each Other <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The formulas invite mistrust until you watch the numbers. The program below implements all three cost functions for the same representative interconnect used in <a href="../module-03-scalability-performance-models/section-3.8.html">Section 3.8</a> ($\alpha = 5$ microseconds, $1/\beta = 100$ gigabytes per second), then does two sweeps. First it fixes a large 64 MiB gradient buffer and grows the worker count $K$, to expose how each algorithm scales out. Then it fixes $K=64$ and grows the message size, to expose the crossover between the latency-optimal tree and the bandwidth-optimal ring. No network is touched; this is the cost model itself, evaluated.</p>
+<pre><code class="language-python">import math
+
+# alpha-beta model parameters for one representative GPU interconnect.
+alpha = 5e-6          # per-message latency: 5 microseconds
+beta  = 1.0 / 100e9   # inverse bandwidth: 1 / (100 GB/s), seconds per byte
+
+def naive_time(n, K):
+    # Gather K vectors to a root, sum there, broadcast back. The root's single
+    # link carries (K-1) vectors in and (K-1) out, serialized: cost grows with K.
+    msgs = 2 * (K - 1)
+    return msgs * alpha + msgs * n * beta
+
+def tree_time(n, K):
+    # Reduce up a binary tree then broadcast down: 2*ceil(log2 K) hops. Each hop
+    # moves the WHOLE n-byte vector, so bandwidth keeps full n but hops are log K.
+    hops = 2 * math.ceil(math.log2(K))
+    return hops * alpha + hops * n * beta
+
+def ring_time(n, K):
+    # Reduce-scatter then all-gather: 2*(K-1) steps, each moving an n/K slice.
+    msgs = 2 * (K - 1)
+    return msgs * alpha + (2 * (K - 1) / K) * n * beta
+
+def fmt(t):
+    return f"{t * 1e3:8.3f}"        # seconds -> milliseconds
+
+print(f"alpha = {alpha*1e6:.1f} us, 1/beta = {1/beta/1e9:.0f} GB/s\n")
+
+print("=== Predicted all-reduce time (ms) vs worker count K, fixed 64 MiB buffer ===")
+n = 64 * 1024**2
+print(f"{'K':&gt;6}{'naive':&gt;10}{'tree':&gt;10}{'ring':&gt;10}   winner")
+for K in [2, 8, 32, 128, 512, 1024]:
+    tn, tt, tr = naive_time(n, K), tree_time(n, K), ring_time(n, K)
+    win = min({"naive": tn, "tree": tt, "ring": tr}.items(), key=lambda kv: kv[1])[0]
+    print(f"{K:&gt;6}{fmt(tn)}{fmt(tt)}{fmt(tr)}   {win}")
+
+print("\n=== Predicted all-reduce time (ms) vs message size, fixed K = 64 ===")
+K = 64
+print(f"{'bytes':&gt;12}{'naive':&gt;10}{'tree':&gt;10}{'ring':&gt;10}   winner")
+for n in [256, 4*1024, 64*1024, 1024**2, 16*1024**2, 256*1024**2]:
+    tn, tt, tr = naive_time(n, K), tree_time(n, K), ring_time(n, K)
+    win = min({"naive": tn, "tree": tt, "ring": tr}.items(), key=lambda kv: kv[1])[0]
+    print(f"{n:&gt;12}{fmt(tn)}{fmt(tt)}{fmt(tr)}   {win}")
+</code></pre>
+<div class="code-caption"><strong>Code 4.4.1:</strong> The alpha-beta cost of naive, tree, and ring all-reduce, evaluated rather than measured. The first sweep grows the worker count $K$ at a fixed 64 MiB buffer; the second grows the message size at a fixed $K=64$ to locate the tree-to-ring crossover.</div>
+<pre><code class="language-text">alpha = 5.0 us, 1/beta = 100 GB/s
+
+=== Predicted all-reduce time (ms) vs worker count K, fixed 64 MiB buffer ===
+     K     naive      tree      ring   winner
+     2   1.352   1.352   0.681   ring
+     8   9.465   4.057   1.244   ring
+    32  41.917   6.761   1.610   ring
+   128 171.727   9.465   2.602   ring
+   512 690.963  12.170   6.450   ring
+  10241383.277  13.522  11.571   ring
+
+=== Predicted all-reduce time (ms) vs message size, fixed K = 64 ===
+       bytes     naive      tree      ring   winner
+         256   0.630   0.060   0.630   tree
+        4096   0.635   0.060   0.630   tree
+       65536   0.713   0.068   0.631   tree
+     1048576   1.951   0.186   0.651   tree
+    16777216  21.769   2.073   0.960   ring
+   268435456 338.859  32.272   5.915   ring</code></pre>
+<div class="code-caption"><strong>Output 4.4.1:</strong> Real output from the model. For a large 64 MiB buffer (top), the ring wins at every worker count and the naive algorithm degrades catastrophically, from 1.4 ms at $K=2$ to 1383 ms at $K=1024$, while the ring stays under 12 ms. For a fixed $K=64$ (bottom), the tree wins for small messages where latency dominates and the ring wins once the message is large enough (between 1 MiB and 16 MiB here) for its flat bandwidth term to pay off.</div>
+<p>Read the top block as the case for the ring. For a large gradient buffer the ring beats the naive algorithm by orders of magnitude and the gap widens with every worker added, because the naive bandwidth term scales with $K$ while the ring's does not. At $K=1024$ the naive all-reduce needs nearly a second and a half; the ring needs eleven milliseconds. The tree is far better than naive but still loses to the ring on large messages, because each tree hop drags the whole 64 MiB vector while each ring hop carries only a $1/K$ slice. The bottom block is the case for the tree: when the message is small, the ring's $2(K-1)\alpha$ latency term and the tree's $2\lceil\log_2 K\rceil\alpha$ term both swamp the negligible bandwidth cost, and the tree's far smaller hop count wins. The crossover between the two sits where the message becomes large enough that bandwidth, not hop count, dominates the bill, exactly the latency-bound versus bandwidth-bound boundary of <a href="../module-03-scalability-performance-models/section-3.8.html">Section 3.8</a>.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Tree Is Latency-Optimal, Ring Is Bandwidth-Optimal, and Message Size Picks the Winner</div>
+<p>There is no universally best all-reduce. The tree minimizes the latency term ($\log K$ hops) and wins when messages are small, so the cost is set by message count. The ring minimizes the bandwidth term (each link carries only $n/K$ per step, capping the total near $2n\beta$ regardless of $K$) and wins when messages are large, so the cost is set by total bytes. The right algorithm is the one whose dominant term matches the regime your message size and worker count put you in. This is why production libraries do not pick one: they switch.</p>
+</div>
+
+<h2>5. Halving-Doubling for Power-of-Two Ranks <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The ring is bandwidth-optimal but its latency term, $2(K-1)\alpha$, is linear in $K$, the same weakness as the naive algorithm. When the worker count is a power of two there is an algorithm that keeps the ring's optimal bandwidth term while cutting the latency term down to logarithmic: <strong>recursive halving and doubling</strong>, often called the Rabenseifner algorithm. Its reduce-scatter phase runs in $\log_2 K$ steps rather than $K-1$. On the first step each worker pairs with the partner $K/2$ ranks away and they exchange and reduce half of the vector each; on the next step the pairing distance halves and each exchanges a quarter; after $\log_2 K$ steps every worker owns a fully reduced $1/K$ slice, the same end state as the ring's reduce-scatter but reached in logarithmically many steps. A mirror-image recursive-doubling all-gather then spreads the completed slices back out in another $\log_2 K$ steps.</p>
+<p>Because the slices halve in size at each step, the total bytes any link carries still sum to the same $\tfrac{2(K-1)}{K}\,n$ as the ring, so the bandwidth term is identical, while the hop count drops from $2(K-1)$ to $2\log_2 K$. The cost becomes</p>
+$$T_{\text{halve-double}}(n, K) = 2\log_2 K\,\alpha + \frac{2(K-1)}{K}\, n\,\beta,$$
+<p>which is the best of both worlds: tree-like latency and ring-like bandwidth, available whenever $K$ is a power of two. The catch in the name is real. The clean recursive pairing depends on $K$ being a power of two; for other worker counts the algorithm needs extra fix-up steps that erode the advantage, which is one reason the ring, indifferent to the exact value of $K$, remained the dependable default while halving-doubling is the specialist that production libraries reach for when the rank count cooperates and the messages are mid-sized.</p>
+
+<h2>6. The Story: Baidu, Horovod, and Why the Ring Took Over <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The ring all-reduce pattern is decades old in high-performance computing, where it was used to sum vectors across supercomputer nodes long before deep learning existed. What changed around 2017 was its arrival in the deep-learning training loop. Researchers at Baidu adapted the HPC ring all-reduce to gradient synchronization and showed that it let data-parallel training scale across many GPUs without the central parameter server becoming a bottleneck, publishing a widely read piece that put "ring all-reduce" into the vocabulary of practitioners who had never touched MPI. The parameter-server architecture that dominated until then, which we develop in its own right when we reach <a href="../../part-3-distributed-ml/module-11-parameter-servers-embeddings/index.html">Chapter 11</a>, funneled gradients through central servers whose bandwidth became the ceiling; the ring removed that ceiling by giving the bandwidth term its near-independence from $K$.</p>
+<p>Shortly after, engineers at Uber packaged the idea into <strong>Horovod</strong>, an open-source library that wrapped TensorFlow (and later PyTorch and others) so that a few lines turned a single-GPU training script into a ring-all-reduce data-parallel job. Horovod's contribution was as much ergonomic as algorithmic: it made the bandwidth-optimal collective trivial to adopt, and it popularized practical refinements such as fusing many small gradient tensors into a few large buffers so the all-reduce ran in the bandwidth-bound regime where the ring shines. That combination, a bandwidth-optimal algorithm plus a frictionless API, is what moved the whole field onto all-reduce-based data parallelism. The pattern lives on today inside NVIDIA's NCCL and PyTorch's <code>DistributedDataParallel</code>, and we trace its full descent into the modern training loop in <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: From a Stalled Parameter Server to a Ring</div>
+<p><strong>Who:</strong> A deep-learning infrastructure engineer at an autonomous-driving startup training a large perception model.</p>
+<p><strong>Situation:</strong> The team trained data-parallel across 32 GPUs using a central parameter server to aggregate gradients, and it had worked acceptably at 8 GPUs.</p>
+<p><strong>Problem:</strong> Scaling from 8 to 32 GPUs barely improved throughput; the parameter server's network link was saturated, carrying every worker's full gradient in and the averaged result back out.</p>
+<p><strong>Dilemma:</strong> Buy a beefier parameter-server machine with a faster NIC (a scale-up patch that would stall again at the next doubling), or change the aggregation algorithm so no single machine carried all the bytes.</p>
+<p><strong>Decision:</strong> They replaced the parameter server with ring all-reduce, reasoning from the cost model that the naive central pattern's bandwidth term scaled with $K$ while the ring's did not.</p>
+<p><strong>How:</strong> They adopted Horovod, wrapped the optimizer in its distributed wrapper, and enabled tensor fusion so the many per-layer gradients were bucketed into a few large all-reduces in the bandwidth-bound regime.</p>
+<p><strong>Result:</strong> Throughput scaled close to linearly from 8 to 32 GPUs, and a later jump to 128 GPUs held up, because the ring's per-step bandwidth cost stayed near $2n\beta$ instead of climbing with the worker count.</p>
+<p><strong>Lesson:</strong> When a central aggregator stops scaling, the fix is usually not a bigger aggregator but an algorithm that spreads the bytes across every link, which is precisely what the ring's flat bandwidth term delivers.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One Call Picks the Algorithm for You</div>
+<p>Code 4.4.1 hand-costed three algorithms, but in practice you never choose one yourself. NVIDIA's NCCL, the collective library underneath PyTorch's <code>DistributedDataParallel</code>, implements ring, tree, and other patterns and auto-selects per call based on message size, worker count, and topology, exactly the decision Output 4.4.1 made by hand. The whole apparatus collapses to a single collective call:</p>
+<pre><code class="language-python"># Run with: torchrun --nproc_per_node=8 thisfile.py
+import torch, torch.distributed as dist
+
+dist.init_process_group("nccl")               # NCCL knows ring, tree, and more
+grad = compute_shard_gradient()               # this worker's partial gradient
+
+dist.all_reduce(grad, op=dist.ReduceOp.SUM)   # NCCL picks ring vs tree internally
+grad /= dist.get_world_size()                 # SUM -> mean
+</code></pre>
+<div class="code-caption"><strong>Code 4.4.2:</strong> The dozens of lines of algorithm selection in Code 4.4.1 collapse to one <code>all_reduce</code> call. NCCL reads the message size and worker count, applies the same latency-bound-versus-bandwidth-bound logic, and dispatches to ring, tree, or a hybrid; you write the contract and the library chooses the route.</div>
+</div>
+
+<h2>7. Choosing the Algorithm in Practice <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Pulling the threads together gives a decision you can make from two numbers. If your messages are large (gradient buffers of megabytes or more, the common case in data-parallel deep learning), you are bandwidth-bound and want the ring, or halving-doubling when the rank count is a power of two and the message is mid-sized. If your messages are small (a handful of bytes of control data, or the tiny per-layer tensors of a tensor-parallel step), you are latency-bound and want the tree, whose logarithmic hop count beats the ring's linear one. The naive gather-to-root is almost never the answer at scale; it survives only for tiny worker counts where its simplicity costs nothing. Table 4.4.1 summarizes the three cost shapes side by side.</p>
+<div class="table-caption"><strong>Table 4.4.1:</strong> The three all-reduce algorithms under the alpha-beta model, with halving-doubling for completeness. The bandwidth term is what scaled deep learning; the latency term is what limits small-message and high-worker-count regimes.</div>
+<table>
+<thead>
+<tr><th scope="col">Algorithm</th><th scope="col">Latency term</th><th scope="col">Bandwidth term</th><th scope="col">Wins when</th></tr>
+</thead>
+<tbody>
+<tr><td>Naive (gather-to-root, broadcast)</td><td>$2(K-1)\alpha$</td><td>$2(K-1)\,n\beta$</td><td>Tiny $K$; never at scale</td></tr>
+<tr><td>Tree (reduce-up, broadcast-down)</td><td>$2\lceil\log_2 K\rceil\,\alpha$</td><td>$2\lceil\log_2 K\rceil\,n\beta$</td><td>Small messages (latency-bound)</td></tr>
+<tr><td>Ring (reduce-scatter, all-gather)</td><td>$2(K-1)\alpha$</td><td>$\frac{2(K-1)}{K}\,n\beta \approx 2n\beta$</td><td>Large messages (bandwidth-bound)</td></tr>
+<tr><td>Halving-doubling (power-of-two $K$)</td><td>$2\log_2 K\,\alpha$</td><td>$\frac{2(K-1)}{K}\,n\beta \approx 2n\beta$</td><td>Power-of-two $K$, mid-to-large messages</td></tr>
+</tbody>
+</table>
+<p>The reason the ring, not the latency-optimal tree, became the symbol of scalable deep learning is that gradient buffers are large and the field cared most about scaling the worker count without paying for it in bandwidth. The ring's flat bandwidth term is precisely the property that let training jobs grow from eight GPUs to thousands while the per-step communication cost stayed roughly fixed. That same reduce-scatter-then-all-gather decomposition you saw inside the ring is not only an all-reduce implementation detail; the two halves are useful collectives in their own right, and splitting them apart is the key to sharded training, which is where the next section goes.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Beyond the Ring (2024 to 2026)</div>
+<p>The ring is a 2017-era default that current systems are steadily moving past. NCCL's modern releases auto-select among ring, tree, and collnet algorithms per call and add hierarchical (two-level) collectives that run a fast intra-node ring over NVLink and a separate inter-node ring over the network, so the slow links carry far fewer bytes; the same hierarchical idea drives PyTorch's hybrid-sharded and 2D device meshes. On the bandwidth side, in-network aggregation pushes the sum into the switch fabric itself: NVIDIA's SHARP performs the reduction inside the InfiniBand or NVLink-switch hardware so the gradient crosses the network roughly once instead of the ring's two passes, cutting the effective bandwidth term for very large all-reduces. Low-precision collectives (FP8 and below) shrink $n$ directly, and communication-avoiding training in the DiLoCo lineage (Douillard et al., 2024) fires the all-reduce far less often. Each of these is legible in the alpha-beta terms of this section: lower the hop count, lower the bytes per hop, or lower how often you pay. We measure the gains these unlock when we evaluate distributed systems in <a href="../module-05-evaluating-distributed-ai/index.html">Chapter 5</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.4.1: When Does the Tree Beat the Ring? <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the alpha-beta formulas in Table 4.4.1 with $\alpha = 5$ microseconds and $1/\beta = 100$ gigabytes per second, find the message size $n$ at which the tree and ring all-reduce times are equal for $K = 64$. Set $2\lceil\log_2 K\rceil(\alpha + n\beta) = 2(K-1)\alpha + \tfrac{2(K-1)}{K} n\beta$, solve for $n$, and check your answer against the crossover visible in the bottom block of Output 4.4.1 (between 1 MiB and 16 MiB). Explain in one sentence why raising $K$ to 1024 moves the crossover toward larger messages.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.4.2: Add Halving-Doubling to the Model <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 4.4.1 with a fourth cost function for recursive halving-doubling, whose latency term is $2\log_2 K\,\alpha$ and whose bandwidth term is the same $\tfrac{2(K-1)}{K}\,n\beta$ as the ring (assume $K$ is a power of two). Print all four algorithms across $K \in \{8, 64, 1024\}$ and message sizes from 1 KiB to 256 MiB. Identify the region of the (message size, $K$) plane where halving-doubling strictly beats both the tree and the ring, and explain in terms of which term it improves over each.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.4.3: Why Not Just Use a Bigger Root? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A colleague proposes fixing the naive gather-to-root all-reduce by giving the root machine a network link ten times faster than every worker's link. Using the cost model, explain what this does to the naive bandwidth term $2(K-1)\,n\beta$, and argue whether a constant-factor speedup of one link can ever make the naive algorithm scale as well as the ring as $K$ grows without bound. Relate your answer to the Key Insight that a collective's cost lives in its busiest link, and to the parameter-server bottleneck described in the Practical Example.</p>
+</div>
+
+<p>You now have the algorithms behind the all-reduce contract, costed and compared, and you know why the bandwidth-optimal ring became the engine of data-parallel deep learning while the latency-optimal tree owns the small-message regime. The ring achieved its flat bandwidth cost by decomposing the all-reduce into a reduce-scatter followed by an all-gather. Those two halves are powerful collectives in their own right: run them on different data, and you get the memory-saving sharded-training methods that let a model too large for one GPU train anyway. The next section, <a href="section-4.5.html">Section 4.5</a>, separates all-gather and reduce-scatter from the ring and shows how they became the primitives behind ZeRO and FSDP.</p>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-4.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 4.3</span><span class="nav-title">All-Reduce: Synchronizing Gradients in Data-Parallel SGD</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 4</span><span class="nav-num">Contents</span><span class="nav-title">Communication Primitives for Distributed Training</span></a>
+<a class="next" href="section-4.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 4.5</span><span class="nav-title">All-Gather and Reduce-Scatter: The Primitives Behind ZeRO and FSDP</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Scalable AI: From Big Data Algorithms to Distributed Intelligence, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>
