@@ -110,17 +110,17 @@ N, K = 1_000_000, 16            # examples, shards (one per worker)
 x = rng.gamma(shape=2.0, scale=3.0, size=N) + 5.0   # skewed feature column
 shards = np.array_split(x, K)   # K disjoint shards, deliberately unequal-ish
 
-# --- Single-pass "ground truth" statistic on the whole training column ---
+# Single-pass "ground truth" statistic on the whole training column.
 true_mean = x.mean()
 true_std  = x.std()             # population std (ddof=0)
 
-# --- Distributed fit: each worker emits a MERGEABLE triple (count, sum, sumsq) ---
+# Distributed fit: each worker emits a MERGEABLE triple (count, sum, sumsq).
 def local_partial(col):
     return np.array([col.size, col.sum(), np.square(col).sum()])
 
 partials = [local_partial(s) for s in shards]        # K independent map outputs
 
-# --- Reduce step: triples are additive, so merging is a plain elementwise sum ---
+# Reduce step: triples are additive, so merging is a plain elementwise sum.
 n, s1, s2 = np.sum(partials, axis=0)                  # the all-reduce
 merged_mean = s1 / n
 merged_var  = s2 / n - merged_mean * merged_mean      # E[x^2] - E[x]^2
@@ -134,7 +134,7 @@ print("merged   std            :", f"{merged_std:.10f}")
 print("max abs diff (mean,std) :",
       f"{max(abs(merged_mean-true_mean), abs(merged_std-true_std)):.2e}")
 
-# --- Transform: apply the SHARED stats identically on every shard ---
+# Transform: apply the SHARED stats identically on every shard.
 def transform(col, mu, sd):
     return (col - mu) / sd
 
@@ -184,7 +184,32 @@ df_z = df.withColumn("x_z", (F.col("x") - F.lit(mu)) / F.lit(sd))
 <p><strong>Lesson:</strong> A per-shard fit is sixty-four subtly different transforms wearing one name. Fit once, globally, with a mergeable aggregation, and ship the constants as a single shared artifact.</p>
 </div>
 
-<h2>4. Materialize Once or Recompute Every Epoch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<h2>4. AI-Native Data Engines: Ray Data, Daft, and Lance <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Spark remains the default distributed DataFrame engine for SQL-shaped feature engineering, but modern AI data pipelines increasingly contain work that is not SQL-shaped: decoding images, reading PDFs, embedding audio, running batch inference, filtering captions with a model, or sampling random records for multimodal training. These workloads stress row-and-column abstractions because the expensive operation is often a Python or GPU function over an object, not a relational expression over scalar columns. That is why AI-native data systems have become part of the data-engineering toolkit rather than a replacement for Spark.</p>
+<p><a href="https://docs.ray.io/en/latest/data/data.html" target="_blank" rel="noopener">Ray Data</a> is built for scalable AI data processing on Ray, with streaming execution for preprocessing, batch inference, and ML training input pipelines. <a href="https://docs.daft.ai/en/stable/" target="_blank" rel="noopener">Daft</a> targets multimodal DataFrames directly, reading images, audio, video, PDFs, JSON, and structured data while scheduling heavy Python transformations across local threads or a Ray cluster. <a href="https://docs.lancedb.com/lance" target="_blank" rel="noopener">Lance</a> pushes the storage format in the same direction: a columnar layout designed for vectors, images, videos, audio, text, fast random access, versioning, and vector search. The choice is not "Spark or these tools"; the production pattern is to use Spark for wide relational joins and governed tables, then reach for Ray Data, Daft, or Lance when the bottleneck is multimodal object processing, GPU batch inference, or random access to vector-rich examples.</p>
+<pre><code class="language-python">import ray
+import ray.data as rd
+
+# Ray Data streams records through CPU preprocessing and GPU batch inference.
+ds = rd.read_parquet("s3://corpus/image_caption_manifest/")
+
+def clean_caption(batch):
+    batch["caption"] = batch["caption"].str.strip().str.lower()
+    return batch
+
+(
+    ds.map_batches(clean_caption, batch_format="pandas")
+      .map_batches(embed_images, num_gpus=1, batch_size=128)
+      .write_parquet("s3://corpus/embedded_shards/run_2026_06_18")
+)
+</code></pre>
+<div class="code-caption"><strong>Code 8.7.3:</strong> A Ray Data preprocessing pipeline for an AI workload that mixes table reads, text cleanup, and GPU image embedding. The same conceptual fit/transform split still applies, but the scheduler is optimized for streaming batches through heterogeneous CPU and GPU work rather than only for relational plans.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Pick the Engine That Matches the Expensive Operation</div>
+<p>If the expensive operation is a SQL join, aggregation, or lakehouse scan, Spark is still the right default. If the expensive operation is a Python function, media decode, model embedding pass, or batch inference stage, Ray Data or Daft often expresses it more directly. If the expensive operation is random access to multimodal examples plus vectors, Lance is a storage-level fit. The reduction is conceptual: instead of forcing every AI preprocessing job into a Spark UDF, choose the tool whose native execution model matches the part of the pipeline that burns the time.</p>
+</div>
+
+<h2>5. Materialize Once or Recompute Every Epoch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 <p>Once the constants are fixed, the transform still has to be applied, and there are two moments to apply it: <strong>once</strong>, writing preprocessed shards to storage that every epoch then reads directly, or <strong>every epoch</strong>, recomputing the transform inside the loader as the raw data streams by. Materializing once turns an $E$-epoch training run from $E$ applications of the transform into one, at the cost of extra storage for the preprocessed copy and a loss of flexibility, since changing the transform means regenerating the whole materialized set. Recomputing keeps storage lean and the pipeline flexible, but pays the transform cost $E$ times and can make the loader the bottleneck if the transform is heavy, the exact loader-starvation failure mode of Section 8.5.</p>
 <p>The decision reduces to comparing two costs over the life of the run. Let $C_t$ be the per-example transform cost, $E$ the number of epochs, $N$ the dataset size, and $C_{io}$ the extra per-example cost of reading a (typically larger) materialized example versus a raw one. Materializing once costs roughly $N \cdot C_t + E \cdot N \cdot C_{io}$ of added work; recomputing costs $E \cdot N \cdot C_t$. Materializing wins when</p>
 $$N \cdot C_t + E \cdot N \cdot C_{io} \;<\; E \cdot N \cdot C_t \quad\Longleftrightarrow\quad C_t \cdot \left(1 - \tfrac{1}{E}\right) \;>\; C_{io},$$
@@ -194,7 +219,7 @@ $$N \cdot C_t + E \cdot N \cdot C_{io} \;<\; E \cdot N \cdot C_t \quad\Longleftr
 <p>Augmentation is the deliberate exception to "materialize once". You <em>want</em> a different random crop, flip, or noise draw each epoch, so freezing augmented examples to disk would defeat the purpose and quietly shrink your effective dataset to a single fixed version of itself. The rule is not "always materialize" but "materialize the deterministic parts; keep the randomness live."</p>
 </div>
 
-<h2>5. Beyond Training: Feature Stores and Serving Consistency <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<h2>6. Beyond Training: Feature Stores and Serving Consistency <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
 <p>The fit/transform discipline does not end at training. A model in production receives raw features at request time and must transform them with the <em>same</em> constants it trained on, or it silently sees inputs from a different distribution than the one it learned. The system that enforces this is a feature store: a service that holds feature definitions and their learned constants, computes features offline in batch for training, and serves the identical computation online at low latency for inference, so the offline and online paths cannot drift apart. This online/offline consistency guarantee is the production-grade form of "fit once, apply everywhere", and it is developed in depth where it matters most, in <a href="../../part-8-case-studies/module-38-case-distributed-recommendation/index.html">the distributed recommendation case study (Chapter 38)</a>, whose feature pipelines fan out across hundreds of features and machines.</p>
 <p>The thread that connects this section to that one is exactly the artifact we have been tracking: the shared constant produced by a distributed fit. Whether it is a mean, a vocabulary, or a learned bucket boundary, it is computed once by a mergeable aggregation across the training shards and then must be applied byte-for-byte identically in every later context. The feature store is the machinery that makes "byte-for-byte identically" a system guarantee rather than a hope.</p>
 <div class="callout thesis-thread">

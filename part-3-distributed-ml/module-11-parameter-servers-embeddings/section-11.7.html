@@ -105,6 +105,13 @@ $$M_\text{table} = R \cdot D \cdot b \text{ bytes}.$$
 <p>Because the embedding table exceeds any single device, it must be partitioned across machines by row range or by hashing the id space: this is model parallelism, applied to a lookup rather than a matmul. Because the dense network is small, it is replicated on every worker and trained data-parallel, exactly as in <a href="../../part-1-foundations/module-01-scale-out-ai/section-1.1.html">Section 1.1</a>. The two halves meet at an all-to-all that ships the looked-up rows from the embedding shards to the dense replicas. This hybrid, model-parallel sparse part plus data-parallel dense part joined by all-to-all, is not one option among many; it is the architecture that essentially every terabyte-scale recommender converges on.</p>
 </div>
 
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: 2D Sparse Parallelism for Embedding Tables</div>
+<p>The simple "one row lives on one shard" story is the right mental model, but the largest recommender jobs now use a richer two-dimensional layout. Within one replica group, embedding tables are split by table, by row, by column, or by a grid that shards both rows and columns. Across replica groups, the same sharded layout is data-parallel, so each group processes a different slice of the batch and later synchronizes updates. Meta and PyTorch describe this as <a href="https://pytorch.org/blog/scaling-recommendation-2d-sparse-parallelism/" target="_blank" rel="noopener">2D sparse parallelism</a>: model parallelism inside a group for capacity and bandwidth, data parallelism across groups for throughput.</p>
+<p>The planner's job is now a placement problem, not a yes-or-no sharding choice. Table-wise sharding keeps a small table whole on one device and avoids intra-table communication, but it fails when one table is too large or too hot. Row-wise sharding spreads a huge table's rows across devices and balances memory, but hot rows can still concentrate lookup traffic. Column-wise sharding splits each vector's dimensions across devices, useful when a table has few rows but wide embeddings. Grid sharding combines row and column splits so a single dominant table can consume the whole cluster without putting all lookup or gradient traffic through one link. TorchRec's <a href="https://meta-pytorch.org/torchrec/concepts.html" target="_blank" rel="noopener">planner and sharder concepts</a> expose these strategies, and the tutorial on <a href="https://docs.pytorch.org/tutorials/intermediate/torchrec_intro_tutorial.html" target="_blank" rel="noopener">large-scale distributed embeddings</a> explains why massive tables require sharding across GPUs.</p>
+<p>The systems consequence for this chapter is that "the embedding table" is no longer a passive key-value store. It is a distributed object with a placement plan, hot-row cache policy, optimizer-state layout, all-to-all schedule, and training-serving consistency rule. The model registry in <a href="../../part-5-distributed-inference/module-26-mlops-distributed-ai/index.html">Chapter 26</a> must version that plan together with the weights, because serving a row under a different partitioning or quantization policy than training used can create silent drift. Modern embedding infrastructure therefore treats placement as part of the model artifact, not as an invisible deployment detail.</p>
+</div>
+
 <h2>2. The All-to-All Between Sparse and Dense <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 <p>Tracing one training step makes the communication concrete. A global batch is split across $W$ dense workers, and each sample names a set of sparse ids: user id, recent item ids, advertiser id, and engineered cross-features. Those ids are scattered across all $S$ embedding shards, because the id space was partitioned by hashing, not by which worker happens to hold the sample. So before any dense compute can run, every worker must send each id to the shard that owns it and receive back the corresponding row. Sending a different slice of ids from every worker to every shard, and receiving a different slice of rows in return, is precisely an all-to-all, the collective introduced for mixture-of-experts routing in <a href="../../part-1-foundations/module-04-communication-primitives/section-4.6.html">Section 4.6</a>. The looked-up rows are then pooled (summed or averaged per feature) and handed to the dense network; on the backward pass, the gradient for each row that was read travels back along the same all-to-all to the shard that owns it, where the push-pull update of <a href="section-11.2.html">Section 11.2</a> applies it.</p>
 <p>The cost of that step is not dominated by floating-point work. If a global batch of $B$ samples each fires $L$ sparse lookups, the step moves on the order of $B \cdot L \cdot D \cdot b$ bytes of embedding rows across the network in each direction. With $B = 65{,}536$, $L = 40$, $D = 128$, and $b = 4$, that is roughly $1.3$ gigabytes of row traffic per step before any compression, while the dense matmuls touch only a few hundred megaflops worth of activations. The step is communication-bound, and the table itself is memory-capacity-bound. Neither bottleneck is arithmetic, which is why this section reasons in bytes and bandwidth rather than in flops.</p>
@@ -123,7 +130,7 @@ import random
 
 random.seed(0)
 
-# ---- Table geometry -----------------------------------------------------
+# Table geometry.
 ROWS = 2_000_000_000        # 2 billion embedding rows (users x items vocabulary)
 DIM = 128                   # embedding width
 BYTES_PER_ELEM = 4          # fp32 storage on the cold tail
@@ -132,7 +139,7 @@ print(f"embedding rows         : {ROWS:,}")
 print(f"embedding dim          : {DIM}")
 print(f"full table size        : {table_bytes / 1e12:.3f} TB (fp32)")
 
-# ---- Sharding across S hosts -------------------------------------------
+# Sharding across S hosts.
 S = 16                      # parameter-server hosts holding the table
 rows_per_host = ROWS // S
 bytes_per_host = table_bytes / S
@@ -140,7 +147,7 @@ print(f"hosts S                : {S}")
 print(f"rows per host          : {rows_per_host:,}")
 print(f"table bytes per host   : {bytes_per_host / 1e9:.1f} GB")
 
-# ---- A training step: lookups for a global batch -----------------------
+# A training step: lookups for a global batch.
 GLOBAL_BATCH = 65536        # samples in the global batch
 LOOKUPS_PER_SAMPLE = 40     # sparse feature ids fired per sample
 total_lookups = GLOBAL_BATCH * LOOKUPS_PER_SAMPLE
@@ -165,7 +172,7 @@ def sample_row():
 
 lookups = [sample_row() for _ in range(20000)]  # sampled estimate of the batch
 
-# ---- Cache hit rate as a function of HBM cache capacity ----------------
+# Cache hit rate as a function of HBM cache capacity.
 def hit_rate(cache_rows):
     cached = set(range(cache_rows))             # cache the most popular rows
     hits = sum(1 for r in lookups if r in cached)
@@ -189,7 +196,7 @@ for cache_rows in (0, 100, 1000, 5000):
     comm_ms = comm_bytes / (NET_GBPS * 1e9) * 1e3
     print(f"{cache_rows:&gt;10} | {hbm_mb:&gt;7.2f} | {hr:&gt;7.3f}  | {comm_bytes/1e6:&gt;17.1f} MB | {comm_ms:&gt;10.2f}")
 
-# ---- Quantization of the cold tail -------------------------------------
+# Quantization of the cold tail.
 print()
 base = table_bytes / 1e12
 for bits, label in ((8, "int8"), (4, "int4")):
@@ -205,7 +212,7 @@ rows per host          : 125,000,000
 table bytes per host   : 64.0 GB
 
 cache_rows |  HBM_MB  | hit_rate | cross-host bytes/step | step comm (ms)
---------------------------------------------------------------------------
+==========================================================================
          0 |    0.00 |   0.000  |            1342.2 MB |      13.42
        100 |    0.05 |   0.576  |             568.8 MB |       5.69
       1000 |    0.51 |   0.751  |             333.7 MB |       3.34
