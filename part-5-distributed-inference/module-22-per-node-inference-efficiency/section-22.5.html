@@ -333,6 +333,57 @@ outputs = llm.generate(["[SYS] You are a helpful assistant. [USER] " + q
 <p>Among the per-node techniques in this chapter, KV-cache management has the largest leverage on serving capacity, and the reason is structural. Quantizing weights or pruning the model shrinks a fixed cost paid once; managing the KV cache governs a dynamic cost paid for every concurrent user, and concurrency is exactly what a serving system sells. Output 22.5.1 showed a single change of allocation policy multiplying the number of sequences a GPU serves by eight, with no change to the model, the hardware, or the quality of any answer. Few other interventions in this book move the capacity needle that far for that little.</p>
 <p>That leverage is why paged KV management became the default in essentially every serious LLM serving stack within two years of its introduction, and why this section sits at the center of the per-node prerequisite. The cache is the substrate on which all the distributed serving of <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a> is built: a fleet's throughput, its cost per token, and its ability to honor long contexts all reduce, at the bottom, to how many tokens of KV one node can hold and how little of that memory it wastes. The next section turns from the memory the attention computation <em>stores</em> to the way that computation <em>runs</em>, with FlashAttention reshaping the attention kernel itself so the per-node compute keeps pace with the per-node memory we have just learned to manage.</p>
 
+<h2>7. KV-Cache Compression: Quantisation and Eviction <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>Paging removes fragmentation; it does not change how many bytes each cached token occupies. At 128K-token contexts the raw cache size becomes severe. A 70B model with 80 transformer layers, grouped-query attention with 8 KV heads, and a head dimension of 128, stored in BF16, occupies</p>
+
+$$M_{\text{KV}} = 80 \times 8 \times 128 \times 128{,}000 \times 2 \times 2 = 26 \text{ GB per request},$$
+
+<p>where the first factor of 2 accounts for keys and values and the second for the 2 bytes of BF16. Even with paging reducing fragmentation to near zero, holding a single long-context request consumes roughly a third of an A100's memory, leaving little room for model weights or concurrent sequences. The 2023-2025 literature developed a class of complementary techniques that reduce the entries themselves rather than managing how existing entries are placed.</p>
+
+<h3>KV Quantisation (KIVI)</h3>
+
+<p>Kim et al. (2024) introduced KIVI, which applies low-bit quantisation directly to the cached keys and values. The central observation is that K tensors exhibit strong per-channel outliers: a small number of channels carry disproportionate magnitude, making uniform quantisation lossy. V tensors are smoother across channels and tolerate uniform quantisation well. KIVI exploits this asymmetry by applying asymmetric INT2 quantisation per-channel to K and INT4 quantisation to V, while keeping a small FP16 residual buffer for the most recent tokens, which are reused immediately and are most sensitive to precision loss. The result is a 2-4x reduction in KV memory with near-zero perplexity degradation on standard benchmarks such as WikiText-2 and C4. The per-channel asymmetric approach is the same structural idea as the activation-outlier handling in SmoothQuant (Section 22.2), applied now to cached activations rather than weight matrices.</p>
+
+<h3>Heavy Hitter Oracle (H2O)</h3>
+
+<p>Zhang et al. (2023) observed that attention mass is not spread uniformly over the context: a small fraction of tokens account for the majority of attention weight received across layers and decoding steps. H2O calls these tokens "heavy hitters" and evicts KV entries for all other positions when the cache budget is exhausted. The eviction policy uses cumulative attention scores: at each layer and step, the tokens with the lowest accumulated attention mass are candidates for removal, while the top-$k$% by attention mass are retained. One finding is essential for any eviction scheme: the first few tokens in a sequence (typically the first 4) receive disproportionately high attention weight regardless of their semantic content. These are called <em>attention sinks</em> (discussed further below), and H2O always retains them alongside the heavy hitters. Without protecting attention sinks, generation quality collapses even when the retained budget is large.</p>
+
+<h3>SnapKV</h3>
+
+<p>Li et al. (2024) addressed a practical inefficiency in per-step eviction schemes: deciding which tokens to evict at every layer and every decoding step adds latency proportional to the cache size. SnapKV replaces this with a one-shot pooling-based eviction. At the start of generation, SnapKV groups key and value vectors by instruction segment, pools attention scores within each group, and selects important positions once. Those selected positions are kept throughout generation; no per-step eviction logic runs during decode. The authors report 3.6x KV-cache compression relative to a full cache, with less than 1% accuracy loss on LongBench. The one-shot nature makes SnapKV straightforwardly compatible with continuous batching: the eviction decision is made during prefill, at negligible overhead relative to the prefill computation itself.</p>
+
+<h3>Attention Sinks and StreamingLLM</h3>
+
+<p>Xiao et al. (2023) named and explained the attention-sink phenomenon: LLMs consistently assign high attention weight to the earliest tokens in a sequence, even when those tokens are semantically irrelevant (such as a BOS token or punctuation). The explanation is that the softmax denominator over attention scores must sum to one, and when a model wants to attend weakly to all real tokens it routes excess probability mass to a small set of "sink" tokens that absorb it without influencing the output value. Any eviction scheme that removes these sink tokens destroys the probability-mass routing and causes generation quality to collapse, regardless of how many other tokens are retained.</p>
+
+<p>StreamingLLM (Xiao et al., 2023) turned this observation into a practical fixed-memory generation scheme: keep the first 4 tokens (the attention sinks) plus a sliding window of the most recent $W$ tokens, and evict everything else. This produces a constant KV-cache size of $4 + W$ entries per layer, enabling generation over arbitrarily long sequences with no increase in memory. The trade-off is that tokens outside the recent window are lost; StreamingLLM is most appropriate for streaming or conversational use cases where distant context is less critical.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Compression and Paging Are Orthogonal</div>
+<p>KV compression and KV paging target different terms in the memory budget. Paging manages <em>which</em> GPU memory pages hold the cache and eliminates allocation waste, but each entry in those pages still occupies its full byte width. Compression shrinks the entries themselves: quantisation reduces bytes per entry and eviction removes entries entirely. The two approaches stack without conflict: a paged allocator can hold quantised or evicted-sparse entries just as easily as full-precision ones. Production systems reflect this layering. vLLM 0.6 and later support quantised KV entries through the <code>kv_cache_dtype</code> option alongside the default paged allocator. SGLang includes built-in H2O-style eviction policies on top of its RadixAttention prefix cache. The practical 2025 configuration is paged allocation with quantised entries and a protected attention-sink budget, combining a dense pack of small entries rather than a dense pack of large ones.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: KV Quantisation and Eviction in vLLM and SGLang</div>
+<p>Both major open-source serving frameworks expose KV compression without requiring custom kernel work. In vLLM, pass <code>kv_cache_dtype="fp8_e5m2"</code> to the engine constructor to store cached keys and values in 8-bit floating point, halving KV memory relative to BF16 with negligible quality loss on most tasks:</p>
+<pre><code class="language-python">from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="meta-llama/Meta-Llama-3-70B-Instruct",
+    kv_cache_dtype="fp8_e5m2",     # halves KV memory; paged allocation is still on by default
+)
+outputs = llm.generate(prompts, SamplingParams(max_tokens=512))
+</code></pre>
+<div class="code-caption"><strong>Code 22.5.3:</strong> Enabling FP8 KV-cache quantisation in vLLM. The <code>kv_cache_dtype</code> argument is the only required change; paged allocation, prefix caching, and the continuous-batching scheduler remain active and layer on top.</div>
+<p>SGLang provides an H2O-style eviction policy via its <code>attention_reduce_in_fp32</code> and heavy-hitter budget parameters. The attention-sink tokens are protected automatically: any eviction policy that ships in a production framework must preserve them or generation degrades visibly on long outputs, so both frameworks hard-code a minimum sink-token count of 4.</p>
+</div>
+
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: A Per-Node Enabler for Fleet-Level Capacity</div>
+<p>KV compression is a single-node mechanism, and like paging before it, its impact propagates through the fleet. Halving the per-entry byte width with INT4 or FP8 quantisation doubles the number of concurrent sequences one GPU can hold, which doubles the throughput the node contributes to the serving fleet before autoscaling must add a replica. The fleet-level throughput and cost arithmetic that <a href="../module-24-distributed-llm-serving/index.html">Chapter 24</a> develops depends on a per-node concurrency budget that compression directly enlarges. Every quantisation bit width you remove from the cache is a multiplication factor on the requests-per-dollar a fleet achieves, which is ultimately the number that determines whether a long-context serving product is economically viable.</p>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 22.5.1: Size the Cache, Find the Ceiling <span class="exercise-type conceptual">Conceptual</span></div>
 <p>Using $M_{\text{KV}} = 2 B S L H d_h p$, take a model with $L = 32$ layers, $H = 32$ key/value heads, $d_h = 128$, in 2-byte precision, served on a GPU with 16 gigabytes of memory left for KV after the weights. (a) Compute the KV bytes per token and the bytes for one 4096-token sequence. (b) What is the largest batch of 4096-token sequences the GPU can hold? (c) Now switch the model to grouped-query attention with $H = 8$ and recompute the batch. State in one sentence why this architectural change, rather than buying memory, is the cheaper path to higher concurrency.</p>

@@ -238,6 +238,48 @@ dcp.load(state_dict, checkpoint_id="ckpt/step_5000")
 </div>
 <p>We now have the full picture: the failure models that describe how a component can break, the independent-failure math that proves at least one will, and the four recovery mechanisms (with checkpoint/restart tuned by $T^{\star} = \sqrt{2CM}$) that turn a certain death into a survivable one. What we have quietly assumed throughout is that a survivor can always tell a dead node from a slow one and always agree with its peers on what state to recover to. A network partition breaks both assumptions, forcing a choice between staying consistent and staying available. That choice, and the staleness it produces in distributed training, is the subject of the next section.</p>
 
+<h2>5. In-Memory and Asynchronous Checkpointing <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The Young-Daly analysis treats the checkpoint write time $C$ as a fixed cost, but at extreme scale $C$ is a serious problem on its own. A 671-billion-parameter model in BF16 carries roughly 1.3 TB of parameter state. At 10 GB/s effective NFS throughput, writing one checkpoint stalls the entire cluster for about 130 seconds. With a 5-minute checkpoint interval that stall alone consumes 43 percent of training time, well above the Young-Daly optimum of roughly 5 percent. The floor overhead $\sqrt{2C/M}$ cannot be shrunk by tuning the interval; the only escape is to reduce $C$ itself. Asynchronous and in-memory checkpointing attack $C$ directly by decoupling the write from the training step.</p>
+<p>The core idea is simple: instead of blocking all ranks while state is flushed to remote storage, copy model parameters and optimizer moments to CPU host RAM on rank 0 (or on every rank in parallel) while the GPU resumes training immediately. A background thread then transfers the CPU-resident snapshot to object storage without touching the GPU at all. From the GPU's perspective the checkpoint is nearly free; the only direct cost is the time to perform the device-to-host transfer at PCIe bandwidth, typically 20 to 50 GB/s, which is one to two orders of magnitude faster than a remote filesystem write. The storage flush happens concurrently with the next training steps, so $C$ in the overhead formula collapses to the device-to-host transfer time rather than the end-to-end storage write time.</p>
+
+<h3>PyTorch Distributed Checkpoint Async Save</h3>
+<p>PyTorch 2.3 formalised this pattern as <code>torch.distributed.checkpoint.async_save()</code>, which serialises all shards to CPU RAM in a background thread and returns immediately. The training loop does not wait for the storage flush; it only waits if a <em>second</em> checkpoint request arrives before the first flush completes, which is easily avoided by choosing an interval longer than the background flush time.</p>
+<pre><code class="language-python">import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.state_dict import get_state_dict
+
+# Obtain the distributed state dict (parameters + optimizer moments, sharded).
+state_dict = get_state_dict(model, optimizer)
+
+# async_save returns a Future; training continues on the GPU immediately.
+# The background thread serialises shards to CPU RAM, then flushes to storage.
+future = dcp.async_save(state_dict, checkpoint_id="ckpt/step_5000")
+
+# ... training steps run here while the flush is in progress ...
+
+# Block only if you need to confirm the checkpoint completed (e.g. before exit).
+future.result()
+</code></pre>
+<div class="code-caption"><strong>Code 2.4.4:</strong> PyTorch DCP <code>async_save()</code> stages the checkpoint to CPU RAM and returns a Future, letting training continue on the GPU while storage writes happen in the background. The call to <code>future.result()</code> is optional during the run and is shown here only for completeness.</div>
+
+<h3>Multi-Tier Checkpointing</h3>
+<p>The device-to-host copy itself can fail (the host could reboot) and the background flush can fail (the storage system could be unreachable). Production LLM training therefore uses a <em>three-tier</em> hierarchy that matches write latency to failure scope:</p>
+<ol>
+  <li><strong>Peer-GPU in-memory replica.</strong> A copy of the shard is written to a peer GPU's device memory over NVLink or InfiniBand at device-to-device bandwidth. Write latency is tens of milliseconds. This tier survives a single-GPU crash within the node but is lost if the entire node goes down. It is the cheapest possible checkpoint and the first line of defense.</li>
+  <li><strong>Host-RAM copy.</strong> The snapshot is transferred to host DRAM via PCIe. Write latency is one to three seconds for a trillion-parameter shard. This tier survives a GPU driver crash or single-GPU failure and persists across a GPU restart on the same node, but is lost if the host itself loses power.</li>
+  <li><strong>Remote object storage.</strong> The snapshot is flushed asynchronously from host RAM to a distributed object store (S3, GCS, or HDFS). Write latency is tens of seconds to minutes depending on network bandwidth and snapshot size. This tier survives node failure and datacenter-level events and is the only tier that survives a full node replacement.</li>
+</ol>
+<p>Each tier is written independently so that training stalls only for the fastest tier; the slower tiers are filled in the background. Gemini (Google, 2023) and the Meta Llama-3 production system (2024) both report using variants of this three-tier structure. In practice, Tier 1 is used for the most frequent snapshots (every few minutes), Tier 2 for medium-frequency checkpoints (every tens of minutes), and Tier 3 for infrequent durable checkpoints (every hour or longer).</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Optimal Interval Formula Applies Tier by Tier</div>
+<p>When you have multiple checkpoint tiers, each with its own write time $T_{\text{write},i}$ and failure scope $\lambda_i$, the Young-Daly formula $T^{\star} = \sqrt{2 \cdot T_{\text{write}} / \lambda}$ applies independently to each tier. At $\lambda = 1$ failure per hour and $T_{\text{write}} = 2$ minutes for a host-RAM flush, the optimal interval is $\sqrt{2 \times 2 / 1} \approx 2$ minutes (matching the flush time itself). For the remote-storage tier at $T_{\text{write}} = 10$ minutes, the same failure rate gives $T^{\star} \approx \sqrt{20} \approx 4.5$ minutes. The counterintuitive result is that "checkpoint as often as possible" is never optimal: each tier has a floor overhead $\sqrt{2 \, T_{\text{write}} \cdot \lambda}$ that cannot be improved by checkpointing more often, only by reducing the write time of that tier.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: CheckFreq, Gemini, and the Production Case for Multi-Tier Checkpointing</div>
+<p>CheckFreq (Mohan et al., NSDI 2021) formalised the case for adaptive, fine-grained checkpoint scheduling that accounts for both the write cost and the straggler variance of large GPU jobs. Gemini (Wang et al., SOSP 2023) demonstrated the three-tier hierarchy in production at Google scale, showing that the combination of peer-GPU replica, host-RAM copy, and remote-storage flush reduces the effective checkpoint overhead to under one percent even at thousand-node scale. PyTorch DCP <code>async_save()</code>, available as a stable API since PyTorch 2.3, is the open-source production realisation of the async staging idea. The research direction currently active (2024 to 2026) is CPU-offload checkpointing integrated with tensor parallelism, where each rank asynchronously offloads only its own shards to host RAM before flushing, eliminating the rank-0 bottleneck that naive implementations carry. These techniques are applied at full LLM scale in <a href="../../part-4-parallel-deep-learning/module-18-elastic-fault-tolerant-training/index.html">Chapter 18</a>, where elastic restart and redundant pipeline replicas complete the picture.</p>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 2.4.1: Read the Crossover Off the Curve <span class="exercise-type conceptual">Conceptual</span></div>
 <p>Using the approximation $P(\text{at least one fails}) \approx 1 - e^{-pK}$ from Section 2, derive the cluster size $K$ at which disruption becomes more likely than not (set the expression equal to $\tfrac{1}{2}$ and solve for $K$). Evaluate it for $p = 0.01$ and confirm it lands near the crossover marked in Figure 2.4.1. Then explain in one sentence why halving $p$ roughly doubles that crossover size, and why that is weak comfort for someone trying to run on ten thousand nodes.</p>

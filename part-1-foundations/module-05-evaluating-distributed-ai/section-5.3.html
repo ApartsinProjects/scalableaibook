@@ -222,6 +222,121 @@ $$\text{TPOT} \approx \frac{2 \cdot N_{\text{params}} \cdot d_{\text{dtype}}}{\t
 <p>An SLA that reads "p99 latency under 1 second" is ambiguous for a token-streaming service. Request whether the SLA measures TTFT, TPOT, or end-to-end latency: they have different drivers and different engineering levers. TTFT is controlled by prefill throughput, queue depth, and prompt length distribution. TPOT is controlled by decode batch size, KV-cache pressure, and memory bandwidth. End-to-end latency is their sum weighted by output length. A vendor or operator who quotes one number without specifying which phase it covers cannot tell you which part of the system to fix when the SLA is breached.</p>
 </div>
 
+<h2>8. MoE-Specific Metrics: Load Imbalance and Expert Utilisation <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The throughput and goodput definitions above treat a model as a single processing unit: tokens in, tokens out, latency measured end-to-end. Mixture-of-Experts (MoE) architectures break that assumption. A 671B-parameter MoE model with 8 experts and top-2 routing activates only 37B parameters per token; the headline parameter count grossly overstates the per-token compute. Standard throughput metrics, tokens per second measured at the system boundary, report the resulting number without revealing whether those tokens were processed efficiently. The hidden issue is routing imbalance: if 60% of tokens in a batch are routed to expert 1 and expert 2 while the other six experts sit idle, the effective throughput is roughly half of what balanced routing would achieve, yet the tokens-per-second counter rises just the same because it cannot see inside the routing decision.</p>
+<p>This gap between reported and effective throughput motivates a set of MoE-specific metrics that track routing health alongside the standard serving numbers. They do not replace goodput or tail-latency SLOs; they supplement them by exposing the internal bottleneck that drives the numbers without appearing in them.</p>
+
+<h3>Expert Utilisation</h3>
+<p>Let $f_i$ be the fraction of tokens in a step that are routed to expert $i$, and let $E$ be the total number of experts. Under perfectly balanced routing, each expert would receive $1/E$ of the tokens. Expert utilisation normalises against that ideal:</p>
+$$U_i = \frac{f_i}{1/E} = E \cdot f_i.$$
+<p>A value of $U_i = 1$ means expert $i$ carries exactly its fair share. Values above 1 indicate a hot expert that processes more tokens than balanced routing would assign; values below 1 indicate an idle or cold expert. In practice, during early training, routing distributions are uneven enough that $U_{\max}$ can exceed 5, meaning the busiest expert handles five times its fair share while others are nearly unused. Monitoring the full distribution of $U_i$ across experts and across training steps reveals whether routing is converging toward balance.</p>
+
+<h3>Load Imbalance Factor</h3>
+<p>A single scalar summarises the routing distribution compactly. The Load Imbalance Factor (LIF) is defined as</p>
+$$\text{LIF} = E \cdot \max_i f_i.$$
+<p>LIF equals 1 when routing is perfectly balanced; LIF equals $E$ in the degenerate case where all tokens collapse to one expert. An LIF of 3 means the busiest expert processes three times its intended share, which has a direct throughput consequence in expert-parallel deployments: the all-to-all collective that dispatches tokens to expert GPUs cannot proceed until every expert GPU finishes its assigned tokens, so the step time is dominated by the overloaded expert. A 3$\times$ overloaded expert effectively stalls the all-to-all barrier, and observed throughput per GPU falls toward one-third of the balanced-routing ceiling, even though the tokens-per-second metric at the system boundary does not show this directly.</p>
+
+<h3>Token Drop Rate</h3>
+<p>Expert-parallel MoE systems typically limit how many tokens each expert will process per step by a capacity factor $c$, chosen to bound memory and compute on each device. If the load on expert $i$ exceeds $c$, the excess tokens are dropped: they receive no expert update for that step. Formally, tokens are dropped when $\text{LIF} > c$. The token drop rate per expert per step is</p>
+$$\text{drop}_i = \max\!\left(0,\; f_i - \frac{c}{E}\right) \cdot N_{\text{batch}},$$
+<p>where $N_{\text{batch}}$ is the total number of tokens in the step. Dropped tokens degrade model quality silently; the training loss continues to decrease, but at a slower rate, and the resulting model may generalise worse than one trained with no drops. Tracking drop rate per expert per step alongside the training loss is the only way to detect this degradation early.</p>
+
+<h3>All-to-All Latency Fraction</h3>
+<p>In expert-parallel MoE deployments, a step consists of roughly four phases: a local computation pass before the MoE layer, an all-to-all dispatch collective that sends tokens to the correct expert GPU, the expert computation on each device, and a second all-to-all gather collective that collects the results. At scale, the two all-to-all collectives together can consume 30 to 60% of step time, a fraction that grows with the number of expert GPUs and the inter-node bandwidth relative to the expert compute time. Reporting aggregate step time alone hides this: a run that completes steps in 800 ms may be spending 480 ms of that in communication, leaving only 320 ms of useful compute. The all-to-all latency fraction should be reported as a separate metric, analogous to the communication-to-computation ratio of Section 5.4, so that profiling can distinguish a compute-bound bottleneck from a network-bound one.</p>
+
+<h3>Computing LIF and Expert Utilisation in Practice</h3>
+<p>In a typical MoE training loop, the router outputs a tensor of shape <code>(batch_tokens, E)</code> representing the gate scores, and the top-$k$ routing decision determines $f_i$ for each expert. The snippet below computes LIF and the full utilisation vector from that routing tensor for a single step.</p>
+<pre><code class="language-python">import torch
+
+def moe_routing_metrics(router_indices: torch.Tensor, num_experts: int) -> dict:
+    """
+    Compute LIF and per-expert utilisation from a routing decision tensor.
+
+    Args:
+        router_indices: LongTensor of shape (num_tokens, top_k) containing the
+                        expert index each token is routed to (one column per
+                        selected expert in top-k routing).
+        num_experts:    Total number of experts E.
+
+    Returns:
+        A dict with keys 'lif', 'utilisation' (tensor of length E),
+        'drop_rate' (tensor of length E, given capacity_factor=1.25),
+        and 'token_counts' (tensor of length E).
+    """
+    num_tokens = router_indices.shape[0]
+    capacity_factor = 1.25                            # common default in Switch/Mixtral
+
+    # Count how many times each expert is selected across all top-k slots.
+    counts = torch.zeros(num_experts, dtype=torch.long)
+    for expert_idx in router_indices.flatten():
+        counts[expert_idx] += 1
+
+    # f_i: fraction of token-expert assignments going to expert i.
+    # With top-k routing, total assignments = num_tokens * top_k.
+    total_assignments = router_indices.numel()
+    f = counts.float() / total_assignments            # shape: (E,)
+
+    utilisation = num_experts * f                     # U_i = E * f_i
+    lif = float(utilisation.max())                    # LIF = E * max_i f_i
+
+    # Token drop rate per expert given the capacity factor.
+    capacity = capacity_factor / num_experts          # per-expert capacity as a fraction
+    drop_fraction = torch.clamp(f - capacity, min=0.0)
+    drop_tokens = (drop_fraction * total_assignments).long()
+
+    return {
+        "lif": lif,
+        "utilisation": utilisation,
+        "token_counts": counts,
+        "drop_tokens": drop_tokens,
+    }
+
+
+# --- Simulate a step with 4096 tokens, 8 experts, top-2 routing. ---
+# Inject a hot-expert scenario: expert 0 gets 40% of assignments,
+# expert 1 gets 20%, and the remaining six share the rest evenly.
+torch.manual_seed(42)
+num_tokens, top_k, E = 4096, 2, 8
+
+weights = torch.tensor([0.40, 0.20, 0.10, 0.10, 0.05, 0.05, 0.05, 0.05])
+assignment_counts = (weights * num_tokens * top_k).long()
+assignment_counts[-1] += num_tokens * top_k - assignment_counts.sum()  # fix rounding
+indices_flat = torch.repeat_interleave(torch.arange(E), assignment_counts)
+router_indices = indices_flat[torch.randperm(len(indices_flat))].reshape(num_tokens, top_k)
+
+metrics = moe_routing_metrics(router_indices, num_experts=E)
+
+print(f"LIF = {metrics['lif']:.3f}  (1.0 = perfect balance)")
+print()
+print(f"{'Expert':>8} {'Tokens':>8} {'Utilisation':>13} {'Drop tokens':>13}")
+print("-" * 46)
+for i in range(E):
+    print(
+        f"{i:>8}  {metrics['token_counts'][i]:>7}  "
+        f"{metrics['utilisation'][i]:>12.3f}  "
+        f"{metrics['drop_tokens'][i]:>12}"
+    )
+</code></pre>
+<div class="code-caption"><strong>Code 5.3.3:</strong> Computing LIF and per-expert utilisation from a top-2 routing tensor. The simulation injects a hot-expert distribution (expert 0 receives 40% of assignments) to illustrate a realistic imbalance scenario. Capacity factor is set to 1.25, the common default in Switch Transformer and Mixtral-style MoE implementations.</div>
+<pre><code class="language-text">LIF = 3.200  (1.0 = perfect balance)
+
+  Expert   Tokens  Utilisation  Drop tokens
+----------------------------------------------
+       0     3277        3.200         2097
+       1     1638        1.600            0
+       2      819        0.800            0
+       3      819        0.800            0
+       4      410        0.400            0
+       5      410        0.400            0
+       6      410        0.400            0
+       7      409        0.400            0</code></pre>
+<div class="code-caption"><strong>Output 5.3.3:</strong> LIF of 3.2 means expert 0 is handling 3.2 times its fair share. With a capacity factor of 1.25, the per-expert capacity is 1.25/8 = 15.6% of assignments; expert 0's 40% share exceeds this, so 2097 tokens are dropped in this step. Experts 4 through 7 are operating at 40% utilisation, sitting largely idle while expert 0 is the bottleneck. In a real training run, sustained LIF above 2 is a signal to inspect the auxiliary load-balancing loss.</div>
+
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: These Metrics Connect to Chapter 17</div>
+<p>The LIF, utilisation vector, and token drop rate introduced here are not just diagnostic tools; they are the quantities that Chapter 17 (MoE Load Balancing) is specifically engineered to control. The auxiliary loss added to MoE training objectives, introduced by Switch Transformer and refined in subsequent work, applies a gradient penalty proportional to the dot product of $f_i$ and the mean gate score for each expert. The bias-update routing strategy used in DeepSeek-V3 adjusts per-expert bias terms at each step to nudge $f_i$ toward $1/E$. Both mechanisms exist to drive LIF toward 1 and token drop rate toward 0. Measuring LIF and utilisation throughout training gives you the feedback signal that confirms whether those mechanisms are working. A run whose LIF stabilises around 1.0 to 1.3 after a few thousand steps is behaving as designed; one that sustains LIF above 3 for extended periods is either missing the aux-loss term, has it weighted too weakly, or has a routing collapse that needs intervention. The metrics you track here are the ground truth that Chapter 17's strategies are accountable to.</p>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 5.3.1: Read the Collapse <span class="exercise-type conceptual">Conceptual</span></div>
 <p>Using Output 5.3.1, identify the largest offered load at which goodput still equals throughput, and the smallest offered load at which goodput has fallen below half of throughput. Explain in terms of the p95 and p99 columns why the goodput begins to fall <em>before</em> throughput plateaus, and why a fleet sized to the raw capacity (500 req/s per replica) rather than to the goodput knee is one traffic spike away from a user-visible outage.</p>

@@ -218,6 +218,73 @@ for B in [1, 10, 100, 1000, 10000, 100000]:
 </div>
 <p>With streaming in place, the data can be arbitrarily larger than any node, read in place from object storage, shuffled well enough for SGD, divided cleanly across workers, and resumed exactly after a failure. What we have assumed so far is that the shards already exist in a clean, decode-ready form. Producing them, parsing, filtering, deduplicating, and tokenizing raw data at a scale that itself exceeds one machine, is the distributed-preprocessing problem, and it is where <a href="section-8.7.html">Section 8.7</a> goes next.</p>
 
+<h2>6. AI-Native Distributed Data Pipelines: Ray Data and Daft <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>WebDataset-style streaming solves the bandwidth problem, but it still leaves transformation logic scattered across custom worker functions. Spark DataFrames, introduced in <a href="../module-07-spark-dataframes/index.html">Chapter 7</a>, offer a more structured alternative, but their execution model was designed for SQL and ETL workloads, not for the heterogeneous, GPU-aware transforms that multimodal AI pipelines require. Two frameworks purpose-built for this gap emerged as the 2024 to 2026 defaults: Ray Data and Daft.</p>
+
+<h3>6.1 Why Spark Under-Serves AI Data Pipelines</h3>
+<p>Spark's execution engine is built around shuffle-based stages: each transformation produces an intermediate dataset that the scheduler partitions and distributes before the next stage reads it. This architecture is optimal when the bottleneck is a wide aggregation or a sort, operations where data must move between nodes anyway. AI preprocessing has different requirements. Random-access sampling without a full shuffle matters because training epochs revisit the corpus with a fresh random permutation, not the same ordered pass Spark optimizes for. Streaming execution directly into GPU memory matters because an intermediate materialization of a decoded image tensor on disk negates the bandwidth advantage that GPU decoding provides. Heterogeneous transforms matter because a single pipeline stage might decode an image (CPU-bound), embed it with a vision encoder (GPU-bound), and join it against a metadata table (I/O-bound); Spark's uniform partition-and-shuffle does not express those different resource affinities cleanly. Finally, Spark's JVM layer adds 50 to 100 ms of overhead per batch for small tensor payloads, a cost invisible at SQL scale but dominant when a training step takes 10 ms.</p>
+
+<h3>6.2 Ray Data: Streaming Execution on the Actor Model</h3>
+<p>Ray Data is a distributed data processing library built on Ray's actor model (the same runtime that <a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a> uses for Ray Train). Rather than staging data through a central shuffle, Ray Data expresses a pipeline as a chain of <code>map_batches</code> calls, each potentially running on a different actor pool:</p>
+<pre><code class="language-python">import ray
+import ray.data
+
+# Read Parquet shards directly from object storage.
+ds = ray.data.read_parquet("s3://my-bucket/multimodal-corpus/")
+
+# Stage 1: decode image bytes to tensors on CPU workers.
+ds = ds.map_batches(decode_images, batch_size=64, num_cpus=4)
+
+# Stage 2: embed each image with a GPU vision encoder.
+ds = ds.map_batches(embed_images, batch_size=32,
+                    compute=ray.data.ActorPoolStrategy(size=4),
+                    num_gpus=1)           # pin this stage to a pool of 4 GPU actors
+
+# Stage 3: write enriched embeddings back to Parquet.
+ds.write_parquet("s3://my-bucket/embeddings/")
+</code></pre>
+<div class="code-caption"><strong>Code 8.6.3:</strong> A Ray Data pipeline: read Parquet shards, decode images on CPU workers, embed on GPU actors, write embeddings. Each stage runs concurrently on its own actor pool; stage N processes a batch while stage N-1 is still reading the next one, so the pipeline never stalls between stages.</div>
+<p>Three properties distinguish Ray Data from a Spark pipeline. First, pipelined streaming: Ray Data overlaps stage execution across batches, so the GPU embedding actor processes batch $i$ while the CPU decode actors are already working on batch $i+1$. There is no barrier between stages. Second, GPU-aware placement: <code>map_batches</code> accepts a <code>compute</code> argument that pins a stage to an actor pool with a declared GPU resource requirement, so the scheduler co-locates the actor with the device and avoids unnecessary host-to-device copies. Third, native integration with Ray Train: Ray Data's <code>iter_batches</code> hands tensors directly to a Ray Train worker via shared memory, bypassing serialization entirely. Anyscale's 2024 benchmarks on multimodal datasets report 2x to 18x throughput improvements over Spark on equivalent preprocessing pipelines, driven primarily by the elimination of intermediate shuffles and the GPU-placement feature.</p>
+
+<h3>6.3 Daft: A Python-Native Multimodal Dataframe</h3>
+<p>Daft takes a different approach. Where Ray Data is a streaming execution engine, Daft is a distributed dataframe with a query planner, inspired by DuckDB's execution model but with an Arrow-native, Rust-core runtime. Its defining feature is that images, embeddings, and tensors are first-class column types, not opaque blobs stored in binary columns. The dataframe knows the shape and dtype of an embedding column and can optimize across it during query planning.</p>
+<pre><code class="language-python">import daft
+
+# Load a metadata table with an image_url column.
+df = daft.read_parquet("s3://my-bucket/metadata/")
+
+# url_download fans out to a distributed pool; image_decode decodes in parallel.
+df = df.with_column("image", daft.col("image_url").url_download().image_decode())
+df = df.with_column("embedding", embed_udf(daft.col("image")))
+df.write_parquet("s3://my-bucket/embeddings/")
+</code></pre>
+<div class="code-caption"><strong>Code 8.6.4:</strong> A Daft pipeline in four lines: read a metadata table, download images from URLs into a distributed pool, decode them as a column operation, compute embeddings via a UDF, and write the result. Daft's lazy evaluator plans the download, decode, and embed stages as a single fused query before executing.</div>
+<p>Two Daft features matter most for AI workloads. The <code>url_download()</code> column expression distributes HTTP or object-storage downloads across a worker pool, so fetching a column of image URLs is as cheap as a parallel read. The <code>image_decode()</code> expression then decodes bytes into Arrow-backed image arrays without any user-written decode loop. Because evaluation is lazy, Daft's query optimizer can fuse the download, decode, and transform steps into a single distributed pass, pruning columns and predicates before any bytes move. Daft integrates with LanceDB (the vector store discussed in <a href="section-8.3.html">Section 8.3</a> in the context of AI-optimized formats) for direct index builds over embedding columns without an intermediate export step.</p>
+
+<h3>6.4 Choosing Between Spark, Ray Data, and Daft</h3>
+<p>The table below summarizes the key trade-offs. Spark remains the right choice when the pipeline is primarily SQL aggregations over structured tables, especially in ecosystems already built around the Databricks or EMR platforms. Ray Data is the right choice when the pipeline is compute-heterogeneous: some stages need CPUs, others need GPUs, and you want pipelined overlap between them. Daft is the right choice when the data is multimodal and you want a high-level dataframe API with native URL, image, and embedding columns rather than writing custom map functions.</p>
+<div class="table-caption"><strong>Table 8.6.2:</strong> Spark, Ray Data, and Daft across five dimensions relevant to AI data pipelines. No single framework dominates: the best choice follows the shape of the pipeline, not a blanket recommendation.</div>
+<table>
+<thead>
+<tr><th scope="col">Dimension</th><th scope="col">Spark</th><th scope="col">Ray Data</th><th scope="col">Daft</th></tr>
+</thead>
+<tbody>
+<tr><td>Shuffle cost</td><td>High (shuffle-based stages, JVM overhead 50-100 ms per small batch)</td><td>Low (pipelined streaming, no inter-stage barrier)</td><td>Low (lazy query planner fuses stages, no unnecessary shuffles)</td></tr>
+<tr><td>GPU-aware execution</td><td>Limited (external UDFs, no native GPU placement)</td><td>Native (<code>num_gpus</code> in <code>map_batches</code>, actor pool pinned to device)</td><td>Supported (UDF resource hints, Arrow GPU buffers via RAPIDS)</td></tr>
+<tr><td>Multimodal columns</td><td>Binary blobs only, no type-aware optimization</td><td>Arbitrary Python objects; tensor columns with Arrow backend</td><td>Native image, embedding, URL column types with first-class ops</td></tr>
+<tr><td>Fault tolerance</td><td>Strong (lineage-based recomputation, mature)</td><td>Good (actor restart, checkpointed lineage on Ray 2.x)</td><td>Growing (partition-level retry, less battle-tested at petabyte scale)</td></tr>
+<tr><td>SQL support</td><td>Full (SparkSQL, Catalyst optimizer, broad ecosystem)</td><td>Partial (basic filter and select, no full SQL planner)</td><td>Growing (DuckDB-inspired SQL API, joins and aggregations supported)</td></tr>
+</tbody>
+</table>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Ray Data and Daft Pipelines at a Glance</div>
+<p>The six-line Ray Data pipeline and the four-line Daft pipeline from Codes 8.6.3 and 8.6.4 cover the majority of multimodal preprocessing patterns. Ray Data's <code>read_parquet</code> to <code>map_batches</code> chain feeds directly into Ray Train for zero-copy data handoff to GPU workers (<a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>). Daft's <code>url_download</code> and <code>image_decode</code> column operations integrate with LanceDB for vector index construction over the resulting embedding columns, closing the loop between data preprocessing and retrieval (<a href="section-8.3.html">Section 8.3</a>). Install both with <code>pip install ray[data] getdaft</code>; no JVM required.</p>
+</div>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: From Storage to the Model, Without Stopping</div>
+<p>The streaming pipeline of Sections 1 to 5 carries bytes from object storage to the trainer; Ray Data and Daft extend that pipeline to also transform the bytes, with GPU awareness, on the way. The result is a single dataflow from raw storage to training-ready tensors that never materializes unnecessary intermediate files. This is the logical completion of the storage-determines-scale argument from <a href="section-8.1.html">Section 8.1</a>: not only must the read path keep the accelerators fed, but the transformation path must also run fast enough not to become the new bottleneck. When the pipeline is assembled from Ray Data actors or Daft column expressions, the transformation throughput scales with the cluster size, and the bottleneck returns to where it belongs: the model step itself.</p>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 8.6.1: When Does Streaming Beat Map-Style? <span class="exercise-type conceptual">Conceptual</span></div>
 <p>For each scenario, decide whether you would use a map-style or an iterable/streaming dataset, and justify it from the properties in Table 8.6.1: (a) a 5-gigabyte image classification set on a node with 2 terabytes of local NVMe; (b) a 30-terabyte multimodal corpus in S3 trained on nodes with 1 terabyte of local disk; (c) an online system that trains continuously on an unbounded event stream that never ends. Explain specifically what would go wrong if you chose the other shape in each case.</p>

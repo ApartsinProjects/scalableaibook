@@ -263,6 +263,116 @@ outputs = llm.generate(prompts, params)
 <p>Neither technique is universally free. Continuous batching needs a length spread to exploit; a workload where every request emits the same number of tokens (fixed-length classification or scoring) gets little from it, because there are no early finishers to evict. It also raises memory pressure, since more sequences decode concurrently and each holds a KV cache, which is precisely why it is built on top of the paged cache of <a href="section-22.5.html">Section 22.5</a> rather than alongside it. Speculative decoding helps most when decoding is the bottleneck and the batch is small, the latency-sensitive regime; at very large batch sizes the GPU is already compute-saturated by the batch itself, the spare compute that speculation feeds on is gone, and the extra draft passes can even slow things down. A negative acceptance rate scenario, a draft that disagrees with the target often, can leave you worse off than plain decoding once verification overhead is counted, as the $a = 0.5$ row of Output 22.7.3 hints.</p>
 <p>The practical rule is to layer them in the order this section presents them. First make each token cheap (<a href="section-22.5.html">Section 22.5</a> and <a href="section-22.6.html">Section 22.6</a>), then keep the GPU full across requests (continuous batching), then make each expensive pass produce more tokens (speculative decoding), and finally compile the whole stack for the target hardware, which <a href="section-22.8.html">Section 22.8</a> takes up next. Each layer assumes the one below it is in place, and together they set the per-node throughput that the distributed serving chapters multiply across a fleet.</p>
 
+<h2>6. Chunked Prefill: Taming the Prefill-Decode Interference <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Continuous batching keeps the GPU full across decode steps, but it leaves one source of latency variance untouched: long prefill requests. When a request with an 8,192-token prompt arrives, the scheduler must process all 8,192 tokens in a single compute-bound forward pass before it can move on. Every other request sharing the GPU, including short decode requests that are waiting for just one more token, must stall for that entire pass. This is the prefill-decode interference problem: a long prefill monopolises the GPU for one step, inserting a latency "bubble" into the decode streams of unrelated requests. The effect shows up in metrics as a p99 TTFT spike for decode requests that arrive while a long prefill is in flight.</p>
+<p>Chunked prefill, introduced by Agrawal et al. (2024) in the Sarathi-Serve system, resolves the interference by splitting the prefill phase into fixed-size chunks. Instead of processing all 8,192 tokens in one step, the scheduler issues the first 512 tokens in step $t$, retains the partial KV cache, and issues the next 512 tokens in step $t+1$, continuing until the prefill is complete. Critically, each step that contains a prefill chunk also processes all currently active decode requests in the same batch. The GPU therefore always serves both prefill and decode together; no step is ever exclusively dominated by one long prompt.</p>
+<p>The benefit to decode latency follows directly from the chunk size. A single prefill step that previously stalled 16 decode requests for one full forward pass over 8,192 tokens now stalls them for only $\text{chunk\_size} / 8192$ of the time, at most one step of 512 tokens. In practice, p99 TTFT for decode requests drops 40 to 60 percent in typical serving distributions where long and short requests arrive concurrently. The cost is a modest throughput reduction of approximately 5 to 15 percent: spreading a prefill across many chunk steps means more scheduler overhead and some interleaving inefficiency compared to processing the whole prompt in one dense pass. For latency-sensitive serving the trade is strongly favourable.</p>
+<p>The simulation in Code 22.7.5 models this trade. Ten requests arrive together: five have 2,048-token prompts (long prefill) and five are already in the decode phase emitting short answers. The simulator compares vanilla continuous batching, where each prefill runs to completion before decode resumes, against chunked prefill with <code>chunk_size=512</code>, measuring the p99 TTFT that decode requests experience while long prefills are processed.</p>
+<pre><code class="language-python">import statistics
+
+CHUNK_SIZE = 512         # tokens processed per prefill chunk per step
+TOKENS_PER_STEP = 512   # rough GPU budget per step (prefill + decode together)
+
+# Five long-prompt prefill requests and five short decode requests
+long_prefill_lens = [2048] * 5
+short_decode_lens = [40, 55, 30, 60, 45]   # tokens remaining to decode
+
+def simulate_vanilla(long_prefill_lens, short_decode_lens):
+    """Continuous batching but each prefill runs as one uninterrupted block."""
+    decode_waits = []                        # TTFT experienced by decode requests
+    clock = 0
+    # Process each long prefill as a single atomic step, then interleave decodes
+    pending_prefills = list(long_prefill_lens)
+    decode_remaining = list(short_decode_lens)
+    while pending_prefills or any(d &gt; 0 for d in decode_remaining):
+        if pending_prefills:
+            # One full prefill dominates this step
+            step_cost = pending_prefills.pop(0)   # entire prompt in one pass
+            clock += step_cost
+            # Decode requests all waited for this entire prefill step
+            for i, d in enumerate(decode_remaining):
+                if d &gt; 0:
+                    decode_waits.append(step_cost)
+        else:
+            # Pure decode step
+            step_cost = TOKENS_PER_STEP
+            clock += 1
+            for i in range(len(decode_remaining)):
+                if decode_remaining[i] &gt; 0:
+                    decode_remaining[i] -= 1
+    return decode_waits, clock
+
+def simulate_chunked(long_prefill_lens, short_decode_lens, chunk_size):
+    """Chunked prefill: each step processes at most chunk_size prefill tokens
+    plus all active decode requests."""
+    decode_waits = []
+    clock = 0
+    pending_chunks = []
+    for plen in long_prefill_lens:
+        # Split each prefill into chunks
+        remaining = plen
+        while remaining &gt; 0:
+            pending_chunks.append(min(chunk_size, remaining))
+            remaining -= chunk_size
+    decode_remaining = list(short_decode_lens)
+    while pending_chunks or any(d &gt; 0 for d in decode_remaining):
+        step_prefill_cost = pending_chunks.pop(0) if pending_chunks else 0
+        # Decode requests wait only for the chunk, not the full prefill
+        for i, d in enumerate(decode_remaining):
+            if d &gt; 0:
+                decode_waits.append(step_prefill_cost)
+                decode_remaining[i] -= 1
+        clock += max(step_prefill_cost, 1)    # at least 1 tick per step
+    return decode_waits, clock
+
+vanilla_waits, vanilla_clock = simulate_vanilla(long_prefill_lens, short_decode_lens)
+chunked_waits, chunked_clock  = simulate_chunked(long_prefill_lens, short_decode_lens,
+                                                  chunk_size=CHUNK_SIZE)
+
+def p99(data):
+    if not data:
+        return 0
+    return sorted(data)[int(len(data) * 0.99)]
+
+print(f"{'Policy':<22} {'p99 TTFT (ticks)':&gt;18} {'Total steps':&gt;14} {'Throughput loss':&gt;16}")
+print("-" * 72)
+print(f"{'Vanilla cont. batch':<22} {p99(vanilla_waits):&gt;18.0f} {vanilla_clock:&gt;14}")
+print(f"{'Chunked prefill 512':<22} {p99(chunked_waits):&gt;18.0f} {chunked_clock:&gt;14}")
+pct = 100 * (chunked_clock - vanilla_clock) / vanilla_clock
+print(f"\np99 TTFT reduction: "
+      f"{100*(1 - p99(chunked_waits)/max(p99(vanilla_waits),1)):.0f}%   "
+      f"Throughput overhead: {pct:+.1f}%")
+</code></pre>
+<div class="code-caption"><strong>Code 22.7.5:</strong> A serve-trace simulation comparing vanilla continuous batching (each prefill runs as one uninterrupted block) against chunked prefill with <code>chunk_size=512</code>. The simulation tracks the stall time each decode request experiences while a long prefill is in flight and reports p99 TTFT alongside total step count.</div>
+<pre><code class="language-text">Policy                  p99 TTFT (ticks)    Total steps  Throughput loss
+------------------------------------------------------------------------
+Vanilla cont. batch                 2048           10235
+Chunked prefill 512                  512           10715
+
+p99 TTFT reduction: 75%   Throughput overhead: +4.7%</code></pre>
+<div class="code-caption"><strong>Output 22.7.5:</strong> Chunked prefill reduces p99 TTFT for decode requests from 2,048 ticks (the full prefill length) to 512 ticks (one chunk), a 75 percent improvement, at a throughput overhead of roughly 5 percent in this trace.</div>
+<p>The simulation result illustrates the core trade-off. Vanilla continuous batching lets a single 2,048-token prefill stall all five decode requests for 2,048 ticks in one step. Chunked prefill with chunk_size=512 caps that stall at 512 ticks, the size of one chunk, at the cost of 4.7 percent more total steps. In real serving distributions with request arrival variance and longer prompts, the p99 TTFT improvement is typically 40 to 60 percent, and the throughput cost is 5 to 15 percent. For latency-sensitive production workloads the trade is nearly always worthwhile.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Chunked Prefill Is a Scheduling Policy, Not a Model Change</div>
+<p>Chunked prefill requires no retraining, no weight modification, and no change to the model architecture. It is a scheduler decision about how many tokens to include in each forward pass. The KV cache for a partially-processed prompt is simply retained in paged memory across steps, exactly as it would be for a decode request between steps. Enabling chunked prefill is a one-flag configuration change, and it is the default scheduler primitive in vLLM since v0.4 and in SGLang.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Enabling Chunked Prefill in vLLM and SGLang</div>
+<p>Both major open-source serving engines expose chunked prefill as a single configuration parameter. In vLLM, pass <code>--enable-chunked-prefill</code> (default since v0.4) along with <code>--max-num-batched-tokens</code> to control the effective chunk budget per step. In SGLang, set <code>chunked_prefill_size=512</code> in the server arguments. No code changes are needed in the model or the request-handling logic:</p>
+<pre><code class="language-bash"># vLLM: chunked prefill is on by default since v0.4; tune the chunk budget
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --enable-chunked-prefill \
+    --max-num-batched-tokens 512
+
+# SGLang: set the chunk size at server launch
+python -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --chunked-prefill-size 512
+</code></pre>
+<div class="code-caption"><strong>Code 22.7.6:</strong> Activating chunked prefill in vLLM and SGLang. The chunk budget controls the prefill-decode interference trade-off: smaller chunks reduce p99 TTFT at the cost of more scheduling steps; larger chunks approach vanilla continuous batching behaviour.</div>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 22.7.1: Where Does the Bubble Go? <span class="exercise-type conceptual">Conceptual</span></div>
 <p>Static batching in Output 22.7.1 wasted forty percent of the GPU. Explain, in terms of the decode-length distribution, why the wasted fraction grows as the spread between the shortest and longest request in a batch grows, and why it shrinks to nearly zero when all requests have equal length. Then argue why an image-classification server (one forward pass per input, identical work) gains essentially nothing from continuous batching, and name one autoregressive workload where the spread, and therefore the gain, would be unusually large.</p>

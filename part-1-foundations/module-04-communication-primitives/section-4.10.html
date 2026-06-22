@@ -234,6 +234,97 @@ for x, y in data_loader:                            # an ordinary training loop
 <p>Chapter 4 closes the foundations of communication. Every collective in Table 4.10.1 returns, transformed, as the engine of a parallel method later in the book: all-reduce becomes the heartbeat of data-parallel training (<a href="../../part-4-parallel-deep-learning/module-15-data-parallel-deep-learning/index.html">Chapter 15</a>), all-gather and reduce-scatter become the memory-saving mechanics of sharded training (<a href="../../part-4-parallel-deep-learning/module-16-model-pipeline-sharded-parallelism/index.html">Chapter 16</a>), and all-to-all becomes the router of expert parallelism (<a href="../../part-4-parallel-deep-learning/module-17-expert-parallelism-moe/index.html">Chapter 17</a>). The overlap discipline you just learned is what keeps all of them affordable at thousands of workers. When a later chapter says "and then we synchronize," it is calling one of these six, scheduled to hide behind the compute it serves.</p>
 </div>
 
+<h2>Context Parallelism and Ring Attention <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>Every collective in this chapter, all-reduce, all-gather, reduce-scatter, all-to-all, broadcast, and gather, handles one of four parallelism axes: data parallelism (DP) shards the batch, tensor parallelism (TP) shards the hidden dimension, pipeline parallelism (PP) shards the layers, and expert parallelism (EP) shards the expert weights. Modern long-context LLM training has added a fifth axis: <strong>context parallelism (CP)</strong>, which shards the sequence dimension across GPUs. The collective pattern CP requires is qualitatively different from all-gather, and it is worth examining here because it illustrates how a new access pattern drives a new primitive.</p>
+
+<h3>Motivation: KV Memory Explodes with Context Length</h3>
+<p>Consider a transformer with a hidden dimension of 8192, BF16 weights, and a sequence length of 128000 tokens. The key and value tensors for one attention layer each have shape $[\text{seq}, \text{hidden}]$, so one layer holds $2 \times 128000 \times 8192 \times 2$ bytes of KV activations:</p>
+$$2 \times 128000 \times 8192 \times 2 \approx 4 \text{ GB per layer.}$$
+<p>For a 80-layer model, that is $80 \times 4 \approx 320$ GB of KV activations, far beyond the 80 GB HBM of a single H100. Context parallelism solves this by slicing the sequence dimension into $P$ equal shards and placing each shard on a separate GPU, so each device holds $1/P$ of the Q, K, and V tensors for every layer.</p>
+
+<h3>Ring Attention: Pipelined Send/Recv Over the Sequence Shard</h3>
+<p>Slicing the sequence raises an immediate correctness problem: the attention score between query token $i$ and key token $j$ requires both to be present on the same device. Liu et al. (2023) solve this with <strong>Ring Attention</strong>: arrange the $P$ CP devices in a logical ring. Each device holds its local Q, K, V shards. In each of the $P$ steps of the ring:</p>
+<ol>
+  <li>Each device computes the attention contribution between its local Q shard and the K, V it currently holds, accumulating the numerator and the log-sum-exp denominator of the softmax using the numerically stable online algorithm.</li>
+  <li>Each device sends the K, V it holds to the next device in the ring and receives K, V from the previous device, overlapping this transfer with the attention computation of step 1.</li>
+</ol>
+<p>After $P$ steps every device has seen every (K, V) shard and holds the fully correct attention output for its Q shard. Total KV communication is $2 \times (P-1)/P \times \lvert KV \rvert$ per layer, and it can be overlapped with the compute of the current step.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Ring Attention Uses Send/Recv, Not All-Gather</div>
+<p>An all-gather would also make every device see every (K, V) shard, but it would need to buffer the full KV tensor on every GPU before any attention could proceed, recreating the memory problem CP was designed to avoid. Ring Attention uses point-to-point <code>send</code>/<code>recv</code> because the K, V arriving from the ring are consumed immediately in the attention kernel: one bucket of KV in, one block of attention scores out, then forward the bucket to the next peer. The pipelined send/recv is what makes the memory footprint stay at $1/P$ per device. This is a case where the right collective is determined not just by bandwidth but by the memory access pattern of the consumer.</p>
+</div>
+
+<pre><code class="language-python">import torch
+import torch.distributed as dist
+
+def ring_attention_step(q_local, k_local, v_local, rank, world_size):
+    """
+    Two-GPU sketch of one Ring Attention step.
+    q_local, k_local, v_local: each has shape [seq/P, heads, head_dim].
+    Returns the attention output for this device's Q shard after one full ring pass.
+    """
+    P = world_size
+    k_buf = k_local.clone()          # K shard that will circulate around the ring
+    v_buf = v_local.clone()          # V shard that will circulate around the ring
+
+    next_rank = (rank + 1) % P
+    prev_rank = (rank - 1) % P
+
+    # Accumulator for the online softmax (numerator and log-sum-exp denominator)
+    out_accum = torch.zeros_like(q_local)
+    lse_accum = torch.full(q_local.shape[:-1] + (1,), float("-inf"))
+
+    for step in range(P):
+        # --- async send current (k_buf, v_buf) to the next peer ---
+        k_send_req = dist.isend(k_buf, dst=next_rank)
+        v_send_req = dist.isend(v_buf, dst=next_rank)
+
+        # Prepare receive buffers for the incoming shard from the previous peer
+        k_recv = torch.empty_like(k_buf)
+        v_recv = torch.empty_like(v_buf)
+        k_recv_req = dist.irecv(k_recv, src=prev_rank)
+        v_recv_req = dist.irecv(v_recv, src=prev_rank)
+
+        # --- compute attention for this (q_local, k_buf, v_buf) pair WHILE sends run ---
+        # (full scaled-dot-product attention with online log-sum-exp accumulation)
+        scores = torch.einsum("shd,thd->sht", q_local, k_buf) / (q_local.shape[-1] ** 0.5)
+        lse_step = scores.logsumexp(dim=-1, keepdim=True)          # [seq/P, heads, 1]
+        attn_w  = (scores - lse_step).exp()
+        out_step = torch.einsum("sht,thd->shd", attn_w, v_buf)
+
+        # online softmax merge (log-sum-exp trick)
+        lse_new  = torch.logaddexp(lse_accum, lse_step)
+        out_accum = (out_accum * (lse_accum - lse_new).exp()
+                     + out_step  * (lse_step  - lse_new).exp())
+        lse_accum = lse_new
+
+        # wait for the ring transfer to complete before overwriting buffers
+        k_recv_req.wait(); v_recv_req.wait()
+        k_send_req.wait(); v_send_req.wait()
+        k_buf, v_buf = k_recv, v_recv   # next step uses the freshly received shard
+
+    return out_accum
+</code></pre>
+<div class="code-caption"><strong>Code 4.10.3:</strong> A two-or-more-GPU sketch of one Ring Attention ring pass. Each step launches asynchronous <code>isend</code>/<code>irecv</code> for the K, V shard, then immediately computes the attention block for the shard currently in hand, overlapping compute and communication. The online log-sum-exp accumulator merges partial softmax results without ever materializing the full attention matrix.</div>
+
+<h3>4D and 5D Parallelism in Production</h3>
+<p>Production LLM training frameworks now combine all five axes simultaneously. Llama-3, Megatron-LM, and TorchTitan run with a parallelism configuration written as $\text{DP} \times \text{CP} \times \text{TP} \times \text{PP}$ (four dimensions) or $\text{DP} \times \text{CP} \times \text{TP} \times \text{PP} \times \text{EP}$ (five dimensions for MoE models). Each dimension shards a different tensor axis:</p>
+<ul>
+  <li><strong>DP</strong> shards the batch dimension: each replica sees different data samples.</li>
+  <li><strong>CP</strong> shards the sequence dimension: each CP rank holds $1/P_\text{CP}$ of the token sequence.</li>
+  <li><strong>TP</strong> shards the hidden/head dimension: each TP rank holds $1/P_\text{TP}$ of the weight matrices.</li>
+  <li><strong>PP</strong> shards the layer dimension: each PP stage holds a contiguous slice of transformer layers.</li>
+  <li><strong>EP</strong> shards the expert index: each EP rank owns a subset of the MoE expert parameters.</li>
+</ul>
+<p>These dimensions are not independent. CP and TP together define which GPUs share NVLink (fast) versus InfiniBand (slower), so frameworks typically colocate the TP group within a single node and span the CP group across nearby nodes within an NVLink domain. The topology-aware placement principles of <a href="section-4.9.html">Section 4.9</a> apply here directly: the wrong rank assignment can route a CP ring-step over PCIe rather than NVLink, adding tens of microseconds per step.</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Ring Attention, Ulysses, and TorchTitan CP</div>
+<p><strong>Ring Attention</strong> (Liu et al., 2023; arXiv:2310.01889) introduced the pipelined ring send/recv pattern described above and proved that the log-sum-exp accumulation is numerically equivalent to global attention. <strong>DeepSpeed Ulysses</strong> (Jacobs et al., 2023) takes an alternative approach: use an all-to-all collective to redistribute the full (Q, K, V) tensors so that each CP device holds all sequence positions but only a subset of attention heads, then run local attention normally and use a second all-to-all to restore the original layout. Ulysses has lower latency for small $P$ because one all-to-all is cheaper than $P$ sequential send/recv rounds, but Ring Attention keeps memory at $O(1/P)$ per device, which becomes the binding constraint at very long contexts or large $P$. <strong>TorchTitan</strong> (arXiv:2410.06511) provides production-quality PyTorch implementations of both approaches with 4D and 5D parallelism support, making them directly usable in training runs without hand-rolling the ring or all-to-all schedule. Context parallelism returns in Chapter 16 (sharded and sequence parallelism) and Chapter 22 (long-context inference).</p>
+</div>
+
 <h2>5. Exercises <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 <div class="callout exercise">
 <div class="callout-title">Exercise 4.10.1: When Does Overlap Stop Helping? <span class="exercise-type conceptual">Conceptual</span></div>

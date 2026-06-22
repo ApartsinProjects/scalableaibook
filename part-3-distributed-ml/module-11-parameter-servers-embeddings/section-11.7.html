@@ -268,6 +268,70 @@ model = DistributedModelParallel(module=ebc, device=torch.device("cuda"))
 </div>
 <p>We have now seen the extreme of the parameter-server story: a model so dominated by its sparse embedding that it must be sharded across hosts, tiered through a memory hierarchy, cached, and quantized, all to keep two budgets, capacity and communication, under control. One question remains before the chapter closes. A table spread over many hosts is a table where, at any moment, some host has probably failed; losing a shard cannot be allowed to lose the model. How a sharded parameter server survives the failure of the machines that hold it is the subject of <a href="section-11.8.html">Section 11.8</a>.</p>
 
+<h2>6. 2D Sparse Parallelism for Embedding Tables <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>The sharding strategies described so far, table-wise, row-wise, and column-wise, are all one-dimensional: each embedding table is split along a single axis. Row-wise sharding spreads each table's rows across GPUs and balances memory capacity, but it concentrates all lookups for a popular item on the single GPU that owns that row. A hot item whose id appears in half the samples in a batch forces half the batch to read from the same shard, creating a communication hot-spot that grows with the item's popularity. Column-wise sharding sidesteps the hot-row problem by splitting each embedding vector's $D$ dimensions across GPUs so that every lookup for every item is spread evenly; the cost is that every lookup then requires an all-reduce across the column-shard GPUs to sum the partial vectors, and for small embeddings that all-reduce overhead exceeds the bandwidth saved.</p>
+
+<p>2D sparse parallelism, introduced in TorchRec's DMPCollection (PyTorch, 2023), eliminates both limitations by sharding a $(V \times D)$ embedding table simultaneously along rows and columns. Conceptually, the table is partitioned into a $P_r \times P_c$ grid of GPU blocks: $P_r$ row-shard groups each holding $V / P_r$ rows, and within each group $P_c$ column shards each holding $D / P_c$ dimensions. A lookup for batch $b$ proceeds in two communication phases. First, a sparse all-to-all over the row shards routes each sample's ids to the GPU block that owns the corresponding rows, collecting partial embedding vectors of width $D / P_c$. Second, a dense all-reduce over the column shards sums the $P_c$ partial vectors into a full $D$-dimensional embedding. The result is that hot-row load is divided by $P_r$ and per-lookup communication falls from $O(D)$ to $O(D / P_c)$: both classical bottlenecks are attacked at once.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Why 2D Wins at Scale</div>
+<p>One-dimensional sharding forces a choice: spread rows across GPUs (row-wise) and tolerate hot-row concentration, or spread dimensions (column-wise) and pay an all-reduce per lookup. 2D sparse parallelism breaks the choice by sharding both axes simultaneously. The row dimension absorbs hot-item skew across $P_r$ GPU groups; the column dimension reduces the bytes moved per lookup by $P_c$. For a terabyte-scale table with a Zipfian popularity head, neither axis alone is sufficient: 2D sharding is the only layout that keeps both memory load and communication load balanced as the table and fleet grow.</p>
+</div>
+
+<p>TorchRec's <code>DistributedModelParallel</code> (DMP) wraps an <code>EmbeddingBagCollection</code> and selects the sharding plan, including 2D grid sharding, automatically based on table vocabulary size, embedding dimension, batch size, and the device topology reported by the process group. The planner evaluates all candidate plans and picks the one that minimises estimated step latency. For very large tables it will choose a 2D plan without any user instruction; for small tables it falls back to table-wise or row-wise placement. The three-line setup below is the full user-facing API:</p>
+
+<pre><code class="language-python"># pip install torchrec ; launch with: torchrun --nproc_per_node=8 script.py
+import torch
+import torch.distributed as dist
+from torchrec import EmbeddingBagCollection, EmbeddingBagConfig
+from torchrec.distributed import DistributedModelParallel
+
+dist.init_process_group(backend="nccl")
+
+# Declare embedding tables; TorchRec's planner selects the sharding strategy.
+ebc = EmbeddingBagCollection(
+    tables=[
+        EmbeddingBagConfig(
+            name="item_id",
+            embedding_dim=128,
+            num_embeddings=2_000_000_000,   # 2 B rows -> planner will choose 2D grid
+            feature_names=["item"],
+        ),
+        EmbeddingBagConfig(
+            name="user_id",
+            embedding_dim=64,
+            num_embeddings=500_000_000,     # 500 M rows
+            feature_names=["user"],
+        ),
+    ],
+    device=torch.device("meta"),            # meta device: no memory allocated yet
+)
+
+# DistributedModelParallel wraps the EBC, runs the placement planner,
+# and wires the sparse all-to-all + column all-reduce automatically.
+# For item_id (2B rows x 128 dim) on an 8-GPU node it will typically
+# select a 2x4 grid (P_r=2 row groups, P_c=4 column shards).
+model = DistributedModelParallel(
+    module=ebc,
+    device=torch.device("cuda"),
+)
+# model is now sharded, all-to-all wired, and ready for the training loop.
+</code></pre>
+<div class="code-caption"><strong>Code 11.7.3:</strong> TorchRec DMPCollection setup for 2D sparse parallelism. Three logical steps: declare the <code>EmbeddingBagCollection</code> on the meta device, hand it to <code>DistributedModelParallel</code>, and the library emits the sharding plan, places the 2D grid of shards, and inserts the sparse all-to-all and column all-reduce into the forward and backward passes automatically.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Meta's Trillion-Parameter Recommendation Tables</div>
+<p>Meta's production recommendation infrastructure trains embedding tables with up to 10 trillion parameters across dense item and user feature spaces. With row-wise sharding alone, the most popular item ids saturated individual GPU-to-switch links during the sparse all-to-all, causing the bottleneck to scale with the Zipf head rather than with the fleet. Switching to 2D sparse parallelism divided hot-row load by the row-shard factor $P_r$ and cut per-lookup bytes by the column-shard factor $P_c$. The reported result is near-linear scaling of sparse-lookup throughput from 64 to 512 GPUs: doubling the GPU count roughly doubles the step throughput, because both the memory load and the communication load are now balanced across the grid. This is the behavior that 1D sharding could not achieve once any single item became genuinely popular at training scale.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: TorchRec, 2D Sparse Parallelism, and the Full Stack (2022 to 2024)</div>
+<p>The conceptual foundation is the TorchRec paper (Ivanov et al., Meta, 2022), which introduced the sharding planner, the EmbeddingBagCollection abstraction, and the pluggable sharder interface that 2D placement later exploited. The operational details of the two-dimensional layout, the sparse all-to-all over row shards followed by the column all-reduce, appear in the PyTorch engineering blog post "Scaling Recommendation Systems Training to Thousands of GPUs with 2D Sparse Parallelism" (2023). The full production stack, including the ZionEX interconnect fabric that makes the column all-reduce fast at scale and the co-designed memory hierarchy that gives each row-shard group its own HBM hot-row cache, is described in "Scaling Recommendation at Meta" (2024). Read together, the three references trace the path from "TorchRec exists" to "we run 10 trillion parameters in 2D on thousands of GPUs," which is the current engineering frontier for sparse distributed training.</p>
+</div>
+
+<p>2D sparse parallelism connects directly to two threads running through this chapter. First, it supersedes the parameter server for embedding tables: instead of workers pushing and pulling rows from a central sharded store, the 2D layout makes each GPU group own its slice of the table and exchange partial vectors through collectives, so DMPCollection effectively replaces the PS tier for embedding parameters while keeping the all-to-all routing that Section 2 described. Second, it anticipates the recommendation case study of <a href="../../part-8-case-studies/module-38-case-distributed-recommendation/index.html">Chapter 38</a>, which shows a full industrial stack where the choice of $P_r$ and $P_c$ is the central systems-design decision, driven by the Zipf exponent of the item distribution and the bisection bandwidth of the interconnect.</p>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 11.7.1: Which Budget Binds? <span class="exercise-type conceptual">Conceptual</span></div>
 <p>For each change, state whether it primarily relieves the memory-capacity budget $M_\text{table}$, the communication budget $M_\text{comm}$, or both, and explain why using the two formulas in Section 5: (a) quantizing the cold-tail rows from fp32 to int4; (b) adding more rows to the HBM hot-row cache; (c) doubling the number of shard hosts $S$ while keeping the table size fixed; (d) replacing two billion independent ids with a compositional embedding that hashes them into ten million shared buckets. Which of these does nothing for the per-step all-to-all time?</p>
