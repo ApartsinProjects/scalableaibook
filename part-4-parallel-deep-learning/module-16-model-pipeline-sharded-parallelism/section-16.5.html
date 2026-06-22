@@ -249,6 +249,58 @@ for batch in loader:                           # the loop looks just like DDP
 
 <p>FSDP is the modern default for large-model training in PyTorch precisely because it makes the ZeRO-3 idea of <a href="section-16.4.html">Section 16.4</a> a five-line change to a DDP script. You now understand the cycle it runs, the wrapping policy that tunes its memory-versus-communication trade-off, the prefetch that hides its cost, and the rule for choosing it over DDP. The next section steps up to the two frameworks that pioneered and industrialized these ideas at the largest scales, DeepSpeed (which introduced ZeRO) and Megatron-LM (which introduced tensor parallelism), and shows how they compose sharding with the other parallelism axes. That story begins in <a href="section-16.6.html">Section 16.6</a>.</p>
 
+<h2>7. FSDP2: Per-Parameter Sharding with DTensor <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The production FSDP described in Section 6 (now called FSDP1) shards at the <em>unit</em> level: the layers inside a unit are flattened into one large buffer, and that buffer is sliced across workers. This design was pragmatic but created friction at every boundary where FSDP interacted with other parallelism features. Freezing individual parameters inside a unit required special-casing. Per-parameter dtypes for mixed-precision training needed workarounds. Composing FSDP1 with tensor parallelism required layout conversions between the flat-buffer representation and the tensor-parallel view, and those conversions were neither cheap nor transparent. <strong>FSDP2</strong>, which became the recommended path in PyTorch 2.4 (2024), solves these problems by changing the representation from one flat buffer per unit to one <code>DTensor</code> per parameter. Each parameter carries its own sharding metadata, and the gather-compute-free cycle from Section 1 is unchanged; what changed is the data structure the cycle operates on.</p>
+
+<h3>7.1 Per-Parameter Sharding and the DTensor Foundation</h3>
+<p>In FSDP1, when you call <code>FullyShardedDataParallel(model, ...)</code>, each unit's parameters are concatenated into a single flat 1-D buffer, which is then split across workers. The unit is the atomic shard granularity: you can freeze or quantize units but not individual parameters within a unit without fighting the flat-buffer layout. FSDP2 replaces each parameter's storage with a <code>DTensor</code>, a distributed tensor object that records, per parameter, which device mesh dimension it is sharded over and how. Because the sharding is on the parameter itself rather than on a unit buffer, every PyTorch operation that inspects a parameter, including gradient hooks, optimizers, quantization transforms, and profilers, sees a correctly-shaped local shard with complete metadata about the global shape and sharding strategy.</p>
+<p>The consequence for composition is substantial. When tensor parallelism splits a weight matrix along the column dimension and FSDP shards it along the row dimension, both operations are expressed as <code>DTensor</code> placements on the same <code>DeviceMesh</code>. No layout conversion is needed; the two sharding dimensions are orthogonal metadata on the same tensor object. The all-gather that FSDP2 issues to materialize a parameter during the forward pass gathers only along the data-parallel mesh dimension, leaving the tensor-parallel sharding intact, so the collective volume is exactly what an FSDP-only run would pay, with no extra reshaping overhead.</p>
+
+<h3>7.2 Memory Improvement: Deterministic Release and Lower Peak</h3>
+<p>FSDP2 achieves approximately <strong>7% lower peak memory</strong> relative to FSDP1 in typical transformer training, for a reason that is architectural rather than algorithmic. In FSDP1, the flat parameter buffer for a unit was allocated by the framework and freed through Python's reference-counting garbage collector. If any Python object in the forward pass retained a reference to that buffer (for example, through a closure in an autograd-function, or a profiler callback), the free was deferred, and the buffer persisted until the reference was released. In practice this meant that the forward peak memory included residual buffer fragments from recently-freed units that had not yet been reclaimed. FSDP2's per-parameter <code>DTensor</code> design makes freeing deterministic: each parameter's full-parameter materialization is released as soon as the parameter's forward hook completes, because no framework-owned buffer exists. Peak memory is therefore governed by the unit that is currently computing, not by the units that were recently freed but are still reference-counted.</p>
+<p>The memory bound follows the same formula as Section 2, now tightened because the "recently freed" slack is gone:</p>
+$$\text{peak}_\text{FSDP2} = \frac{M}{K} + \max_u m_u,$$
+<p>where $M$ is total parameters, $K$ the data-parallel world size, and $m_u$ the size of the largest unit. In FSDP1 the empirical peak was measurably above this bound; in FSDP2 it tracks it closely.</p>
+
+<h3>7.3 TorchTitan: Multi-Dimensional Parallelism on FSDP2</h3>
+<p>FSDP2's DTensor foundation is the building block of <strong>TorchTitan</strong>, the PyTorch-native reference stack for training large language models with composable multi-dimensional parallelism. TorchTitan stacks data parallelism (via FSDP2), context parallelism (CP, which shards the sequence dimension across workers to handle long contexts), tensor parallelism (TP, intra-layer column and row splits), and pipeline parallelism (PP, layer-stage splits) over a single <code>DeviceMesh</code> with named dimensions. Because all four axes use the same <code>DTensor</code> primitive, adding or removing a parallelism axis is a configuration change, not a code change. The TorchTitan paper (Lippman et al., ICLR 2025, <a href="https://arxiv.org/abs/2410.06511" target="_blank" rel="noopener">arXiv:2410.06511</a>) reports horizontal scaling of Llama-3-like models from 8 to thousands of GPUs using this DP + CP + TP + PP combination, with measured efficiency numbers for each parallelism axis independently and in combination.</p>
+
+<h3>7.4 Migration: FSDP1 to FSDP2</h3>
+<p>Moving an existing FSDP1 training script to FSDP2 is a small change at the call site. The wrapping API changes from a class constructor to a per-parameter function call, and the auto-wrap policy is replaced by explicit iteration over the model's named modules. The gather-compute-free cycle, the prefetch behavior, and the training loop are unchanged. The code below shows the minimal diff for the script from Code 16.5.2. Both versions produce identical training results; the difference is in how the shard metadata is stored internally.</p>
+<pre><code class="language-python"># FSDP1 (the API shown in Code 16.5.2):
+# from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+# from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+# import functools
+#
+# policy = functools.partial(transformer_auto_wrap_policy,
+#                            transformer_layer_cls={TransformerBlock})
+# model = FSDP(model, auto_wrap_policy=policy)
+
+# FSDP2 (recommended as of PyTorch 2.4):
+from torch.distributed._composable.fsdp import fully_shard
+
+# Apply per-parameter sharding to each transformer block individually,
+# then to the root model. The gather-compute-free cycle is unchanged;
+# only the internal representation switches from flat buffers to DTensor.
+for block in model.transformer_blocks:
+    fully_shard(block)         # shard each block's parameters as DTensors
+fully_shard(model)             # shard root-level parameters (embeddings, LM head)
+
+# The training loop is identical to FSDP1 (and to DDP):
+opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for batch in loader:
+    opt.zero_grad()
+    loss = model(batch).loss
+    loss.backward()
+    opt.step()
+</code></pre>
+<div class="code-caption"><strong>Code 16.5.3:</strong> FSDP1-to-FSDP2 migration. The commented block is the FSDP1 wrapping from Code 16.5.2; the active block is the FSDP2 replacement using <code>fully_shard()</code> applied per-block and then to the root. The training loop beneath is identical in both versions. The internal change is that each parameter becomes a <code>DTensor</code> shard rather than a slice of a unit-level flat buffer.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: One Primitive for All Parallelism Axes</div>
+<p>FSDP1 stored shards as slices of a framework-owned flat buffer, which was an internal representation that other PyTorch features did not know how to handle. Tensor parallelism, pipeline parallelism, and Float8 quantization each had to convert to and from that representation when composing with FSDP1, paying a layout-conversion cost and requiring bespoke integration code. FSDP2's move to <code>DTensor</code> makes data-parallel sharding the same kind of object as a tensor-parallel column split or a context-parallel sequence split: a placement annotation on a standard tensor. Composing two parallelism axes is placing two annotations on the same object over two orthogonal mesh dimensions. The layout-conversion overhead disappears, and the cost model from Chapter 3 applies cleanly to each axis independently. TorchTitan's ability to stack four parallelism axes with a handful of configuration lines is the direct payoff of this unification.</p>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 16.5.1: Count the Bytes on the Wire <span class="exercise-type analysis">Analysis</span></div>
 <p>A model has $M$ parameters wrapped into $U$ equal FSDP units across $K$ workers, trained in 16-bit precision (2 bytes per parameter). Per training step, write expressions for the total bytes each worker sends-plus-receives for (a) the forward all-gathers, (b) the backward all-gathers, and (c) the gradient reduce-scatter. Compare the sum to DDP's single gradient all-reduce (which moves about $2M$ bytes per worker for a ring algorithm). Confirm the "roughly $1.5\times$" claim of Table 16.5.1, and state what happens to each term as $U$ grows with $K$ fixed.</p>

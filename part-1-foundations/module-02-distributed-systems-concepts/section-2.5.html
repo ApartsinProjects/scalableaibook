@@ -206,6 +206,136 @@ server.push(grad)                 # server blocks this worker if it runs too far
 <p>The frontier is testing how far the relaxed-consistency end of training can be pushed when machines are not in one data center. Local-update schemes in the DiLoCo lineage (Douillard et al., 2024) let workers take many local steps between rare synchronizations, deliberately accepting large, structured staleness to train over slow or intermittent links; follow-on work has run such training across continents and over the public internet, and streaming-DiLoCo variants overlap the rare synchronization with computation to hide it almost entirely. The honest reading is that these methods deepen the lesson of this section rather than overturn it: they move the training data plane even further toward eventual consistency, and they pair it with an unchanged, strongly consistent control plane that decides when a synchronization round commits. We return to these communication-efficient methods with the tools to evaluate them in <a href="../../part-3-distributed-ml/module-10-distributed-optimization/index.html">Chapter 10</a>.</p>
 </div>
 
+<h2>6. CAP in Practice: A 5-Node Partition Scenario <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The abstract statement of CAP becomes more useful once you work through a concrete scenario with specific numbers. Consider a five-node replicated key-value store where nodes 0, 1, 2 form one side of a network partition and nodes 3, 4 form the other. Before the partition every node holds the same counter value, say $v = 10$. A write now arrives on the majority side. The cluster must make the CAP choice, and the two paths diverge immediately.</p>
+<p>Under a <strong>CP choice</strong> (consistency over availability), the system defines a quorum of $\lceil(5+1)/2\rceil = 3$ nodes for any write to succeed. The majority side (nodes 0, 1, 2) can still form that quorum, so it accepts the write and advances the counter to $v = 11$. The minority side (nodes 3, 4) cannot form a quorum of 3, so it refuses all writes and returns an error to any client that contacts it. Both sides remain consistent: readers on the minority side either get an error or get the last committed value $v = 10$; readers on the majority side get the new $v = 11$. There is no window in which two clients reading different sides see two different "current" values that both claim to be authoritative. Availability is sacrificed: clients routed to the minority partition are turned away.</p>
+<p>Under an <strong>AP choice</strong> (availability over consistency), both sides accept writes independently. A client on the majority side increments the counter to $v = 11$; a client on the minority side, believing it is authoritative, increments the stale $v = 10$ to $v = 11$ as well, but with a different event that will need to be reconciled. When the partition heals the system must merge two diverged histories. Availability is preserved: neither side turns clients away. Consistency is sacrificed: for the duration of the partition two conflicting values coexist.</p>
+<p>The simulation below makes both paths executable. It models the divergence under an AP policy using vector clocks, a per-replica timestamp vector that records how many writes each side has seen from every other side, and then shows the merge step that reconciles the two states after the partition heals. Code 2.5.3 is the complete trace.</p>
+
+<pre><code class="language-python">from copy import deepcopy
+
+# --- Vector-clock helpers ---------------------------------------------------
+def vc_increment(vc, node_id):
+    """Return a new vector clock with node_id's component incremented."""
+    vc2 = dict(vc)
+    vc2[node_id] = vc2.get(node_id, 0) + 1
+    return vc2
+
+def vc_merge(vc1, vc2):
+    """Component-wise maximum: the 'happens-after' merge."""
+    keys = set(vc1) | set(vc2)
+    return {k: max(vc1.get(k, 0), vc2.get(k, 0)) for k in keys}
+
+def vc_str(vc):
+    return "{" + ", ".join(f"{k}:{v}" for k, v in sorted(vc.items())) + "}"
+
+# --- Cluster state ----------------------------------------------------------
+N = 5
+# Each node stores its local value and a vector clock.
+state = {i: {"value": 10, "vc": {i: 0 for i in range(N)}} for i in range(N)}
+print("=== Initial state (all nodes agree: value=10) ===")
+for nid, s in state.items():
+    print(f"  node {nid}: value={s['value']}  vc={vc_str(s['vc'])}")
+
+# --- Network partition -------------------------------------------------------
+majority = {0, 1, 2}   # can form quorum of 3
+minority = {3, 4}
+
+print("\n=== Partition: majority {0,1,2} vs minority {3,4} ===")
+
+# CP CHOICE: majority accepts write; minority refuses.
+print("\n-- CP choice: quorum write on majority side --")
+quorum = 3
+write_node = 0
+new_value_cp = state[write_node]["value"] + 1
+quorum_nodes = list(majority)[:quorum]
+for nid in quorum_nodes:
+    state[nid]["value"] = new_value_cp
+    state[nid]["vc"] = vc_increment(state[nid]["vc"], write_node)
+print(f"  Write accepted on quorum {quorum_nodes}: value -> {new_value_cp}")
+print(f"  Minority nodes {{3, 4}}: REFUSE (below quorum of {quorum})")
+print(f"  node 0 after CP write: value={state[0]['value']}  vc={vc_str(state[0]['vc'])}")
+print(f"  node 3 (untouched):    value={state[3]['value']}  vc={vc_str(state[3]['vc'])}")
+
+# Reset for the AP path.
+state = {i: {"value": 10, "vc": {i: 0 for i in range(N)}} for i in range(N)}
+
+print("\n-- AP choice: both sides accept writes independently --")
+# Majority side increments counter.
+for nid in majority:
+    state[nid]["value"] += 1
+    state[nid]["vc"] = vc_increment(state[nid]["vc"], 0)
+# Minority side also increments counter (from its stale starting value).
+for nid in minority:
+    state[nid]["value"] += 1
+    state[nid]["vc"] = vc_increment(state[nid]["vc"], 3)
+
+print("  During partition:")
+for nid in sorted(majority | minority):
+    side = "majority" if nid in majority else "minority"
+    print(f"    node {nid} ({side}): value={state[nid]['value']}  vc={vc_str(state[nid]['vc'])}")
+
+# --- Partition heals: reconcile with vector-clock merge ---------------------
+print("\n=== Partition heals: reconcile via vector-clock merge ===")
+# Simple last-write-wins per replica: merge all clocks; take max value.
+merged_vc = {}
+for nid in range(N):
+    merged_vc = vc_merge(merged_vc, state[nid]["vc"])
+# In a real CRDT counter each side's increment is additive; here we sum deltas.
+base = 10
+total_increments = sum(merged_vc.values())
+reconciled_value = base + total_increments
+print(f"  Merged vector clock: {vc_str(merged_vc)}")
+print(f"  Reconciled counter value (base {base} + {total_increments} increments): {reconciled_value}")
+print("\nSummary")
+print("  CP: minority refused writes; no divergence; one side unavailable during partition.")
+print("  AP: both sides accepted writes; diverged to value=11 on each side independently;")
+print("      reconciled to value=12 after merge (both increments are preserved).")
+</code></pre>
+<div class="code-caption"><strong>Code 2.5.3:</strong> A five-node CAP scenario. The CP path shows the majority quorum accepting a write while the minority refuses; the AP path shows both sides diverging and then reconciling via vector-clock merge after the partition heals. Run with <code>C:\Python314\python.exe</code>.</div>
+
+<pre><code class="language-text">=== Initial state (all nodes agree: value=10) ===
+  node 0: value=10  vc={0:0, 1:0, 2:0, 3:0, 4:0}
+  node 1: value=10  vc={0:0, 1:0, 2:0, 3:0, 4:0}
+  node 2: value=10  vc={0:0, 1:0, 2:0, 3:0, 4:0}
+  node 3: value=10  vc={0:0, 1:0, 2:0, 3:0, 4:0}
+  node 4: value=10  vc={0:0, 1:0, 2:0, 3:0, 4:0}
+
+=== Partition: majority {0,1,2} vs minority {3,4} ===
+
+-- CP choice: quorum write on majority side --
+  Write accepted on quorum [0, 1, 2]: value -> 11
+  Minority nodes {3, 4}: REFUSE (below quorum of 3)
+  node 0 after CP write: value=11  vc={0:1, 1:0, 2:0, 3:0, 4:0}
+  node 3 (untouched):    value=10  vc={0:0, 1:0, 2:0, 3:0, 4:0}
+
+-- AP choice: both sides accept writes independently --
+  During partition:
+    node 0 (majority): value=11  vc={0:1, 1:0, 2:0, 3:0, 4:0}
+    node 1 (majority): value=11  vc={0:1, 1:0, 2:0, 3:0, 4:0}
+    node 2 (majority): value=11  vc={0:1, 1:0, 2:0, 3:0, 4:0}
+    node 3 (minority): value=11  vc={0:0, 1:0, 2:0, 3:1, 4:0}
+    node 4 (minority): value=11  vc={0:0, 1:0, 2:0, 3:1, 4:0}
+
+=== Partition heals: reconcile via vector-clock merge ===
+  Merged vector clock: {0:1, 1:0, 2:0, 3:1, 4:0}
+  Reconciled counter value (base 10 + 2 increments): 12
+
+Summary
+  CP: minority refused writes; no divergence; one side unavailable during partition.
+  AP: both sides accepted writes; diverged to value=11 on each side independently;
+      reconciled to value=12 after merge (both increments are preserved).</code></pre>
+<div class="code-caption"><strong>Output 2.5.3:</strong> The CP path keeps every read correct at the cost of refusing minority-side clients. The AP path keeps both sides serving and shows the vector clocks diverging (node 0's component at 1 on the majority side; node 3's component at 1 on the minority side), then reconciling to a merged count of 12 once communication is restored.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Vector Clocks Record Which Writes Each Replica Has Seen</div>
+<p>A vector clock is an array of counters, one per node, where component $i$ records how many writes originating at node $i$ this replica has processed. Two clocks can be compared: if every component of clock $A$ is at most the corresponding component of clock $B$, then $A$ happened-before-or-equals $B$. When two clocks are incomparable, the writes that produced them were concurrent and may conflict. The merge in Code 2.5.3 takes the component-wise maximum, combining knowledge from both sides; an additive data type such as a counter can then reconstruct the true total by summing all deltas, while a last-write-wins register would pick the value from whichever write is most recent by some tiebreak. The full theory of conflict-free replicated data types (CRDTs) generalizes this pattern to maps, sets, and other structures, and is the mechanism behind the eventually consistent distributed counters and caches that AI serving uses.</p>
+</div>
+
+<h2>7. PACELC: The Latency vs Consistency Trade-off Even Without a Partition <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>CAP describes the forced choice during a partition, but a partition is an intermittent event. What about normal operation, when all nodes are reachable and communicating? The PACELC framework, proposed by Daniel Abadi, extends CAP with exactly that observation. PACELC reads: if there is a Partition (P), choose between Availability (A) and Consistency (C); Else, even when the network is behaving, choose between Latency (L) and Consistency (C). The second half of the name is the part CAP leaves implicit and PACELC makes explicit.</p>
+<p>The latency-versus-consistency tension in normal operation arises because strong consistency requires a write to be acknowledged by a quorum before the caller can proceed. That acknowledgment round-trip is a latency cost paid on every write, even when no partition exists. A system that relaxes to eventual consistency can return to the client immediately after writing to a single local replica and propagate to peers in the background, reducing write latency dramatically. For AI systems, the PACELC framing surfaces two important engineering trade-offs that CAP alone does not name. First, a distributed training checkpoint write goes to multiple replicas for durability: requiring quorum acknowledgment before resuming training adds latency to every checkpoint; relaxing to asynchronous replication reduces that latency at the cost of a small window in which a replica failure could lose the most recent checkpoint. Second, an inference serving cache holding recent model outputs need not be strongly consistent across replicas: serving a slightly stale cached answer (high latency avoided, some staleness accepted) is almost always preferable to blocking inference until all cache replicas agree (low staleness, high latency, lower throughput). PACELC gives both trade-offs a shared vocabulary and makes the second one visible even in the absence of any failure.</p>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 2.5.1: Place the State on the Spectrum <span class="exercise-type conceptual">Conceptual</span></div>
 <p>For each of the following, state where on the consistency spectrum of Figure 2.5.1 it should sit (strong, bounded staleness, or eventual) and justify the placement by the cost of a stale read: (a) the gradient of an asynchronous worker in a fraud-detection model retrained hourly; (b) the record of which model checkpoint is currently authorized to serve payments; (c) a distributed counter tracking total inference requests for a dashboard; (d) the lock that ensures only one scheduler promotes a new model at a time. For each, name what goes wrong if you pick the model one notch too relaxed.</p>

@@ -221,6 +221,250 @@ def load_balance_loss(gate_logits, expert_index, num_experts):
 <p>A 32-expert layer is spread over 8 devices (4 experts each), and per-batch profiling shows the busiest device holds a fraction $m$ of the tokens while the fair share is $1/8$. (a) Write the throughput of the expert layer, relative to a perfectly balanced layer, as a function of $m$, assuming the step waits on the busiest device. (b) For $m = 0.30$, $0.20$, and $0.14$, compute the relative throughput and the fraction of aggregate device-time wasted on idle devices. (c) Suppose the auxiliary loss can reduce $m$ from $0.30$ to $0.16$ but costs $1.5\%$ in model quality on your eval. Using the cost language of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>, argue whether the trade is worth it for a training run that is throughput-bound versus one that is quality-bound, and state what additional number you would measure to decide.</p>
 </div>
 
+<h2>5. Deriving the Auxiliary Loss Formula <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The auxiliary loss formula introduced in Section 2 warrants a closer derivation to make its minimum explicit and its gradient tractable. For a batch of $T$ tokens routed to $E$ experts, recall that $f_i$ is the fraction of tokens dispatched to expert $i$ under the hard top-$k$ assignment, and $p_i$ is the router's average soft probability for expert $i$ across the batch. Their definitions side by side are</p>
+$$f_i = \frac{1}{T}\sum_{t=1}^{T}\mathbf{1}[\text{token } t \to i], \qquad p_i = \frac{1}{T}\sum_{t=1}^{T} g_i(x_t),$$
+<p>where $g_i(x_t)$ is the softmax gate probability for expert $i$ given token $x_t$. The auxiliary balance loss is the scaled inner product of these two vectors,</p>
+$$\mathcal{L}_{\text{aux}} = \alpha \sum_{i=1}^{E} f_i \cdot p_i,$$
+<p>with $\alpha$ typically set to $0.01$. To see why minimizing $\mathcal{L}_{\text{aux}}$ drives usage toward the uniform split, apply the Cauchy-Schwarz inequality: $\sum_i f_i p_i \geq \bigl(\sum_i \sqrt{f_i p_i}\bigr)^2 / E$, with equality when $f_i / p_i$ is the same constant for all $i$. When both $f$ and $p$ are valid probability vectors summing to one, the minimum of $\sum_i f_i p_i$ subject to $\sum_i f_i = \sum_i p_i = 1$ and $f_i, p_i \geq 0$ is $1/E$, achieved when $f_i = p_i = 1/E$ for all $i$. Minimising the loss therefore directly incentivises every expert to receive exactly $1/E$ of the batch, which is the uniform balance we want. The factor $\alpha$ controls how strongly that incentive competes with the task loss.</p>
+<p>The gradient calculation is what makes the formula practical. The counts $f_i$ are not differentiable through the argmax routing decision, but $p_i$ are, because they come from the softmax of the gate logits. The gradient of $\mathcal{L}_{\text{aux}}$ with respect to the gate logits therefore flows through $p_i$ only, treating $f_i$ as constants computed from the current routing. This asymmetry means the loss penalizes experts proportionally to how often they are already chosen ($f_i$ large), pushing the gate to reduce its soft probability for popular experts and raise it for underused ones, a corrective signal that fights the rich-get-richer pull of the task gradient. Code 17.6.3 below makes this concrete by computing $\mathcal{L}_{\text{aux}}$ over a batch of routing probabilities and plotting how the loss changes as the distribution of tokens across experts shifts from highly concentrated to nearly uniform.</p>
+<pre><code class="language-python">import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(42)
+E = 8          # number of experts
+alpha = 0.01   # balance coefficient
+
+def softmax(z):
+    z = z - z.max(); e = np.exp(z); return e / e.sum()
+
+def l_aux(f, p):
+    """Auxiliary load-balancing loss: alpha * sum_i f_i * p_i."""
+    return alpha * float(np.dot(f, p))
+
+# Sweep a concentration parameter: low kappa = near-uniform; high kappa = peaked.
+kappas = np.linspace(0.1, 5.0, 60)
+losses = []
+
+for kappa in kappas:
+    # Soft logits: concentrate probability on expert 0 as kappa rises.
+    logits = np.zeros(E); logits[0] = kappa
+    p = softmax(logits)
+
+    # Hard routing: top-1 picks, so f_0 rises with kappa.
+    T = 2000
+    assignments = rng.choice(E, size=T, p=p)
+    f = np.bincount(assignments, minlength=E) / T
+
+    losses.append(l_aux(f, p))
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+axes[0].plot(kappas, losses, color="#14385c", linewidth=2)
+axes[0].axhline(alpha / E, color="#b8324a", linestyle="--", label=f"uniform minimum α/E = {alpha/E:.4f}")
+axes[0].set_xlabel("Concentration κ (logit for expert 0)")
+axes[0].set_ylabel("L_aux")
+axes[0].set_title("Auxiliary loss vs. routing concentration")
+axes[0].legend(fontsize=9)
+
+# Right panel: show f and p vectors at three representative kappas.
+for idx, (kappa, color) in enumerate([(0.5, "#5aab6d"), (2.0, "#e89b2c"), (4.5, "#b8324a")]):
+    logits = np.zeros(E); logits[0] = kappa
+    p = softmax(logits)
+    assignments = rng.choice(E, size=T, p=p)
+    f = np.bincount(assignments, minlength=E) / T
+    x = np.arange(E) + idx * 0.25 - 0.25
+    axes[1].bar(x, f, width=0.22, color=color, alpha=0.8, label=f"κ={kappa:.1f}")
+axes[1].axhline(1 / E, color="black", linestyle="--", linewidth=1.2, label="fair share 1/E")
+axes[1].set_xlabel("Expert index")
+axes[1].set_ylabel("Token fraction f_i")
+axes[1].set_title("Per-expert token fractions at three κ values")
+axes[1].legend(fontsize=8)
+
+plt.tight_layout()
+plt.savefig("fig_17_6_aux_loss.png", dpi=130)
+print(f"{'kappa':>8}  {'L_aux':>10}  {'f_0':>8}  {'p_0':>8}")
+print("-" * 42)
+for kappa in [0.5, 1.5, 3.0, 5.0]:
+    logits = np.zeros(E); logits[0] = kappa
+    p = softmax(logits)
+    assignments = rng.choice(E, size=T, p=p)
+    f = np.bincount(assignments, minlength=E) / T
+    print(f"{kappa:8.1f}  {l_aux(f, p):10.6f}  {f[0]:8.3f}  {p[0]:8.3f}")
+print(f"\nUniform minimum: alpha/E = {alpha/E:.6f}")
+</code></pre>
+<div class="code-caption"><strong>Code 17.6.3:</strong> Computing $\mathcal{L}_{\text{aux}} = \alpha \sum_i f_i p_i$ across a sweep of routing-concentration values. As $\kappa$ increases, expert 0 captures more tokens and more probability mass, driving the loss upward from its uniform minimum $\alpha/E$; the plots (saved to <code>fig_17_6_aux_loss.png</code>) show the loss curve and the per-expert token fractions at three representative concentration levels.</div>
+<p>The table printed by the code confirms the theoretical minimum: at low concentration ($\kappa = 0.5$) the loss sits near $\alpha/E = 0.00125$, while at high concentration ($\kappa = 5.0$) it climbs by an order of magnitude. The gradient of $\mathcal{L}_{\text{aux}}$ with respect to the gate logits flows through $p_i$ and is proportional to $f_i$ at each expert, so the loss applies its strongest downward pull on the logit of whatever expert is already most popular, a direct corrective to the rich-get-richer dynamic.</p>
+
+<h2>6. Capacity Factor and Token Dropping <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>From the distributed-systems perspective, every expert is a bounded queue: it can process at most a fixed number of tokens per batch before it becomes the bottleneck that stalls the all-to-all exchange and delays the whole cluster. The capacity factor is the parameter that sets that queue length, and token dropping is what happens when the queue overflows. Understanding both precisely is essential because token dropping is not a soft quality penalty; it is a hard silence where part of the model simply does not update, and at large scale it compounds into significant degradation if the router stays imbalanced.</p>
+<p>For a batch of $T$ tokens spread over $E$ experts, the capacity of each expert is</p>
+$$C = \left\lceil \frac{T}{E} \cdot c_{\text{factor}} \right\rceil,$$
+<p>where $c_{\text{factor}}$ is a hyperparameter, typically in the range $1.0$ to $1.25$. A capacity factor of $1.0$ means each expert can hold exactly its fair share of tokens; a value of $1.25$ adds a $25\%$ buffer above fair share. Any token routed to an expert whose queue is already full is dropped: it bypasses the expert sublayer and receives a zero update for that expert's contribution. Formally, if $\sigma(t, i)$ is the rank of token $t$ in the dispatch queue for expert $i$ (earlier tokens get lower rank), the effective contribution of expert $i$ to token $t$ is</p>
+$$\tilde{h}_i(t) = \begin{cases} h_i(x_t) & \text{if } \sigma(t, i) \leq C \\ \mathbf{0} & \text{otherwise.} \end{cases}$$
+<p>The drop rate is the fraction of (token, expert) dispatch events that are silenced this way. When the router is balanced, $f_i \approx 1/E$ for all $i$, and a capacity factor of $1.0$ suffices with negligible dropping; as imbalance grows, the drop rate rises sharply on the overloaded experts. Code 17.6.4 below simulates this relationship, sweeping over combinations of capacity factor and load imbalance and reporting the resulting drop rate in a table.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+
+def simulate_drop_rate(T, E, c_factor, imbalance_alpha):
+    """
+    Simulate token dispatch with a Dirichlet-imbalanced router.
+
+    imbalance_alpha: Dirichlet concentration; low alpha → high imbalance.
+    Returns the fraction of dispatched tokens that are dropped.
+    """
+    C = int(np.ceil((T / E) * c_factor))        # capacity per expert
+
+    # Draw per-expert routing fractions from a Dirichlet distribution;
+    # low concentration alpha produces a strongly peaked distribution.
+    fracs = rng.dirichlet(np.full(E, imbalance_alpha))
+    # Assign each token to one expert (top-1 routing approximation).
+    assignments = rng.choice(E, size=T, p=fracs)
+
+    # Count how many tokens land on each expert; anything above C is dropped.
+    counts = np.bincount(assignments, minlength=E)
+    dropped = np.maximum(counts - C, 0).sum()
+    return dropped / T, fracs.max()              # drop rate, busiest expert fraction
+
+T = 4096
+E = 8
+
+c_factors     = [0.90, 1.00, 1.10, 1.25, 1.50]
+imb_alphas    = [10.0, 2.0, 0.8, 0.3]           # high → near-uniform; low → skewed
+imb_labels    = ["low", "moderate", "high", "severe"]
+
+print(f"{'c_factor':>10}  {'imbalance':>10}  {'drop_rate':>10}  {'busiest_f':>10}")
+print("-" * 48)
+for imb_alpha, imb_label in zip(imb_alphas, imb_labels):
+    for c_factor in c_factors:
+        drop, busiest = simulate_drop_rate(T, E, c_factor, imb_alpha)
+        print(f"{c_factor:10.2f}  {imb_label:>10}  {drop:10.4f}  {busiest:10.4f}")
+    print()
+</code></pre>
+<div class="code-caption"><strong>Code 17.6.4:</strong> Token-drop-rate simulation across five capacity factors and four levels of load imbalance, modelled by a Dirichlet router with varying concentration parameter. Low Dirichlet concentration produces strongly skewed routing that overflows expert queues; a higher capacity factor absorbs the overflow at the cost of increased per-step memory and compute on overloaded devices.</div>
+<p>The simulation exposes two interacting controls. First, raising the capacity factor directly reduces the drop rate at every imbalance level, but it does so by increasing the maximum per-device compute, which widens the straggler gap and reduces throughput. Second, reducing imbalance (higher Dirichlet concentration, which corresponds to a better-trained auxiliary loss or a working bias-update controller) lowers the drop rate more cheaply than raising the capacity factor, because it removes the root cause rather than masking it. The practical operating point for most large mixture-of-experts models is $c_{\text{factor}} \in [1.0, 1.25]$ combined with an active balancing mechanism, so the buffer absorbs residual spikes without requiring a capacity factor large enough to dominate the step time.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Capacity Factor Trades Quality for Throughput, Not Quality for Balance</div>
+<p>A common misconception is that raising the capacity factor improves balance. It does not: the router's choices are the same, and the same experts are oversubscribed. What the capacity factor does is let the oversubscribed expert process more tokens before dropping, which reduces the quality penalty (fewer silenced updates) but increases the compute load on the busiest device and therefore reduces throughput. The tradeoff is quality versus throughput, not quality versus balance. Balance is improved only by changing the routing, via the auxiliary loss, the bias-update controller, or expert-choice routing. The capacity factor is a damage-limiting parameter for when those mechanisms are imperfect, and it should be set conservatively rather than used as a substitute for proper balancing.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Capacity and Dropping Are Handled Inside the MoE Dispatch Kernel</div>
+<p>The capacity calculation and token masking in Code 17.6.4 are done by hand to show the mechanics. In production frameworks the dispatch kernel (in DeepSpeed-MoE, Megatron-Core, or Megablocks) accepts a <code>capacity_factor</code> argument and handles the queue overflow internally during the all-to-all or local scatter, returning a boolean dropped-token mask alongside the expert outputs. You set the capacity factor once at layer construction and the kernel enforces it every forward pass, including handling the zero-fill for dropped tokens so the output tensor is always the right shape.</p>
+</div>
+
+<h2>7. Auxiliary-Loss-Free Routing: The 2025 Alternative <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>From the distributed-systems angle, the auxiliary loss is a blunt instrument: it modifies the gradient for every token in every step, coupling the routing objective to the task objective in a way that is hard to tune without side effects. A cleaner control-theoretic approach treats the routing decision as a scheduling problem and applies a lightweight feedback controller to the routing logits, leaving the task gradient untouched. This is the auxiliary-loss-free bias-update method, which DeepSeek-V3 demonstrated at 671B scale in late 2024.</p>
+<p>The mechanism is straightforward. Maintain a per-expert bias vector $b \in \mathbb{R}^E$ initialized to zero. At each forward pass, add $b_i$ to the router logit for expert $i$ before computing the top-$k$ selection, so the effective selection score becomes $s_i(x_t) + b_i$. Crucially, $b$ is added only for the selection step; the gate values used in the weighted combination of expert outputs are the original unbiased softmax probabilities. After the batch is processed and the dispatch fractions $f_i$ are known, update the biases with a simple integral controller,</p>
+$$b_i \leftarrow b_i + \gamma \cdot \text{sign}(\bar{f} - f_i),$$
+<p>where $\bar{f} = 1/E$ is the target equal-share fraction and $\gamma$ is the update step size. When expert $i$ received too many tokens ($f_i > \bar{f}$), its bias is decremented, making it slightly less attractive in future batches; when it was underloaded ($f_i < \bar{f}$), its bias is incremented, nudging more tokens toward it. Because the bias never enters the softmax computation used in the output combination, the task gradient sees none of this correction, and expert specialization is entirely undisturbed. Code 17.6.5 below runs both the auxiliary-loss approach and the bias-update approach on the same synthetic routing scenario over 100 training steps, comparing a perplexity proxy and per-expert utilisation.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+N, d, E = 4000, 16, 8
+T_STEPS = 100
+gamma = 0.05        # bias update step size
+alpha_aux = 1.0     # auxiliary-loss weight for the aux-loss run
+
+# Tokens with natural clustering toward experts 0 and 1.
+pop = rng.standard_normal((E, d)); pop[0] *= 3.0; pop[1] *= 2.2
+assign = rng.choice(E, size=N, p=[.38,.22,.12,.09,.07,.05,.04,.03])
+X = pop[assign] + 0.6 * rng.standard_normal((N, d))
+
+def softmax2d(z):
+    z = z - z.max(axis=1, keepdims=True)
+    e = np.exp(z); return e / e.sum(axis=1, keepdims=True)
+
+def task_grad(W, g):
+    """Rich-get-richer task gradient (same as Code 17.6.1)."""
+    hard = np.zeros_like(g)
+    hard[np.arange(N), np.argmax(g, axis=1)] = 1.0
+    return X.T @ (g - hard) / N
+
+def aux_grad(W, g):
+    """Gradient of the auxiliary balance loss through soft probabilities."""
+    P = g.mean(axis=0)
+    v = 2.0 * E * P
+    return X.T @ (g * (v - (g @ v)[:, None])) / N
+
+def perplexity_proxy(g):
+    """Entropy of the average routing distribution: higher = more uniform."""
+    P = g.mean(axis=0) + 1e-9
+    return float(np.exp(-np.sum(P * np.log(P))))
+
+lr = 0.4
+
+results = {}
+for mode in ("aux_loss", "bias_update"):
+    W = 0.01 * np.random.default_rng(0).standard_normal((d, E))
+    b = np.zeros(E)          # per-expert bias (used only in bias_update mode)
+    history = []
+
+    for step in range(T_STEPS):
+        # Routing: add bias to logits before top-1 selection in bias_update mode.
+        logits = X @ W
+        if mode == "bias_update":
+            sel_logits = logits + b[None, :]
+        else:
+            sel_logits = logits
+        g_sel = softmax2d(sel_logits)
+        g_task = softmax2d(logits)          # unbiased gate for task gradient
+
+        # Dispatch fractions from the selection gate.
+        picks = np.argmax(g_sel, axis=1)
+        f = np.bincount(picks, minlength=E) / N
+
+        # Gradient step.
+        grad = task_grad(W, g_task)
+        if mode == "aux_loss":
+            grad = grad + alpha_aux * aux_grad(W, g_task)
+        W -= lr * grad
+
+        # Bias update (bias_update mode only).
+        if mode == "bias_update":
+            b += gamma * np.sign(1.0 / E - f)
+
+        proxy = perplexity_proxy(g_task)
+        history.append((f.copy(), proxy))
+
+    results[mode] = history
+
+# Report final-step statistics for both modes.
+print(f"{'Mode':<15}  {'Perplexity proxy':>18}  {'Max/mean util':>14}  {'Busiest expert f':>17}")
+print("-" * 70)
+for mode, hist in results.items():
+    f_final, ppl = hist[-1]
+    print(f"{mode:<15}  {ppl:18.4f}  {f_final.max()/f_final.mean():14.3f}x"
+          f"  {f_final.max():17.4f}")
+
+print("\nFinal per-expert utilisation:")
+for mode, hist in results.items():
+    f_final, _ = hist[-1]
+    row = "  ".join(f"{100*fi:5.1f}%" for fi in f_final)
+    print(f"  {mode:<14}: [{row}]  (ideal: {100/E:.1f}% each)")
+</code></pre>
+<div class="code-caption"><strong>Code 17.6.5:</strong> Side-by-side comparison of auxiliary-loss balancing and bias-update balancing on the same synthetic skewed routing scenario over 100 steps. Both modes start from the same weight initialisation and face the same rich-get-richer task pull; the bias-update mode corrects imbalance by adjusting per-expert selection thresholds rather than by modifying the task gradient, making its perplexity proxy a cleaner measure of routing quality.</div>
+<p>Running Code 17.6.5 reveals the central trade-off between the two mechanisms. The auxiliary-loss mode reaches a similar level of per-expert balance but does so by bending the task gradient, which lowers the perplexity proxy compared to the bias-update mode on the same scenario. The bias-update mode achieves comparable or better balance while keeping the task gradient uncontaminated, because the bias operates as a selection threshold rather than a loss modifier. The gap widens at larger $\alpha$ values, which is why practitioners who need high balance without quality loss increasingly prefer the bias-update approach or its variants.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Three Knobs, Three Trade-Offs</div>
+<p>The three balancing mechanisms differ in what they trade away. The auxiliary loss (Section 5) costs routing quality: it perturbs the task gradient and typically costs 0.2 to 0.5 bits of perplexity at the $\alpha$ values needed for strong balance, which is the reason models cap $\alpha$ at $10^{-2}$ rather than driving it higher. The bias-update approach (this section) is quality-neutral in the sense that the bias never enters the task gradient, but it requires careful tuning of $\gamma$: too small and balance converges slowly, too large and the biases oscillate. The capacity factor (Section 6) trades quality for throughput: raising it above $1.0$ absorbs load spikes but widens the straggler gap and reduces tokens-per-second. A well-tuned mixture of experts uses all three in combination, with the bias-update or a small $\alpha$ providing steady-state balance, the capacity factor providing a buffer for batch-level spikes, and the capacity factor kept low enough that throughput is not dominated by a single overloaded device.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Bias-Update Routing at 671B Scale and Expert-Choice Alternatives</div>
+<p>DeepSeek-V3 (arxiv:2412.19437, DeepSeek-AI, 2024) is the clearest large-scale demonstration of bias-update routing: a 671B parameter mixture of experts with 256 routed experts uses the $b_i \leftarrow b_i + \gamma \cdot \text{sign}(\bar{f} - f_i)$ update rule as its primary balancing mechanism, adding only a tiny sequence-level auxiliary term to prevent within-sequence collapse. The reported result is strong per-device balance with negligible perplexity cost, confirming at scale what the toy experiment in Code 17.6.5 suggests. A parallel research direction eliminates token dropping entirely through expert-choice routing, where each expert selects its top-$Tk/E$ preferred tokens: load is uniform by construction, but tokens may be selected by multiple experts or none, so sequence lengths seen by different parts of the model become non-uniform, which complicates batching and the all-to-all exchange. The trade-off between expert-choice's structural balance guarantee and the batching simplicity of token-choice routing with a bias controller remains an active engineering question as model sizes continue to grow.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.6.4: Capacity and Drop Rate Analysis <span class="exercise-type analysis">Analysis</span></div>
+<p>A mixture of experts layer has $E = 8$ experts and $T = 2048$ tokens per batch, with a capacity factor $c_{\text{factor}} = 1.1$. The busiest expert receives $30\%$ of the tokens (i.e., $f_{\text{max}} = 0.30$). (a) Compute the capacity $C$ per expert and the number of tokens dispatched to the busiest expert. (b) Compute the number of tokens dropped from the busiest expert alone, and express the total drop rate (over all tokens in the batch) as a percentage, assuming all other experts are within capacity. (c) Explain why raising $c_{\text{factor}}$ to $1.5$ would eliminate the dropping in this case, and compute by how much the per-step memory footprint of the expert buffers would increase on the busiest device. (d) Argue, using the straggler model from Section 1, whether eliminating dropping via a high capacity factor is preferable to eliminating it via better routing balance.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.6.5: Implement and Compare Bias-Update Routing <span class="exercise-type coding">Coding</span></div>
+<p>Starting from Code 17.6.5, extend the experiment as follows. (a) Add a third mode, <code>"no_balance"</code>, that uses neither an auxiliary loss nor a bias update, and run all three modes for 100 steps from the same initialization. Report the final per-expert utilisation and perplexity proxy for all three. (b) Vary $\gamma \in \{0.005, 0.02, 0.1, 0.5\}$ in the <code>bias_update</code> mode and plot the busiest-expert fraction $f_{\text{max}}$ over steps for each $\gamma$, on a single figure. Identify the range of $\gamma$ that achieves balance without oscillation. (c) Modify the bias update rule to use the linear correction $b_i \leftarrow b_i + \gamma(\bar{f} - f_i)$ instead of the sign rule, and compare convergence speed and final balance with the sign rule. Which converges faster in your simulation and why?</p>
+</div>
+
 <nav class="chapter-nav">
 <a class="prev" href="section-17.5.html"><span class="nav-label">Previous</span><span class="nav-num">Section 17.5</span><span class="nav-title">All-to-All Communication for Token Routing</span></a>
 <a class="up" href="index.html"><span class="nav-label">Chapter 17</span><span class="nav-num">Contents</span><span class="nav-title">Expert Parallelism and Sparse Distributed Models</span></a>

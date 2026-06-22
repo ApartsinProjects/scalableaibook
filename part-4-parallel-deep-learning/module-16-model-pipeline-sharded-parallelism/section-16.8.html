@@ -223,6 +223,179 @@ block = checkpoint_wrapper(block, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
 <p>A training run on one node has accelerators that are 55 percent utilized (memory-bound, batch shrunk to fit) and a step time of 800 ms. Enabling activation checkpointing would let you triple the microbatch, lifting per-step throughput, but adds a 25 percent recompute overhead to each step. Estimate the new step time and the new effective samples-per-second, and argue from these numbers whether checkpointing is worth it here. Then describe one regime, in terms of accelerator utilization and the memory headroom of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a>, where the same change would be a net loss.</p>
 </div>
 
+<h2>7. Memory Budget for Activations <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>From a distributed-systems perspective, every shard in a tensor-parallel or pipeline-parallel plan must independently afford its activation stack. To reason about whether a shard fits, you need a concrete formula. The activation memory for a single training step on one device (assuming no checkpointing yet) is:</p>
+$$M_{\text{act}} = B \cdot S \cdot H \cdot L \cdot d_{\text{dtype}}$$
+<p>where $B$ is the batch size (micro-batch per device), $S$ is the sequence length, $H$ is the hidden dimension, $L$ is the number of layers held on this device, and $d_{\text{dtype}}$ is the number of bytes per element (2 for BF16 or FP16, 4 for FP32). This formula counts one hidden-state tensor per layer, which is the dominant term; attention intermediate tensors add a smaller $O(B \cdot S^2)$ term per layer that becomes significant at very long sequences.</p>
+<p>To see why the number is alarming in practice, substitute GPT-3-scale values: $H = 12288$, $L = 96$, $B = 4$, $S = 2048$, BF16 ($d_{\text{dtype}} = 2$):</p>
+$$M_{\text{act}} = 4 \times 2048 \times 12288 \times 96 \times 2 \approx 19.6\,\text{GB}$$
+<p>That is almost 20 GB just for activations on a single device, before parameters, gradients, or optimizer state. A GPU with 40 GB of HBM has essentially no headroom left for anything else after the activations alone. This is the gap that the three strategies in the next section attack.</p>
+
+<h2>8. Three Strategies: Cost Models <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>In a distributed training run, every device faces the same local question: how much activation memory will I use, and at what compute cost? There are three canonical answers. Table 16.8.1 summarizes them; the subsections below derive the entries and then a Python simulation (Code 16.8.3) measures effective throughput for each.</p>
+
+<table>
+<caption><strong>Table 16.8.1:</strong> Activation-memory strategies compared by GPU memory cost, recompute overhead, and when the strategy is the right choice. $M_{\text{act}}$ is the baseline full-activation footprint from the formula above; PCIe bandwidth is typically 8 GB/s effective for activation traffic.</caption>
+<thead>
+<tr><th>Strategy</th><th>GPU activation memory</th><th>Extra FLOPs</th><th>Bandwidth demand</th></tr>
+</thead>
+<tbody>
+<tr><td>Full activations</td><td>$M_{\text{act}}$</td><td>0%</td><td>None</td></tr>
+<tr><td>Selective checkpointing (recompute attention)</td><td>$\approx M_{\text{act}} / 4$</td><td>~33% extra</td><td>None</td></tr>
+<tr><td>Full checkpointing (recompute every layer)</td><td>$O(L)$ (boundaries only)</td><td>~100% extra</td><td>None</td></tr>
+<tr><td>CPU offload</td><td>$\approx 0$ for activations</td><td>Minimal recompute</td><td>~8 GB/s PCIe round-trip per layer</td></tr>
+</tbody>
+</table>
+
+<p><strong>Full activations</strong> stores every layer's output tensor and performs no recomputation. GPU memory cost is $M = M_{\text{act}}$ and extra FLOPs are zero. This is the fastest strategy when memory is not the binding constraint.</p>
+<p><strong>Selective checkpointing</strong> exploits the fact that attention's $QK^TV$ computation produces intermediate tensors that are large (the attention matrix is $O(S^2)$ per head) but cheap to recompute relative to the dense feed-forward projections. Keeping only the attention inputs and recomputing the attention internals during the backward pass reduces the total stored activation by roughly a factor of four, because attention intermediates dominate the per-layer footprint at the context lengths where memory pressure bites. The recompute penalty is modest: attention is memory-bandwidth-bound on the forward pass, so rerunning it costs roughly one third of an extra forward pass in wall-clock time.</p>
+<p><strong>Full checkpointing</strong> stores only the input to each layer (the boundary checkpoints) and recomputes all internal tensors during the backward pass. GPU memory shrinks to $O(L)$ boundary tensors, which is small, at the cost of approximately one full extra forward pass, doubling the compute relative to the baseline. Section 3 derived this as the $O(\sqrt{L})$ optimal when checkpoints are spaced every $\sqrt{L}$ layers; full per-layer checkpointing is the extreme limit where every layer is its own segment.</p>
+<p><strong>CPU offload</strong> copies the stored activations to host (CPU) DRAM over PCIe rather than keeping them on the GPU. GPU memory for activations approaches zero, and host DRAM (often 512 GB to 2 TB on server nodes) absorbs the full $M_{\text{act}}$. The bottleneck is PCIe bandwidth: at a realistic 8 GB/s effective throughput (the theoretical 16 GB/s PCIe 4.0 ceiling divided by roughly two for protocol and contention overhead), moving 20 GB of activations per step requires about 2.5 seconds of transfer time per round-trip, which quickly dominates step time unless the model is very large or compute per layer is slow. CPU offload therefore wins only when the model will not fit on the GPU even with full checkpointing.</p>
+<p>Code 16.8.3 below simulates all four strategies on a parameterized model, reporting effective throughput in samples per second. It also computes the breakeven point at which CPU offload's transfer cost equals the recompute cost of full checkpointing, giving a principled criterion for choosing between them.</p>
+<pre><code class="language-python">"""
+Code 16.8.3  –  Simulated throughput for four activation strategies.
+
+We model a transformer with L layers, hidden dimension H, sequence length S,
+and batch size B. Each forward pass costs `fwd_ms` ms per layer; PCIe transfer
+of one layer's activations costs `pcie_ms` ms per layer (one way). We do not
+run real GPU code; we add up latency analytically so the breakeven formula is
+transparent.
+"""
+
+import math
+
+# ── Model and hardware parameters ───────────────────────────────────────────
+H   = 12288       # hidden dimension (GPT-3 scale)
+L   = 96          # number of layers
+B   = 4           # micro-batch per device
+S   = 2048        # sequence length
+DTYPE_BYTES = 2   # BF16
+
+# Time budgets (milliseconds, rough estimates for an A100 at this scale)
+fwd_ms_per_layer   = 12.0   # one layer forward
+bwd_ms_per_layer   = 24.0   # one layer backward (approximately 2x forward)
+pcie_gbps_eff      = 8.0    # effective PCIe bandwidth GB/s
+
+act_bytes_per_layer = B * S * H * DTYPE_BYTES          # bytes for one layer's activation
+act_gb_per_layer    = act_bytes_per_layer / 1e9
+pcie_ms_per_layer   = (act_gb_per_layer / pcie_gbps_eff) * 1000  # ms for one layer round-trip
+
+# ── Strategy cost models ─────────────────────────────────────────────────────
+
+def full_activations(L):
+    """Store all activations: no recompute, no transfer."""
+    fwd_total = L * fwd_ms_per_layer
+    bwd_total = L * bwd_ms_per_layer
+    step_ms   = fwd_total + bwd_total
+    gpu_act_gb = L * act_gb_per_layer
+    return step_ms, gpu_act_gb
+
+def selective_checkpoint(L):
+    """Recompute attention internals only (~1/4 of activation memory saved).
+    Extra cost is roughly 1/3 of one forward pass (attention recompute only)."""
+    fwd_total  = L * fwd_ms_per_layer
+    bwd_total  = L * bwd_ms_per_layer
+    recompute  = (L * fwd_ms_per_layer) * 0.33   # attention is ~33% of fwd time
+    step_ms    = fwd_total + bwd_total + recompute
+    gpu_act_gb = (L * act_gb_per_layer) / 4.0
+    return step_ms, gpu_act_gb
+
+def full_checkpoint(L):
+    """Recompute every layer: one extra forward pass, memory only for boundaries."""
+    fwd_total  = L * fwd_ms_per_layer
+    bwd_total  = L * bwd_ms_per_layer
+    recompute  = L * fwd_ms_per_layer              # full extra forward
+    step_ms    = fwd_total + bwd_total + recompute
+    # Only boundary activations stay on GPU; ~sqrt(L) tensors in optimal placement.
+    seg        = max(1, round(math.sqrt(L)))
+    n_ckpt     = math.ceil(L / seg)
+    gpu_act_gb = (n_ckpt + seg) * act_gb_per_layer
+    return step_ms, gpu_act_gb
+
+def cpu_offload(L):
+    """Transfer activations to CPU; PCIe round-trip per layer, minimal recompute."""
+    fwd_total    = L * fwd_ms_per_layer
+    bwd_total    = L * bwd_ms_per_layer
+    # Each layer's activation goes to CPU on forward and comes back on backward.
+    transfer_ms  = L * pcie_ms_per_layer * 2      # send + receive
+    step_ms      = fwd_total + bwd_total + transfer_ms
+    gpu_act_gb   = 0.0                             # activations live in host RAM
+    return step_ms, gpu_act_gb
+
+# ── Throughput table ─────────────────────────────────────────────────────────
+strategies = [
+    ("Full activations",     full_activations),
+    ("Selective checkpoint", selective_checkpoint),
+    ("Full checkpoint",      full_checkpoint),
+    ("CPU offload",          cpu_offload),
+]
+
+print(f"Model: H={H}, L={L}, B={B}, S={S}, BF16")
+print(f"Activation per layer: {act_gb_per_layer*1000:.1f} MB  |  "
+      f"PCIe ms/layer (round-trip): {pcie_ms_per_layer*2:.2f} ms")
+print()
+print(f"{'Strategy':<26} {'Step (ms)':>10} {'Samples/s':>10} {'GPU act (GB)':>13}")
+print("-" * 65)
+for name, fn in strategies:
+    ms, gb = fn(L)
+    sps    = (B / ms) * 1000   # samples per second
+    print(f"{name:<26} {ms:>10.0f} {sps:>10.2f} {gb:>13.1f}")
+
+# ── Breakeven: CPU offload vs full checkpoint ─────────────────────────────────
+# Offload wins when transfer_ms < recompute_ms
+# L * pcie_ms * 2 < L * fwd_ms   =>   pcie_ms * 2 < fwd_ms
+# =>  2 * (act_gb / pcie_gbps) * 1000 < fwd_ms_per_layer
+breakeven_pcie = fwd_ms_per_layer / (2 * act_gb_per_layer * 1000) * 1e3  # GB/s
+print()
+print("Breakeven (CPU offload vs full checkpoint):")
+print(f"  Offload wins when PCIe bandwidth > {breakeven_pcie:.1f} GB/s effective")
+print(f"  (at {pcie_gbps_eff} GB/s effective, "
+      f"{'offload wins' if pcie_gbps_eff > breakeven_pcie else 'checkpointing wins'})")
+</code></pre>
+<div class="code-caption"><strong>Code 16.8.3:</strong> Analytic simulation of step time and GPU activation memory for the four strategies on a GPT-3-scale model. Adjust <code>fwd_ms_per_layer</code> and <code>pcie_gbps_eff</code> for your hardware; the breakeven formula at the bottom tells you when CPU offload is preferable to full recomputation.</div>
+
+<p>The output of Code 16.8.3 shows that full activations is fastest but GPU-memory-hungry, selective checkpointing cuts memory by 4x at a modest 11 percent step-time cost, full checkpointing cuts memory to near zero but adds a full extra forward pass, and CPU offload is slowest because PCIe transfer time at 8 GB/s dominates for this model size. The breakeven analysis confirms that at typical PCIe bandwidths, full checkpointing wins over offload unless the model literally cannot be held in GPU memory even with checkpoints, because the recompute forward is simply faster than the round-trip transfer.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: When to Use Each Strategy</div>
+<p>Checkpointing wins when FLOPs are cheap and memory is the bottleneck, which is the typical case in large-batch training where the GPU has spare compute cycles after the batch was shrunk to fit. CPU offload wins when the model does not fit even with full checkpointing, for example at extreme sequence lengths (above 8K to 16K tokens) or when the per-device model shard is unusually large. Full activations win when memory is ample and throughput is the only objective, typically for small models or for inference where there is no backward pass. Selective checkpointing is the pragmatic middle ground: it delivers most of the memory relief of full checkpointing at a fraction of the compute cost, which is why it has become the default in production training stacks (Megatron-LM, Hugging Face Trainer, and DeepSpeed all select it when checkpointing is enabled).</p>
+</div>
+
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: From Roofline to Recompute, and from Training to Inference</div>
+<p>The roofline model of <a href="../../part-1-foundations/module-03-scalability-performance-models/index.html">Chapter 3</a> classifies operations as either memory-bandwidth-bound or compute-bound based on their arithmetic intensity. Activation checkpointing reframes the backward pass: without checkpointing the backward is memory-bandwidth-bound because it streams large activation tensors from HBM; with full checkpointing the device runs a second forward pass whose dense matrix multiplications are compute-bound, moving the working point up the roofline from the bandwidth ceiling toward the compute ceiling. The same trade reappears at inference time in a different costume: KV-cache offloading in <a href="../../part-5-distributed-inference/module-22-per-node-inference-efficiency/index.html">Chapter 22</a> moves the growing key-value cache to CPU DRAM to extend the effective context window, applying exactly the same CPU-offload idea to the inference-time analog of activation memory. Understanding the training-time trade makes the inference-time version immediately intuitive.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One Function and One Config Flag</div>
+<p>Code 16.8.3 built the cost model from first principles; production code delegates the bookkeeping to the framework. PyTorch provides <code>torch.utils.checkpoint.checkpoint()</code>, which requires exactly three lines to retrofit an existing block:</p>
+<pre><code class="language-python">from torch.utils.checkpoint import checkpoint
+
+# Replace: out = block(x)
+out = checkpoint(block, x, use_reentrant=False)   # activations discarded and recomputed
+</code></pre>
+<p>DeepSpeed activates its own checkpointing implementation, which supports CPU offload and selective recomputation, with a single config flag:</p>
+<pre><code class="language-python">ds_config = {
+    "activation_checkpointing": {
+        "partition_activations": True,      # shard stored checkpoints across data-parallel ranks
+        "cpu_checkpointing": False,         # set True to enable CPU offload instead of recompute
+        "contiguous_memory_optimization": True
+    }
+}
+</code></pre>
+<div class="code-caption"><strong>Code 16.8.4:</strong> PyTorch one-liner for recompute checkpointing and the DeepSpeed config block for offload-or-recompute selection. Both handle autograd graph surgery internally; you choose the strategy by swapping one flag.</div>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.8.4: Activation Budget for a 70B Model <span class="exercise-type analysis">Analysis</span></div>
+<p>A 70B-parameter model has hidden dimension $H = 8192$, 80 transformer layers, and is trained with micro-batch $B = 2$ and sequence length $S = 4096$ in BF16. Using the formula $M_{\text{act}} = B \cdot S \cdot H \cdot L \cdot d_{\text{dtype}}$: (a) compute the full activation memory per device assuming no sharding across layers; (b) compute the approximate GPU memory with selective checkpointing (factor of 4 reduction); (c) compute the GPU memory with full checkpointing using optimal $\sqrt{L}$ boundary placement. Which strategy allows the activations to fit within 80 GB of HBM alongside a sharded parameter slice of approximately 5 GB?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.8.5: Throughput vs Batch Size with Checkpointing <span class="exercise-type coding">Coding</span></div>
+<p>Using PyTorch, implement a small transformer encoder (4 to 8 layers, $H = 512$, 4 attention heads) and train it on random data. Instrument two variants: one that calls each block normally and one that wraps each block in <code>torch.utils.checkpoint.checkpoint()</code>. For batch sizes of 8, 16, 32, 64, and 128 (or until OOM), record tokens per second for both variants. Plot tokens/sec versus batch size for each variant on the same axes, and add a vertical dashed line at the batch size where the non-checkpointed variant runs out of memory. Briefly explain the shape of the two curves in terms of the memory and compute cost models from this section.</p>
+</div>
+
 <nav class="chapter-nav">
 <a class="prev" href="section-16.7.html"><span class="nav-label">Previous</span><span class="nav-num">Section 16.7</span><span class="nav-title">Sequence and Context Parallelism</span></a>
 <a class="up" href="index.html"><span class="nav-label">Chapter 16</span><span class="nav-num">Contents</span><span class="nav-title">Model, Pipeline, and Sharded Parallelism</span></a>

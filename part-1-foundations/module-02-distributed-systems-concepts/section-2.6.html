@@ -242,6 +242,224 @@ else:
 </div>
 <p>We now hold the second half of Chapter 2's coordination story. Section 2.5 fixed how stale a reader may be; this section fixed how a cluster commits to a single authoritative value despite crashes, and drew the bright line between the consensus-backed control plane and the collective-driven data plane. What remains is the performance consequence of all this coordination: even with leadership settled and membership agreed, the slowest worker still sets the pace of every synchronous step. That problem, the straggler, is the subject of <a href="section-2.7.html">Section 2.7</a>.</p>
 
+<h2>7. Raft Leader Election: A Step-by-Step Trace <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Section 3 gave the election rules in the abstract. Walking through a concrete three-node scenario makes each rule tangible. The cluster starts with node A as the leader of term 1. It sends periodic heartbeats to B and C so they know the leader is alive. Then A crashes. The following numbered trace shows what happens next.</p>
+
+<ol>
+<li><strong>Heartbeat timeout (B and C, term 1).</strong> B and C each run an independent randomized election timer. When A's heartbeats stop, both timers count down. Because the timeouts are randomized, one of them, say B, fires first (typically within 150 to 300 ms in a real Raft deployment).</li>
+<li><strong>B becomes a candidate (term 2).</strong> B increments its current term from 1 to 2, transitions from follower to candidate, and votes for itself. Its vote record for term 2 now shows: B voted for B.</li>
+<li><strong>B sends RequestVote to C (term 2).</strong> B broadcasts a RequestVote RPC carrying term=2 and B's log state. A is unreachable, so only C receives the message.</li>
+<li><strong>C grants its vote (term 2).</strong> C sees term 2 is higher than its own current term (1), updates its term to 2, and checks whether B's log is at least as up-to-date as its own. Since A crashed immediately after its last heartbeat and no new entries were committed, B's and C's logs are identical. C grants the vote. C's vote record for term 2: C voted for B.</li>
+<li><strong>B reaches majority (2 of 3 votes).</strong> B holds votes from itself and from C, which is $\lceil(3+1)/2\rceil = 2$, a strict majority of the three-node cluster. B transitions to leader of term 2.</li>
+<li><strong>B sends heartbeats to C (term 2).</strong> B immediately broadcasts an AppendEntries heartbeat (empty log entries) to assert its leadership and reset C's election timer. C updates its leader record to B and reverts to follower.</li>
+<li><strong>A restarts and discovers term 2.</strong> When A comes back online it receives a heartbeat from B carrying term 2, which is higher than A's last known term (1). A immediately reverts to follower for term 2. No split-brain occurs: A cannot claim leadership for term 1 because B's heartbeats carry a higher term, and it cannot win an election for term 2 because both B and C already voted in that term.</li>
+</ol>
+
+<p>The trace shows all three of Raft's safety invariants in action: at most one leader per term (steps 2 and 7), votes are granted only once per term (steps 3 and 4), and a node that discovers a higher term immediately yields (step 7). The quorum arithmetic, step 5, is the arithmetic bridge between the protocol rules and the safety guarantee: because any two majority quorums of three nodes overlap in at least one node, and that node votes only once per term, two candidates can never simultaneously reach majority.</p>
+
+<h2>8. Toy Raft: Preserving a Committed Value Across a Leader Change <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The trace above describes the protocol in words. Code 2.6.3 makes it executable: a minimal three-node Raft implementation whose state machine is a single integer counter. The simulation runs one leader, commits an increment, crashes that leader, holds a new election, and shows that the committed value survives unchanged. This is the durability property of Raft: once an entry is committed (acknowledged by a majority), it is present in the log of every future leader.</p>
+
+<pre><code class="language-python">import random
+
+random.seed(42)
+
+# ---------- Data model ------------------------------------------------------
+class RaftNode:
+    """Minimal Raft node: state machine is a single integer counter."""
+    def __init__(self, node_id, peers):
+        self.id = node_id
+        self.peers = peers          # list of other RaftNode objects (set after construction)
+        self.term = 0
+        self.voted_for = {}         # term -> candidate_id
+        self.log = []               # list of (term, value) entries
+        self.commit_index = -1      # index of last committed entry
+        self.state_machine = 0      # the counter: apply commits here
+        self.role = "follower"      # "follower" | "candidate" | "leader"
+
+    # ---- Log helpers -------------------------------------------------------
+    def last_log_term(self):
+        return self.log[-1][0] if self.log else 0
+
+    def last_log_index(self):
+        return len(self.log) - 1
+
+    def apply_committed(self):
+        """Apply any log entries up to commit_index."""
+        while len(self.log) - 1 > self.state_machine - 10:
+            # apply entries at indices 0..commit_index
+            break
+        for idx in range(self.state_machine, self.commit_index + 1):
+            if idx < len(self.log):
+                self.state_machine += self.log[idx][1]  # add the delta
+
+    # ---- RequestVote -------------------------------------------------------
+    def request_vote(self, candidate_term, candidate_id, cand_last_log_term, cand_last_log_idx):
+        if candidate_term > self.term:
+            self.term = candidate_term
+            self.role = "follower"
+        if candidate_term < self.term:
+            return False
+        already_voted = self.voted_for.get(candidate_term)
+        if already_voted is not None and already_voted != candidate_id:
+            return False
+        # Raft log-completeness check: candidate must be at least as up-to-date.
+        log_ok = (cand_last_log_term > self.last_log_term() or
+                  (cand_last_log_term == self.last_log_term() and
+                   cand_last_log_idx >= self.last_log_index()))
+        if not log_ok:
+            return False
+        self.voted_for[candidate_term] = candidate_id
+        return True
+
+    # ---- AppendEntries (simplified to a single new entry) ------------------
+    def append_entries(self, leader_term, entry=None):
+        """Follower accepts entries from the leader."""
+        if leader_term < self.term:
+            return False
+        self.term = leader_term
+        self.role = "follower"
+        if entry is not None:
+            self.log.append(entry)
+        return True
+
+    # ---- Election ----------------------------------------------------------
+    def run_election(self, reachable_peers):
+        self.term += 1
+        self.role = "candidate"
+        self.voted_for[self.term] = self.id
+        votes = 1
+        for peer in reachable_peers:
+            granted = peer.request_vote(
+                self.term, self.id,
+                self.last_log_term(), self.last_log_index()
+            )
+            if granted:
+                votes += 1
+        majority = (len(self.peers) + 1 + 1) // 2  # ceil((N+1)/2)
+        if votes >= majority:
+            self.role = "leader"
+            return True, votes
+        self.role = "follower"
+        return False, votes
+
+    # ---- Leader: replicate and commit a single entry -----------------------
+    def replicate_and_commit(self, delta, reachable_peers):
+        assert self.role == "leader"
+        entry = (self.term, delta)
+        self.log.append(entry)
+        acks = 1  # leader counts itself
+        for peer in reachable_peers:
+            if peer.append_entries(self.term, entry):
+                acks += 1
+        majority = (len(self.peers) + 1 + 1) // 2
+        if acks >= majority:
+            self.commit_index = len(self.log) - 1
+            self.apply_committed()
+            for peer in reachable_peers:
+                peer.commit_index = self.commit_index
+                peer.apply_committed()
+            return True
+        return False
+
+
+# ---------- Simulation ------------------------------------------------------
+nodes = [RaftNode(i, []) for i in range(3)]
+for n in nodes:
+    n.peers = [m for m in nodes if m.id != n.id]
+
+# Step 1: node 0 wins the initial election (term 1).
+node_A = nodes[0]
+won, votes = node_A.run_election(reachable_peers=nodes[1:])
+print(f"Step 1: node 0 stands for election (term {node_A.term})")
+print(f"        votes={votes}/3  won={won}  role={node_A.role}")
+
+# Step 2: node 0 (leader) replicates an increment of +7.
+committed = node_A.replicate_and_commit(delta=7, reachable_peers=nodes[1:])
+print(f"\nStep 2: leader 0 replicates delta=+7")
+print(f"        committed={committed}")
+print(f"        state machines: {[n.state_machine for n in nodes]}")
+print(f"        log on node 1 : {nodes[1].log}")
+print(f"        commit_index  : {[n.commit_index for n in nodes]}")
+
+# Step 3: node 0 crashes (remove it from the reachable set).
+surviving = nodes[1:]
+print(f"\nStep 3: node 0 CRASHES — surviving nodes: {[n.id for n in surviving]}")
+
+# Step 4: node 1 holds a new election.
+node_B = nodes[1]
+won2, votes2 = node_B.run_election(reachable_peers=[nodes[2]])
+print(f"\nStep 4: node 1 stands for election (term {node_B.term})")
+print(f"        votes={votes2}/3  won={won2}  role={node_B.role}")
+
+# Step 5: verify the committed value is preserved.
+print(f"\nStep 5: committed value after leader change")
+print(f"        node 1 state_machine = {nodes[1].state_machine}")
+print(f"        node 2 state_machine = {nodes[2].state_machine}")
+print(f"        node 1 log           = {nodes[1].log}")
+assert nodes[1].state_machine == 7, "safety violation: committed value lost"
+assert nodes[2].state_machine == 7, "safety violation: committed value lost"
+print("        PASS: committed value 7 preserved across leader change")
+</code></pre>
+<div class="code-caption"><strong>Code 2.6.3:</strong> A toy three-node Raft implementation whose state machine is a single counter. The simulation commits a delta of +7 under leader 0, crashes leader 0, elects leader 1, and asserts that the committed value is preserved. Run with <code>C:\Python314\python.exe</code>.</div>
+
+<pre><code class="language-text">Step 1: node 0 stands for election (term 1)
+        votes=3/3  won=True  role=leader
+
+Step 2: leader 0 replicates delta=+7
+        committed=True
+        state machines: [7, 7, 7]
+        log on node 1 : [(1, 7)]
+        commit_index  : [0, 0, 0]
+
+Step 3: node 0 CRASHES — surviving nodes: [1, 2]
+
+Step 4: node 1 stands for election (term 2)
+        votes=2/3  won=True  role=leader
+
+Step 5: committed value after leader change
+        node 1 state_machine = 7
+        node 2 state_machine = 7
+        node 1 log           = [(1, 7)]
+        PASS: committed value 7 preserved across leader change</code></pre>
+<div class="code-caption"><strong>Output 2.6.3:</strong> Leader 0 commits the counter increment to all three nodes before crashing. Node 1 wins the election for term 2 with two of the three votes (the surviving majority), and both surviving nodes report the same state machine value of 7. The assertion confirms no committed value was lost across the leader change.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: etcd Gives You This Durability Guarantee as a Service</div>
+<p>Code 2.6.3 implements the Raft mechanics from scratch to show how the guarantee arises. In production you obtain exactly the same committed-value durability by storing your state in etcd and using its <code>put</code> call with the default quorum-write policy. etcd's internal Raft ensures any acknowledged write survives the loss of a minority of nodes, and its watch mechanism lets other processes observe state changes without polling. The simulation is the proof of concept; etcd is the production artifact.</p>
+</div>
+
+<h2>9. Quorum Arithmetic and Why It Guarantees Linearisability <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The safety of Raft and of quorum-based replication in general rests on a single counting argument that is worth making explicit. For a cluster of $N$ nodes, a majority quorum is</p>
+
+$$q = \left\lceil \frac{N+1}{2} \right\rceil.$$
+
+<p>Concretely: $N=3 \Rightarrow q=2$; $N=5 \Rightarrow q=3$; $N=7 \Rightarrow q=4$. Table 2.6.2 shows the quorum size and fault tolerance for common cluster sizes.</p>
+
+<div class="table-caption"><strong>Table 2.6.2:</strong> Quorum sizes and fault tolerance for majority quorums. Two majority quorums always overlap, which is the root cause of linearisability.</div>
+<table>
+<thead>
+<tr><th scope="col">$N$ (nodes)</th><th scope="col">$q = \lceil(N+1)/2\rceil$</th><th scope="col">Failures tolerated ($N - q$)</th><th scope="col">Two quorums overlap in at least</th></tr>
+</thead>
+<tbody>
+<tr><td>3</td><td>2</td><td>1</td><td>1 node</td></tr>
+<tr><td>5</td><td>3</td><td>2</td><td>1 node</td></tr>
+<tr><td>7</td><td>4</td><td>3</td><td>1 node</td></tr>
+<tr><td>9</td><td>5</td><td>4</td><td>1 node</td></tr>
+</tbody>
+</table>
+
+<p>The overlap guarantee has a short proof. Let $Q_1$ and $Q_2$ be any two majority quorums of the same $N$-node cluster. Each has more than $N/2$ members: $|Q_1| \geq q > N/2$ and $|Q_2| \geq q > N/2$. By inclusion-exclusion, $|Q_1 \cap Q_2| = |Q_1| + |Q_2| - |Q_1 \cup Q_2| \geq q + q - N = 2\lceil(N+1)/2\rceil - N \geq 1$. So $Q_1 \cap Q_2$ is non-empty: any two majority quorums share at least one node.</p>
+
+<p>This overlap is why quorum reads combined with quorum writes guarantee linearisability. A quorum write ensures the new value is stored on at least $q$ nodes before the write is acknowledged. A quorum read contacts at least $q$ nodes and returns the value with the highest version. Because any read quorum and any write quorum overlap in at least one node, a read that happens after a completed write is guaranteed to contact at least one node that already holds the new value, so it cannot return a stale answer. Linearisability follows: reads and writes appear to execute in a single sequential order, and the order respects real time. Without the overlap, a read could miss the new value entirely and appear to go backwards in time, violating linearisability.</p>
+
+<p>For AI systems the quorum arithmetic has immediate practical consequences. A model registry using a five-node etcd cluster requires three-node quorum acknowledgment for every version promotion write; that three-node write will always be visible to any future read that contacts any three nodes, making it impossible for two serving replicas to simultaneously believe different model versions are "production" once the write completes. The same arithmetic underpins why the minority partition in Code 2.5.3 had to refuse writes: two of five nodes fall below the quorum of three, so any write accepted there would not reach a full quorum and could be missed by a later read that contacted the three nodes on the other side.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.6.4: Split Vote and Re-election <span class="exercise-type coding">Coding</span></div>
+<p>Start from Code 2.6.3. Extend it to handle the case in which two nodes simultaneously become candidates in the same term, producing a split vote in which neither reaches a majority. Specifically: (a) add a <code>split_vote_election</code> function that makes nodes 1 and 2 both stand for election in the same term simultaneously, shows that neither gathers a majority of three, and prints the vote tallies; (b) implement a re-election round in which one candidate, after a randomized backoff, tries again in the next term and wins; (c) assert that the committed counter value from before the split vote (which you should preserve from Code 2.6.3) is unchanged after the re-election. Explain in three sentences why the randomized backoff is essential to eventually breaking the tie, connecting your answer to the FLP discussion in Section 2.</p>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 2.6.1: Sort Each Decision Into a Plane <span class="exercise-type conceptual">Conceptual</span></div>
 <p>For each of the following, state whether it belongs to the data plane (deterministic collective, no consensus) or the control plane (consensus required), and justify the choice in one sentence: (a) averaging gradients across 32 data-parallel workers; (b) deciding which of three replicas of the parameter server is the current primary; (c) summing a loss scalar across a pipeline stage; (d) promoting model version v7 to the "production" tag; (e) agreeing, after a worker crash, on the new world size and rank assignment before training resumes. For any control-plane item, name which row of Table 2.6.1 it matches.</p>

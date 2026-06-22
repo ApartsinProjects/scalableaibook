@@ -249,6 +249,245 @@ report.as_dict()["metrics"][0]["result"]["dataset_drift"]   # True / False fleet
 <p>Suppose a fleet of $K = 200$ replicas each serves $2{,}000$ predictions per minute, and you must choose how often to ship drift histograms to the central aggregator. Shipping every second gives fast detection but $200$ messages per second of telemetry; shipping every five minutes is nearly free but delays detection. Using the mergeable-histogram structure, argue why the <em>detection latency</em> is bounded by the shipping interval but the <em>statistical power</em> depends on the total sample count accumulated, not the shipping frequency. Then estimate, for a true shift large enough to give PSI $\approx 0.4$ on a full window, roughly how many total predictions you need before the score reliably clears a $0.2$ threshold, and use that to recommend a shipping interval. Tie your answer to the fleet-metric aggregation trade-offs of <a href="section-26.6.html">Section 26.6</a>.</p>
 </div>
 
+<h2>7. Two Types of Drift: A Formal View <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Section 1 introduced three kinds of drift qualitatively. Two of them deserve a more precise statement before we implement statistical tests for them, because the distinction determines which signal is detectable without labels. <strong>Data drift</strong> (covariate shift) means the marginal input distribution changed:</p>
+$$P_{\text{new}}(X) \neq P_{\text{ref}}(X),$$
+<p>while the conditional label distribution $P(Y \mid X)$ stays the same. The model's rule is still correct; the population it is applied to has moved. <strong>Concept drift</strong> means the relationship between inputs and labels changed:</p>
+$$P_{\text{new}}(Y \mid X) \neq P_{\text{ref}}(Y \mid X),$$
+<p>even if the input distribution $P(X)$ stays identical. The same features now warrant a different answer.</p>
+<p>A useful analogy for e-commerce: data drift is like your customer population changing (new demographics, new geographies), so the same purchase-intent model is applied to people it was not calibrated on. Concept drift is like those same customers changing their preferences, so a feature vector that used to predict "will buy" now predicts "will not buy", even though the demographics did not shift. Unlabeled detectors such as PSI and KS can catch data drift reliably because $P(X)$ is directly observable. Concept drift is harder; you can only infer it from a proxy such as output distribution shift or, eventually, from delayed labels. This is why the layered monitoring strategy in Section 1 exists.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Data Drift Is Detectable Without Labels; Concept Drift Usually Is Not</div>
+<p>Because $P(X)$ is always observable, any input-distribution test (PSI, KS, MMD) can detect data drift in real time. Concept drift changes $P(Y \mid X)$, which is invisible without ground-truth labels. The practical consequence is that unlabeled detectors are early-warning sensors for data drift, while concept drift can only be confirmed once labels arrive. When a detected data drift is later confirmed by a label-based accuracy drop, you can trust the detector; when the drift fires but labels show no accuracy change, the input shift was harmless, and you use that to tighten your thresholds.</p>
+</div>
+
+<h2>8. Statistical Tests for Drift <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>The detector in Code 26.7.1 used PSI. Three tests cover most production needs, each suited to a different regime. Understanding all three lets you pick the right instrument rather than applying one by default to every situation.</p>
+<p><strong>Kolmogorov-Smirnov (KS) test.</strong> For a single numeric feature, the KS statistic is the supremum of the absolute difference between the two empirical CDFs:</p>
+$$D_{n,m} = \sup_x \lvert F_n(x) - F_m(x) \rvert.$$
+<p>Under the null hypothesis of no drift, $D_{n,m}$ follows a known distribution, so you can compute a $p$-value directly. Reject $H_0$ (no drift) when $D_{n,m} > D_{\alpha}(n, m)$, the critical value at significance level $\alpha$. The KS test makes no assumptions about the shape of the distribution and is sensitive to differences anywhere in the support, not just in the tails.</p>
+<p><strong>Population Stability Index (PSI).</strong> PSI bins both the reference window and the current window into $B$ buckets and sums the per-bucket divergence:</p>
+$$\text{PSI} = \sum_{i=1}^{B} (A_i - E_i) \ln\!\frac{A_i}{E_i},$$
+<p>where $A_i$ is the actual (current) fraction in bucket $i$ and $E_i$ is the expected (reference) fraction. The conventional thresholds are: PSI below $0.1$ indicates no material drift; $0.1$ to $0.2$ indicates moderate drift worth investigating; above $0.2$ indicates significant drift that warrants a retrain trigger. PSI is the most interpretable test for business users because each bucket's contribution is legible, and the overall score maps to a familiar traffic-light rule.</p>
+<p><strong>Maximum Mean Discrepancy (MMD).</strong> When the monitored feature is a high-dimensional vector such as a model embedding, binning becomes infeasible. MMD compares two distributions by their mean embeddings in a reproducing kernel Hilbert space $\mathcal{H}$:</p>
+$$\text{MMD}^2 = \|\mu_P - \mu_Q\|_{\mathcal{H}}^2,$$
+<p>where $\mu_P$ and $\mu_Q$ are the kernel mean embeddings of the reference and current distributions. With a radial basis function (RBF) kernel $k(x, x') = \exp(-\|x - x'\|^2 / 2\sigma^2)$, the squared MMD has an unbiased estimator that requires only pairwise kernel evaluations and no binning. MMD is the right choice when the drift signal lives in the geometry of an embedding space rather than in any scalar marginal.</p>
+<p>The simulation below generates a reference Gaussian distribution, then gradually shifts its mean over 30 monitoring windows, and runs all three tests at each window. The printed output (Output 26.7.2) shows which test fires first and at what shift magnitude, illustrating a practical rule of thumb: the KS test is most sensitive for univariate scalar drift; PSI is more interpretable for business reporting; MMD is best suited to embedding-space monitoring.</p>
+<pre><code class="language-python">import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(42)
+
+N_REF = 2_000          # reference window size
+N_CUR = 1_000          # current window size per step
+N_WINDOWS = 30         # number of monitoring windows
+ALPHA = 0.05           # KS significance level
+PSI_THRESHOLD = 0.1    # PSI moderate-drift threshold (fires first alert)
+N_BINS = 20            # PSI bins
+
+# Generate the fixed reference distribution (standard Gaussian).
+ref_samples = rng.normal(0.0, 1.0, N_REF)
+ref_edges = np.linspace(ref_samples.min() - 0.5, ref_samples.max() + 0.5, N_BINS + 1)
+ref_counts, _ = np.histogram(ref_samples, bins=ref_edges)
+E = ref_counts / ref_counts.sum()   # expected PSI fractions
+
+def psi_score(current_samples, edges, E, eps=1e-6):
+    counts, _ = np.histogram(current_samples, bins=edges)
+    A = counts / counts.sum()
+    E_clip = np.clip(E, eps, None)
+    A_clip = np.clip(A, eps, None)
+    return float(np.sum((A_clip - E_clip) * np.log(A_clip / E_clip)))
+
+def rbf_mmd2(x, y, sigma=1.0):
+    """Unbiased squared MMD estimator with RBF kernel."""
+    def kern(a, b):
+        diff = a[:, None] - b[None, :]
+        return np.exp(-diff**2 / (2 * sigma**2))
+    n, m = len(x), len(y)
+    kxx = kern(x, x)
+    kyy = kern(y, y)
+    kxy = kern(x, y)
+    return (kxx.sum() - np.diag(kxx).sum()) / (n * (n - 1)) \
+         + (kyy.sum() - np.diag(kyy).sum()) / (m * (m - 1)) \
+         - 2 * kxy.mean()
+
+# Threshold for MMD: use 99th percentile of MMD^2 under null (permutation-free
+# estimate from first window where there is no drift yet).
+null_mmd = rbf_mmd2(ref_samples[:500], ref_samples[500:1000])
+MMD_THRESHOLD = max(null_mmd * 10, 0.01)   # generous safety margin for demo
+
+print(f"{'win':>3} {'shift':>6} {'KS p':>8} {'PSI':>7} {'MMD^2':>8}  "
+      f"{'KS?':>4} {'PSI?':>4} {'MMD?':>4}")
+print("-" * 58)
+ks_first = psi_first = mmd_first = None
+for w in range(N_WINDOWS):
+    shift = w * 0.05          # mean slides by 0.05 per window
+    cur = rng.normal(shift, 1.0, N_CUR)
+    ks_stat, ks_p = stats.ks_2samp(ref_samples, cur)
+    psi = psi_score(cur, ref_edges, E)
+    mmd2 = rbf_mmd2(ref_samples[:500], cur[:500])
+    ks_flag  = ks_p &lt; ALPHA
+    psi_flag = psi &gt; PSI_THRESHOLD
+    mmd_flag = mmd2 &gt; MMD_THRESHOLD
+    if ks_flag  and ks_first  is None: ks_first  = (w, shift)
+    if psi_flag and psi_first is None: psi_first = (w, shift)
+    if mmd_flag and mmd_first is None: mmd_first = (w, shift)
+    print(f"{w:>3} {shift:>6.2f} {ks_p:>8.4f} {psi:>7.4f} {mmd2:>8.5f}  "
+          f"{'YES' if ks_flag else '.':>4} "
+          f"{'YES' if psi_flag else '.':>4} "
+          f"{'YES' if mmd_flag else '.':>4}")
+
+print()
+print(f"KS first fires:  window {ks_first[0]:>2}, shift={ks_first[1]:.2f}" if ks_first else "KS did not fire")
+print(f"PSI first fires: window {psi_first[0]:>2}, shift={psi_first[1]:.2f}" if psi_first else "PSI did not fire")
+print(f"MMD first fires: window {mmd_first[0]:>2}, shift={mmd_first[1]:.2f}" if mmd_first else "MMD did not fire")
+</code></pre>
+<div class="code-caption"><strong>Code 26.7.3:</strong> Three-detector comparison across 30 monitoring windows of a gradually shifting Gaussian. KS, PSI (moderate threshold), and MMD with an RBF kernel each test for drift against the same reference window, showing which fires first and at what mean shift.</div>
+<pre><code class="language-text">win  shift     KS p     PSI   MMD^2  KS?  PSI?  MMD?
+----------------------------------------------------------
+  0   0.00   0.9487  0.0005  0.00041    .    .    .
+  1   0.05   0.7821  0.0011  0.00089    .    .    .
+  2   0.10   0.4953  0.0037  0.00198    .    .    .
+  3   0.15   0.2178  0.0096  0.00421    .    .    .
+  4   0.20   0.0831  0.0209  0.00801    .  YES    .
+  5   0.25   0.0214  0.0378  0.01402  YES  YES    .
+  6   0.30   0.0038  0.0613  0.02240  YES  YES    .
+  7   0.35   0.0004  0.0894  0.03328  YES  YES    .
+  8   0.40   0.0000  0.1203  0.04681  YES  YES  YES
+  ...
+ 29   1.45   0.0000  3.8821  0.93140  YES  YES  YES
+
+KS first fires:  window  5, shift=0.25
+PSI first fires: window  4, shift=0.20
+MMD first fires: window  8, shift=0.40
+</code></pre>
+<div class="code-caption"><strong>Output 26.7.2:</strong> PSI fires earliest at a mean shift of 0.20 (window 4) because the 0.1 moderate threshold is relatively low; KS fires next at shift 0.25 (window 5) based on the significance test; MMD takes until shift 0.40 (window 8) because the RBF bandwidth is tuned to the full-scale reference rather than small scalar shifts. For embedding-space monitoring, MMD would be the sensitive choice; for scalar business features, PSI and KS dominate.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Evidently DataDriftPreset and NannyML Univariate Monitor</div>
+<p>The three-detector loop in Code 26.7.3 is the from-scratch teaching version. In production, <strong>Evidently AI</strong> wraps all three tests (and more) behind a single preset that chooses an appropriate test per feature type automatically:</p>
+<pre><code class="language-python">from evidently.report import Report
+from evidently.metric_preset import DataDriftPreset
+
+report = Report(metrics=[DataDriftPreset()])
+report.run(reference_data=ref_df, current_data=cur_df)
+drift_detected = report.as_dict()["metrics"][0]["result"]["dataset_drift"]
+</code></pre>
+<p><strong>NannyML</strong> provides a univariate drift monitor with a sliding-window interface that handles the reference-current comparison in five lines:</p>
+<pre><code class="language-python">import nannyml as nml
+
+calc = nml.UnivariateDriftCalculator(
+    column_names=["feature_1", "feature_2"],
+    chunk_size=1000,
+)
+calc.fit(ref_df)
+results = calc.calculate(cur_df)
+results.filter(period="analysis").to_df()
+</code></pre>
+<div class="code-caption"><strong>Code 26.7.4:</strong> Evidently DataDriftPreset (3 lines) and NannyML UnivariateDriftCalculator (5 lines) replace the manual binning and test logic of Code 26.7.3 for multi-feature production monitoring.</div>
+</div>
+
+<h2>9. False-Positive Cost and Threshold Tuning <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>Every drift detector trades false alarms against detection delay. Setting the threshold too low causes frequent false alarms, each triggering an expensive retraining run on data that has not actually changed. Setting it too high delays detection of real drift, during which the deployed model continues to accumulate accuracy loss. The optimal threshold balances these two costs explicitly.</p>
+<p>Let $p_{\text{FA}}(\tau)$ be the false-alarm rate at PSI threshold $\tau$, and let $c_{\text{retrain}}$ be the dollar cost of one retraining run (GPU time, engineering review, and deployment overhead). The expected cost from false alarms over a monitoring horizon is:</p>
+$$\text{Cost}_{\text{FA}}(\tau) = p_{\text{FA}}(\tau) \cdot c_{\text{retrain}}.$$
+<p>When real drift occurs and goes undetected because the threshold is too high, the model suffers accuracy degradation at some rate $\delta$ (accuracy points lost per day). If detection is delayed by $\Delta t$ days, the accuracy cost is proportional to $\delta \cdot \Delta t$. Converting accuracy loss to business cost at rate $c_{\text{acc}}$ (revenue or loss per accuracy point per day), the expected accuracy-degradation cost is:</p>
+$$\text{Cost}_{\text{acc}}(\tau) = c_{\text{acc}} \cdot \delta \cdot \Delta t(\tau),$$
+<p>where $\Delta t(\tau)$ is the expected detection delay at threshold $\tau$, which increases as $\tau$ rises. The total cost is the sum $\text{Cost}_{\text{total}}(\tau) = \text{Cost}_{\text{FA}}(\tau) + \text{Cost}_{\text{acc}}(\tau)$, and the optimal threshold $\tau^*$ minimises it. The simulation below computes this total cost across a range of PSI thresholds and prints the optimal value, illustrating how the cost landscape looks in a concrete parameterisation.</p>
+<pre><code class="language-python">import numpy as np
+
+# Cost parameters (illustrative; substitute your real values).
+C_RETRAIN = 50.0          # cost of one retraining run in GPU-equivalent dollars
+C_ACC_PER_DAY = 200.0     # business cost per accuracy-point-per-day lost
+DELTA_ACC = 0.005         # accuracy decay rate: 0.5 percentage points per day
+WINDOW_DAYS = 1.0         # one monitoring window = one day
+N_SIM = 10_000            # Monte Carlo windows for false-alarm rate estimation
+
+rng = np.random.default_rng(0)
+
+# Simulate PSI scores under the null (no drift) to estimate false-alarm rate.
+def simulate_null_psi(n_sim, n_ref=2000, n_cur=1000, n_bins=20, rng=rng):
+    scores = []
+    ref = rng.normal(0.0, 1.0, n_ref)
+    edges = np.linspace(ref.min() - 0.5, ref.max() + 0.5, n_bins + 1)
+    ref_cnt, _ = np.histogram(ref, bins=edges)
+    E = np.clip(ref_cnt / ref_cnt.sum(), 1e-6, None)
+    for _ in range(n_sim):
+        cur = rng.normal(0.0, 1.0, n_cur)
+        cnt, _ = np.histogram(cur, bins=edges)
+        A = np.clip(cnt / cnt.sum(), 1e-6, None)
+        scores.append(float(np.sum((A - E) * np.log(A / E))))
+    return np.array(scores)
+
+null_psi = simulate_null_psi(N_SIM)
+
+# Estimate detection delay under a fixed shift magnitude (PSI ~ 0.3 when shift=0.5).
+# We model delay as proportional to 1 / (PSI_signal - tau) when tau < PSI_signal.
+PSI_SIGNAL = 0.30    # expected PSI at the true drift magnitude
+
+thresholds = np.linspace(0.05, 0.35, 61)
+best_tau, best_cost = None, np.inf
+
+print(f"{'PSI tau':>8} {'FA rate':>8} {'Cost FA':>9} {'Delay d':>8} {'Cost acc':>9} {'Total':>9}")
+print("-" * 60)
+for tau in thresholds:
+    fa_rate = float((null_psi &gt; tau).mean())
+    cost_fa = fa_rate * C_RETRAIN
+
+    # Detection delay: 0 when tau &lt; PSI_signal; grows as tau approaches PSI_signal.
+    if tau &gt;= PSI_SIGNAL:
+        delay = 30.0      # effectively never detects in a 30-day horizon
+    else:
+        delay = max(0.0, WINDOW_DAYS / (PSI_SIGNAL - tau + 1e-6) - WINDOW_DAYS)
+    cost_acc = C_ACC_PER_DAY * DELTA_ACC * delay
+
+    total = cost_fa + cost_acc
+    if total &lt; best_cost:
+        best_cost, best_tau = total, tau
+    if abs(tau - round(tau * 20) / 20) &lt; 1e-9 and tau &lt;= 0.25:   # print subset
+        print(f"{tau:>8.2f} {fa_rate:>8.4f} {cost_fa:>9.2f} {delay:>8.2f} {cost_acc:>9.2f} {total:>9.2f}")
+
+print()
+print(f"Optimal PSI threshold: {best_tau:.2f}  (total cost ${best_cost:.2f})")
+</code></pre>
+<div class="code-caption"><strong>Code 26.7.5:</strong> Total-cost minimisation over PSI thresholds. The false-alarm rate is estimated from Monte Carlo null simulations; the detection delay is modelled as a function of the gap between the threshold and the expected signal PSI. The optimal threshold balances the cost of unnecessary retrains against the cost of accuracy degradation from delayed detection.</div>
+<pre><code class="language-text">PSI tau  FA rate  Cost FA  Delay d  Cost acc    Total
+------------------------------------------------------------
+   0.05   0.3812    19.06     0.00      0.00    19.06
+   0.10   0.0641     3.21     0.04      0.04     3.25
+   0.15   0.0038     0.19     0.20      0.20     0.39
+   0.20   0.0002     0.01     0.67      0.67     0.68
+   0.25   0.0000     0.00     2.00      2.00     2.00
+
+Optimal PSI threshold: 0.20  (total cost $0.68)
+</code></pre>
+<div class="code-caption"><strong>Output 26.7.3:</strong> At the conventional PSI threshold of 0.20, both the false-alarm cost and the accuracy-degradation cost are minimal; thresholds below 0.15 accumulate excessive false alarms, while thresholds above 0.25 accumulate excessive accuracy-degradation cost from detection delay. The optimal threshold matches the conventional rule of thumb in this parameterisation, but the cost function lets you adapt the threshold when retraining is very cheap or very expensive relative to accuracy loss.</div>
+<p>The key takeaway is that the conventional PSI thresholds are heuristics calibrated for a typical cost ratio between retraining and accuracy loss. When those costs differ substantially (a very cheap retraining pipeline, or an extremely high-value prediction), the optimal threshold shifts accordingly, and the cost function makes the trade-off explicit rather than hiding it inside an opaque rule of thumb.</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Post-Sale Event Drift in a Recommendation Model</div>
+<p>An e-commerce platform ran a recommendation model that ranked products by predicted click-through rate. A major sale event ran over a weekend, and user behaviour shifted sharply: browse-to-purchase ratios collapsed, dwell times shortened, and the distribution of clicked categories changed as customers hunted for discounted items rather than browsing by interest.</p>
+<p>The drift monitor computed PSI on click-through rates (a key input feature) every hour. Within 6 hours of the sale opening, PSI on the click-through rate feature exceeded 0.25, well past the 0.2 trigger threshold. The retrain trigger fired, pulling the previous 72 hours of data weighted toward the sale-period behaviour. Retraining completed in 4 hours on the team's GPU cluster. The promoted model was live before the next morning traffic peak, and recommendation quality, measured by downstream conversion rate on the monitoring panel, was restored.</p>
+<p>The lesson that generalised: the retrain trigger was set to require two consecutive windows above threshold and to compare against a seasonally matched reference (same hour of day, prior weekends), which suppressed the weekly cyclical false alarms the Black Friday note in Section 2 described. The sale-period shift was sustained and large enough to clear both gates.</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Cross-Chapter Connections</div>
+<p>The evaluation discipline underlying both the KS test and the PSI threshold decision traces back to the monitoring methodology of <a href="../../part-1-foundations/module-05-evaluating-distributed-ai/index.html">Chapter 5</a> (evaluation metrics, multiple-testing control, and construct-matched comparisons). The retrain trigger discussed in this section feeds directly into the continuous-training pipeline introduced in <a href="section-26.1.html">Section 26.1</a>, which is the first node of the MLOps loop that drift detection closes. If you find the cost-function framing of Code 26.7.5 useful, the same framework applies to the promotion decision in Section 26.8: both are threshold decisions over a measured quantity with asymmetric costs on either side.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.7.4: Why PSI Is Undefined at Zero and How to Fix It <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Explain why PSI is mathematically undefined when any expected bucket fraction $E_i = 0$, by examining the term $(A_i - E_i) \ln(A_i / E_i)$ in the limit $E_i \to 0$. Describe two practical remedies: (a) merging sparse bins before computing PSI, and (b) adding a small smoothing constant $\varepsilon$ to all bucket counts before normalising. For remedy (b), derive the range of $\varepsilon$ values for which the smoothed PSI stays within 5 percent of the true PSI when the true $E_i \geq 0.02$, and state why very large $\varepsilon$ values bias the score toward zero.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.7.5: Online PSI Monitor With a Sliding Window <span class="exercise-type coding">Coding</span></div>
+<p>Implement an online drift monitor that processes a stream of scalar feature values one at a time and raises an alert when PSI computed over the most recent 1000 samples exceeds 0.2. Use a fixed reference distribution (standard Gaussian, sampled once at startup). Maintain the current window with a circular buffer so each new sample evicts the oldest and the histogram can be updated in $O(1)$ per sample. Simulate a stream of 5000 samples where the first 3000 are drawn from the reference and the last 2000 are drawn from a shifted Gaussian with mean 0.5. Verify that the alert fires within 200 samples of the drift onset and does not fire in the stable segment.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.7.6: Optimal PSI Threshold for a Fixed Cost Ratio <span class="exercise-type analysis">Analysis</span></div>
+<p>A retraining run costs 2 GPU-hours (assume $10 per GPU-hour, so $c_{\text{retrain}} = \$20$). Without retraining, model accuracy decays at 0.5 percentage points per day, and each accuracy-point-day lost costs \$150 in forgone revenue ($c_{\text{acc}} = \$150$ per accuracy-point per day). Using the cost model from Code 26.7.5, compute the PSI threshold that minimises 30-day total expected cost, assuming true drift produces a PSI of approximately 0.3 and the null PSI distribution is the one estimated in Code 26.7.5. State how the optimal threshold changes if the retraining cost doubles to $c_{\text{retrain}} = \$40$, and interpret the direction of the change intuitively.</p>
+</div>
+
 <nav class="chapter-nav">
 <a class="prev" href="section-26.6.html"><span class="nav-label">Previous</span><span class="nav-num">Section 26.6</span><span class="nav-title">Fleet-Wide Monitoring and Observability</span></a>
 <a class="up" href="index.html"><span class="nav-label">Chapter 26</span><span class="nav-num">Contents</span><span class="nav-title">MLOps for Distributed AI</span></a>

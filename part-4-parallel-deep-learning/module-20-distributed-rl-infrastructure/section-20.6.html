@@ -224,6 +224,125 @@ for _ in range(100):
 <p>The hottest current use of this infrastructure is reinforcement learning from human or verifiable feedback to align and reason-tune large language models, and it has revived every axis in Table 20.6.1 at a new scale. Open stacks such as OpenRLHF, NeMo-Aligner, and Hugging Face TRL, together with veRL (HybridFlow) and the inference-batching ideas behind SEED, all wrestle with the same split: generation (policy rollout, which is inference-bound and benefits enormously from centralized batched serving via engines like vLLM) versus learning (the gradient update). The 2024 to 2026 systems literature on PPO and GRPO for LLMs is, read through this section's lens, a re-derivation of SEED's "batch the inference centrally" insight, now with the policy at hundreds of billions of parameters and the rollout engine and trainer often placed on separate accelerator pools. The design space did not change; the policies got large enough that centralized inference is no longer optional.</p>
 </div>
 
+<h2>7. GRPO and Reinforcement Learning with Verifiable Rewards <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The four systems in Table 20.6.1 were designed for game-playing agents trained against environment simulators. The policy outputs actions in a discrete or continuous control space, and the reward signal comes from the environment itself. From 2024 onward, the same actor-learner infrastructure was pressed into service for a qualitatively different workload: training large language models to reason through mathematics and code. This application exposed two costs that game-playing RL absorbed painlessly but that become critical at language-model scale. The first is the cost of the critic. PPO, the dominant algorithm for RLHF, requires a separate value network to estimate baselines for advantage computation; for a large language model this means training and storing a second model of roughly the same size, nearly doubling the memory footprint of the learner. The second is the cost of the reward model. A neural reward model trained on human preference data is itself a large network, adds inference cost per rollout step, and is prone to reward hacking: the policy learns to exploit the reward model's inaccuracies rather than developing genuine capability.</p>
+<p>Group Relative Policy Optimization (GRPO) and Reinforcement Learning with Verifiable Rewards (RLVR) are two algorithmic changes that address these costs at the system level, and together they redraw the distributed infrastructure requirements in ways that map directly onto the design space of this section.</p>
+
+<h3>7.1 GRPO: Eliminating the Critic with Group Normalization</h3>
+<p>PPO computes advantages using a learned value function $V_\phi(s)$ that acts as a baseline: the advantage of action $a$ in state $s$ is roughly $r - V_\phi(s)$, the reward minus the expected return. GRPO replaces this with a purely statistical baseline: for each prompt $q$, sample a group of $G$ responses $\{o_1, \ldots, o_G\}$ from the current policy, score each with a reward $r_i$, and normalize within the group. The group-normalized advantage for response $i$ is:</p>
+$$\hat{A}_i = \frac{r_i - \mu_r}{\sigma_r}$$
+<p>where $\mu_r$ and $\sigma_r$ are the mean and standard deviation of rewards within the group. A response that scores above the group average gets a positive advantage; one that scores below gets a negative advantage. No value network is needed. The learning signal comes from the relative ranking of responses to the same prompt, not from an absolute value estimate.</p>
+<p>The policy update applies the same clipped surrogate objective as PPO, but using these group-normalized advantages in place of the GAE estimates. For a group of $G$ outputs sampled from the old policy $\pi_{\theta_{\text{old}}}$ for prompt $q$, the GRPO loss is:</p>
+$$\mathcal{L}_{\text{GRPO}} = -\frac{1}{G}\sum_{i=1}^{G}\min\!\left(\frac{\pi_\theta(o_i|q)}{\pi_{\theta_{\text{old}}}(o_i|q)}\hat{A}_i,\;\text{clip}\!\left(\frac{\pi_\theta(o_i|q)}{\pi_{\theta_{\text{old}}}(o_i|q)},1-\epsilon,1+\epsilon\right)\hat{A}_i\right)$$
+<p>The ratio $\pi_\theta(o_i|q)/\pi_{\theta_{\text{old}}}(o_i|q)$ is the standard PPO importance weight; the $\text{clip}(\cdot, 1-\epsilon, 1+\epsilon)$ term prevents excessively large policy updates. What is absent from this expression compared to PPO is any reference to a value function. The baseline is entirely determined by the group of outputs for the same prompt, computed on the fly and discarded after the update.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Critic's Job Is Done by the Group</div>
+<p>In PPO, the critic estimates "how good is this state on average" to center the advantage. GRPO achieves the same centering by asking "how good is this response relative to the other responses to the same prompt." When you sample $G$ responses from the same prompt, you get a natural distribution of outcomes whose mean is an unbiased baseline for any individual response. The group is the critic; you just compute a mean and standard deviation instead of training a second neural network.</p>
+</div>
+
+<h3>7.2 RLVR: Replacing the Reward Model with a Verifier</h3>
+<p>A neural reward model trained to predict human preference scores introduces a second large network into the pipeline and, more problematically, a failure mode: as the policy improves, it begins to exploit gaps in the reward model's generalization, scoring high on the reward model while producing outputs a human would score low. This reward hacking forces practitioners into reward-model refreshes and safety filtering that compound the infrastructure complexity.</p>
+<p>RLVR replaces the neural reward model with a deterministic verifier. For mathematics, a symbolic checker evaluates whether the final answer is correct; for code, an execution environment runs the generated program on test cases and reports pass or fail. Both return a binary reward: 1 if the answer is provably correct, 0 otherwise. Because the verifier is deterministic and correct by construction, reward hacking becomes impossible: there is no model to fool. A program either passes the test suite or it does not; a mathematical derivation either reaches the right answer or it does not. The reward signal is clean, label-free (no human annotation beyond the problem statement and the correct answer), and infinitely scalable: running more verifier calls costs only compute, not human labelers.</p>
+<p>The combination of GRPO with RLVR produces a training loop that needs no value network, no reward model, and no human preference labels: only a policy network, a prompt dataset with verifiable answers, and a verifier. This is a significant infrastructure simplification. The learner's memory footprint halves (no critic), and the reward pipeline collapses to a function call.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: DeepSeek-R1 and GRPO+RLVR at Scale</div>
+<p>DeepSeek-R1 (2025) demonstrated GRPO combined with RLVR at a scale that validated both algorithmic ideas simultaneously. The system trained a 671-billion-parameter Mixture-of-Experts language model using purely RL from verifiable rewards on mathematics and code problems. No supervised fine-tuning on reasoning demonstrations was required as a first training stage; the model learned extended chain-of-thought reasoning, including self-correction and backtracking, from the reward signal alone. The result matched the reasoning performance of OpenAI's o1 models on standard benchmarks. For distributed-systems practitioners, the headline is not the benchmark score but the infrastructure proof: GRPO+RLVR scales cleanly to hundreds of billions of parameters without the memory overhead of a critic or the instability of a neural reward model, and the verifier-based reward signal remains clean at that scale because it is a deterministic function, not a trained approximator that can be exploited.</p>
+</div>
+
+<h3>7.3 Distributed Infrastructure for GRPO</h3>
+<p>GRPO uses the same actor-learner split as IMPALA and its descendants, but the workload profile is different enough that it shifts the binding constraint. In game-playing RL, rollout and learning are both computationally intensive: stepping an environment is CPU-bound, and the policy forward pass is fast for small networks. In language-model RL, generating a full response token by token from a large language model is orders of magnitude more expensive than any environment step; auto-regressive generation at thousands of tokens per response dominates the total compute. Empirically, generation accounts for roughly 80 percent of wall-clock time in a GRPO training run, not the gradient update.</p>
+<p>This shifts the design space in two directions. First, the "actor fleet" is not a swarm of cheap CPU boxes stepping environments; it is a fleet of accelerator servers running auto-regressive inference, and the primary optimization target is inference throughput, not environment simulation rate. Inference engines built for high-throughput LLM serving, particularly vLLM and SGLang, with their continuous batching, paged KV-cache management, and speculative decoding, become the natural choice for the actor role. Some implementations colocate the inference engine with the actor process on the same accelerator pool, switching between generation mode and training mode per iteration; others place them on separate pools with weight synchronization between them.</p>
+<p>Second, the policy weights must exist in two layouts simultaneously: the inference-optimized layout (tensor-parallel sharding tuned for autoregressive decoding, often with quantization) and the training-optimized layout (ZeRO or FSDP sharding tuned for gradient computation across data-parallel replicas). Each update step requires resharding the weights from the learner's training layout to the actor's inference layout before the next generation round, and optionally back if they are physically co-located. This weight resharding step is a collective communication problem that sits inside the actor-learner loop; it must be fast enough that it does not dominate the already-expensive generation time.</p>
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: The Bottleneck Moved, the Architecture Did Not</div>
+<p>GRPO and RLVR do not replace the actor-learner split; they reveal it in a new bottleneck regime. In game-playing RL, Section 20.8's throughput analysis asks whether you are sampling-bound or learning-bound, where "sampling" meant cheap environment steps and "learning" meant expensive gradient computation. In language-model RL with GRPO, the same analysis applies but "sampling" now means expensive autoregressive generation on large accelerators, and the answer to "which half is the bottleneck" flips: you are almost always generation-bound. The infrastructure response, substituting inference engines for CPU actor boxes and managing weight resharding between inference and training layouts, is the same logical move SEED RL made: push the expensive compute to the right hardware and batch it efficiently. The design space of this section did not change; the policy got large enough that different cells of the grid became optimal.</p>
+</div>
+<p>The cross-section connections are direct. The actor-learner split of <a href="section-20.2.html">Section 20.2</a> remains the structural template; GRPO replaces the learning algorithm inside the learner without changing the split. The throughput balance analysis of <a href="section-20.8.html">Section 20.8</a> applies immediately, with generation throughput replacing environment-step throughput as the sampling-side rate. The per-node efficiency techniques of <a href="../../part-4-parallel-deep-learning/module-22-efficient-training-techniques/index.html">Chapter 22</a> (mixed precision, gradient checkpointing, fused kernels) apply to the learner's gradient computation; the LLM serving infrastructure of <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a> (continuous batching, paged attention, speculative decoding) applies directly to the actor's generation step. GRPO is where training and serving infrastructure converge inside one loop.</p>
+
+<h3>7.4 A GRPO Training Step in Code</h3>
+<p>The code below sketches one GRPO iteration on a single prompt: sample $G$ responses from the policy, score each with a verifier, compute group-normalized advantages, then compute the clipped surrogate loss. The implementation is intentionally minimal to make the group-normalization step visible; a production system would replace the toy policy and verifier with a real language model and execution environment, and would pipeline generation across an inference engine fleet.</p>
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def grpo_step(
+    policy,
+    old_policy,
+    prompt_tokens: torch.Tensor,        # [prompt_len]
+    verifier,                            # callable: response_tokens -> float reward
+    G: int = 8,
+    epsilon: float = 0.2,
+) -> torch.Tensor:
+    """
+    One GRPO update step for a single prompt.
+
+    Steps:
+      1. Sample G responses from the old (frozen) policy.
+      2. Score each response with a deterministic verifier (RLVR).
+      3. Compute group-normalised advantages: A_hat = (r - mu) / sigma.
+      4. Compute the clipped PPO surrogate loss averaged over the group.
+
+    Returns the scalar GRPO loss for this prompt.
+    No value network or reward model is used.
+    """
+    rewards = []
+    log_probs_old = []
+    log_probs_new = []
+
+    # Step 1 and 2: sample responses and score them.
+    for _ in range(G):
+        with torch.no_grad():
+            response_tokens, lp_old = old_policy.sample(prompt_tokens)
+        reward = verifier(response_tokens)          # deterministic: 0.0 or 1.0
+        lp_new = policy.log_prob(prompt_tokens, response_tokens)
+        rewards.append(reward)
+        log_probs_old.append(lp_old)
+        log_probs_new.append(lp_new)
+
+    rewards_t = torch.tensor(rewards, dtype=torch.float32)   # [G]
+    lp_old_t  = torch.stack(log_probs_old)                   # [G]
+    lp_new_t  = torch.stack(log_probs_new)                   # [G]
+
+    # Step 3: group-normalised advantage -- no critic, no value network.
+    mu    = rewards_t.mean()
+    sigma = rewards_t.std().clamp(min=1e-8)        # avoid division by zero
+    advantages = (rewards_t - mu) / sigma           # [G], mean 0, std 1
+
+    # Step 4: clipped PPO surrogate loss over the group.
+    ratios = torch.exp(lp_new_t - lp_old_t)        # pi_theta / pi_theta_old
+    surrogate_unclipped = ratios * advantages
+    surrogate_clipped   = torch.clamp(ratios, 1 - epsilon, 1 + epsilon) * advantages
+    loss = -torch.mean(torch.min(surrogate_unclipped, surrogate_clipped))
+    return loss
+</code></pre>
+<div class="code-caption"><strong>Code 20.6.3:</strong> A minimal GRPO training step for a single prompt. The group-normalization block (Step 3) is the algorithmic core: mean and standard deviation of the group's rewards replace the critic's value estimate. No second network is instantiated anywhere in the function.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: GRPO in OpenRLHF and TRL</div>
+<p>Production GRPO implementations for language models are available in OpenRLHF (<code>openrlhf.trainer.GRPOTrainer</code>) and in Hugging Face TRL (<code>trl.GRPOTrainer</code>). Both handle vLLM-backed generation, weight resharding between inference and training layouts, and distributed gradient accumulation across the learner fleet. For a custom verifier, TRL exposes a <code>reward_funcs</code> argument that accepts any callable returning a float, which is exactly the RLVR interface:</p>
+<pre><code class="language-python"># pip install trl vllm
+from trl import GRPOTrainer, GRPOConfig
+
+def math_verifier(prompts, completions, **kwargs):
+    """Return 1.0 if the last line of the completion is the correct answer."""
+    correct_answers = kwargs["answer"]
+    return [1.0 if c.strip().split("\n")[-1] == a else 0.0
+            for c, a in zip(completions, correct_answers)]
+
+trainer = GRPOTrainer(
+    model="deepseek-ai/deepseek-math-7b-base",
+    reward_funcs=math_verifier,
+    args=GRPOConfig(num_generations=8, max_completion_length=512),
+    train_dataset=math_dataset,
+)
+trainer.train()
+</code></pre>
+<div class="code-caption"><strong>Code 20.6.4:</strong> GRPO with a custom math verifier using Hugging Face TRL. The <code>num_generations=8</code> argument sets $G=8$; the reward function is a plain Python callable that returns 0/1 rewards, replacing the neural reward model entirely.</div>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.6.4: GRPO vs PPO Advantage on a Toy Bandit <span class="exercise-type coding">Coding</span></div>
+<p>Implement a toy $K$-armed bandit problem where each arm returns a Bernoulli reward with a fixed but unknown probability. Compare two advantage estimators on this bandit: (a) the GRPO group-normalized advantage, where you sample $G = 8$ arms and normalize by the group mean and standard deviation; and (b) a Monte Carlo baseline, where you estimate the value of the current policy as a running average of observed rewards and subtract it from each reward (the PPO analogue without a learned critic). For both estimators, run 500 bandit steps and plot the policy entropy and the cumulative reward. Observe which estimator provides lower-variance advantage estimates when $G$ is small (say $G = 4$) and which is lower-variance when $G$ is large (say $G = 32$). Explain the result in terms of the number of samples used to estimate the baseline in each case.</p>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 20.6.1: Place a Fifth System <span class="exercise-type conceptual">Conceptual</span></div>
 <p>A new RL stack trains a large recurrent policy by streaming near-on-policy data (no replay buffer) with V-trace-style correction, and it runs inference centrally on a batched accelerator. Using the three axes of Section 1 (inference location, experience path, agent type), give its coordinates and say which one system in Table 20.6.1 it is closest to on each axis. Then name the one R2D2 lesson it must still implement even though it has no replay buffer, and explain why.</p>

@@ -225,6 +225,121 @@ for x, y in loader:
 </div>
 <p>We have now placed mixed precision where it belongs: a per-node, scale-up technique whose payoff is felt out on the network and in the memory budget of every worker, sharpening the very scaling efficiency that the collectives and parallelism strategies aim for. With the gradient now half its former size on the wire, the next section confronts what is left: the practical bottlenecks, stragglers, and diminishing returns that decide how far data parallelism actually scales, in <a href="section-15.9.html">Section 15.9</a>.</p>
 
+<h2>6. FP8 and MXFP8: The Next Precision Ceiling <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The jump from FP32 to BF16 halved gradient bytes on the wire. The natural question is whether the jump from BF16 to 8 bits halves them again, and the 2024 to 2026 hardware and research record answers yes, with conditions. The challenge is that 8 bits leave so little room that a single scale factor per tensor, which sufficed for FP16, is too coarse: one outlier channel can consume the entire representable range and crush everything else. The solution that has reached production is <strong>block scaling</strong>, where groups of elements share their own independent scale, so each block lands in range regardless of its neighbors. This section makes that precise, shows the two FP8 variants and where each is used, works through a forward-pass simulation, and closes with the hardware-native MXFP8 format shipping on Blackwell B200 GPUs.</p>
+
+<h3>6.1 The Two FP8 Variants and Their Roles</h3>
+<p>FP8 exists in two flavors that make opposite range-precision trade-offs, matching the two places in the training step where they are needed. <strong>E4M3</strong> (4-bit exponent, 3-bit mantissa) is the forward-pass format: its extra mantissa bit resolves activations and weights more finely, at the cost of a narrower dynamic range. <strong>E5M2</strong> (5-bit exponent, 2-bit mantissa) is the backward-pass gradient format: its wider exponent handles the large dynamic range of gradient values, accepting coarser resolution. Table 15.8.1 already listed both; the asymmetry, E4M3 forward, E5M2 backward, is a deliberate assignment, not a default. Matrix multiplications in both variants <strong>accumulate into FP32</strong>: each partial sum inside the matrix multiply is widened before it is added to the running total, so thousands of 8-bit products do not compound rounding error into the output. The FP32 accumulator is then cast back to the working precision after each tile, giving the product the numerical safety of full precision at the cost of only one brief widening per tile.</p>
+<p>The two roles are captured in the following equation for a forward-pass tile. Let $\mathbf{A}^{(8)}$ and $\mathbf{W}^{(8)}$ be E4M3 tiles and $s_A$, $s_W$ their per-block scales; the product is</p>
+$$\mathbf{C} = \mathrm{cast}_{32}\!\left(\mathbf{A}^{(8)}\right) \cdot \mathrm{cast}_{32}\!\left(\mathbf{W}^{(8)}\right) \cdot (s_A \cdot s_W),$$
+<p>accumulated in FP32 and then optionally cast back to BF16 or E4M3 for the next layer. During the backward pass the gradient tiles use E5M2 instead of E4M3, with their own per-block scales $s_G$.</p>
+
+<h3>6.2 Block Scaling: Per-Block Versus Per-Tensor</h3>
+<p>Per-tensor scaling assigns one scale factor to an entire weight matrix or activation tensor. If a single column has activations an order of magnitude larger than the rest, the scale must accommodate that column, which means every other column wastes most of its representable levels. Per-block scaling divides the tensor into small rectangular tiles (commonly 128 by 128 elements for standard FP8, 32 elements per block for the MX formats) and attaches an independent FP32 scale to each tile. Every tile is then scaled so that its own largest element sits near the top of the 8-bit range, and outlier columns no longer penalize the rest of the tensor. The memory cost of these per-block scales is small: a 128-by-128 tile covers 16,384 elements, and its one FP32 scale adds 4 bytes, a 0.024% overhead. Figure 15.8.2 illustrates the contrast.</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Per-tensor versus per-block scaling: a matrix with one large-value column, showing how per-tensor scaling wastes the representable range for every other column while per-block scaling allocates its own scale to each 128-by-128 tile.">
+<defs>
+<marker id="arr1583" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b1583 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.4; }
+.r1583 { fill:#fde8e8; stroke:#b01010; stroke-width:1.2; }
+.g1583 { fill:#eaf3ec; stroke:#2f7d4f; stroke-width:1.2; }
+.t1583 { font:600 13px sans-serif; fill:#14385c; text-anchor:middle; }
+.s1583 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l1583 { fill:none; stroke:#14385c; stroke-width:1.5; marker-end:url(#arr1583); }
+</style>
+<text class="t1583" x="195" y="24">Per-tensor scaling (one scale for all)</text>
+<rect class="b1583" x="30" y="36" width="330" height="100" rx="8"/>
+<rect class="r1583" x="294" y="36" width="66" height="100" rx="4"/>
+<text class="s1583" x="170" y="90">small values</text>
+<text class="s1583" x="327" y="90">outlier</text>
+<text class="s1583" x="327" y="108">column</text>
+<text class="s1583" x="190" y="160">One FP32 scale covers the outlier: all other elements</text>
+<text class="s1583" x="190" y="176">waste most of their 8-bit representable range</text>
+<text class="t1583" x="590" y="24">Per-block scaling (one scale per 128×128 tile)</text>
+<rect class="g1583" x="430" y="36" width="80" height="50" rx="4"/><text class="s1583" x="470" y="64">s1</text>
+<rect class="g1583" x="514" y="36" width="80" height="50" rx="4"/><text class="s1583" x="554" y="64">s2</text>
+<rect class="g1583" x="598" y="36" width="80" height="50" rx="4"/><text class="s1583" x="638" y="64">s3</text>
+<rect class="g1583" x="682" y="36" width="80" height="50" rx="4"/><text class="s1583" x="722" y="64">s4 (outlier)</text>
+<rect class="g1583" x="430" y="90" width="80" height="46" rx="4"/><text class="s1583" x="470" y="116">s5</text>
+<rect class="g1583" x="514" y="90" width="80" height="46" rx="4"/><text class="s1583" x="554" y="116">s6</text>
+<rect class="g1583" x="598" y="90" width="80" height="46" rx="4"/><text class="s1583" x="638" y="116">s7</text>
+<rect class="g1583" x="682" y="90" width="80" height="46" rx="4"/><text class="s1583" x="722" y="116">s8</text>
+<text class="s1583" x="592" y="160">Each tile has its own scale: the outlier tiles use</text>
+<text class="s1583" x="592" y="176">a larger s4/s8; all others are optimally ranged</text>
+</svg>
+<figcaption><strong>Figure 15.8.2:</strong> Per-tensor versus per-block scaling for a matrix with one large-value column. With a single tensor-wide scale (left), the outlier column forces a large denominator that wastes most of the 8-bit range for every other column. With per-block scales (right), each 128-by-128 tile carries its own FP32 scale and fills its range independently, so activation outliers do not degrade the precision of the surrounding tiles.</figcaption>
+</figure>
+
+<h3>6.3 DeepSeek-V3: The First Large-Scale FP8 Pretraining Run</h3>
+<p>Prior to 2024, FP8 training had been demonstrated in controlled research settings but not at production scale. The <a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">DeepSeek-V3 technical report</a> changed that. DeepSeek-V3 is a 671-billion-parameter mixture-of-experts model pretrained substantially in FP8: linear-layer forward and backward passes used E4M3 and E5M2 respectively, with per-128-element-tile block scaling, while attention layers, residual additions, and the routing gate ran in BF16. The result reached quality statistically indistinguishable from a BF16 baseline, establishing that FP8 pretraining at full frontier scale is viable, not merely a laboratory curiosity. The report attributed a significant fraction of the model's cost efficiency to FP8, because the halved memory bandwidth and doubled theoretical compute throughput (relative to BF16 Tensor Cores on Hopper) translated directly into fewer GPU-hours per token.</p>
+
+<h3>6.4 PyTorch MXFP8 on Blackwell B200</h3>
+<p>The <strong>MX (Microscaling) formats</strong>, specified by the Open Compute Project, push block scaling to 32 elements per block rather than 128. MXFP8 attaches one shared exponent (an 8-bit integer) to every 32 consecutive values in a row or column, so the hardware can decode the block's range locally without any software scale-management loop. Blackwell B200 Tensor Cores decode MX block scales natively in silicon, eliminating the software overhead of maintaining and applying FP8 scale tensors that Hopper required. A 2026 PyTorch and Nebius study using TorchTitan with MXFP8 and DeepEP routing on B200 GPUs for DeepSeek-V3-style MoE training reported <strong>41% faster pretraining throughput relative to BF16</strong> on the same hardware, attributable to the combination of halved memory bandwidth, doubled compute throughput, and the removal of the software scale-management overhead that limited earlier FP8 implementations.</p>
+<p>The code below demonstrates the key pieces: casting weights and activations to <code>torch.float8_e4m3fn</code>, performing a simulated forward pass with FP32 accumulation, and computing the per-tensor scale factor that keeps values in range. Code 15.8.3 is intentionally self-contained and runs on any CUDA-capable device; it does not use the Transformer Engine or Blackwell hardware, so it simulates FP32 accumulation via explicit casting rather than hardware-native tile accumulation.</p>
+<pre><code class="language-python">import torch
+
+# Simulated single-layer FP8 forward pass with FP32 accumulation.
+# Runs on any CUDA device; does not require Hopper/Blackwell Transformer Engine.
+torch.manual_seed(0)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+batch, in_f, out_f = 64, 512, 1024
+X = torch.randn(batch, in_f, device=device)   # activations, BF16 in real training
+W = torch.randn(out_f, in_f, device=device)   # weight matrix
+
+# --- Per-tensor scale computation ---
+# Scale each tensor so its max absolute value maps to FP8 E4M3's max (448.0).
+fp8_max = 448.0                                # max representable in E4M3
+scale_X = fp8_max / X.abs().max().clamp(min=1e-12)
+scale_W = fp8_max / W.abs().max().clamp(min=1e-12)
+
+# Cast to FP8 E4M3 (forward-pass format) using per-tensor scales.
+X_fp8 = (X * scale_X).to(torch.float8_e4m3fn)
+W_fp8 = (W * scale_W).to(torch.float8_e4m3fn)
+
+# --- FP32 accumulation ---
+# Cast back to FP32 before the matrix multiply so partial sums accumulate cleanly.
+# In hardware (Hopper/Blackwell Transformer Engine) this widening happens inside
+# the Tensor Core tile; here we emulate it explicitly.
+X_f32 = X_fp8.to(torch.float32) / scale_X
+W_f32 = W_fp8.to(torch.float32) / scale_W
+Y_fp8_path = X_f32 @ W_f32.T                  # FP32 accumulation (emulated)
+
+# Reference: full-precision baseline
+Y_ref = X @ W.T
+
+abs_err = (Y_fp8_path - Y_ref).abs()
+print(f"FP8 E4M3 forward pass (per-tensor scale, FP32 accumulation)")
+print(f"  output shape       : {tuple(Y_fp8_path.shape)}")
+print(f"  max absolute error : {abs_err.max().item():.4f}")
+print(f"  mean absolute error: {abs_err.mean().item():.4f}")
+print(f"  X storage (FP8)    : {X_fp8.element_size() * X_fp8.numel() / 1024:.1f} KB")
+print(f"  W storage (FP8)    : {W_fp8.element_size() * W_fp8.numel() / 1024:.1f} KB")
+print(f"  X storage (FP32)   : {X.element_size() * X.numel() / 1024:.1f} KB  (4x larger)")
+</code></pre>
+<div class="code-caption"><strong>Code 15.8.3:</strong> FP8 E4M3 forward pass with per-tensor scaling and FP32 accumulation. The scale is computed so that the largest absolute value in each tensor maps to FP8 E4M3's maximum (448.0). FP32 accumulation is emulated by casting back before the matrix multiply; on Hopper and Blackwell hardware this widening happens inside the Tensor Core without explicit casts.</div>
+<pre><code class="language-text">FP8 E4M3 forward pass (per-tensor scale, FP32 accumulation)
+  output shape       : (64, 1024)
+  max absolute error : 3.2891
+  mean absolute error: 0.3847
+  X storage (FP8)    : 32.0 KB
+  W storage (FP8)    : 512.0 KB
+  X storage (FP32)   : 128.0 KB  (4x larger)
+</code></pre>
+<div class="code-caption"><strong>Output 15.8.3:</strong> FP8 E4M3 with per-tensor scaling achieves a 4x reduction in parameter storage relative to FP32. The mean absolute error (0.38) is acceptable for most training steps; per-block scaling (128-element tiles) would reduce this further by giving outlier channels their own scale.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: FP8 Halves Memory and Doubles Bandwidth, but Outliers Demand Scale Management</div>
+<p>Moving from BF16 to FP8 halves the bytes per parameter and gradient, which doubles effective memory bandwidth and halves the all-reduce payload, following the same logic that made BF16 attractive over FP32. The critical difference is that FP8's reduced mantissa makes it brittle to activation outliers: a single large-magnitude channel can exhaust the representable range and crush every other channel's precision if only a per-tensor scale is used. Per-block scaling (128 by 128 tiles for standard FP8, 32 elements per block for MX formats) is the remedy, giving each tile its own scale so that outlier channels do not penalize their neighbors. Getting block scales right requires tracking them through the forward pass, ensuring they are available for the backward pass, and keeping the overhead of scale metadata small relative to the savings from 8-bit storage. FP32 accumulation inside each matrix-multiply tile is non-negotiable: without it, thousands of 8-bit partial sums compound rounding error and the result diverges.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: MXFP4 and FP4 Inference on Next-Generation Hardware</div>
+<p>MXFP8 on Blackwell is 2025 production; the active research frontier has already moved to MXFP4 and FP4. Blackwell B200 GPUs ship with a hardware FP4 inference mode (NVFP4, 4-bit floating point) that can serve inference at roughly twice the token throughput of FP8 by halving the memory bandwidth again and doubling the number of weights that fit in the L2 and HBM. Training at FP4 precision is the open research question for 2025 to 2026: the mantissa space (1 bit after the sign and a 2-bit exponent in E2M1) is so small that standard gradient flows diverge without corrective mechanisms such as stochastic rounding, higher-precision residuals, or mixed-granularity block scales. Early results from Microsoft's MXFP4 experiments and from Blackwell partner previews suggest that FP4 training is approaching viability for certain layer types (embedding lookups, attention projections) with BF16 residuals, while dense linear layers remain more challenging. The trajectory mirrors the BF16-to-FP8 transition: hardware capability arrives first, inference adoption follows within one product cycle, and training adoption requires one more cycle of algorithmic stabilization.</p>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 15.8.1: Range Versus Precision <span class="exercise-type conceptual">Conceptual</span></div>
 <p>Using Table 15.8.1, explain in two or three sentences why BF16 needs no loss scaling while FP16 does, referring to the exponent-bit counts and the resulting dynamic ranges. Then describe a workload where FP16's extra mantissa bit (10 versus BF16's 7) would matter enough to justify the loss-scaling machinery, and one where BF16 is the clear choice. Why does the field default to BF16 on hardware that supports it?</p>

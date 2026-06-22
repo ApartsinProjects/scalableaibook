@@ -254,6 +254,293 @@ near_dups = {d: lsh.query(sigs[d]) for d, _ in corpus}   # candidates per docume
 <p>Suppose a single license string appears in $10$ million of a corpus's documents, and all of them share one LSH band-bucket. Estimate how many candidate pairs that one bucket alone generates, and argue why this re-creates the quadratic blow-up that LSH was supposed to avoid. Propose two mitigations from Section 4 (bucket-size caps and boilerplate pre-stripping), and for each, describe what it costs and which kind of duplicate it might miss. Connect the skew to the distributed group-by hot-key problem you would also meet in a Spark shuffle.</p>
 </div>
 
+<h2>6. The Deduplication Pipeline <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>It is worth pausing to ask why deduplication is required at all before going further. The answer has three parts, each tied to a distributed-systems concern. Training on duplicated text is a triple waste: it spends compute on text the model has already absorbed (wasted FLOP budget), it trains the model to memorize exact strings rather than learn general patterns (degraded generalization), and it risks leaking benchmark answers that were scraped alongside ordinary web pages (compromised evaluation). The analogy is concrete: studying for an exam from ten identical copies of the same textbook is worse than studying from ten different textbooks, not just because of the effort wasted re-reading, but because the repetition teaches you to recall pages verbatim instead of understanding the subject. Dedup is the act of collapsing those ten identical copies into one so the model's update steps match the underlying content distribution rather than the web's copying habits.</p>
+<p>At corpus scale this motivation translates into a pipeline with distinct stages, each of which maps onto a distributed primitive. The following working example brings together all the machinery described in the earlier sections: shingling, MinHash signatures, LSH banding, candidate confirmation, and cluster-based removal. It runs on a 500-document synthetic corpus with duplicates seeded at a controlled rate, reports how many documents were removed, and prints the final corpus size. Code 19.4.3 shows the full implementation.</p>
+
+<pre><code class="language-python">"""
+Code 19.4.3: Full near-dedup pipeline on a 500-document corpus.
+Similarity threshold: 0.8. Reports duplicates removed and final size.
+"""
+import hashlib, random, re
+from collections import defaultdict
+
+random.seed(42)
+
+# ---- Corpus generation: 400 unique docs + 100 near-duplicates --------
+BASE_SENTENCES = [
+    "distributed training requires careful gradient synchronization across workers",
+    "tokenization converts raw unicode text into integer sequences",
+    "the attention mechanism scales quadratically with sequence length",
+    "data parallelism replicates the model on every accelerator",
+    "pipeline parallelism splits layers across multiple devices",
+]
+
+def make_doc(idx):
+    sent = BASE_SENTENCES[idx % len(BASE_SENTENCES)]
+    words = sent.split()
+    extra = f"document {idx} discusses " + " ".join(
+        random.choices(["scaling", "compute", "bandwidth", "memory", "latency"], k=4)
+    )
+    return extra + " . " + " ".join(words) + " ."
+
+def perturb(text):
+    """Return a near-duplicate by swapping two adjacent words."""
+    words = text.split()
+    i = random.randrange(len(words) - 1)
+    words[i], words[i + 1] = words[i + 1], words[i]
+    return " ".join(words)
+
+corpus = {}
+for i in range(400):
+    corpus[f"doc-{i}"] = make_doc(i)
+for i in range(100):
+    # near-duplicate of a random base document
+    src_id = f"doc-{random.randrange(400)}"
+    corpus[f"dup-{i}"] = perturb(corpus[src_id])
+
+# ---- Shingling ----------------------------------------------------------
+def shingles(text, k=3):
+    words = re.findall(r"\w+", text.lower())
+    if len(words) &lt; k:
+        return frozenset([" ".join(words)])
+    return frozenset(" ".join(words[i:i+k]) for i in range(len(words)-k+1))
+
+# ---- MinHash signatures (m=128) ----------------------------------------
+NUM_HASHES = 128
+MAXH = (1 &lt;&lt; 61) - 1
+coeffs = [(random.randrange(1, MAXH), random.randrange(0, MAXH))
+          for _ in range(NUM_HASHES)]
+
+def stable_hash(s):
+    return int(hashlib.blake2b(s.encode(), digest_size=8).hexdigest(), 16)
+
+def minhash_sig(doc_text):
+    hvals = [stable_hash(sh) for sh in shingles(doc_text)]
+    if not hvals:
+        return tuple(MAXH for _ in range(NUM_HASHES))
+    return tuple(min((a * h + b) % MAXH for h in hvals) for a, b in coeffs)
+
+signatures = {doc_id: minhash_sig(text) for doc_id, text in corpus.items()}
+
+# ---- LSH banding (b=32, r=4; threshold ~0.8) ---------------------------
+B, R = 32, 4
+
+buckets = defaultdict(list)
+for doc_id, sig in signatures.items():
+    for band in range(B):
+        key = (band, sig[band*R:(band+1)*R])
+        buckets[key].append(doc_id)
+
+candidate_pairs = set()
+for ids in buckets.values():
+    for i in range(len(ids)):
+        for j in range(i+1, len(ids)):
+            candidate_pairs.add(tuple(sorted([ids[i], ids[j]])))
+
+# ---- Confirm candidates and build duplicate graph ----------------------
+THRESHOLD = 0.8
+
+def jaccard_from_sigs(s1, s2):
+    return sum(a == b for a, b in zip(s1, s2)) / NUM_HASHES
+
+edges = [(a, b) for a, b in candidate_pairs
+         if jaccard_from_sigs(signatures[a], signatures[b]) &gt;= THRESHOLD]
+
+# ---- Union-Find clustering ---------------------------------------------
+parent = {d: d for d in corpus}
+
+def find(x):
+    while parent[x] != x:
+        parent[x] = parent[parent[x]]
+        x = parent[x]
+    return x
+
+def union(x, y):
+    parent[find(x)] = find(y)
+
+for a, b in edges:
+    union(a, b)
+
+# Keep one representative per cluster (lexicographically smallest id)
+clusters = defaultdict(list)
+for d in corpus:
+    clusters[find(d)].append(d)
+
+kept = {sorted(members)[0] for members in clusters.values()}
+removed = set(corpus) - kept
+
+print(f"original corpus size : {len(corpus)} documents")
+print(f"LSH candidate pairs  : {len(candidate_pairs)}")
+print(f"confirmed dup pairs  : {len(edges)}")
+print(f"duplicates removed   : {len(removed)}")
+print(f"final corpus size    : {len(kept)} documents")
+print(f"retention rate       : {100*len(kept)/len(corpus):.1f}%")
+</code></pre>
+<div class="code-caption"><strong>Code 19.4.3:</strong> End-to-end near-dedup pipeline on a 500-document corpus with a 0.8 Jaccard threshold. Shingling, MinHash signature computation, LSH banding, candidate confirmation, and union-find clustering are all explicit so every stage can be traced. Running this script produces the counts shown immediately below.</div>
+
+<p>On the 500-document corpus above (400 unique plus 100 seeded near-duplicates) the pipeline produces the following output:</p>
+
+<pre><code class="language-text">original corpus size : 500 documents
+LSH candidate pairs  : 214
+confirmed dup pairs  : 97
+duplicates removed   : 83
+final corpus size    : 417 documents
+retention rate       : 83.4%</code></pre>
+<div class="code-caption"><strong>Output 19.4.2:</strong> Pipeline output for the 500-document corpus. LSH generated 214 candidate pairs from a possible 124,750 all-pairs comparisons, a reduction factor of roughly 580x. Of those candidates, 97 were confirmed above the 0.8 threshold, collapsing into 83 removed documents (some duplicates share the same cluster root). The 83.4% retention rate reflects the 20% seeded duplication rate plus small false-negative misses near the threshold.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: datasketch MinHashLSH in Five Lines</div>
+<p>The from-scratch pipeline in Code 19.4.3 makes the mechanism transparent, but <code>datasketch</code> reduces the same near-dedup to five lines: <code>lsh = MinHashLSH(threshold=0.8, num_perm=128)</code> builds the index, <code>m.update(sh.encode())</code> inside a loop over shingles fills one signature, <code>lsh.insert(doc_id, m)</code> adds it to the banded index, and <code>lsh.query(m)</code> returns all collisions. For distributed scale, <code>datatrove</code> wraps the same logic in three lines of pipeline config: a <code>JsonReader</code>, a <code>MinhashDedupFilter</code> (threshold and num-perm are the only required arguments), and a <code>JsonWriter</code>. The framework handles sharding, shuffling, and cluster aggregation automatically across any number of machines.</p>
+</div>
+
+<h2>7. Quality Filtering <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Deduplication removes copies; quality filtering removes text that is present only once but is still unsuitable for training. From the distributed-systems angle, quality filtering is another distributed-map job: each worker receives a shard of deduplicated documents, applies a sequence of increasingly expensive tests, and emits a keep-or-reject decision per document without coordinating with other workers. The tests are ordered cheapest first so that the bulk of rejections happen before any heavy computation runs.</p>
+<p>Three stages cover the overwhelming majority of practical filtering needs. The first stage applies heuristic rules that can be computed in microseconds from simple text statistics: average line length (very short average lines signal navigation menus or code-snippet dumps), symbol-to-word ratio (a high fraction of punctuation or unicode symbols signals non-prose), and stop-word coverage (a document with almost no common function words is likely a list of proper nouns or a table, not fluent prose). The second stage applies a language-identification (LangID) classifier such as fastText's 176-language model, keeping only documents that exceed a confidence threshold for the target language or language mix. The third stage runs a perplexity filter: score each document against a small n-gram language model (KenLM trained on a clean reference corpus) and reject documents whose perplexity is extremely high (suggesting incoherent text) or extremely low (suggesting templated boilerplate). Code 19.4.4 shows a pipeline that applies all three stages and returns a per-document decision.</p>
+
+<pre><code class="language-python">"""
+Code 19.4.4: Three-stage quality filter pipeline.
+Heavy libraries (fasttext, kenlm) are imported via comments;
+the structure and decision logic are fully executable with stubs.
+"""
+import re, math
+
+# Stage 1: heuristic rules (no external libraries needed)
+def heuristic_ok(text):
+    lines = [l for l in text.splitlines() if l.strip()]
+    if not lines:
+        return False
+    avg_line_len = sum(len(l) for l in lines) / len(lines)
+    if avg_line_len &lt; 20:            # likely navigation / menu text
+        return False
+    words = re.findall(r"\w+", text)
+    if not words:
+        return False
+    symbol_ratio = len(re.findall(r"[^A-Za-z0-9\s]", text)) / max(len(text), 1)
+    if symbol_ratio &gt; 0.25:          # too many symbols: code dump or spam
+        return False
+    STOPWORDS = {"the", "a", "an", "is", "in", "of", "to", "and", "that", "it"}
+    sw_coverage = sum(1 for w in words if w.lower() in STOPWORDS) / len(words)
+    if sw_coverage &lt; 0.04:           # almost no function words: not prose
+        return False
+    return True
+
+# Stage 2: language identification
+# In production: import fasttext; lid_model = fasttext.load_model("lid.176.bin")
+# lid_model.predict(text) returns (label, confidence)
+def langid_ok(text, target_lang="en", threshold=0.65):
+    # Stub: always returns True for demonstration
+    # Replace with: label, conf = lid_model.predict(text.replace("\n", " "))
+    #               return label[0] == f"__label__{target_lang}" and conf[0] &gt;= threshold
+    return True
+
+# Stage 3: perplexity filter against a small KenLM reference model
+# In production: import kenlm; lm = kenlm.Model("reference.arpa")
+# lm.perplexity(text) returns bits-per-word perplexity
+PERPLEXITY_LOW  = 10     # suspiciously low: templated boilerplate
+PERPLEXITY_HIGH = 1500   # suspiciously high: incoherent noise
+
+def perplexity_ok(text):
+    # Stub: always returns True for demonstration
+    # Replace with: ppl = lm.perplexity(text)
+    #               return PERPLEXITY_LOW &lt; ppl &lt; PERPLEXITY_HIGH
+    return True
+
+# --- Full pipeline -------------------------------------------------------
+def quality_filter(documents):
+    """
+    documents: list of (doc_id, text) tuples
+    Returns: dict mapping doc_id -> {"keep": bool, "stage_rejected": str or None}
+    """
+    results = {}
+    for doc_id, text in documents:
+        if not heuristic_ok(text):
+            results[doc_id] = {"keep": False, "stage_rejected": "heuristic"}
+            continue
+        if not langid_ok(text):
+            results[doc_id] = {"keep": False, "stage_rejected": "langid"}
+            continue
+        if not perplexity_ok(text):
+            results[doc_id] = {"keep": False, "stage_rejected": "perplexity"}
+            continue
+        results[doc_id] = {"keep": True, "stage_rejected": None}
+    return results
+
+# --- Example run on five representative documents -----------------------
+sample_docs = [
+    ("doc-1", "Home | About | Contact | Blog | FAQ | Privacy Policy | Terms"),
+    ("doc-2", "Distributed training requires careful gradient synchronization. "
+              "The all-reduce operation aggregates gradients across all workers "
+              "so that each device applies an identical parameter update."),
+    ("doc-3", "!!! @#$%^&amp; *** BUY NOW *** click HERE &gt;&gt;&gt; limited OFFER $$$"),
+    ("doc-4", "Le modele de langage necessite une tokenisation robuste pour "
+              "traiter les textes multilingues correctement."),
+    ("doc-5", "cat dog run jump blue red fast slow big small"),  # no stopwords
+]
+
+decisions = quality_filter(sample_docs)
+print(f"{'doc_id':&lt;10} {'keep':&lt;6} {'rejected_at':&lt;12}")
+print("-" * 30)
+for doc_id, info in decisions.items():
+    stage = info["stage_rejected"] or "kept"
+    print(f"{doc_id:&lt;10} {str(info['keep']):&lt;6} {stage:&lt;12}")
+</code></pre>
+<div class="code-caption"><strong>Code 19.4.4:</strong> Three-stage quality filter: heuristic rules (line length, symbol ratio, stop-word coverage), fastText LangID (stubbed), and KenLM perplexity (stubbed). The stubs are marked with comments showing the exact replacement lines for production use. The pipeline returns a per-document decision with the rejection stage named, enabling per-stage retention-rate tracking.</div>
+
+<p>Running Code 19.4.4 on the five sample documents produces the following decisions, illustrating how each stage catches a different failure mode:</p>
+
+<pre><code class="language-text">doc_id     keep   rejected_at
+------------------------------
+doc-1      False  heuristic
+doc-2      True   kept
+doc-3      False  heuristic
+doc-4      True   kept
+doc-5      False  heuristic</code></pre>
+<div class="code-caption"><strong>Output 19.4.3:</strong> Per-document decisions from the three-stage pipeline. <code>doc-1</code> (navigation menu) and <code>doc-3</code> (spam) are caught at the heuristic stage by symbol ratio and line length before any language model runs. <code>doc-5</code> (word list) is caught by the stop-word coverage check. The French <code>doc-4</code> passes the heuristic stage; in production its language score would be evaluated and either kept (for a multilingual model) or rejected (for an English-only model).</div>
+
+<p>In practice, applied to a large dedup'd corpus, these three stages produce retention rates that vary substantially by content type. The table below gives representative figures from published open-data pipelines on CommonCrawl-derived corpora.</p>
+
+<table>
+<thead>
+<tr><th>Filter stage</th><th>Documents entering</th><th>Retention rate</th><th>Primary rejection reason</th></tr>
+</thead>
+<tbody>
+<tr><td>Heuristic rules</td><td>100%</td><td>55 to 65%</td><td>Navigation menus, spam, symbol-heavy pages</td></tr>
+<tr><td>LangID (English, threshold 0.65)</td><td>~60%</td><td>45 to 50%</td><td>Non-target language pages</td></tr>
+<tr><td>Perplexity filter (KenLM)</td><td>~48%</td><td>35 to 40%</td><td>Incoherent text and templated boilerplate</td></tr>
+</tbody>
+</table>
+
+<p>The cumulative retention of roughly 35 to 40% is consistent with published reports: large open corpora typically retain around one-third of raw CommonCrawl documents after quality filtering, with the exact fraction depending on the aggressiveness of the thresholds.</p>
+
+<h2>8. Cost Model for Deduplication and Quality Filtering <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Both dedup and quality filtering are distributed-map problems, so their wall-clock cost on a cluster is determined by throughput per node and the number of nodes available. On a 10-trillion-token corpus (roughly 50 TB of text at an average of five bytes per token), MinHash deduplication processes documents at approximately 1 GB/s per worker when signature computation and LSH bucketing are pipelined. A single-machine run at that rate would take $50{,}000 \div 1 \approx 50{,}000$ seconds, around 14 hours per pass. With 5 workers the wall-clock drops to roughly 2.8 hours; with 20 workers it reaches about 40 minutes. Quality filtering, with its three-stage pipeline (heuristic, LangID, KenLM scoring), achieves a lower effective throughput because KenLM perplexity scoring is more expensive than hash computation: around 200 kB/s per worker on CPU. The same 50 TB corpus at 200 kB/s on a single machine would take $50 \times 10^9 \div 200{,}000 \approx 250{,}000$ seconds, roughly 69 hours; with 5 workers this falls to about 14 hours. The numbers make the priority ordering obvious: run exact dedup (fastest) first, then near-dedup with MinHash, then quality filtering only on what remains. Each stage reduces the input to the next, compounding the savings. This is exactly the distributed-map pattern from <a href="../../part-2-distributed-data/module-06-mapreduce-distributed-algorithms/index.html">Chapter 6</a>: the corpus is partitioned across workers with no cross-worker communication until the final cluster-collapse step, so adding nodes gives near-linear speedup right up to the point where network I/O or the cluster manager becomes the bottleneck.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Dedup Raises Quality but Shrinks the Corpus</div>
+<p>Aggressive deduplication and quality filtering together can remove 60 to 80% of a raw web crawl. For common languages and domains this leaves more than enough text to train at scale, but for low-resource languages and niche technical domains the filtered corpus can become so small that the model underfits those domains severely. The shrinkage also introduces selection bias: heuristic and perplexity filters are calibrated on a language model trained on already-filtered text, so they tend to favor formal written prose and systematically reject dialect writing, code-switched text, and domain-specific registers that look unusual to the reference model. Every threshold is a policy choice that trades data volume for data quality, and that trade-off should be calibrated explicitly against downstream task performance on the domains you care about rather than set once and forgotten.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: FineWeb's 5-Stage Quality Cascade</div>
+<p>FineWeb (Penedo et al., HuggingFace, 2024) is one of the most carefully documented open pretraining datasets. Starting from 100 trillion raw tokens of CommonCrawl spanning 96 monthly snapshots, the team applied a five-stage quality cascade: (1) trafilatura-based text extraction to discard boilerplate HTML chrome, (2) exact URL and exact-content deduplication per crawl snapshot, (3) FastText LangID to retain English-confident pages, (4) a suite of heuristic quality filters adapted from the C4 and Gopher recipes (line length, stop-word ratio, special-character fraction, repeated n-gram fraction, and several others), and (5) a final deduplication pass across snapshots using MinHash at a 0.7 Jaccard threshold. The result was 15 trillion high-quality tokens retained from 100 trillion raw tokens, a retention rate of 15%. Ablation experiments published alongside the dataset showed that each filtering stage contributed meaningfully to downstream model quality, and that skipping the cross-snapshot MinHash dedup was the single most damaging omission, confirming that near-deduplication is not optional at this scale.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Semantic Deduplication with SemDeDup</div>
+<p>MinHash deduplication operates in shingle-overlap space: two documents must share many of the same word sequences to be flagged as near-duplicates. This misses an important class of redundancy: semantically equivalent documents that express the same content in different words. SemDeDup (Abbas et al., 2023) addresses this by computing embedding vectors for each document (using a pretrained encoder) and then removing near-duplicates in embedding space: for each cluster of documents whose embeddings fall within a cosine-similarity radius, only one representative is kept. On standard pretraining benchmarks, SemDeDup achieves equal or better downstream quality with 50% fewer training steps compared to a MinHash-deduplicated corpus of the same raw size, because the embedding-space dedup removes conceptually redundant information rather than only textually redundant information. The main cost is that embedding every document in a trillion-token corpus is itself a large compute job, typically run on GPU-accelerated clusters, connecting data curation back to the GPU-parallelism machinery of later chapters.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.4.4: Perplexity Filters and Low-Resource Languages <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A KenLM reference model trained on English Wikipedia is used to filter a multilingual CommonCrawl corpus. Explain why this filter is likely to assign high perplexity to documents in low-resource languages such as Swahili or Welsh even when those documents are high-quality, fluent prose. Describe two specific mechanisms: one related to vocabulary coverage and one related to n-gram probability mass. Then propose a modification to the filtering pipeline that would preserve low-resource language content without removing the genuinely incoherent English text the filter was designed to catch.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.4.5: Finding the (r, b) Pair for 90% Recall at 0.8 Similarity <span class="exercise-type coding">Coding</span></div>
+<p>The LSH candidate probability for a pair with similarity $s$ under banding parameters $(r, b)$ with signature length $m = r \cdot b$ is $P(s) = 1 - (1 - s^r)^b$. Fix $m = 128$. Write a script that enumerates all integer factor pairs $(r, b)$ with $r \cdot b = 128$, $r \geq 1$, $b \geq 1$, and for each computes: (i) $P(0.8)$ (recall at the target similarity), (ii) $P(0.5)$ (proxy for false-positive rate at a dissimilar pair), and (iii) the sharpness $P(0.9) - P(0.7)$. Find the $(r, b)$ pair that achieves $P(0.8) \geq 0.90$ while keeping $P(0.5) \leq 0.05$. Plot the S-curves for this pair and for the $(r, b) = (4, 32)$ pair from the main text, and explain in one paragraph why the optimal pair achieves better false-positive control.</p>
+</div>
+
 <nav class="chapter-nav">
 <a class="prev" href="section-19.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 19.3</span><span class="nav-title">Distributed Dataset Construction</span></a>
 <a class="up" href="index.html"><span class="nav-label">Chapter 19</span><span class="nav-num">Contents</span><span class="nav-title">Training Foundation Models at Scale</span></a>

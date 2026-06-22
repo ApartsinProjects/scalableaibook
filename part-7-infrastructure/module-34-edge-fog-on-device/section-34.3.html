@@ -199,6 +199,102 @@ out = sess.run(None, {"input": x})                       # runs on NPU, CPU fall
 <p>On a server, a model's cost shows up on an electricity bill the operator never personally feels. On a phone, the same model warms the device in the user's hand and the battery icon ticks down while they watch. It is the one deployment in this book where the end user pays the energy term of $E_{\text{infer}}$ directly, in heat and battery percent, which is why a runtime that wastes a few millijoules per inference gets noticed in a way no datacenter ever notices a stray watt.</p>
 </div>
 
+<h2>5. On-Device Generative LLMs <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>The sections above treated on-device inference as the domain of compact convolutional nets and keyword spotters. Since 2024, that picture has changed substantially. Mobile system-on-chips now integrate dedicated neural processing units delivering 30 to 50 TOPS at 5 to 10 W, and flagship phones with 8 to 16 GB of RAM can run 4-bit-quantised 7-to-8-billion-parameter language models at 30 to 90 tokens per second. The device has become a credible host for generative intelligence, not merely for classification or keyword spotting, and a new stack has grown up to exploit that shift.</p>
+
+<div class="callout thesis-thread">
+<div class="callout-title">Thesis Thread: Intelligence at the Outermost Point of the Distribution Axis</div>
+<p>Chapter 1 introduced the cloud-to-device axis as the organizing geometry of distributed AI: intelligence can be concentrated at a small number of powerful nodes or scattered to many weak ones. On-device generative LLMs are the outermost point of that axis. Every round-trip to the cloud is eliminated, together with its latency, bandwidth cost, and privacy exposure, but the model must accept the tightest resource ceiling in the entire book. The quantization and compression techniques of Section 2 are not optional overheads here; they are the gate that decides whether the intelligence can exist at the endpoint at all. Running a 7B language model on a phone is the same distribution thesis applied to its sharpest form: intelligence at the device, at zero per-query server cost, with the full capability constraint that comes with it.</p>
+</div>
+
+<h3>5.1 Why It Is Possible Now: Mobile NPUs</h3>
+<p>Three hardware generations made on-device generative inference practical. Apple's Neural Engine in the A17 and A18 chips delivers 35 to 38 TOPS at under 5 W; Qualcomm's Hexagon NPU in the Snapdragon 8 Gen 3 reaches 45 TOPS; MediaTek's APU in the Dimensity 9300 delivers 33 TOPS. These figures matter because a generative decoder step is a sequence of matrix-vector products over the weight matrix: each step reads the full model weights from memory once, which is precisely the operation an integer-optimised NPU executes most efficiently. At 40 TOPS of 4-bit throughput, a 7B model's 3.5 GB of weights can be consumed in roughly a second of arithmetic, which translates to tens of decode tokens per second on a device that consumes less power than a reading lamp.</p>
+<p>The memory-bandwidth constraint is equally important. A 7B model at 4-bit precision occupies 3.5 GB (from $P \cdot b/8 = 7 \times 10^9 \times 4 / 8 = 3.5 \times 10^9$ bytes). A phone with 12 GB/s of LPDDR5X memory bandwidth can stream those weights in roughly $3.5 \times 10^9 / (12 \times 10^9) \approx 0.29$ seconds per decode pass, yielding a theoretical ceiling of about 3.5 tokens per second from memory bandwidth alone, before the NPU's arithmetic adds its own ceiling. In practice, grouped quantization and NPU instruction packing push observed rates to 30 to 90 tokens per second on current hardware, meaning the NPU arithmetic is fast enough that the bottleneck shifts back to memory bandwidth, which is exactly the decode-phase regime described in <a href="../../part-5-distributed-inference/module-24-distributed-llm-serving/index.html">Chapter 24</a>.</p>
+
+<h3>5.2 The Quantisation and Runtime Stack</h3>
+<p>Section 2 showed that a 7B model at int4 occupies 3.5 GB. On-device generative inference requires two additional refinements beyond the symmetric per-tensor scheme of Code 34.3.1: weight-only quantization with grouped scales, and a runtime that compiles the resulting model to the device NPU.</p>
+<p><strong>Weight-only quantisation (AWQ and GPTQ).</strong> Activation-aware Weight Quantization (AWQ) and Generative Pre-trained Transformer Quantization (GPTQ) both quantize only the weights, leaving activations in floating point. This avoids accumulating quantization error through multiple activation non-linearities, which would degrade generation quality. AWQ selects the scale for each weight group by minimizing the reconstruction error on a small calibration set of activations, while GPTQ solves a layer-wise second-order minimization. Both produce 4-bit weights with per-group scales.</p>
+<p><strong>Grouped quantisation.</strong> Rather than one scale per tensor or per channel, grouped quantisation assigns one scale to every $g$ consecutive weights, typically $g = 128$. Each scale is stored in float16, so the overhead is $P / g$ float16 values added to $P$ int4 values. At $g = 128$, the overhead is 0.78 percent of the weight footprint, a negligible price for the quality preserved by using a tighter local scale. The total memory for a 7B model at 4-bit with $g = 128$ groups remains comfortably below 4 GB.</p>
+<p><strong>Runtimes.</strong> Three runtimes are in wide use as of 2025 to 2026. <strong>llama.cpp</strong> compiles quantized GGUF-format models to CPU, GPU, and Metal backends with a single binary; it was the first runtime to run a 7B model on consumer hardware. <strong>ExecuTorch 1.0</strong> (GA October 2025) is PyTorch's on-device path: a model is exported from PyTorch, quantized, and compiled to a backend-specific delegate, with a Hexagon NPU backend that achieves 18 to 38 times faster prefill than CPU-only execution. <strong>MLC-LLM</strong> uses the TVM compiler to generate optimised kernels for Metal, OpenCL, and Vulkan, covering the full range of mobile and embedded GPUs.</p>
+
+<h3>5.3 The Prefill/Decode Split and Hybrid NPU Scheduling</h3>
+<p>Generative inference has two phases with very different arithmetic characters, as Chapter 24 established. <strong>Prefill</strong> processes the input prompt in parallel: it is a batch of large matrix-matrix products (the query, key, and value projections over all prompt tokens), which saturates GPU parallelism but is irregular and memory-intensive on an NPU. <strong>Decode</strong> generates one token at a time: it is a sequence of matrix-vector products over the weight matrix, which an NPU executes extremely efficiently because the access pattern is regular and the arithmetic is integer.</p>
+<p>This asymmetry motivates hybrid CPU-NPU scheduling. The prefill phase is routed to the CPU plus GPU, where multi-core parallelism and the GPU's floating-point throughput handle the irregular attention computation efficiently. The decode phase is routed to the NPU, which sustains integer matmul throughput at low power. ExecuTorch's Hexagon backend implements exactly this split, reporting 18 to 38 times faster prefill than CPU-only in the case where it routes the attention computation to GPU subgraphs and the linear layers to the Hexagon NPU. The practitioner's rule of thumb: use the NPU for weight-reads-and-accumulate (the linear layers in decode), use the GPU or CPU for irregular attention and activation operations (prefill).</p>
+
+<h3>5.4 Exporting a Model for On-Device Deployment with ExecuTorch</h3>
+<p>The pipeline for deploying a quantized LLM to a device with ExecuTorch follows a three-stage pattern: export the model from PyTorch to a portable representation, apply weight-only quantization, and compile the result to a device-specific backend. The snippet below shows the canonical export pipeline. The resulting <code>.pte</code> file is the artifact shipped to the device runtime.</p>
+<pre><code class="language-python">import torch
+from executorch.exir import to_edge
+from torch.export import export
+from torchao.quantization import quantize_, int4_weight_only
+
+# 1. Load (or define) the model in eager mode.
+model = load_pretrained_llm("meta-llama/Llama-3.2-3B")  # 3B weights, float32
+model.eval()
+
+# 2. Apply 4-bit weight-only quantisation with group size 128.
+#    AWQ/GPTQ calibration would precede this step in production.
+quantize_(model, int4_weight_only(group_size=128))
+
+# 3. Export to a strict portable graph (torch.export captures the compute graph).
+example_inputs = (torch.zeros(1, 64, dtype=torch.long),)  # (batch, seq_len)
+exported = export(model, example_inputs)
+
+# 4. Lower to the ExecuTorch edge dialect, then compile to the Hexagon backend.
+edge_prog = to_edge(exported)
+et_prog = edge_prog.to_executorch()          # backend-agnostic .pte bytecode
+
+# 5. Serialize the artifact for on-device deployment.
+with open("llm_q4.pte", "wb") as f:
+    et_prog.write_to_file(f)
+
+print("Exported model size:", round(f.tell() / 1e9, 2), "GB")
+# Expected for a 3B model at int4: approx 1.7 GB
+</code></pre>
+<div class="code-caption"><strong>Code 34.3.3:</strong> ExecuTorch export pipeline: load a pre-trained LLM, apply 4-bit weight-only quantization (group size 128 via torchao), export the compute graph with <code>torch.export</code>, lower it to the ExecuTorch edge dialect, and serialize to a <code>.pte</code> artifact. The same five-step pattern applies to any model size; a 7B model at int4 produces a file near 3.5 GB. The backend delegate (<code>to_executorch()</code>) is swapped for the Hexagon or XNNPACK backend to target a specific NPU.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: llama.cpp in Two CLI Lines, ExecuTorch Export in Five Python Lines</div>
+<p>For local experimentation, llama.cpp offers the fastest path to running a quantized LLM on any hardware:</p>
+<pre><code class="language-bash"># Download a pre-quantized 7B model in Q4_K_M format from HuggingFace.
+huggingface-cli download bartowski/Meta-Llama-3.1-8B-Instruct-GGUF \
+    --include "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" --local-dir ./models
+
+# Run it on CPU (or Metal GPU on macOS via -ngl 99).
+llama-cli -m ./models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf \
+    -p "Explain on-device AI in one paragraph." -n 200
+</code></pre>
+<div class="code-caption"><strong>Code 34.3.4:</strong> llama.cpp two-step: download a pre-quantized GGUF and run it with <code>llama-cli</code>. The <code>-ngl 99</code> flag offloads all layers to the Metal GPU on Apple Silicon; omitting it runs on CPU. The ExecuTorch five-line export is shown in Code 34.3.3.</div>
+</div>
+
+<h3>5.5 Tradeoffs: Privacy, Offline Operation, and Capability Constraints</h3>
+<p>On-device generative inference offers three advantages that cloud serving cannot match at any price. <strong>Privacy:</strong> the input prompt and all intermediate activations remain on the device; no token is transmitted to any server. This matters for personal writing, health queries, private messages, and any scenario where the user would not want a cloud provider to see the content. <strong>Offline operation:</strong> the model answers regardless of network connectivity, which is essential for field devices, aircraft, and low-bandwidth environments. <strong>Zero marginal cost:</strong> each query costs the operator nothing, because the compute is the user's own hardware.</p>
+<p>Three constraints push back. <strong>Context window is limited by RAM:</strong> the key-value cache for a 7B model at context length $L$ occupies $2 \cdot L \cdot n_{\text{layers}} \cdot d_{\text{head}} \cdot n_{\text{heads}} \cdot 2$ bytes (two for float16, two tensors for K and V). For a typical 32-layer, 4096-hidden-dim, 32-head model at $L = 4096$ tokens: $2 \times 4096 \times 32 \times 128 \times 32 \times 2 \approx 2.1$ GB, which added to the 3.5 GB of weights fills 8 GB RAM completely. In practice, phones support 2048 to 4096 token contexts; 8K or longer contexts are not feasible without offloading. <strong>Model quality is capped by size:</strong> a 3.5 GB model is at most a 7B-parameter model, and frontier capability requires 70B or more parameters. Complex reasoning, long-document summarisation, and multi-step tool use remain cloud tasks. <strong>Battery life constrains sustained inference:</strong> running an NPU at 40 TOPS continuously at 10 W draws a 4000 mAh battery down in roughly 4 hours of uninterrupted inference, so on-device LLMs are appropriate for interactive, bursty workloads rather than continuous background processing.</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Apple Intelligence on iPhone 16</div>
+<p><strong>Architecture:</strong> Apple Intelligence, shipping on iPhone 15 Pro and iPhone 16, runs a family of on-device language models estimated at around 3 billion parameters, distilled and quantized for the Apple Neural Engine in the A17 and A18 chips.</p>
+<p><strong>What runs on-device:</strong> Writing tool suggestions (rewrite, proofread, summarise), notification triage, photo search, and basic Siri requests are handled entirely locally by the on-device model, with no data leaving the device.</p>
+<p><strong>What escalates to the cloud:</strong> Complex requests that exceed the capability of the 3B on-device model are forwarded to Private Cloud Compute (PCC), Apple's privacy-preserving server-side inference infrastructure. PCC uses hardware attestation and ephemeral processing so that even Apple's own servers cannot log the request content.</p>
+<p><strong>Why this matters architecturally:</strong> Apple Intelligence is a hybrid edge-cloud system with an explicit escalation policy. The on-device model handles the majority of queries (keeping data local and incurring zero server cost), while PCC handles the tail of hard queries. The split-computing framework of <a href="section-34.4.html">Section 34.4</a> describes exactly this pattern: run locally while the local model suffices, escalate when it does not.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Speculative Decoding on Device (2025 to 2026)</div>
+<p>Speculative decoding (Leviathan et al., 2023) uses a small draft model to propose several tokens, then verifies the full batch with the target model in one forward pass, recovering the exact target distribution in fewer sequential steps. On a device with both an NPU and CPU, a natural split emerges: the small draft model runs on the NPU (fast matrix-vector products, low power) and proposes a window of four to eight tokens, then the larger target model verifies the window on the CPU and GPU in one pass. Early 2025 to 2026 results report two to three times throughput improvement over sequential decoding on mobile hardware, because the NPU draft step is cheap and the CPU-GPU verification pass amortizes over multiple proposed tokens. The key open question is how to maintain draft acceptance rates as the on-device target model is itself heavily quantized; a draft trained on the unquantized teacher can diverge from the quantized target, reducing the speedup.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.3.4: Maximum Tokens per Second on a Phone <span class="exercise-type analysis">Analysis</span></div>
+<p>A flagship phone has 8 GB of RAM, 12 GB/s of LPDDR5X memory bandwidth, and an NPU delivering 40 TOPS at 4-bit integer precision. You plan to deploy a 7B language model at 4-bit weight-only quantization with group size 128.</p>
+<p>(a) Compute the weight footprint using $\text{bytes} = P \cdot b / 8$ and confirm it is approximately 3.5 GB.</p>
+<p>(b) Compute the maximum tokens per second from the memory-bandwidth ceiling: each decode step must stream all model weights through the memory bus once, so $\text{tokens/sec}_{\text{mem}} = \text{bandwidth} / \text{weight bytes}$.</p>
+<p>(c) Compute the maximum tokens per second from the NPU arithmetic ceiling: each decode step requires approximately $2P$ multiply-accumulate operations (one forward pass over the weight matrix), so $\text{tokens/sec}_{\text{NPU}} = \text{TOPS} / (2P)$, where TOPS is in operations per second at 4-bit precision.</p>
+<p>(d) Which ceiling binds? Explain in one sentence why on-device LLM decode is memory-bandwidth-bound rather than compute-bound, and relate this to the same conclusion in Chapter 24 for datacenter serving.</p>
+<p>(e) At a context length of 2048 tokens, estimate the KV-cache footprint (assume 32 layers, 32 heads, head dimension 128, float16) and verify whether it fits alongside the weights in 8 GB. State whether a 4K-token context is feasible on this device.</p>
+</div>
+
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 34.3.1: Does It Fit? <span class="exercise-type conceptual">Conceptual</span></div>
 <p>A device grants an inference engine 2 GB of RAM, of which roughly 30 percent must be reserved for activations and the key-value cache. Using $\text{bytes} = P \cdot b/8$, decide whether each of the following fits the remaining weight budget, and if not, what compression would make it fit: (a) a 1.5-billion-parameter model in fp16; (b) the same model in int4; (c) a 7-billion-parameter model in int8; (d) a 7-billion-parameter model in int4. State for each which of the four constraints from Section 1 you used.</p>
